@@ -20,7 +20,7 @@ end
 -- MAIN PROGRAM
 -- =============================================================================
 
-local VERSION      = "1.2.5"
+local VERSION      = "1.2.0"
 local PROTOCOL     = "quid_bank"
 local DB_TIMEOUT   = 5
 local IDLE_TIMEOUT = 60
@@ -165,22 +165,17 @@ end
 -- Input field: light-grey fill on white card so it's clearly visible,
 -- with a left accent marker when focused. Caps indicator on the right.
 local function inputField(x, y, w, value, masked, focused)
-  local bg = focused and C.in_act or C.in_bg
-  -- Full width fill first — this is what keeps it from shrinking
+  -- Always grey, always full width — focus shown only by blinking cursor
+  local bg = C.in_bg
   fill(x, y, w, 1, bg)
-  -- Left edge focus marker (1 char)
-  at(x, y, focused and "\149" or " ", focused and C.accent or C.dim, bg)
-  -- Text fills the rest: w-1 chars from x+1
-  local inner_w = w - 1
   local display = masked and string.rep("*", #value) or value
-  -- Pad to exactly inner_w so the grey background always fills completely
-  local padded  = display .. string.rep(" ", math.max(0, inner_w - #display))
-  at(x+1, y, padded:sub(1, inner_w), C.in_fg, bg)
+  local padded  = display .. string.rep(" ", math.max(0, w - #display))
+  at(x, y, padded:sub(1, w), C.in_fg, bg)
   if focused then
     if capsLock then
       at(x + w - 5, y, "CAPS", C.caps, bg)
     end
-    term.setCursorPos(x + 1 + math.min(#value, inner_w - 1), y)
+    term.setCursorPos(x + math.min(#value, w - 1), y)
     term.setCursorBlink(true)
   end
   return {x1=x, y1=y, x2=x+w-1, y2=y}
