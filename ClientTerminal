@@ -20,7 +20,7 @@ end
 -- MAIN PROGRAM
 -- =============================================================================
 
-local VERSION      = "1.2.0"
+local VERSION      = "1.2.4"
 local PROTOCOL     = "quid_bank"
 local DB_TIMEOUT   = 5
 local IDLE_TIMEOUT = 60
@@ -31,30 +31,33 @@ local W, H = term.getSize()
 -- COLOUR PALETTE  — professional banking aesthetic
 -- =============================================================================
 local C = {
-  bg       = colors.gray,        -- page background
+  bg       = colors.lightGray,   -- page background (light, like a website)
   card     = colors.white,       -- card/panel background
   card_fg  = colors.black,       -- text on cards
-  accent   = colors.cyan,        -- primary brand colour
-  accent_fg= colors.black,       -- text on accent
-  header   = colors.lightBlue,   -- top bar
+  accent   = colors.purple,      -- primary brand colour
+  accent_fg= colors.white,
+  header   = colors.purple,      -- top bar (NatWest purple)
   hdr_fg   = colors.white,
-  label    = colors.lightGray,   -- muted label text
-  body     = colors.white,       -- normal body text
-  dim      = colors.lightGray,
-  in_bg    = colors.white,
+  label    = colors.gray,        -- muted label text (readable on white)
+  body     = colors.black,       -- normal body text
+  dim      = colors.gray,
+  in_bg    = colors.lightGray,   -- input fill - distinct from white card
   in_fg    = colors.black,
-  in_act   = colors.lightBlue,   -- active/focused input border row
-  btn_pri  = colors.cyan,        -- primary button
+  in_act   = colors.white,       -- focused input - white with accent cursor
+  in_border= colors.gray,        -- input border marker
+  btn_pri  = colors.purple,      -- primary button
   btn_sec  = colors.lightGray,   -- secondary button
   btn_dan  = colors.red,         -- destructive button
   btn_fg   = colors.white,
   err      = colors.red,
-  ok       = colors.lime,
-  money    = colors.lime,
+  ok       = colors.green,
+  money    = colors.black,       -- balance in black like real banking
+  money_pos= colors.green,
   sep      = colors.lightGray,   -- separator lines
   tab_act  = colors.white,       -- active tab
-  tab_bg   = colors.lightGray,   -- inactive tab
-  tab_fg   = colors.black,
+  tab_bg   = colors.gray,        -- inactive tab
+  tab_fg_a = colors.purple,      -- active tab text
+  tab_fg_i = colors.white,       -- inactive tab text
   caps     = colors.orange,      -- caps lock warning
 }
 
@@ -159,20 +162,23 @@ local function hit(b, mx, my)
   return b and mx>=b.x1 and mx<=b.x2 and my==b.y1
 end
 
--- Input field with focus highlight and caps indicator
+-- Input field: light-grey fill on white card so it's clearly visible,
+-- with a left accent marker when focused. Caps indicator on the right.
 local function inputField(x, y, w, value, masked, focused)
   local bg = focused and C.in_act or C.in_bg
-  local fg = focused and C.btn_fg or C.in_fg
   fill(x, y, w, 1, bg)
+  -- Left edge marker shows focus
+  at(x, y, focused and "\149" or " ", focused and C.accent or C.in_border, bg)
   local display = masked and string.rep("*", #value) or value
-  local padded  = display .. string.rep(" ", math.max(0, w - #display))
-  at(x, y, padded:sub(1, w), fg, bg)
+  local inner_w = w - 2
+  local padded  = display .. string.rep(" ", math.max(0, inner_w - #display))
+  at(x+1, y, padded:sub(1, inner_w), C.in_fg, bg)
   if focused then
-    -- Caps indicator at end of field
     if capsLock then
       at(x + w - 5, y, "CAPS", C.caps, bg)
     end
-    term.setCursorPos(x + math.min(#value, w - (capsLock and 6 or 1)), y)
+    local cap = capsLock and 6 or 1
+    term.setCursorPos(x + 1 + math.min(#value, inner_w - (capsLock and 5 or 0)), y)
     term.setCursorBlink(true)
   end
   return {x1=x, y1=y, x2=x+w-1, y2=y}
@@ -185,10 +191,12 @@ local function tabStrip(y, tabs, active)
   local btns = {}
   for i, label in ipairs(tabs) do
     local x  = (i-1)*tw + 1
-    local col = (i == active) and C.tab_act or C.tab_bg
+    local is_active = (i == active)
+    local col = is_active and C.tab_act or C.tab_bg
+    local fg  = is_active and C.tab_fg_a or C.tab_fg_i
     fill(x, y, tw, 1, col)
     local tx = x + math.floor((tw - #label)/2)
-    at(tx, y, label, C.tab_fg, col)
+    at(tx, y, label, fg, col)
     btns[i] = {x1=x, y1=y, x2=x+tw-1, y2=y}
   end
   return btns
@@ -405,7 +413,6 @@ local function screenLogin()
           local cy = focused==1 and (card_y+2) or (card_y+5)
           local masked = focused==2
           inputField(4, cy, W-6, fields[focused], masked, true)
-          term.setCursorPos(4+math.min(#fields[focused],W-7),cy)
         end
 
       elseif p1 == keys.tab then
@@ -430,7 +437,6 @@ local function screenLogin()
         local cy = focused==1 and (card_y+2) or (card_y+5)
         local masked = focused==2
         inputField(4, cy, W-6, fields[focused], masked, true)
-        term.setCursorPos(4+math.min(#fields[focused],W-7),cy)
       end
 
     elseif ev == "mouse_click" then
@@ -612,7 +618,6 @@ local function screenTransfer()
           setField(focused, v:sub(1,-2))
           local cy = focused==1 and 7 or (focused==2 and 10 or 13)
           inputField(4, cy, W-6, getField(focused), false, true)
-          term.setCursorPos(4+math.min(#getField(focused),W-7),cy)
         end
 
       elseif p1 == keys.tab or p1 == keys.enter then
@@ -631,7 +636,6 @@ local function screenTransfer()
         setField(focused, v .. ch)
         local cy = focused==1 and 7 or (focused==2 and 10 or 13)
         inputField(4, cy, W-6, getField(focused), false, true)
-        term.setCursorPos(4+math.min(#getField(focused),W-7),cy)
       end
 
     elseif ev == "mouse_click" then
