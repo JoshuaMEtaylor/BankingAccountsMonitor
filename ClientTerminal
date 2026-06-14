@@ -16,208 +16,141 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.1.0"
-local PROTOCOL = "quid_bank"
-local PROTOCOL_BROADCAST = "quid_bank_discovery"
-local DB_TIMEOUT = 5
-local IDLE_TIMEOUT = 60  -- seconds before auto-logout
+-- =============================================================================
+-- MAIN PROGRAM
+-- =============================================================================
 
--- Tracks last successful update for display
-local CLIENT_VERSION_FILE = "client_version.db"
+local VERSION      = "1.2."
+local PROTOCOL     = "quid_bank"
+local DB_TIMEOUT   = 5
+local IDLE_TIMEOUT = 60
 
-local function saveClientVersion(info)
-  local f = fs.open(CLIENT_VERSION_FILE, "w")
-  if f then f.write(textutils.serialize(info)); f.close() end
-end
+local W, H = term.getSize()
 
-local function loadClientVersion()
-  if not fs.exists(CLIENT_VERSION_FILE) then return nil end
-  local f = fs.open(CLIENT_VERSION_FILE, "r")
-  if not f then return nil end
-  local text = f.readAll(); f.close()
-  local ok, data = pcall(textutils.unserialize, text)
-  return ok and data or nil
-end
-
-local clientVersionInfo = loadClientVersion()
+-- =============================================================================
+-- COLOURS
+-- =============================================================================
+local C = {
+  bg       = colors.black,
+  panel    = colors.gray,
+  hdr_bg   = colors.yellow,
+  hdr_fg   = colors.black,
+  title    = colors.yellow,
+  body     = colors.white,
+  dim      = colors.lightGray,
+  in_bg    = colors.white,
+  in_fg    = colors.black,
+  green    = colors.green,
+  red      = colors.red,
+  blue     = colors.blue,
+  gray     = colors.gray,
+  btn_fg   = colors.white,
+  err      = colors.red,
+  ok       = colors.lime,
+  money    = colors.lime,
+  border   = colors.yellow,
+}
 
 -- =============================================================================
 -- STATE
 -- =============================================================================
-local W, H = term.getSize()
+local db_id     = nil
+local modemName = nil
+
 local session = {
   logged_in    = false,
   citizen_id   = nil,
   display_name = nil,
   username     = nil,
-  balance      = nil,
+  _password    = nil,
+  balance      = 0,
   title        = nil,
-  last_activity = nil,
-}
-
-local db_id = nil  -- computer ID of the treasury DB, discovered on boot
-
--- =============================================================================
--- COLOURS
--- =============================================================================
-local COL = {
-  bg         = colors.black,
-  panel      = colors.gray,
-  header_bg  = colors.yellow,
-  header_txt = colors.black,
-  title_txt  = colors.yellow,
-  body_txt   = colors.white,
-  dim_txt    = colors.lightGray,
-  input_bg   = colors.white,
-  input_txt  = colors.black,
-  btn_green  = colors.green,
-  btn_red    = colors.red,
-  btn_blue   = colors.blue,
-  btn_gray   = colors.gray,
-  btn_txt    = colors.white,
-  error_txt  = colors.red,
-  success_txt= colors.lime,
-  money_txt  = colors.lime,
-  border     = colors.yellow,
+  last_act     = 0,
 }
 
 -- =============================================================================
--- DRAWING HELPERS
+-- DRAWING
 -- =============================================================================
 local function cls()
-  term.setBackgroundColor(COL.bg)
-  term.setTextColor(COL.body_txt)
+  term.setBackgroundColor(C.bg)
+  term.setTextColor(C.body)
   term.clear()
-  term.setCursorPos(1, 1)
+  term.setCursorPos(1,1)
 end
 
-local function setColor(fg, bg)
-  if fg then term.setTextColor(fg) end
-  if bg then term.setBackgroundColor(bg) end
-end
-
-local function drawRect(x, y, w, h, bg)
-  term.setBackgroundColor(bg or COL.panel)
-  for row = y, y + h - 1 do
-    term.setCursorPos(x, row)
-    term.write(string.rep(" ", w))
-  end
-end
-
-local function writeAt(x, y, text, fg, bg)
+local function at(x, y, text, fg, bg)
   term.setCursorPos(x, y)
   if bg then term.setBackgroundColor(bg) end
   if fg then term.setTextColor(fg) end
   term.write(text)
 end
 
-local function centreText(y, text, fg, bg)
-  local x = math.floor((W - #text) / 2) + 1
-  writeAt(x, y, text, fg, bg)
+local function fill(x, y, w, h, bg)
+  term.setBackgroundColor(bg or C.panel)
+  for row = y, y+h-1 do
+    term.setCursorPos(x, row)
+    term.write(string.rep(" ", w))
+  end
 end
 
-local function drawHeader(title)
-  -- Top bar
-  drawRect(1, 1, W, 3, COL.header_bg)
-  writeAt(1, 1, string.rep(" ", W), nil, COL.header_bg)
-  writeAt(1, 2, string.rep(" ", W), nil, COL.header_bg)
-  writeAt(1, 3, string.rep(" ", W), nil, COL.header_bg)
-  centreText(1, "QUID BANK OF PLENTY", COL.header_txt, COL.header_bg)
-  centreText(2, title, COL.header_txt, COL.header_bg)
-  -- Footer with version + update status
-  drawRect(1, H, W, 1, COL.panel)
-  writeAt(1, H, string.rep(" ", W), nil, COL.panel)
+local function centre(y, text, fg, bg)
+  local x = math.max(1, math.floor((W - #text) / 2) + 1)
+  at(x, y, text, fg, bg)
+end
+
+local function header(title)
+  fill(1, 1, W, 2, C.hdr_bg)
+  centre(1, "QUID BANK OF PLENTY", C.hdr_fg, C.hdr_bg)
+  centre(2, title, C.hdr_fg, C.hdr_bg)
+  fill(1, H, W, 1, C.panel)
   local footer = "v" .. VERSION
-  if clientVersionInfo and clientVersionInfo.last_updated then
-    local t    = math.floor(clientVersionInfo.last_updated / 1000)
-    local secs = t % 60;  t = math.floor(t/60)
-    local mins = t % 60;  t = math.floor(t/60)
-    local hrs  = t % 24
-    footer = footer .. string.format("  |  Updated %02d:%02d:%02d", hrs, mins, secs)
-  else
-    footer = footer .. "  |  No update this session"
-  end
-  centreText(H, footer, COL.dim_txt, COL.panel)
+  centre(H, footer, C.dim, C.panel)
 end
 
--- Draw a clickable button, returns {x1,y1,x2,y2,label}
-local function drawButton(x, y, w, label, col)
-  col = col or COL.btn_blue
-  drawRect(x, y, w, 1, col)
+-- Draw a button, return hit-test table
+local function btn(x, y, w, label, col)
+  col = col or C.blue
+  fill(x, y, w, 1, col)
   local tx = x + math.floor((w - #label) / 2)
-  writeAt(tx, y, label, COL.btn_txt, col)
-  return { x1=x, y1=y, x2=x+w-1, y2=y, label=label }
+  at(tx, y, label, C.btn_fg, col)
+  return {x1=x, y1=y, x2=x+w-1, y2=y}
 end
 
-local function clicked(btn, mx, my)
-  return mx >= btn.x1 and mx <= btn.x2 and my >= btn.y1 and my <= btn.y2
+local function hit(b, mx, my)
+  return b and mx >= b.x1 and mx <= b.x2 and my == b.y1
 end
 
--- Masked or plain input field, returns typed string
-local function inputField(x, y, w, mask)
-  term.setCursorPos(x, y)
-  term.setBackgroundColor(COL.input_bg)
-  term.setTextColor(COL.input_txt)
-  term.write(string.rep(" ", w))
-  term.setCursorPos(x, y)
-  term.setCursorBlink(true)
-  local buf = ""
-  while true do
-    local ev, p1, p2, p3 = os.pullEvent()
-    if ev == "char" then
-      if #buf < w - 1 then
-        buf = buf .. p1
-        term.setCursorPos(x, y)
-        term.setBackgroundColor(COL.input_bg)
-        term.setTextColor(COL.input_txt)
-        local display = mask and string.rep("*", #buf) or buf
-        term.write(display .. string.rep(" ", w - #display))
-        term.setCursorPos(x + #buf, y)
-      end
-    elseif ev == "key" then
-      if p1 == keys.enter then break
-      elseif p1 == keys.backspace and #buf > 0 then
-        buf = buf:sub(1, -2)
-        term.setCursorPos(x, y)
-        term.setBackgroundColor(COL.input_bg)
-        term.setTextColor(COL.input_txt)
-        local display = mask and string.rep("*", #buf) or buf
-        term.write(display .. string.rep(" ", w - #display))
-        term.setCursorPos(x + #buf, y)
-      end
-    elseif ev == "mouse_click" then
-      break
-    end
+-- Draw an input field, return its display region
+local function field(x, y, w, value, masked, focused)
+  local display = masked and string.rep("*", #value) or value
+  local padded  = display .. string.rep(" ", w - #display)
+  fill(x, y, w, 1, C.in_bg)
+  at(x, y, padded:sub(1, w), C.in_fg, C.in_bg)
+  if focused then
+    term.setCursorPos(x + math.min(#value, w-1), y)
+    term.setCursorBlink(true)
   end
-  term.setCursorBlink(false)
-  return buf
+  return {x1=x, y1=y, x2=x+w-1, y2=y}
 end
 
 -- =============================================================================
 -- NETWORK
 -- =============================================================================
-local modemName     = nil
-local modemWireless = false
-
 local function openModem()
-  -- First pass: prefer wireless/ender modem
   for _, name in ipairs(peripheral.getNames()) do
     if peripheral.getType(name) == "modem" then
-      local modem = peripheral.wrap(name)
-      if modem and modem.isWireless and modem.isWireless() then
+      local m = peripheral.wrap(name)
+      if m and m.isWireless and m.isWireless() then
         rednet.open(name)
         modemName = name
-        modemWireless = true
         return true
       end
     end
   end
-  -- Second pass: fallback to any modem
   for _, name in ipairs(peripheral.getNames()) do
     if peripheral.getType(name) == "modem" then
       rednet.open(name)
       modemName = name
-      modemWireless = false
       return true
     end
   end
@@ -225,97 +158,36 @@ local function openModem()
 end
 
 local function dbRequest(req)
-  if not db_id then return false, "Not connected to bank server" end
+  if not db_id then return false, "Not connected" end
   rednet.send(db_id, req, PROTOCOL)
-  local sender, msg, proto = rednet.receive(PROTOCOL, DB_TIMEOUT)
-  if not sender or not msg then
-    return false, "No response from server (timeout)"
-  end
-  if type(msg) ~= "table" then
-    return false, "Invalid server response"
+  local sender, msg = rednet.receive(PROTOCOL, DB_TIMEOUT)
+  if not sender or type(msg) ~= "table" then
+    return false, "No response from server"
   end
   return msg.success, msg.response
-end
-
--- =============================================================================
--- SESSION
--- =============================================================================
-local function resetSession()
-  session.logged_in    = false
-  session.citizen_id   = nil
-  session.display_name = nil
-  session.username     = nil
-  session.balance      = nil
-  session.title        = nil
-  session.last_activity = nil
-end
-
-local function touchActivity()
-  session.last_activity = os.clock()
-end
-
-local function checkIdleTimeout()
-  if not session.logged_in then return false end
-  if not session.last_activity then return false end
-  return (os.clock() - session.last_activity) >= IDLE_TIMEOUT
-end
-
-local function refreshBalance()
-  if not session.logged_in then return end
-  local ok, res = dbRequest({
-    type     = "balance",
-    username = session.username,
-    password = session._password,
-  })
-  if ok and type(res) == "table" then
-    session.balance = res.balance
-  end
 end
 
 -- =============================================================================
 -- SCREENS
 -- =============================================================================
 
--- Error/message banner (inline, not a screen)
-local function showMessage(y, msg, col)
-  col = col or COL.error_txt
-  drawRect(2, y, W-2, 1, COL.bg)
-  centreText(y, msg, col, COL.bg)
-  sleep(0)
-end
-
-local function clearMessage(y)
-  drawRect(2, y, W-2, 1, COL.bg)
-end
-
 -- -----------------------------------------------------------------------
--- SCREEN: Connecting
+-- CONNECTING
 -- -----------------------------------------------------------------------
 local function screenConnecting()
   cls()
-  drawHeader("Connecting...")
-  centreText(7, "Locating Quid Bank server...", COL.dim_txt)
+  header("Connecting...")
+  centre(7, "Locating Quid Bank server...", C.dim)
 
   for attempt = 1, 5 do
-    drawRect(1, 10, W, 1, COL.bg)
-    centreText(10, "Attempt " .. attempt .. " of 5...", COL.dim_txt)
-
+    fill(1, 9, W, 1, C.bg)
+    centre(9, "Attempt " .. attempt .. " of 5...", C.dim)
     rednet.broadcast({ type = "ping" }, PROTOCOL)
-
     local sender, msg = rednet.receive(PROTOCOL, 3)
-
     if sender and type(msg) == "table" then
-      -- Accept a direct ping reply from the server
-      if msg.success and type(msg.response) == "table" then
+      if (msg.success and type(msg.response) == "table") or msg.type == "treasury_online" then
         db_id = sender
-        centreText(10, "Connected to server " .. sender, COL.success_txt)
-        sleep(0.5)
-        return true
-      end
-      -- Also accept the treasury_online broadcast if server sent it on this protocol
-      if msg.type == "treasury_online" then
-        db_id = sender
-        centreText(10, "Connected to server " .. sender, COL.success_txt)
+        centre(9, "Connected! Server: " .. sender, C.ok)
         sleep(0.5)
         return true
       end
@@ -323,475 +195,450 @@ local function screenConnecting()
   end
 
   cls()
-  drawHeader("Connection Failed")
-  centreText(7,  "Could not reach bank server.", COL.error_txt)
-  local modemLine = "Modem: " .. tostring(modemName or "NONE") ..
-    (modemWireless and " (wireless)" or " (WIRED - wrong type!)")
-  centreText(9, modemLine, modemWireless and COL.dim_txt or COL.error_txt)
-  centreText(11, "Is the Treasury DB computer running?", COL.dim_txt)
-  centreText(13, "Retrying in 5 seconds...", COL.dim_txt)
+  header("Connection Failed")
+  centre(7,  "Could not reach bank server.", C.err)
+  centre(9,  "Modem: " .. tostring(modemName or "NONE"), C.dim)
+  centre(11, "Is the Treasury DB running?", C.dim)
+  centre(13, "Retrying in 5 seconds...", C.dim)
   sleep(5)
   return false
 end
 
 -- -----------------------------------------------------------------------
--- SCREEN: Welcome / Login / Create Account
+-- LOGIN / REGISTER  — full event-driven, all clicks work
 -- -----------------------------------------------------------------------
 local function screenLogin()
-  resetSession()
+  session.logged_in = false
 
-  local mode = "login"  -- "login" or "create"
-  local error_msg = ""
-  local success_msg = ""
+  local mode    = "login"   -- "login" or "register"
+  local focused = 1         -- which field has focus (1/2/3)
+  local fields  = {"", "", ""}   -- [1]=user/display [2]=pass/user [3]=pass(reg only)
+  local err     = ""
 
   local function draw()
     cls()
-    drawHeader(mode == "login" and "Welcome" or "Create Account")
-
-    -- Bank logo area
-    centreText(5, "QUID BANK", COL.title_txt)
-    centreText(6, "of Plenty", COL.dim_txt)
+    header(mode == "login" and "Log In" or "Create Account")
+    term.setCursorBlink(false)
 
     -- Tab buttons
-    local tab_w = math.floor(W / 2) - 2
-    local btn_login  = drawButton(2,       8, tab_w, "  Log In  ",  mode=="login"  and COL.btn_blue or COL.btn_gray)
-    local btn_create = drawButton(tab_w+3, 8, tab_w, "  Register",  mode=="create" and COL.btn_blue or COL.btn_gray)
+    local tab_w = math.floor(W/2) - 1
+    local b_login = btn(1,       4, tab_w, "Log In",   mode=="login"    and C.blue or C.gray)
+    local b_reg   = btn(tab_w+2, 4, tab_w, "Register", mode=="register" and C.blue or C.gray)
 
     -- Divider
-    drawRect(1, 9, W, 1, COL.panel)
-    writeAt(1, 9, string.rep("-", W), COL.border, COL.bg)
+    at(1, 5, string.rep("-", W), C.border, C.bg)
+
+    local b_submit
 
     if mode == "login" then
-      writeAt(3, 11, "Username:", COL.dim_txt, COL.bg)
-      drawRect(3, 12, W-4, 1, COL.input_bg)
-
-      writeAt(3, 14, "Password:", COL.dim_txt, COL.bg)
-      drawRect(3, 15, W-4, 1, COL.input_bg)
-
-      local btn_go = drawButton(math.floor(W/2)-5, 17, 12, "[ Log In ]", COL.btn_green)
+      at(3, 7,  "Username:", C.dim, C.bg)
+      field(3, 8,  W-4, fields[1], false, focused==1)
+      at(3, 10, "Password:", C.dim, C.bg)
+      field(3, 11, W-4, fields[2], true,  focused==2)
+      b_submit = btn(math.floor(W/2)-5, 13, 12, "[ Log In ]", C.green)
     else
-      writeAt(3, 11, "Display Name:", COL.dim_txt, COL.bg)
-      drawRect(3, 12, W-4, 1, COL.input_bg)
-
-      writeAt(3, 14, "Username:", COL.dim_txt, COL.bg)
-      drawRect(3, 15, W-4, 1, COL.input_bg)
-
-      writeAt(3, 17, "Password:", COL.dim_txt, COL.bg)
-      drawRect(3, 18, W-4, 1, COL.input_bg)
-
-      local btn_go = drawButton(math.floor(W/2)-6, 20, 14, "[ Create Account ]", COL.btn_green)
+      at(3, 7,  "Display Name:", C.dim, C.bg)
+      field(3, 8,  W-4, fields[1], false, focused==1)
+      at(3, 10, "Username:",     C.dim, C.bg)
+      field(3, 11, W-4, fields[2], false, focused==2)
+      at(3, 13, "Password:",     C.dim, C.bg)
+      field(3, 14, W-4, fields[3], true,  focused==3)
+      b_submit = btn(math.floor(W/2)-7, 16, 16, "[ Create Account ]", C.green)
     end
 
-    -- Messages
-    if error_msg ~= "" then
-      centreText(H-2, error_msg, COL.error_txt, COL.bg)
+    if err ~= "" then centre(H-2, err, C.err, C.bg) end
+
+    -- Reposition cursor on focused field after full redraw
+    if focused == 1 then
+      local v = fields[1]
+      term.setCursorPos(3 + math.min(#v, W-5), 8)
+    elseif focused == 2 then
+      local v = fields[2]
+      term.setCursorPos(3 + math.min(#v, W-5), 11)
+    elseif focused == 3 then
+      local v = fields[3]
+      term.setCursorPos(3 + math.min(#v, W-5), 14)
     end
-    if success_msg ~= "" then
-      centreText(H-2, success_msg, COL.success_txt, COL.bg)
-    end
+    term.setCursorBlink(true)
+
+    return b_login, b_reg, b_submit
   end
 
-  draw()
+  local b_login, b_reg, b_submit = draw()
 
-  -- Field input loop
-  while true do
-    -- Redraw tabs + layout fresh each time so clicks register
-    cls()
-    drawHeader(mode == "login" and "Welcome" or "Create Account")
-    centreText(5, "QUID BANK", COL.title_txt)
-    centreText(6, "of Plenty", COL.dim_txt)
-
-    local tab_w    = math.floor(W / 2) - 2
-    local btn_login  = drawButton(2,       8, tab_w, "  Log In  ", mode=="login"  and COL.btn_blue or COL.btn_gray)
-    local btn_create = drawButton(tab_w+3, 8, tab_w, "  Register", mode=="create" and COL.btn_blue or COL.btn_gray)
-    drawRect(1, 9, W, 1, COL.bg)
-    writeAt(1, 9, string.rep("-", W), COL.border, COL.bg)
-
-    if error_msg ~= "" then centreText(H-2, error_msg, COL.error_txt, COL.bg) end
-    if success_msg ~= "" then centreText(H-2, success_msg, COL.success_txt, COL.bg) end
-
-    local display_name, username, password = "", "", ""
-
+  local function fieldAt(my)
     if mode == "login" then
-      writeAt(3, 11, "Username:", COL.dim_txt, COL.bg)
-      drawRect(3, 12, W-4, 1, COL.input_bg)
-      writeAt(3, 14, "Password:", COL.dim_txt, COL.bg)
-      drawRect(3, 15, W-4, 1, COL.input_bg)
-      local btn_go = drawButton(math.floor(W/2)-5, 17, 12, "[ Log In ]", COL.btn_green)
+      if my == 8  then return 1 end
+      if my == 11 then return 2 end
+    else
+      if my == 8  then return 1 end
+      if my == 11 then return 2 end
+      if my == 14 then return 3 end
+    end
+    return nil
+  end
 
-      -- Get username
-      writeAt(3, 12, "", nil, nil)
-      username = inputField(3, 12, W-4, false)
-      error_msg = ""; success_msg = ""
-      centreText(H-2, "", nil, COL.bg)
-
-      -- Check for tab click during input
-      if username == "" then
-        -- Possible mouse click handled inside inputField, redraw
-        goto continue
+  local function submit()
+    if mode == "login" then
+      if fields[1] == "" or fields[2] == "" then err = "Fill in all fields"; return end
+      err = "Authenticating..."
+      b_login, b_reg, b_submit = draw()
+      local ok, res = dbRequest({ type="login", username=fields[1], password=fields[2] })
+      if ok and type(res) == "table" then
+        session.logged_in    = true
+        session.citizen_id   = res.citizen_id
+        session.display_name = res.display_name
+        session.username     = fields[1]
+        session._password    = fields[2]
+        session.balance      = res.balance or 0
+        session.title        = res.title
+        session.last_act     = os.clock()
+        return "dashboard"
+      else
+        err = tostring(res or "Login failed")
       end
-
-      -- Get password
-      password = inputField(3, 15, W-4, true)
-
-      -- Wait for button click or enter
-      local btn_go2 = drawButton(math.floor(W/2)-5, 17, 12, "[ Log In ]", COL.btn_green)
-      local ev, btn, mx, my = os.pullEvent("mouse_click")
-      if clicked(btn_login, mx, my) then mode="login"; goto continue end
-      if clicked(btn_create, mx, my) then mode="create"; goto continue end
-
-      -- Attempt login
-      if username ~= "" and password ~= "" then
-        centreText(H-2, "Authenticating...", COL.dim_txt, COL.bg)
-        local ok, res = dbRequest({
-          type     = "login",
-          username = username,
-          password = password,
-        })
-        if ok and type(res) == "table" then
-          session.logged_in    = true
-          session.citizen_id   = res.citizen_id
-          session.display_name = res.display_name
-          session.username     = username
-          session._password    = password
-          session.balance      = res.balance
-          session.title        = res.title
-          session.last_activity = os.clock()
-          return "dashboard"
-        else
-          error_msg = tostring(res or "Login failed")
-          success_msg = ""
-        end
-      end
-
-    else  -- create mode
-      writeAt(3, 11, "Display Name:", COL.dim_txt, COL.bg)
-      drawRect(3, 12, W-4, 1, COL.input_bg)
-      writeAt(3, 14, "Username:", COL.dim_txt, COL.bg)
-      drawRect(3, 15, W-4, 1, COL.input_bg)
-      writeAt(3, 17, "Password:", COL.dim_txt, COL.bg)
-      drawRect(3, 18, W-4, 1, COL.input_bg)
-      local btn_go = drawButton(math.floor(W/2)-6, 20, 14, "[ Create Account ]", COL.btn_green)
-
-      display_name = inputField(3, 12, W-4, false)
-      if display_name == "" then goto continue end
-
-      username = inputField(3, 15, W-4, false)
-      if username == "" then goto continue end
-
-      password = inputField(3, 18, W-4, true)
-
-      local btn_go2 = drawButton(math.floor(W/2)-6, 20, 14, "[ Create Account ]", COL.btn_green)
-      local ev, btn, mx, my = os.pullEvent("mouse_click")
-      if clicked(btn_login, mx, my)  then mode="login";  goto continue end
-      if clicked(btn_create, mx, my) then mode="create"; goto continue end
-
-      if display_name ~= "" and username ~= "" and password ~= "" then
-        centreText(H-2, "Creating account...", COL.dim_txt, COL.bg)
-        local ok, res = dbRequest({
-          type         = "create_account",
-          display_name = display_name,
-          username     = username,
-          password     = password,
-        })
-        if ok and type(res) == "table" then
-          -- Auto-login
-          session.logged_in    = true
-          session.citizen_id   = res.citizen_id
-          session.display_name = res.display_name
-          session.username     = username
-          session._password    = password
-          session.balance      = res.balance or 0
-          session.title        = res.title
-          session.last_activity = os.clock()
-          return "dashboard"
-        else
-          error_msg = tostring(res or "Registration failed")
-          success_msg = ""
-        end
+    else
+      if fields[1]=="" or fields[2]=="" or fields[3]=="" then err="Fill in all fields"; return end
+      err = "Creating account..."
+      b_login, b_reg, b_submit = draw()
+      local ok, res = dbRequest({ type="create_account", display_name=fields[1], username=fields[2], password=fields[3] })
+      if ok and type(res) == "table" then
+        session.logged_in    = true
+        session.citizen_id   = res.citizen_id
+        session.display_name = res.display_name
+        session.username     = fields[2]
+        session._password    = fields[3]
+        session.balance      = res.balance or 0
+        session.title        = res.title
+        session.last_act     = os.clock()
+        return "dashboard"
+      else
+        err = tostring(res or "Registration failed")
       end
     end
-
-    ::continue::
   end
-end
-
--- -----------------------------------------------------------------------
--- SCREEN: Dashboard
--- -----------------------------------------------------------------------
-local function screenDashboard()
-  refreshBalance()
-
-  local function draw()
-    cls()
-    drawHeader("Account Dashboard")
-
-    -- Welcome
-    writeAt(3, 5, "Welcome back,", COL.dim_txt)
-    writeAt(17, 5, session.display_name or "Unknown", COL.title_txt)
-    writeAt(3, 6, session.title or "Account Holder", COL.dim_txt)
-
-    -- Balance card
-    drawRect(3, 8, W-4, 4, COL.panel)
-    writeAt(3, 8, string.rep(" ", W-4), COL.border, COL.panel)
-    centreText(9, "BALANCE", COL.dim_txt, COL.panel)
-    centreText(10, (session.balance or 0) .. " Quid", COL.money_txt, COL.panel)
-    writeAt(3, 11, string.rep(" ", W-4), COL.border, COL.panel)
-
-    -- Account ID
-    writeAt(3, 13, "Account ID:", COL.dim_txt)
-    writeAt(15, 13, session.citizen_id or "", COL.dim_txt)
-
-    -- Buttons
-    local bw = math.floor((W-6) / 2)
-    local btn_transfer = drawButton(3,      15, bw, "Transfer Funds", COL.btn_blue)
-    local btn_history  = drawButton(bw+4,   15, bw, "Transaction History", COL.panel)
-    local btn_refresh  = drawButton(3,      17, bw, "Refresh Balance", COL.panel)
-    local btn_logout   = drawButton(bw+4,   17, bw, "Log Out", COL.btn_red)
-
-    -- Idle timer hint
-    writeAt(3, H-1, "Auto-logout in " .. IDLE_TIMEOUT .. "s of inactivity", COL.dim_txt)
-
-    return btn_transfer, btn_history, btn_refresh, btn_logout
-  end
-
-  local btn_transfer, btn_history, btn_refresh, btn_logout = draw()
 
   while true do
-    -- Check idle timeout
-    if checkIdleTimeout() then
-      return "timeout"
-    end
-
-    local ev, p1, p2, p3 = os.pullEventRaw()
+    local ev, p1, p2, p3 = os.pullEvent()
 
     if ev == "mouse_click" then
       local mx, my = p2, p3
-      touchActivity()
-      if clicked(btn_transfer, mx, my) then return "transfer" end
-      if clicked(btn_history,  mx, my) then return "history"  end
-      if clicked(btn_logout,   mx, my) then return "logout"   end
-      if clicked(btn_refresh,  mx, my) then
-        refreshBalance()
-        btn_transfer, btn_history, btn_refresh, btn_logout = draw()
+
+      -- Tab switching
+      if hit(b_login, mx, my) and mode ~= "login" then
+        mode = "login"; fields = {"","",""}; focused = 1; err = ""
+        b_login, b_reg, b_submit = draw()
+
+      elseif hit(b_reg, mx, my) and mode ~= "register" then
+        mode = "register"; fields = {"","",""}; focused = 1; err = ""
+        b_login, b_reg, b_submit = draw()
+
+      -- Submit
+      elseif hit(b_submit, mx, my) then
+        local next = submit()
+        if next then return next end
+        b_login, b_reg, b_submit = draw()
+
+      -- Field focus
+      else
+        local f = fieldAt(my)
+        if f then
+          focused = f
+          b_login, b_reg, b_submit = draw()
+        end
       end
-    elseif ev == "timer" then
-      if checkIdleTimeout() then return "timeout" end
+
+    elseif ev == "char" then
+      local maxlen = W - 5
+      if #fields[focused] < maxlen then
+        fields[focused] = fields[focused] .. p1
+        -- Just update the focused field inline, no full redraw
+        if focused == 1 then field(3, 8,  W-4, fields[1], false, true)
+        elseif focused == 2 then
+          field(3, mode=="login" and 11 or 11, W-4, fields[2], mode=="login", focused==2)
+        elseif focused == 3 then field(3, 14, W-4, fields[3], true,  true)
+        end
+        -- Reposition cursor
+        local cy = focused==1 and 8 or (focused==2 and 11 or 14)
+        term.setCursorPos(3 + math.min(#fields[focused], W-5), cy)
+      end
+
+    elseif ev == "key" then
+      if p1 == keys.backspace then
+        if #fields[focused] > 0 then
+          fields[focused] = fields[focused]:sub(1, -2)
+          local cy = focused==1 and 8 or (focused==2 and 11 or 14)
+          local masked = (mode=="login" and focused==2) or (mode=="register" and focused==3)
+          field(3, cy, W-4, fields[focused], masked, true)
+          term.setCursorPos(3 + math.min(#fields[focused], W-5), cy)
+        end
+      elseif p1 == keys.enter then
+        -- Tab to next field or submit on last
+        local maxField = mode=="login" and 2 or 3
+        if focused < maxField then
+          focused = focused + 1
+          b_login, b_reg, b_submit = draw()
+        else
+          local next = submit()
+          if next then return next end
+          b_login, b_reg, b_submit = draw()
+        end
+      elseif p1 == keys.tab then
+        local maxField = mode=="login" and 2 or 3
+        focused = focused % maxField + 1
+        b_login, b_reg, b_submit = draw()
+      end
+    end
+  end
+end
+
+-- -----------------------------------------------------------------------
+-- DASHBOARD
+-- -----------------------------------------------------------------------
+local function screenDashboard()
+  -- Refresh balance
+  local ok, res = dbRequest({ type="balance", username=session.username, password=session._password })
+  if ok and type(res)=="table" then session.balance = res.balance end
+
+  cls()
+  header("Dashboard")
+
+  at(3, 4, "Welcome,", C.dim)
+  at(12, 4, session.display_name or "", C.title)
+  at(3, 5, session.title or "Account Holder", C.dim)
+
+  -- Balance card
+  fill(3, 7, W-4, 4, C.panel)
+  centre(8,  "YOUR BALANCE", C.dim, C.panel)
+  centre(9,  tostring(session.balance or 0) .. " Quid", C.money, C.panel)
+  centre(10, "Account: " .. (session.citizen_id or ""), C.dim, C.panel)
+
+  -- Buttons
+  local bw = math.floor((W-6)/2)
+  local b_transfer = btn(3,      12, bw, "Transfer",    C.blue)
+  local b_history  = btn(bw+4,   12, bw, "History",     C.blue)
+  local b_refresh  = btn(3,      14, bw, "Refresh",     C.gray)
+  local b_logout   = btn(bw+4,   14, bw, "Log Out",     C.red)
+
+  at(3, H-1, "Auto-logout after " .. IDLE_TIMEOUT .. "s inactivity", C.dim)
+
+  while true do
+    if (os.clock() - session.last_act) >= IDLE_TIMEOUT then return "timeout" end
+
+    local ev, p1, p2, p3 = os.pullEvent()
+    if ev == "mouse_click" then
+      session.last_act = os.clock()
+      local mx, my = p2, p3
+      if hit(b_transfer, mx, my) then return "transfer" end
+      if hit(b_history,  mx, my) then return "history"  end
+      if hit(b_logout,   mx, my) then return "logout"   end
+      if hit(b_refresh,  mx, my) then return "dashboard" end
+    elseif ev == "key" then
+      session.last_act = os.clock()
     elseif ev == "terminate" then
       return "quit"
     end
-
-    -- Refresh display every 15s
-    if os.clock() % 15 < 0.1 then
-      btn_transfer, btn_history, btn_refresh, btn_logout = draw()
-    end
   end
 end
 
 -- -----------------------------------------------------------------------
--- SCREEN: Transfer
+-- TRANSFER
 -- -----------------------------------------------------------------------
 local function screenTransfer()
-  local error_msg = ""
+  local fields  = {"", ""}  -- [1]=recipient [2]=amount
+  local memo    = ""
+  local focused = 1
+  local err     = ""
 
   local function draw()
     cls()
-    drawHeader("Transfer Funds")
+    header("Transfer Funds")
+    term.setCursorBlink(false)
 
-    writeAt(3, 5,  "From:", COL.dim_txt)
-    writeAt(9, 5,  session.citizen_id or "", COL.body_txt)
-    writeAt(3, 6,  "Balance:", COL.dim_txt)
-    writeAt(11, 6, (session.balance or 0) .. " Quid", COL.money_txt)
+    at(3, 4, "From:    ", C.dim); at(12, 4, session.citizen_id or "", C.dim)
+    at(3, 5, "Balance: ", C.dim); at(12, 5, tostring(session.balance) .. " Quid", C.money)
 
-    writeAt(3, 9,  "Recipient (username or account ID):", COL.dim_txt)
-    drawRect(3, 10, W-4, 1, COL.input_bg)
+    at(3, 7,  "Recipient (username or account ID):", C.dim)
+    field(3, 8,  W-4, fields[1], false, focused==1)
 
-    writeAt(3, 12, "Amount (Quid):", COL.dim_txt)
-    drawRect(3, 13, W-4, 1, COL.input_bg)
+    at(3, 10, "Amount (Quid):", C.dim)
+    field(3, 11, W-4, fields[2], false, focused==2)
 
-    writeAt(3, 15, "Memo (optional):", COL.dim_txt)
-    drawRect(3, 16, W-4, 1, COL.input_bg)
+    at(3, 13, "Memo (optional):", C.dim)
+    field(3, 14, W-4, memo, false, focused==3)
 
-    local bw = math.floor((W-6)/2)
-    local btn_confirm = drawButton(3,    18, bw, "Confirm Transfer", COL.btn_green)
-    local btn_back    = drawButton(bw+4, 18, bw, "< Back",           COL.btn_gray)
+    local bw     = math.floor((W-6)/2)
+    local b_send = btn(3,    16, bw, "Send",   C.green)
+    local b_back = btn(bw+4, 16, bw, "< Back", C.gray)
 
-    if error_msg ~= "" then centreText(H-2, error_msg, COL.error_txt, COL.bg) end
+    if err ~= "" then centre(H-2, err, C.err, C.bg) end
 
-    return btn_confirm, btn_back
+    local cy = focused==1 and 8 or (focused==2 and 11 or 14)
+    local v  = focused==3 and memo or fields[focused]
+    term.setCursorPos(3 + math.min(#v, W-5), cy)
+    term.setCursorBlink(true)
+
+    return b_send, b_back
   end
 
-  local btn_confirm, btn_back = draw()
+  local b_send, b_back = draw()
+
+  local function fieldAt(my)
+    if my == 8  then return 1 end
+    if my == 11 then return 2 end
+    if my == 14 then return 3 end
+  end
 
   while true do
-    touchActivity()
+    session.last_act = os.clock()
+    local ev, p1, p2, p3 = os.pullEvent()
 
-    -- Get recipient
-    local to_id = inputField(3, 10, W-4, false)
-    if to_id == "" then
-      local ev, b, mx, my = os.pullEvent("mouse_click")
-      if clicked(btn_back, mx, my) then return "dashboard" end
-      goto continue
-    end
+    if ev == "mouse_click" then
+      local mx, my = p2, p3
+      if hit(b_back, mx, my) then return "dashboard" end
+      if hit(b_send, mx, my) then
+        local amount = tonumber(fields[2])
+        if fields[1] == "" then err = "Enter a recipient"
+        elseif not amount or amount <= 0 then err = "Enter a valid amount"
+        else
+          err = "Sending..."
+          draw()
+          local ok, res = dbRequest({ type="transfer", username=session.username, password=session._password, to_id=fields[1], amount=amount, memo=memo })
+          if ok and type(res)=="table" then
+            -- Success
+            cls()
+            header("Transfer Complete")
+            centre(8,  "Transfer Successful!", C.ok)
+            centre(10, tostring(amount) .. " Quid sent to " .. fields[1], C.body)
+            centre(11, "TX: " .. tostring(res.tx_id or ""), C.dim)
+            local ok2, res2 = dbRequest({ type="balance", username=session.username, password=session._password })
+            if ok2 and type(res2)=="table" then session.balance = res2.balance end
+            centre(13, "New balance: " .. session.balance .. " Quid", C.money)
+            btn(math.floor(W/2)-4, 15, 10, "[ OK ]", C.blue)
+            os.pullEvent("mouse_click")
+            return "dashboard"
+          else
+            err = tostring(res or "Transfer failed")
+            b_send, b_back = draw()
+          end
+        end
+      end
+      local f = fieldAt(my)
+      if f then focused = f; b_send, b_back = draw() end
 
-    -- Get amount
-    local amount_str = inputField(3, 13, W-4, false)
-    local amount = tonumber(amount_str)
-    if not amount or amount <= 0 then
-      error_msg = "Enter a valid amount"
-      btn_confirm, btn_back = draw()
-      goto continue
-    end
-
-    -- Get memo
-    local memo = inputField(3, 16, W-4, false)
-
-    -- Confirm button
-    btn_confirm, btn_back = draw()
-    -- Show summary above button
-    writeAt(3, 17, string.format("Send %d Quid to %s", amount, to_id), COL.body_txt)
-    local ev, b, mx, my = os.pullEvent("mouse_click")
-    if clicked(btn_back, mx, my) then return "dashboard" end
-
-    if clicked(btn_confirm, mx, my) then
-      centreText(H-2, "Processing...", COL.dim_txt, COL.bg)
-      local ok, res = dbRequest({
-        type     = "transfer",
-        username = session.username,
-        password = session._password,
-        to_id    = to_id,
-        amount   = amount,
-        memo     = memo,
-      })
-      if ok and type(res) == "table" then
-        -- Success screen
-        cls()
-        drawHeader("Transfer Complete")
-        centreText(8,  "Transfer Successful!", COL.success_txt)
-        centreText(10, res.tx_id or "TX confirmed", COL.dim_txt)
-        centreText(11, amount .. " Quid sent to " .. to_id, COL.body_txt)
-        refreshBalance()
-        centreText(13, "New balance: " .. (session.balance or 0) .. " Quid", COL.money_txt)
-        local btn_ok = drawButton(math.floor(W/2)-5, 15, 12, "[ OK ]", COL.btn_blue)
-        os.pullEvent("mouse_click")
-        return "dashboard"
+    elseif ev == "char" then
+      local maxlen = W-5
+      if focused == 3 then
+        if #memo < maxlen then memo = memo .. p1; field(3, 14, W-4, memo, false, true); term.setCursorPos(3+math.min(#memo,W-5),14) end
       else
-        error_msg = tostring(res or "Transfer failed")
-        btn_confirm, btn_back = draw()
+        if #fields[focused] < maxlen then
+          fields[focused] = fields[focused] .. p1
+          local cy = focused==1 and 8 or 11
+          field(3, cy, W-4, fields[focused], false, true)
+          term.setCursorPos(3+math.min(#fields[focused],W-5),cy)
+        end
+      end
+
+    elseif ev == "key" then
+      if p1 == keys.backspace then
+        local cy = focused==1 and 8 or (focused==2 and 11 or 14)
+        if focused == 3 then
+          if #memo > 0 then memo=memo:sub(1,-2); field(3,14,W-4,memo,false,true); term.setCursorPos(3+math.min(#memo,W-5),14) end
+        else
+          if #fields[focused]>0 then fields[focused]=fields[focused]:sub(1,-2); field(3,cy,W-4,fields[focused],false,true); term.setCursorPos(3+math.min(#fields[focused],W-5),cy) end
+        end
+      elseif p1 == keys.tab or p1 == keys.enter then
+        focused = focused % 3 + 1
+        b_send, b_back = draw()
       end
     end
-
-    ::continue::
   end
 end
 
 -- -----------------------------------------------------------------------
--- SCREEN: Transaction History
+-- HISTORY
 -- -----------------------------------------------------------------------
 local function screenHistory()
   cls()
-  drawHeader("Transaction History")
-  centreText(7, "Loading...", COL.dim_txt)
+  header("Transaction History")
+  centre(7, "Loading...", C.dim)
 
-  local ok, res = dbRequest({
-    type     = "ledger_history",
-    username = session.username,
-    password = session._password,
-    limit    = 12,
-  })
+  local ok, res = dbRequest({ type="ledger_history", username=session.username, password=session._password, limit=12 })
 
   cls()
-  drawHeader("Transaction History")
+  header("Transaction History")
 
-  local btn_back = drawButton(math.floor(W/2)-4, H-2, 10, "< Back", COL.btn_gray)
+  local b_back = btn(math.floor(W/2)-4, H-2, 10, "< Back", C.gray)
 
   if not ok or type(res) ~= "table" then
-    centreText(8, "Could not load history", COL.error_txt)
-    os.pullEvent("mouse_click")
-    return "dashboard"
-  end
-
-  local history = res.history or {}
-
-  -- Header row
-  writeAt(2,  5, "TX ID",     COL.dim_txt)
-  writeAt(12, 5, "Type",      COL.dim_txt)
-  writeAt(22, 5, "Amount",    COL.dim_txt)
-  writeAt(32, 5, "Dir",       COL.dim_txt)
-  writeAt(37, 5, "Memo",      COL.dim_txt)
-  writeAt(1,  6, string.rep("-", W-1), COL.border)
-
-  if #history == 0 then
-    centreText(10, "No transactions yet", COL.dim_txt)
+    centre(8, "Could not load history", C.err)
   else
-    for i, tx in ipairs(history) do
-      local row = 6 + i
-      if row >= H - 2 then break end
-      local col = tx.direction == "IN" and COL.money_txt or COL.error_txt
-      local dir = tx.direction == "IN" and "+ " or "- "
-      writeAt(2,  row, tostring(tx.tx_id or ""):sub(1,9),         COL.dim_txt)
-      writeAt(12, row, tostring(tx.type or ""):sub(1,9),           COL.dim_txt)
-      writeAt(22, row, dir .. tostring(tx.amount or 0) .. "q",     col)
-      writeAt(32, row, tostring(tx.direction or ""):sub(1,4),      col)
-      writeAt(37, row, tostring(tx.memo or ""):sub(1, W-37),       COL.dim_txt)
-    end
-  end
+    local history = res.history or {}
+    session.balance = res.balance or session.balance
 
-  writeAt(2, H-2, "Balance: " .. (res.balance or 0) .. " Quid", COL.money_txt)
+    at(2,  5, "ID",     C.dim); at(12, 5, "Type",   C.dim)
+    at(22, 5, "Amount", C.dim); at(34, 5, "Memo",   C.dim)
+    at(1,  6, string.rep("-", W-1), C.border)
+
+    if #history == 0 then
+      centre(10, "No transactions yet", C.dim)
+    else
+      for i, tx in ipairs(history) do
+        local row = 6 + i
+        if row >= H-2 then break end
+        local col = tx.direction=="IN" and C.money or C.err
+        local dir = tx.direction=="IN" and "+" or "-"
+        at(2,  row, tostring(tx.tx_id or ""):sub(1,9),           C.dim)
+        at(12, row, tostring(tx.type  or ""):sub(1,9),           C.dim)
+        at(22, row, dir .. tostring(tx.amount or 0) .. "q",      col)
+        at(34, row, tostring(tx.memo  or ""):sub(1, W-34),       C.dim)
+      end
+    end
+
+    at(2, H-2, "Balance: " .. tostring(res.balance or 0) .. " Quid", C.money)
+  end
 
   while true do
-    touchActivity()
-    local ev, b, mx, my = os.pullEvent("mouse_click")
-    if clicked(btn_back, mx, my) then return "dashboard" end
+    local ev, p1, p2, p3 = os.pullEvent("mouse_click")
+    if hit(b_back, p2, p3) then return "dashboard" end
   end
 end
 
 -- -----------------------------------------------------------------------
--- SCREEN: Timeout notice
+-- TIMEOUT
 -- -----------------------------------------------------------------------
 local function screenTimeout()
   cls()
-  drawHeader("Session Expired")
-  centreText(8,  "You have been logged out", COL.dim_txt)
-  centreText(9,  "due to inactivity.", COL.dim_txt)
-  centreText(12, "Press any key to continue", COL.body_txt)
+  header("Session Expired")
+  centre(8,  "Logged out due to inactivity.", C.dim)
+  centre(10, "Click anywhere to continue.", C.body)
   os.pullEvent("mouse_click")
-  resetSession()
+  session.logged_in = false
   return "login"
 end
 
 -- =============================================================================
--- MAIN LOOP
+-- MAIN
 -- =============================================================================
 local function main()
   if not openModem() then
     cls()
-    print("ERROR: No modem found.")
-    print("Attach an Ender Modem and reboot.")
+    print("ERROR: No modem found. Attach an Ender Modem and reboot.")
     return
   end
 
-  -- Connect to DB
-  local connected = false
-  while not connected do
-    connected = screenConnecting()
-  end
-
-  -- Start idle timer
-  local idle_timer = os.startTimer(5)
+  while not screenConnecting() do end
 
   local screen = "login"
-
   while true do
     if screen == "login"     then screen = screenLogin()     end
     if screen == "dashboard" then screen = screenDashboard() end
     if screen == "transfer"  then screen = screenTransfer()  end
     if screen == "history"   then screen = screenHistory()   end
     if screen == "timeout"   then screen = screenTimeout()   end
-    if screen == "logout"    then resetSession(); screen = "login" end
+    if screen == "logout"    then session.logged_in=false; screen="login" end
     if screen == "quit"      then break end
   end
-
   cls()
   print("Terminal closed.")
 end
