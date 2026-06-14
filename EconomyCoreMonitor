@@ -1,6 +1,6 @@
 -- =============================================================================
 -- ECONOMY CORE MONITOR
--- Quid national statistics display - stripped Minecraft-server core build
+-- Quid national statistics display - contract-aware Minecraft core build
 --
 -- Shows only:
 --   GDP
@@ -12,12 +12,15 @@
 --   COMPANIES
 --   TRANSACTIONS PER DAY
 --
--- Read-only. No banking controls. No trade panel. No CPI/policy clutter.
+-- Read-only. No banking controls. No trade panel. Starts looking for contract/GDP data.
 -- =============================================================================
 
-local VERSION         = "0.4.2-COMPANY"
+local VERSION         = "0.5.0-CONTRACT-GDP"
 local PROTOCOL        = "quid_bank"
+local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT      = 5
+local CONTRACT_TIMEOUT = 3
+local GDP_PERIOD_MS   = 24 * 60 * 60 * 1000
 local REFRESH_SECONDS = 5
 local TEXT_SCALE      = 0.5
 local HISTORY_FILE    = "data/economy_core_monitor_history.db"
@@ -27,6 +30,8 @@ local native_term = term.current()
 local monitor = nil
 local modem_name = nil
 local db_id = nil
+local contract_id = nil
+local last_contract_error = ""
 local last_error = ""
 local last_snapshot = nil
 local last_update_text = "never"
@@ -325,20 +330,62 @@ local function connectServer()
   centerIn(1, math.floor(h / 2), w, "Connecting to Quid Bank server...", colors.lightGray, colors.black)
   centerIn(1, math.floor(h / 2) + 1, w, "Modem: " .. tostring(modem_name or "none"), colors.gray, colors.black)
   for attempt = 1, 8 do
-    centerIn(1, math.floor(h / 2) + 3, w, "Attempt " .. attempt .. " of 8", colors.gray, colors.black)
+    centerIn(1, math.floor(h / 2) + 3, w, "Bank attempt " .. attempt .. " of 8", colors.gray, colors.black)
     rednet.broadcast({ type = "ping" }, PROTOCOL)
     local sender, msg = rednet.receive(PROTOCOL, 4)
     if sender and type(msg) == "table" then
       if msg.type == "treasury_online" or msg.success == true then
         db_id = sender
-        centerIn(1, math.floor(h / 2) + 5, w, "Connected to server " .. tostring(db_id), colors.lime, colors.black)
+        centerIn(1, math.floor(h / 2) + 5, w, "Connected to bank " .. tostring(db_id), colors.lime, colors.black)
         sleep(0.4)
         return true
       end
     end
   end
-  last_error = "Unable to discover server"
+  last_error = "Unable to discover bank server"
   return false
+end
+
+local function connectContractServer(silent)
+  contract_id = nil
+  last_contract_error = ""
+
+  if not silent then
+    local w, h = getSize()
+    centerIn(1, math.floor(h / 2) + 7, w, "Looking for ContractServer...", colors.lightGray, colors.black)
+  end
+
+  rednet.broadcast({ type = "ping" }, CONTRACT_PROTOCOL)
+  local deadline = os.clock() + CONTRACT_TIMEOUT
+  while true do
+    local remaining = deadline - os.clock()
+    if remaining <= 0 then break end
+    local sender, msg = rednet.receive(CONTRACT_PROTOCOL, remaining)
+    if sender and type(msg) == "table" then
+      if msg.success == true or msg.type == "contract_server_online" then
+        contract_id = sender
+        return true
+      end
+    end
+  end
+
+  last_contract_error = "No ContractServer"
+  return false
+end
+
+local function contractRequest(req, timeout)
+  timeout = timeout or CONTRACT_TIMEOUT
+  if not contract_id then return false, "No ContractServer connected" end
+  rednet.send(contract_id, req, CONTRACT_PROTOCOL)
+  local deadline = os.clock() + timeout
+  while true do
+    local remaining = deadline - os.clock()
+    if remaining <= 0 then return false, "No response from ContractServer" end
+    local sender, msg = rednet.receive(CONTRACT_PROTOCOL, remaining)
+    if sender == contract_id and type(msg) == "table" and msg.success ~= nil then
+      return msg.success, msg.response
+    end
+  end
 end
 
 -- =============================================================================
@@ -428,6 +475,145 @@ local function estimateTxPerDay(currentTx)
   return perDay, "Estimated from local monitor history"
 end
 
+local function getPriceValue(entry)
+  if type(entry) == "table" then
+    return tonumber(entry.unit_price or entry.price or entry.value)
+  end
+  return tonumber(entry)
+end
+
+local function estimateInflationFromPrices(prices)
+  if type(prices) ~= "table" then
+    return nil, "Awaiting official prices"
+  end
+
+  local total = 0
+  local count = 0
+  for _, entry in pairs(prices) do
+    if type(entry) == "table" then
+      local current = getPriceValue(entry)
+      local historyList = entry.history
+      local previous = nil
+      if type(historyList) == "table" and #historyList > 0 then
+        local latest = historyList[#historyList]
+        if type(latest) == "table" then
+          previous = tonumber(latest.price or latest.unit_price or latest.value)
+        else
+          previous = tonumber(latest)
+        end
+      end
+      if current and previous and previous > 0 then
+        total = total + (((current / previous) - 1) * 100)
+        count = count + 1
+      end
+    end
+  end
+
+  if count <= 0 then
+    return nil, "Awaiting price history / CPI source"
+  end
+
+  return total / count, "Estimated from official price changes"
+end
+
+local function fetchPriceInflation()
+  local okPrices, priceRes = dbRequest({ type = "get_prices" }, 3)
+  if okPrices and type(priceRes) == "table" then
+    return estimateInflationFromPrices(priceRes.prices or {})
+  end
+  return nil, "Awaiting get_prices"
+end
+
+local function analyseContracts(contracts, status)
+  local now = nowMs()
+  local gdp = 0
+  local gdpEvents = 0
+  local fulfilledValue = 0
+  local openValue = 0
+  local claimedValue = 0
+  local totalValue = 0
+  local newestFulfilled = nil
+
+  contracts = type(contracts) == "table" and contracts or {}
+  for _, c in ipairs(contracts) do
+    if type(c) == "table" then
+      local reward = tonumber(c.reward or c.value or c.amount) or 0
+      local st = tostring(c.status or "")
+      totalValue = totalValue + reward
+      if st == "open" then openValue = openValue + reward end
+      if st == "claimed" then claimedValue = claimedValue + reward end
+      if st == "fulfilled" or st == "paid" or st == "closed" then
+        fulfilledValue = fulfilledValue + reward
+        local t = tonumber(c.fulfilled_at or c.paid_at or c.closed_at or c.updated or c.created)
+        if t then
+          if not newestFulfilled or t > newestFulfilled then newestFulfilled = t end
+          if now - t <= GDP_PERIOD_MS then
+            gdp = gdp + reward
+            gdpEvents = gdpEvents + 1
+          end
+        else
+          -- If old contracts have no timestamp, count them as visible fulfilled output.
+          gdp = gdp + reward
+          gdpEvents = gdpEvents + 1
+        end
+      end
+    end
+  end
+
+  status = type(status) == "table" and status or {}
+  return {
+    connected = contract_id ~= nil,
+    total = tonumber(status.total) or #contracts,
+    open = tonumber(status.open) or 0,
+    claimed = tonumber(status.claimed) or 0,
+    fulfilled = tonumber(status.fulfilled) or 0,
+    cancelled = tonumber(status.cancelled) or 0,
+    gdp_24h = gdp,
+    gdp_events = gdpEvents,
+    fulfilled_value = fulfilledValue,
+    open_value = openValue,
+    claimed_value = claimedValue,
+    total_value = totalValue,
+    newest_fulfilled = newestFulfilled,
+    status = "GDP from fulfilled contracts, rolling 24h",
+  }
+end
+
+local function fetchContractEconomy()
+  if not contract_id then
+    connectContractServer(true)
+  end
+  if not contract_id then
+    return {
+      connected = false,
+      status = "Waiting for ContractServer",
+      open = 0,
+      claimed = 0,
+      fulfilled = 0,
+      cancelled = 0,
+      total = 0,
+    }
+  end
+
+  local okStatus, status = contractRequest({ type = "status" }, 2)
+  if not okStatus or type(status) ~= "table" then
+    local err = tostring(status or "status unavailable")
+    contract_id = nil
+    last_contract_error = err
+    return { connected = false, status = err, open = 0, claimed = 0, fulfilled = 0, cancelled = 0, total = 0 }
+  end
+
+  local okList, listRes = contractRequest({ type = "list_contracts", status = "all" }, 3)
+  local contracts = {}
+  if okList and type(listRes) == "table" then
+    contracts = listRes.contracts or {}
+  end
+
+  local out = analyseContracts(contracts, status)
+  out.server_id = contract_id
+  return out
+end
+
 local function normaliseNationalStats(raw)
   local monetaryRaw = raw.monetary or raw.supply or {}
   local outputRaw = raw.output or raw.gdp or {}
@@ -475,7 +661,6 @@ local function normaliseNationalStats(raw)
       private_supply = private,
       treasury_reserve = treasury,
       reserve_share = reserveShare,
-      supply_growth = num(monetaryRaw.supply_growth),
       status = monetaryRaw.status or "Live",
     },
     scale = {
@@ -487,6 +672,7 @@ local function normaliseNationalStats(raw)
       top_companies = scaleRaw.top_companies or scaleRaw.company_top10 or raw.top_companies or {},
       source = raw.source or "national_statistics",
     },
+    contracts = raw.contracts or raw.contract_activity or {},
   }
 end
 
@@ -509,34 +695,47 @@ local function fallbackSnapshot()
   if issued and issued > 0 and treasury then reserveShare = (treasury / issued) * 100 end
 
   local txDay, txStatus = estimateTxPerDay(status.tx_count)
+  local inflation, inflationStatus = fetchPriceInflation()
+  local contractEco = fetchContractEconomy()
+
+  local gdp = nil
+  local outputStatus = "Waiting for ContractServer / fulfilled contracts"
+  if contractEco and contractEco.connected then
+    gdp = tonumber(contractEco.gdp_24h) or 0
+    outputStatus = contractEco.status or "GDP from fulfilled contracts"
+  end
+
+  local population = num(status.citizen_count)
+  local gdpCap = nil
+  if gdp and population and population > 0 then gdpCap = gdp / population end
 
   return {
-    mode = "CURRENT DATA FALLBACK",
-    quality = "PARTIAL",
+    mode = "FALLBACK + CONTRACTS",
+    quality = contractEco and contractEco.connected and "LIVE" or "PARTIAL",
     time = status.time or nowMs(),
-    gdp = nil,
-    gdp_per_capita = nil,
-    inflation = nil,
-    output_status = "Needs economic output ledger / national_statistics.gdp",
-    inflation_status = "Needs official inflation value or CPI history",
+    gdp = gdp,
+    gdp_per_capita = gdpCap,
+    inflation = inflation,
+    output_status = outputStatus,
+    inflation_status = inflationStatus,
     inequality = inequalityFromAccounts(accounts),
     monetary = {
       issued_supply = issued,
       private_supply = private,
       treasury_reserve = treasury,
       reserve_share = reserveShare,
-      supply_growth = growthPct(issued, history.issued_supply and history.issued_supply[#history.issued_supply]),
       status = "Live from ledger supply",
     },
     scale = {
-      population = num(status.citizen_count),
+      population = population,
       companies = num(status.company_count),
       transactions_total = num(status.tx_count),
       transactions_per_day = txDay,
       tx_day_status = txStatus,
       top_companies = topCompaniesFromAccounts(accounts),
-      source = "current_server",
+      source = "bank status + accounts + contract server",
     },
+    contracts = contractEco,
   }
 end
 
@@ -547,6 +746,21 @@ local function refreshSnapshot()
   local snap = nil
   if okNational and type(national) == "table" then
     snap = normaliseNationalStats(national)
+
+    local contractEco = fetchContractEconomy()
+    snap.contracts = contractEco
+    if (not snap.gdp) and contractEco and contractEco.connected then
+      snap.gdp = tonumber(contractEco.gdp_24h) or 0
+      snap.output_status = contractEco.status or "GDP from fulfilled contracts"
+      local pop = snap.scale and tonumber(snap.scale.population)
+      if pop and pop > 0 then snap.gdp_per_capita = snap.gdp / pop end
+    end
+
+    if not snap.inflation then
+      local inf, infStatus = fetchPriceInflation()
+      snap.inflation = inf
+      snap.inflation_status = infStatus
+    end
   else
     local fallback, err = fallbackSnapshot()
     if not fallback then return false, err end
@@ -705,19 +919,23 @@ local function drawScaleCard(x, y, w, h, snap)
   metric(x + 2, y + 3, "Companies", tostring(s.companies or "Awaiting data"), s.companies and colors.white or C.warn)
   metric(x + 2, y + 4, "Transactions / day", s.transactions_per_day and (fmtNum(s.transactions_per_day, 1) .. " / day") or "Collecting baseline", s.transactions_per_day and colors.white or C.warn)
 
-  writeAt(x + 2, y + 6, "Top companies", colors.white, C.bg)
+  local c = snap and snap.contracts or {}
+  local contractLine = "Contracts O/C/F: " .. tostring(c.open or 0) .. "/" .. tostring(c.claimed or 0) .. "/" .. tostring(c.fulfilled or 0)
+  writeAt(x + 2, y + 5, shortText(contractLine, w - 4), c.connected and C.good or C.warn, C.bg)
+
+  writeAt(x + 2, y + 7, "Top companies", colors.white, C.bg)
   local top = s.top_companies or {}
   if type(top) ~= "table" or #top == 0 then
-    writeAt(x + 2, y + 7, "No company account data", C.warn, C.bg)
+    writeAt(x + 2, y + 8, "No company account data", C.warn, C.bg)
   else
-    local maxRows = math.min(10, #top, math.max(1, h - 9))
+    local maxRows = math.min(10, #top, math.max(1, h - 10))
     for i = 1, maxRows do
       local company = top[i] or {}
       local name = shortText(company.name or company.id or ("Company " .. i), math.max(8, w - 18))
       local bal = fmtMoney(company.balance)
       local line = tostring(i) .. ". " .. name
-      writeAt(x + 2, y + 6 + i, shortText(line, w - 18), C.text, C.bg)
-      writeAt(x + w - #bal - 2, y + 6 + i, bal, colors.white, C.bg)
+      writeAt(x + 2, y + 7 + i, shortText(line, w - 18), C.text, C.bg)
+      writeAt(x + w - #bal - 2, y + 7 + i, bal, colors.white, C.bg)
     end
   end
 
@@ -734,14 +952,15 @@ local function drawHeader(snap)
   writeAt(2, 2, "Mode: " .. tostring(snap and snap.mode or "CONNECTING"), C.dim, C.bg)
   writeAt(34, 2, "Data: " .. tostring(snap and snap.quality or "NO DATA"), (snap and snap.quality == "OFFICIAL") and C.good or C.warn, C.bg)
   writeAt(54, 2, "Updated: " .. tostring(last_update_text), C.dim, C.bg)
-  if db_id then writeAt(82, 2, "Server: " .. tostring(db_id), C.dim, C.bg) end
+  if db_id then writeAt(82, 2, "Bank: " .. tostring(db_id), C.dim, C.bg) end
+  if contract_id then writeAt(96, 2, "Contracts: " .. tostring(contract_id), C.dim, C.bg) end
 end
 
 local function drawFooter()
   local w, h = getSize()
   fill(1, h - 1, w, 2, C.bg)
   writeAt(1, h - 1, string.rep("-", w), C.dim, C.bg)
-  local text = "Refresh: " .. REFRESH_SECONDS .. "s   CORE COMPANY BUILD   Monitor: " .. (monitor and "attached" or "terminal") .. "   [Q] Quit"
+  local text = "Refresh: " .. REFRESH_SECONDS .. "s   CONTRACT GDP BUILD   Monitor: " .. (monitor and "attached" or "terminal") .. "   [Q] Quit"
   writeAt(2, h, text, C.dim, C.bg)
   if last_error ~= "" then writeAt(math.max(2, w - #last_error - 2), h, last_error, C.bad, C.bg) end
 end
@@ -804,6 +1023,7 @@ local function main()
     drawScreen()
     sleep(3)
   end
+  connectContractServer(true)
 
   local ok, err = refreshSnapshot()
   if not ok then last_error = tostring(err) end
