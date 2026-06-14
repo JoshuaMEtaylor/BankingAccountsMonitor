@@ -16,7 +16,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.1.1"
+local VERSION  = "1.1.0"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
 local DB_TIMEOUT = 5
