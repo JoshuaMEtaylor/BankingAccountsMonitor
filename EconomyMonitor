@@ -4,7 +4,7 @@
 --
 -- Install manually:
 --   delete startup
---   wget your raw github url startup.lua
+--   wget <your raw github url> startup.lua
 --   startup.lua
 --
 -- This is a read-only national statistics monitor.
