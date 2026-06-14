@@ -16,7 +16,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.1.1"
+local VERSION  = "1.1.0"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
 local DB_TIMEOUT = 5
@@ -196,44 +196,32 @@ end
 -- =============================================================================
 -- NETWORK
 -- =============================================================================
+local modemName     = nil
+local modemWireless = false
+
 local function openModem()
+  -- First pass: prefer wireless/ender modem
+  for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.getType(name) == "modem" then
+      local modem = peripheral.wrap(name)
+      if modem and modem.isWireless and modem.isWireless() then
+        rednet.open(name)
+        modemName = name
+        modemWireless = true
+        return true
+      end
+    end
+  end
+  -- Second pass: fallback to any modem
   for _, name in ipairs(peripheral.getNames()) do
     if peripheral.getType(name) == "modem" then
       rednet.open(name)
+      modemName = name
+      modemWireless = false
       return true
     end
   end
   return false
-end
-
-local function findDB()
-  -- Try up to 3 times with increasing patience
-  for attempt = 1, 3 do
-    -- Broadcast ping on the bank protocol
-    rednet.broadcast({ type = "ping" }, PROTOCOL)
-
-    local deadline = os.clock() + 3
-    while os.clock() < deadline do
-      local sender, msg, proto = rednet.receive(PROTOCOL, 1)
-      if sender and type(msg) == "table" then
-        -- Server replies wrap responses as {success=bool, response={...}}
-        if msg.success == true and type(msg.response) == "table" and msg.response.version then
-          return sender
-        end
-        -- Also accept the raw treasury_online broadcast the server sends periodically
-        if msg.type == "treasury_online" and msg.version then
-          -- Send a direct ping to confirm it's alive
-          rednet.send(sender, { type = "ping" }, PROTOCOL)
-          local s2, m2 = rednet.receive(PROTOCOL, 2)
-          if s2 == sender and type(m2) == "table" and m2.success then
-            return sender
-          end
-          return sender  -- accept it anyway, broadcast proves it's online
-        end
-      end
-    end
-  end
-  return nil
 end
 
 local function dbRequest(req)
@@ -306,53 +294,42 @@ end
 local function screenConnecting()
   cls()
   drawHeader("Connecting...")
+  centreText(7, "Locating Quid Bank server...", COL.dim_txt)
 
-  centreText(7,  "Locating Quid Bank server...", COL.dim_txt)
-  centreText(9,  "Sending discovery ping...", COL.dim_txt)
-  centreText(11, "Attempt 1 of 3", COL.dim_txt)
+  for attempt = 1, 5 do
+    drawRect(1, 10, W, 1, COL.bg)
+    centreText(10, "Attempt " .. attempt .. " of 5...", COL.dim_txt)
 
-  -- Show attempt progress on screen
-  local function showAttempt(n, status)
-    drawRect(1, 11, W, 1, COL.bg)
-    centreText(11, "Attempt " .. n .. " of 3  " .. status, COL.dim_txt)
-  end
-
-  for attempt = 1, 3 do
-    showAttempt(attempt, "pinging...")
     rednet.broadcast({ type = "ping" }, PROTOCOL)
 
-    local deadline = os.clock() + 3
-    while os.clock() < deadline do
-      local sender, msg, proto = rednet.receive(PROTOCOL, 1)
-      if sender and type(msg) == "table" then
-        if msg.success == true and type(msg.response) == "table" and msg.response.version then
-          db_id = sender
-          centreText(11, "Connected! Server ID: " .. sender, COL.success_txt)
-          sleep(0.5)
-          return true
-        end
-        if msg.type == "treasury_online" and msg.version then
-          db_id = sender
-          centreText(11, "Connected! Server ID: " .. sender, COL.success_txt)
-          sleep(0.5)
-          return true
-        end
+    local sender, msg = rednet.receive(PROTOCOL, 3)
+
+    if sender and type(msg) == "table" then
+      -- Accept a direct ping reply from the server
+      if msg.success and type(msg.response) == "table" then
+        db_id = sender
+        centreText(10, "Connected to server " .. sender, COL.success_txt)
+        sleep(0.5)
+        return true
+      end
+      -- Also accept the treasury_online broadcast if server sent it on this protocol
+      if msg.type == "treasury_online" then
+        db_id = sender
+        centreText(10, "Connected to server " .. sender, COL.success_txt)
+        sleep(0.5)
+        return true
       end
     end
-
-    showAttempt(attempt, "no response")
-    sleep(0.3)
   end
 
-  -- Failed
   cls()
   drawHeader("Connection Failed")
   centreText(7,  "Could not reach bank server.", COL.error_txt)
-  centreText(9,  "Check that:", COL.dim_txt)
-  centreText(10, "- Treasury DB computer is on", COL.dim_txt)
-  centreText(11, "- Both computers have modems", COL.dim_txt)
-  centreText(12, "- Modems are Ender modems", COL.dim_txt)
-  centreText(14, "Retrying in 5 seconds...", COL.dim_txt)
+  local modemLine = "Modem: " .. tostring(modemName or "NONE") ..
+    (modemWireless and " (wireless)" or " (WIRED - wrong type!)")
+  centreText(9, modemLine, modemWireless and COL.dim_txt or COL.error_txt)
+  centreText(11, "Is the Treasury DB computer running?", COL.dim_txt)
+  centreText(13, "Retrying in 5 seconds...", COL.dim_txt)
   sleep(5)
   return false
 end
@@ -819,12 +796,4 @@ local function main()
   print("Terminal closed.")
 end
 
--- Wrap in timer loop for idle detection
-local function timerLoop()
-  while true do
-    os.startTimer(5)
-    os.pullEvent("timer")
-  end
-end
-
-parallel.waitForAny(main, timerLoop)
+main()
