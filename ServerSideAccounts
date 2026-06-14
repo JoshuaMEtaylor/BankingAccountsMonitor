@@ -78,7 +78,7 @@ if selfRebuild() then return end
 -- MAIN PROGRAM  (runs after a clean relaunch, or if the update was skipped/failed)
 -- =============================================================================
 
-local VERSION  = "1.2.0"
+local VERSION  = "1.2.1"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
