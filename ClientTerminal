@@ -2,43 +2,21 @@
 -- QUID BANK OF PLENTY - CLIENT TERMINAL
 -- ClientTerminal
 -- =============================================================================
--- Runs on any Advanced Computer with Ender Modem.
--- Full GUI with mouse support. Username + password login from any terminal.
---
--- Install:
---   wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/main/ClientTerminal startup.lua
---   reboot
--- =============================================================================
 
-local GITHUB_URL = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/ClientTerminal"
-local SELF       = "startup.lua"
-
-local bootArgs   = {...}
-
-if bootArgs[1] ~= "--updated" then
+local args = {...}
+if args[1] ~= "--updated" then
   print("[ Quid Bank of Plenty ]")
-  print("Fetching latest from GitHub...")
-
-  if fs.exists(SELF) then fs.delete(SELF) end
-
-  shell.run("wget", GITHUB_URL, SELF)
-
-  if fs.exists(SELF) then
-    print("Done. Launching...")
-    sleep(0.3)
-    shell.run(SELF, "--updated")
-  else
-    print("Download failed. Check network/GitHub.")
-  end
-
+  print("Deleting old version...")
+  fs.delete("startup.lua")
+  print("Downloading latest from GitHub...")
+  shell.run("wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/ClientTerminal startup.lua")
+  print("Relaunching...")
+  sleep(0.5)
+  shell.run("startup.lua", "--updated")
   return
 end
 
--- =============================================================================
--- MAIN PROGRAM  (only reached via --updated after a clean rebuild)
--- =============================================================================
-
-local VERSION  = "1.1.0"
+local VERSION  = "1.1.1"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
 local DB_TIMEOUT = 5
