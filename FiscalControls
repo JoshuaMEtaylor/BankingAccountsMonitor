@@ -1,6 +1,6 @@
 -- =============================================================================
 -- QUID BANK OF PLENTY - TREASURY CONTROL TERMINAL
--- TreasuryTerminal
+-- FiscalControls
 -- =============================================================================
 -- Purpose:
 --   State-side control terminal for the Quid treasury and national finance system.
@@ -13,7 +13,7 @@
 --   company_info, set_price
 --
 -- Install/update pattern:
---   wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/TreasuryTerminal startup.lua
+--   wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/FiscalControls startup.lua
 --   startup.lua
 -- =============================================================================
 
@@ -23,7 +23,7 @@ if args[1] ~= "--updated" then
   print("Deleting old version...")
   fs.delete("startup.lua")
   print("Downloading latest from GitHub...")
-  shell.run("wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/TreasuryTerminal startup.lua")
+  shell.run("wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/FiscalControls startup.lua")
   print("Relaunching...")
   sleep(0.5)
   shell.run("startup.lua", "--updated")
@@ -34,7 +34,7 @@ end
 -- MAIN PROGRAM
 -- =============================================================================
 
-local VERSION      = "1.0.0"
+local VERSION      = "1.0.1"
 local TERMINAL_NAME= "QUID TREASURY CONTROL"
 local PROTOCOL     = "quid_bank"
 local DB_TIMEOUT   = 5
