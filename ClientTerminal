@@ -20,7 +20,7 @@ end
 -- MAIN PROGRAM
 -- =============================================================================
 
-local VERSION      = "1.2.1"
+local VERSION      = "1.2.0"
 local PROTOCOL     = "quid_bank"
 local DB_TIMEOUT   = 5
 local IDLE_TIMEOUT = 60
@@ -28,27 +28,34 @@ local IDLE_TIMEOUT = 60
 local W, H = term.getSize()
 
 -- =============================================================================
--- COLOURS
+-- COLOUR PALETTE  — professional banking aesthetic
 -- =============================================================================
 local C = {
-  bg       = colors.black,
-  panel    = colors.gray,
-  hdr_bg   = colors.yellow,
-  hdr_fg   = colors.black,
-  title    = colors.yellow,
-  body     = colors.white,
+  bg       = colors.gray,        -- page background
+  card     = colors.white,       -- card/panel background
+  card_fg  = colors.black,       -- text on cards
+  accent   = colors.cyan,        -- primary brand colour
+  accent_fg= colors.black,       -- text on accent
+  header   = colors.lightBlue,   -- top bar
+  hdr_fg   = colors.white,
+  label    = colors.lightGray,   -- muted label text
+  body     = colors.white,       -- normal body text
   dim      = colors.lightGray,
   in_bg    = colors.white,
   in_fg    = colors.black,
-  green    = colors.green,
-  red      = colors.red,
-  blue     = colors.blue,
-  gray     = colors.gray,
+  in_act   = colors.lightBlue,   -- active/focused input border row
+  btn_pri  = colors.cyan,        -- primary button
+  btn_sec  = colors.lightGray,   -- secondary button
+  btn_dan  = colors.red,         -- destructive button
   btn_fg   = colors.white,
   err      = colors.red,
   ok       = colors.lime,
   money    = colors.lime,
-  border   = colors.yellow,
+  sep      = colors.lightGray,   -- separator lines
+  tab_act  = colors.white,       -- active tab
+  tab_bg   = colors.lightGray,   -- inactive tab
+  tab_fg   = colors.black,
+  caps     = colors.orange,      -- caps lock warning
 }
 
 -- =============================================================================
@@ -56,9 +63,10 @@ local C = {
 -- =============================================================================
 local db_id     = nil
 local modemName = nil
+local capsLock  = false   -- tracked manually
 
 local session = {
-  logged_in    = false,
+  logged_in = false,
   citizen_id   = nil,
   display_name = nil,
   username     = nil,
@@ -69,7 +77,7 @@ local session = {
 }
 
 -- =============================================================================
--- DRAWING
+-- DRAWING PRIMITIVES
 -- =============================================================================
 local function cls()
   term.setBackgroundColor(C.bg)
@@ -79,17 +87,23 @@ local function cls()
 end
 
 local function at(x, y, text, fg, bg)
+  if x < 1 or y < 1 or y > H then return end
   term.setCursorPos(x, y)
   if bg then term.setBackgroundColor(bg) end
   if fg then term.setTextColor(fg) end
-  term.write(text)
+  local maxw = W - x + 1
+  if maxw <= 0 then return end
+  term.write(tostring(text):sub(1, maxw))
 end
 
 local function fill(x, y, w, h, bg)
-  term.setBackgroundColor(bg or C.panel)
+  term.setBackgroundColor(bg or C.card)
+  local row_str = string.rep(" ", math.max(0, w))
   for row = y, y+h-1 do
-    term.setCursorPos(x, row)
-    term.write(string.rep(" ", w))
+    if row >= 1 and row <= H then
+      term.setCursorPos(x, row)
+      term.write(row_str)
+    end
   end
 end
 
@@ -98,39 +112,99 @@ local function centre(y, text, fg, bg)
   at(x, y, text, fg, bg)
 end
 
-local function header(title)
-  fill(1, 1, W, 2, C.hdr_bg)
-  centre(1, "QUID BANK OF PLENTY", C.hdr_fg, C.hdr_bg)
-  centre(2, title, C.hdr_fg, C.hdr_bg)
-  fill(1, H, W, 1, C.panel)
-  local footer = "v" .. VERSION
-  centre(H, footer, C.dim, C.panel)
+local function hline(y, fg, bg)
+  at(1, y, string.rep("-", W), fg or C.sep, bg or C.bg)
 end
 
--- Draw a button, return hit-test table
-local function btn(x, y, w, label, col)
-  col = col or C.blue
+-- =============================================================================
+-- UI COMPONENTS
+-- =============================================================================
+
+-- Top bar: bank name left, version right
+local function topBar()
+  fill(1, 1, W, 1, C.header)
+  at(2,       1, "QUID BANK OF PLENTY",           C.hdr_fg, C.header)
+  at(W-#VERSION, 1, VERSION,                       C.dim,    C.header)
+end
+
+-- Section card: a labelled white panel
+local function card(x, y, w, h)
+  fill(x, y, w, h, C.card)
+end
+
+-- Label above, value below (inside a card)
+local function labelValue(x, y, label, value, val_col)
+  at(x, y,   label, C.label, C.card)
+  at(x, y+1, value, val_col or C.card_fg, C.card)
+end
+
+-- Thin separator
+local function sep(y)
+  fill(1, y, W, 1, C.bg)
+  at(1, y, string.rep("\140", W), C.sep, C.bg)
+end
+
+-- Button: returns hit-test table
+local function btn(x, y, w, label, col, fg)
+  col = col or C.btn_pri
+  fg  = fg  or C.btn_fg
+  if col == C.card then fg = C.card_fg end
   fill(x, y, w, 1, col)
   local tx = x + math.floor((w - #label) / 2)
-  at(tx, y, label, C.btn_fg, col)
+  at(tx, y, label, fg, col)
   return {x1=x, y1=y, x2=x+w-1, y2=y}
 end
 
 local function hit(b, mx, my)
-  return b and mx >= b.x1 and mx <= b.x2 and my == b.y1
+  return b and mx>=b.x1 and mx<=b.x2 and my==b.y1
 end
 
--- Draw an input field, return its display region
-local function field(x, y, w, value, masked, focused)
+-- Input field with focus highlight and caps indicator
+local function inputField(x, y, w, value, masked, focused)
+  local bg = focused and C.in_act or C.in_bg
+  local fg = focused and C.btn_fg or C.in_fg
+  fill(x, y, w, 1, bg)
   local display = masked and string.rep("*", #value) or value
-  local padded  = display .. string.rep(" ", w - #display)
-  fill(x, y, w, 1, C.in_bg)
-  at(x, y, padded:sub(1, w), C.in_fg, C.in_bg)
+  local padded  = display .. string.rep(" ", math.max(0, w - #display))
+  at(x, y, padded:sub(1, w), fg, bg)
   if focused then
-    term.setCursorPos(x + math.min(#value, w-1), y)
+    -- Caps indicator at end of field
+    if capsLock then
+      at(x + w - 5, y, "CAPS", C.caps, bg)
+    end
+    term.setCursorPos(x + math.min(#value, w - (capsLock and 6 or 1)), y)
     term.setCursorBlink(true)
   end
   return {x1=x, y1=y, x2=x+w-1, y2=y}
+end
+
+-- Tab strip: returns list of hit-test tables
+local function tabStrip(y, tabs, active)
+  fill(1, y, W, 1, C.bg)
+  local tw = math.floor(W / #tabs)
+  local btns = {}
+  for i, label in ipairs(tabs) do
+    local x  = (i-1)*tw + 1
+    local col = (i == active) and C.tab_act or C.tab_bg
+    fill(x, y, tw, 1, col)
+    local tx = x + math.floor((tw - #label)/2)
+    at(tx, y, label, C.tab_fg, col)
+    btns[i] = {x1=x, y1=y, x2=x+tw-1, y2=y}
+  end
+  return btns
+end
+
+-- Status bar at bottom
+local function statusBar(msg, col)
+  fill(1, H, W, 1, C.bg)
+  if msg and msg ~= "" then
+    at(2, H, msg, col or C.dim, C.bg)
+  end
+  if session.logged_in then
+    local idle = math.max(0, IDLE_TIMEOUT - math.floor(os.clock() - session.last_act))
+    local idle_str = "Logout in " .. idle .. "s"
+    at(W - #idle_str, H, idle_str, C.dim, C.bg)
+  end
 end
 
 -- =============================================================================
@@ -176,18 +250,19 @@ end
 -- -----------------------------------------------------------------------
 local function screenConnecting()
   cls()
-  header("Connecting...")
-  centre(7, "Locating Quid Bank server...", C.dim)
+  topBar()
+  fill(1, 2, W, H-1, C.bg)
+  centre(math.floor(H/2)-1, "Connecting to Quid Bank...", C.dim, C.bg)
 
   for attempt = 1, 5 do
-    fill(1, 9, W, 1, C.bg)
-    centre(9, "Attempt " .. attempt .. " of 5...", C.dim)
+    fill(1, math.floor(H/2)+1, W, 1, C.bg)
+    centre(math.floor(H/2)+1, "Attempt " .. attempt .. " of 5", C.dim, C.bg)
     rednet.broadcast({ type = "ping" }, PROTOCOL)
     local sender, msg = rednet.receive(PROTOCOL, 3)
     if sender and type(msg) == "table" then
       if (msg.success and type(msg.response) == "table") or msg.type == "treasury_online" then
         db_id = sender
-        centre(9, "Connected! Server: " .. sender, C.ok)
+        centre(math.floor(H/2)+1, "Connected.", C.ok, C.bg)
         sleep(0.5)
         return true
       end
@@ -195,96 +270,91 @@ local function screenConnecting()
   end
 
   cls()
-  header("Connection Failed")
-  centre(7,  "Could not reach bank server.", C.err)
-  centre(9,  "Modem: " .. tostring(modemName or "NONE"), C.dim)
-  centre(11, "Is the Treasury DB running?", C.dim)
-  centre(13, "Retrying in 5 seconds...", C.dim)
+  topBar()
+  centre(math.floor(H/2)-2, "Connection Failed", C.err, C.bg)
+  centre(math.floor(H/2),   "Could not reach the bank server.", C.dim, C.bg)
+  centre(math.floor(H/2)+1, "Modem: " .. tostring(modemName or "none"), C.dim, C.bg)
+  centre(math.floor(H/2)+3, "Retrying in 5 seconds...", C.dim, C.bg)
   sleep(5)
   return false
 end
 
 -- -----------------------------------------------------------------------
--- LOGIN / REGISTER  — full event-driven, all clicks work
+-- LOGIN / REGISTER
 -- -----------------------------------------------------------------------
 local function screenLogin()
   session.logged_in = false
-
-  local mode    = "login"   -- "login" or "register"
-  local focused = 1         -- which field has focus (1/2/3)
-  local fields  = {"", "", ""}   -- [1]=user/display [2]=pass/user [3]=pass(reg only)
+  local mode    = "login"
+  local focused = 1
+  local fields  = { "", "" }   -- login: [1]=user [2]=pass
+                               -- register: [1]=user [2]=pass
   local err     = ""
+
+  local function numFields()
+    return 2
+  end
 
   local function draw()
     cls()
-    header(mode == "login" and "Log In" or "Create Account")
+    topBar()
     term.setCursorBlink(false)
 
-    -- Tab buttons
-    local tab_w = math.floor(W/2) - 1
-    local b_login = btn(1,       4, tab_w, "Log In",   mode=="login"    and C.blue or C.gray)
-    local b_reg   = btn(tab_w+2, 4, tab_w, "Register", mode=="register" and C.blue or C.gray)
+    -- Tab strip
+    local tabs = tabStrip(3, {"  Log In  ", "  Register  "}, mode=="login" and 1 or 2)
 
-    -- Divider
-    at(1, 5, string.rep("-", W), C.border, C.bg)
+    -- Card
+    local card_y = 5
+    local card_h = H - card_y - 1
+    card(2, card_y, W-2, card_h)
 
+    -- Fields
     local b_submit
-
     if mode == "login" then
-      at(3, 7,  "Username:", C.dim, C.bg)
-      field(3, 8,  W-4, fields[1], false, focused==1)
-      at(3, 10, "Password:", C.dim, C.bg)
-      field(3, 11, W-4, fields[2], true,  focused==2)
-      b_submit = btn(math.floor(W/2)-5, 13, 12, "[ Log In ]", C.green)
+      at(4, card_y+1, "Username", C.label, C.card)
+      inputField(4, card_y+2, W-6, fields[1], false, focused==1)
+      at(4, card_y+4, "Password", C.label, C.card)
+      inputField(4, card_y+5, W-6, fields[2], true, focused==2)
+      b_submit = btn(4, card_y+7, W-6, "Log In", C.btn_pri)
     else
-      at(3, 7,  "Display Name:", C.dim, C.bg)
-      field(3, 8,  W-4, fields[1], false, focused==1)
-      at(3, 10, "Username:",     C.dim, C.bg)
-      field(3, 11, W-4, fields[2], false, focused==2)
-      at(3, 13, "Password:",     C.dim, C.bg)
-      field(3, 14, W-4, fields[3], true,  focused==3)
-      b_submit = btn(math.floor(W/2)-7, 16, 16, "[ Create Account ]", C.green)
+      at(4, card_y+1, "Username", C.label, C.card)
+      inputField(4, card_y+2, W-6, fields[1], false, focused==1)
+      at(4, card_y+4, "Password", C.label, C.card)
+      inputField(4, card_y+5, W-6, fields[2], true, focused==2)
+      b_submit = btn(4, card_y+7, W-6, "Create Account", C.btn_pri)
     end
 
-    if err ~= "" then centre(H-2, err, C.err, C.bg) end
-
-    -- Reposition cursor on focused field after full redraw
-    if focused == 1 then
-      local v = fields[1]
-      term.setCursorPos(3 + math.min(#v, W-5), 8)
-    elseif focused == 2 then
-      local v = fields[2]
-      term.setCursorPos(3 + math.min(#v, W-5), 11)
-    elseif focused == 3 then
-      local v = fields[3]
-      term.setCursorPos(3 + math.min(#v, W-5), 14)
+    -- Error
+    if err ~= "" then
+      local ecol = (err:find("ing%.%.%.") or err:find("Creating")) and C.dim or C.err
+      at(4, card_y + 9, err:sub(1, W-6), ecol, C.card)
     end
+
+    statusBar()
+
+    -- Reposition cursor
+    local cy = focused==1 and (card_y+2) or (card_y+5)
+    local v  = fields[focused] or ""
+    term.setCursorPos(4 + math.min(#v, W-7), cy)
     term.setCursorBlink(true)
 
-    return b_login, b_reg, b_submit
+    return tabs, b_submit, card_y
   end
 
-  local b_login, b_reg, b_submit = draw()
+  local tabs, b_submit, card_y = draw()
 
-  local function fieldAt(my)
-    if mode == "login" then
-      if my == 8  then return 1 end
-      if my == 11 then return 2 end
-    else
-      if my == 8  then return 1 end
-      if my == 11 then return 2 end
-      if my == 14 then return 3 end
-    end
+  local function fieldY(my, cy)
+    if my == card_y+2 then return 1 end
+    if my == card_y+5 then return 2 end
     return nil
   end
 
-  local function submit()
+  local function doSubmit()
+    if fields[1]=="" or fields[2]=="" then err="Please fill in all fields"; return nil end
     if mode == "login" then
-      if fields[1] == "" or fields[2] == "" then err = "Fill in all fields"; return end
       err = "Authenticating..."
-      b_login, b_reg, b_submit = draw()
+      draw()
       local ok, res = dbRequest({ type="login", username=fields[1], password=fields[2] })
-      if ok and type(res) == "table" then
+      if ok and type(res)=="table" then
         session.logged_in    = true
         session.citizen_id   = res.citizen_id
         session.display_name = res.display_name
@@ -295,19 +365,19 @@ local function screenLogin()
         session.last_act     = os.clock()
         return "dashboard"
       else
-        err = tostring(res or "Login failed")
+        err = tostring(res or "Incorrect username or password")
       end
     else
-      if fields[1]=="" or fields[2]=="" or fields[3]=="" then err="Fill in all fields"; return end
+      if #fields[2] < 4 then err="Password must be 4+ characters"; return nil end
       err = "Creating account..."
-      b_login, b_reg, b_submit = draw()
-      local ok, res = dbRequest({ type="create_account", display_name=fields[1], username=fields[2], password=fields[3] })
-      if ok and type(res) == "table" then
+      draw()
+      local ok, res = dbRequest({ type="create_account", display_name=fields[1], username=fields[1], password=fields[2] })
+      if ok and type(res)=="table" then
         session.logged_in    = true
         session.citizen_id   = res.citizen_id
         session.display_name = res.display_name
-        session.username     = fields[2]
-        session._password    = fields[3]
+        session.username     = fields[1]
+        session._password    = fields[2]
         session.balance      = res.balance or 0
         session.title        = res.title
         session.last_act     = os.clock()
@@ -316,77 +386,74 @@ local function screenLogin()
         err = tostring(res or "Registration failed")
       end
     end
+    return nil
   end
 
   while true do
     local ev, p1, p2, p3 = os.pullEvent()
 
-    if ev == "mouse_click" then
-      local mx, my = p2, p3
+    if ev == "key" then
+      if p1 == keys.capsLock then
+        capsLock = not capsLock
+        local cy = focused==1 and (card_y+2) or (card_y+5)
+        local masked = focused==2
+        inputField(4, cy, W-6, fields[focused], masked, true)
 
-      -- Tab switching
-      if hit(b_login, mx, my) and mode ~= "login" then
-        mode = "login"; fields = {"","",""}; focused = 1; err = ""
-        b_login, b_reg, b_submit = draw()
+      elseif p1 == keys.backspace then
+        if #fields[focused] > 0 then
+          fields[focused] = fields[focused]:sub(1,-2)
+          local cy = focused==1 and (card_y+2) or (card_y+5)
+          local masked = focused==2
+          inputField(4, cy, W-6, fields[focused], masked, true)
+          term.setCursorPos(4+math.min(#fields[focused],W-7),cy)
+        end
 
-      elseif hit(b_reg, mx, my) and mode ~= "register" then
-        mode = "register"; fields = {"","",""}; focused = 1; err = ""
-        b_login, b_reg, b_submit = draw()
+      elseif p1 == keys.tab then
+        focused = focused % numFields() + 1
+        tabs, b_submit, card_y = draw()
 
-      -- Submit
-      elseif hit(b_submit, mx, my) then
-        local next = submit()
-        if next then return next end
-        b_login, b_reg, b_submit = draw()
-
-      -- Field focus
-      else
-        local f = fieldAt(my)
-        if f then
-          focused = f
-          b_login, b_reg, b_submit = draw()
+      elseif p1 == keys.enter then
+        if focused < numFields() then
+          focused = focused + 1
+          tabs, b_submit, card_y = draw()
+        else
+          local next = doSubmit()
+          if next then return next end
+          tabs, b_submit, card_y = draw()
         end
       end
 
     elseif ev == "char" then
-      local maxlen = W - 5
-      if #fields[focused] < maxlen then
-        fields[focused] = fields[focused] .. p1
-        -- Just update the focused field inline, no full redraw
-        if focused == 1 then field(3, 8,  W-4, fields[1], false, true)
-        elseif focused == 2 then
-          field(3, mode=="login" and 11 or 11, W-4, fields[2], mode=="login", focused==2)
-        elseif focused == 3 then field(3, 14, W-4, fields[3], true,  true)
-        end
-        -- Reposition cursor
-        local cy = focused==1 and 8 or (focused==2 and 11 or 14)
-        term.setCursorPos(3 + math.min(#fields[focused], W-5), cy)
+      if #fields[focused] < W-7 then
+        local ch = capsLock and p1:upper() or p1
+        fields[focused] = fields[focused] .. ch
+        local cy = focused==1 and (card_y+2) or (card_y+5)
+        local masked = focused==2
+        inputField(4, cy, W-6, fields[focused], masked, true)
+        term.setCursorPos(4+math.min(#fields[focused],W-7),cy)
       end
 
-    elseif ev == "key" then
-      if p1 == keys.backspace then
-        if #fields[focused] > 0 then
-          fields[focused] = fields[focused]:sub(1, -2)
-          local cy = focused==1 and 8 or (focused==2 and 11 or 14)
-          local masked = (mode=="login" and focused==2) or (mode=="register" and focused==3)
-          field(3, cy, W-4, fields[focused], masked, true)
-          term.setCursorPos(3 + math.min(#fields[focused], W-5), cy)
+    elseif ev == "mouse_click" then
+      local mx, my = p2, p3
+      -- Tab clicks
+      if hit(tabs[1], mx, my) and mode ~= "login" then
+        mode="login"; fields={"",""}; focused=1; err=""
+        tabs, b_submit, card_y = draw()
+      elseif hit(tabs[2], mx, my) and mode ~= "register" then
+        mode="register"; fields={"",""}; focused=1; err=""
+        tabs, b_submit, card_y = draw()
+      -- Submit
+      elseif hit(b_submit, mx, my) then
+        local next = doSubmit()
+        if next then return next end
+        tabs, b_submit, card_y = draw()
+      -- Field focus
+      else
+        local f = fieldY(my, card_y)
+        if f then
+          focused = f
+          tabs, b_submit, card_y = draw()
         end
-      elseif p1 == keys.enter then
-        -- Tab to next field or submit on last
-        local maxField = mode=="login" and 2 or 3
-        if focused < maxField then
-          focused = focused + 1
-          b_login, b_reg, b_submit = draw()
-        else
-          local next = submit()
-          if next then return next end
-          b_login, b_reg, b_submit = draw()
-        end
-      elseif p1 == keys.tab then
-        local maxField = mode=="login" and 2 or 3
-        focused = focused % maxField + 1
-        b_login, b_reg, b_submit = draw()
       end
     end
   end
@@ -396,36 +463,59 @@ end
 -- DASHBOARD
 -- -----------------------------------------------------------------------
 local function screenDashboard()
-  -- Refresh balance
+  -- Refresh balance on entry
   local ok, res = dbRequest({ type="balance", username=session.username, password=session._password })
   if ok and type(res)=="table" then session.balance = res.balance end
 
-  cls()
-  header("Dashboard")
+  local err = ""
 
-  at(3, 4, "Welcome,", C.dim)
-  at(12, 4, session.display_name or "", C.title)
-  at(3, 5, session.title or "Account Holder", C.dim)
+  local function draw()
+    cls()
+    topBar()
+    term.setCursorBlink(false)
 
-  -- Balance card
-  fill(3, 7, W-4, 4, C.panel)
-  centre(8,  "YOUR BALANCE", C.dim, C.panel)
-  centre(9,  tostring(session.balance or 0) .. " Quid", C.money, C.panel)
-  centre(10, "Account: " .. (session.citizen_id or ""), C.dim, C.panel)
+    -- Account header strip
+    fill(1, 2, W, 2, C.card)
+    at(3, 2, session.username or "", C.card_fg, C.card)
+    at(3, 3, session.title or "Account Holder", C.label, C.card)
+    at(W - #(session.citizen_id or "") - 1, 2, session.citizen_id or "", C.label, C.card)
 
-  -- Buttons
-  local bw = math.floor((W-6)/2)
-  local b_transfer = btn(3,      12, bw, "Transfer",    C.blue)
-  local b_history  = btn(bw+4,   12, bw, "History",     C.blue)
-  local b_refresh  = btn(3,      14, bw, "Refresh",     C.gray)
-  local b_logout   = btn(bw+4,   14, bw, "Log Out",     C.red)
+    sep(4)
 
-  at(3, H-1, "Auto-logout after " .. IDLE_TIMEOUT .. "s inactivity", C.dim)
+    -- Balance card
+    card(2, 5, W-2, 4)
+    at(4, 5, "CURRENT BALANCE", C.label, C.card)
+    local bal_str = tostring(session.balance or 0) .. " Quid"
+    at(4, 6, bal_str, C.money, C.card)
+    at(4, 7, "Available to spend", C.label, C.card)
+
+    sep(9)
+
+    -- Action buttons — 2x2 grid
+    local bw = math.floor((W-3)/2)
+    local b_transfer = btn(2,      10, bw, "New Transfer",   C.btn_pri)
+    local b_history  = btn(bw+3,   10, bw, "View History",   C.btn_pri)
+    local b_refresh  = btn(2,      12, bw, "Refresh",        C.btn_sec, C.card_fg)
+    local b_logout   = btn(bw+3,   12, bw, "Sign Out",       C.btn_dan)
+
+    sep(14)
+
+    -- Account info strip
+    fill(1, 15, W, H-15, C.bg)
+    at(3, 15, "Bank:   Quid Bank of Plenty",   C.dim, C.bg)
+    at(3, 16, "Server: " .. tostring(db_id),   C.dim, C.bg)
+
+    statusBar(err, C.err)
+    return b_transfer, b_history, b_refresh, b_logout
+  end
+
+  local b_transfer, b_history, b_refresh, b_logout = draw()
 
   while true do
     if (os.clock() - session.last_act) >= IDLE_TIMEOUT then return "timeout" end
 
     local ev, p1, p2, p3 = os.pullEvent()
+
     if ev == "mouse_click" then
       session.last_act = os.clock()
       local mx, my = p2, p3
@@ -445,37 +535,51 @@ end
 -- TRANSFER
 -- -----------------------------------------------------------------------
 local function screenTransfer()
-  local fields  = {"", ""}  -- [1]=recipient [2]=amount
+  local fields  = { "", "" }  -- [1]=recipient [2]=amount
   local memo    = ""
   local focused = 1
   local err     = ""
 
   local function draw()
     cls()
-    header("Transfer Funds")
+    topBar()
     term.setCursorBlink(false)
 
-    at(3, 4, "From:    ", C.dim); at(12, 4, session.citizen_id or "", C.dim)
-    at(3, 5, "Balance: ", C.dim); at(12, 5, tostring(session.balance) .. " Quid", C.money)
+    -- From strip
+    fill(1, 2, W, 2, C.card)
+    at(3, 2, "From",            C.label, C.card)
+    at(3, 3, session.citizen_id or "", C.card_fg, C.card)
+    local bal_str = tostring(session.balance) .. " Quid"
+    at(W - #bal_str - 1, 2, "Balance",  C.label, C.card)
+    at(W - #bal_str - 1, 3, bal_str,    C.money, C.card)
 
-    at(3, 7,  "Recipient (username or account ID):", C.dim)
-    field(3, 8,  W-4, fields[1], false, focused==1)
+    sep(4)
 
-    at(3, 10, "Amount (Quid):", C.dim)
-    field(3, 11, W-4, fields[2], false, focused==2)
+    card(2, 5, W-2, H-6)
 
-    at(3, 13, "Memo (optional):", C.dim)
-    field(3, 14, W-4, memo, false, focused==3)
+    at(4, 6,  "Recipient", C.label, C.card)
+    inputField(4, 7,  W-6, fields[1], false, focused==1)
+
+    at(4, 9,  "Amount (Quid)", C.label, C.card)
+    inputField(4, 10, W-6, fields[2], false, focused==2)
+
+    at(4, 12, "Memo (optional)", C.label, C.card)
+    inputField(4, 13, W-6, memo,      false, focused==3)
 
     local bw     = math.floor((W-6)/2)
-    local b_send = btn(3,    16, bw, "Send",   C.green)
-    local b_back = btn(bw+4, 16, bw, "< Back", C.gray)
+    local b_send = btn(4,      15, bw, "Send Transfer", C.btn_pri)
+    local b_back = btn(bw+5,   15, bw, "Cancel",        C.btn_sec, C.card_fg)
 
-    if err ~= "" then centre(H-2, err, C.err, C.bg) end
+    if err ~= "" then
+      local ecol = err:find("ing%.%.%.") and C.dim or C.err
+      at(4, 17, err:sub(1,W-6), ecol, C.card)
+    end
 
-    local cy = focused==1 and 8 or (focused==2 and 11 or 14)
+    statusBar()
+
+    local cy = focused==1 and 7 or (focused==2 and 10 or 13)
     local v  = focused==3 and memo or fields[focused]
-    term.setCursorPos(3 + math.min(#v, W-5), cy)
+    term.setCursorPos(4 + math.min(#v, W-7), cy)
     term.setCursorBlink(true)
 
     return b_send, b_back
@@ -484,74 +588,104 @@ local function screenTransfer()
   local b_send, b_back = draw()
 
   local function fieldAt(my)
-    if my == 8  then return 1 end
-    if my == 11 then return 2 end
-    if my == 14 then return 3 end
+    if my==7  then return 1 end
+    if my==10 then return 2 end
+    if my==13 then return 3 end
   end
+
+  local function getField(f) return f==3 and memo or fields[f] end
+  local function setField(f, v) if f==3 then memo=v else fields[f]=v end end
 
   while true do
     session.last_act = os.clock()
     local ev, p1, p2, p3 = os.pullEvent()
 
-    if ev == "mouse_click" then
-      local mx, my = p2, p3
-      if hit(b_back, mx, my) then return "dashboard" end
-      if hit(b_send, mx, my) then
-        local amount = tonumber(fields[2])
-        if fields[1] == "" then err = "Enter a recipient"
-        elseif not amount or amount <= 0 then err = "Enter a valid amount"
-        else
-          err = "Sending..."
-          draw()
-          local ok, res = dbRequest({ type="transfer", username=session.username, password=session._password, to_id=fields[1], amount=amount, memo=memo })
-          if ok and type(res)=="table" then
-            -- Success
-            cls()
-            header("Transfer Complete")
-            centre(8,  "Transfer Successful!", C.ok)
-            centre(10, tostring(amount) .. " Quid sent to " .. fields[1], C.body)
-            centre(11, "TX: " .. tostring(res.tx_id or ""), C.dim)
-            local ok2, res2 = dbRequest({ type="balance", username=session.username, password=session._password })
-            if ok2 and type(res2)=="table" then session.balance = res2.balance end
-            centre(13, "New balance: " .. session.balance .. " Quid", C.money)
-            btn(math.floor(W/2)-4, 15, 10, "[ OK ]", C.blue)
-            os.pullEvent("mouse_click")
-            return "dashboard"
-          else
-            err = tostring(res or "Transfer failed")
-            b_send, b_back = draw()
-          end
-        end
-      end
-      local f = fieldAt(my)
-      if f then focused = f; b_send, b_back = draw() end
+    if ev == "key" then
+      if p1 == keys.capsLock then
+        capsLock = not capsLock
+        local cy = focused==1 and 7 or (focused==2 and 10 or 13)
+        inputField(4, cy, W-6, getField(focused), false, true)
 
-    elseif ev == "char" then
-      local maxlen = W-5
-      if focused == 3 then
-        if #memo < maxlen then memo = memo .. p1; field(3, 14, W-4, memo, false, true); term.setCursorPos(3+math.min(#memo,W-5),14) end
-      else
-        if #fields[focused] < maxlen then
-          fields[focused] = fields[focused] .. p1
-          local cy = focused==1 and 8 or 11
-          field(3, cy, W-4, fields[focused], false, true)
-          term.setCursorPos(3+math.min(#fields[focused],W-5),cy)
+      elseif p1 == keys.backspace then
+        local v = getField(focused)
+        if #v > 0 then
+          setField(focused, v:sub(1,-2))
+          local cy = focused==1 and 7 or (focused==2 and 10 or 13)
+          inputField(4, cy, W-6, getField(focused), false, true)
+          term.setCursorPos(4+math.min(#getField(focused),W-7),cy)
         end
-      end
 
-    elseif ev == "key" then
-      if p1 == keys.backspace then
-        local cy = focused==1 and 8 or (focused==2 and 11 or 14)
-        if focused == 3 then
-          if #memo > 0 then memo=memo:sub(1,-2); field(3,14,W-4,memo,false,true); term.setCursorPos(3+math.min(#memo,W-5),14) end
-        else
-          if #fields[focused]>0 then fields[focused]=fields[focused]:sub(1,-2); field(3,cy,W-4,fields[focused],false,true); term.setCursorPos(3+math.min(#fields[focused],W-5),cy) end
-        end
       elseif p1 == keys.tab or p1 == keys.enter then
+        if p1 == keys.enter and focused == 3 then
+          -- treat as submit
+          goto do_submit
+        end
         focused = focused % 3 + 1
         b_send, b_back = draw()
       end
+
+    elseif ev == "char" then
+      local v = getField(focused)
+      if #v < W-7 then
+        local ch = capsLock and p1:upper() or p1
+        setField(focused, v .. ch)
+        local cy = focused==1 and 7 or (focused==2 and 10 or 13)
+        inputField(4, cy, W-6, getField(focused), false, true)
+        term.setCursorPos(4+math.min(#getField(focused),W-7),cy)
+      end
+
+    elseif ev == "mouse_click" then
+      local mx, my = p2, p3
+      if hit(b_back, mx, my) then return "dashboard" end
+      if hit(b_send, mx, my) then goto do_submit end
+      local f = fieldAt(my)
+      if f then focused = f; b_send, b_back = draw() end
     end
+
+    goto continue
+    ::do_submit::
+    do
+      local amount = tonumber(fields[2])
+      if fields[1]=="" then err="Enter a recipient"
+      elseif not amount or amount<=0 then err="Enter a valid amount"
+      else
+        err = "Processing..."
+        draw()
+        local ok, res = dbRequest({ type="transfer", username=session.username, password=session._password, to_id=fields[1], amount=amount, memo=memo })
+        if ok and type(res)=="table" then
+          -- Success screen
+          cls()
+          topBar()
+          fill(1, 2, W, H-2, C.bg)
+          card(3, 4, W-4, 9)
+          centre(5,  "Transfer Complete", C.ok, C.card)
+          at(5,  7,  "To:     ", C.label, C.card)
+          at(14, 7,  fields[1],  C.card_fg, C.card)
+          at(5,  8,  "Amount: ", C.label, C.card)
+          at(14, 8,  tostring(amount) .. " Quid", C.money, C.card)
+          at(5,  9,  "Ref:    ", C.label, C.card)
+          at(14, 9,  tostring(res.tx_id or ""), C.label, C.card)
+          if memo ~= "" then
+            at(5, 10, "Memo:   ", C.label, C.card)
+            at(14,10, memo:sub(1,W-15), C.card_fg, C.card)
+          end
+          -- Refresh balance
+          local ok2, res2 = dbRequest({ type="balance", username=session.username, password=session._password })
+          if ok2 and type(res2)=="table" then session.balance = res2.balance end
+          at(5, 11, "Balance:", C.label, C.card)
+          at(14,11, tostring(session.balance) .. " Quid", C.money, C.card)
+          btn(math.floor(W/2)-5, 14, 12, "Back to Home", C.btn_pri)
+          statusBar()
+          os.pullEvent("mouse_click")
+          return "dashboard"
+        else
+          err = tostring(res or "Transfer failed")
+          b_send, b_back = draw()
+        end
+      end
+    end
+    ::continue::
+    b_send, b_back = draw()
   end
 end
 
@@ -560,43 +694,60 @@ end
 -- -----------------------------------------------------------------------
 local function screenHistory()
   cls()
-  header("Transaction History")
-  centre(7, "Loading...", C.dim)
+  topBar()
+  fill(1, 2, W, H-2, C.bg)
+  centre(math.floor(H/2), "Loading transactions...", C.dim, C.bg)
 
-  local ok, res = dbRequest({ type="ledger_history", username=session.username, password=session._password, limit=12 })
+  local ok, res = dbRequest({ type="ledger_history", username=session.username, password=session._password, limit=10 })
 
   cls()
-  header("Transaction History")
+  topBar()
 
-  local b_back = btn(math.floor(W/2)-4, H-2, 10, "< Back", C.gray)
+  -- Balance strip
+  fill(1, 2, W, 2, C.card)
+  at(3, 2, "Transaction History",          C.card_fg, C.card)
+  local bal_str = tostring(res and res.balance or session.balance) .. " Quid"
+  at(W - #bal_str - 1, 2, bal_str,         C.money,   C.card)
+  at(3, 3, session.citizen_id or "",        C.label,   C.card)
+
+  sep(4)
+
+  local b_back = btn(2, H-1, math.floor(W/2)-1, "< Back to Dashboard", C.btn_sec, C.card_fg)
 
   if not ok or type(res) ~= "table" then
-    centre(8, "Could not load history", C.err)
+    centre(8, "Could not load transactions.", C.err, C.bg)
   else
     local history = res.history or {}
     session.balance = res.balance or session.balance
 
-    at(2,  5, "ID",     C.dim); at(12, 5, "Type",   C.dim)
-    at(22, 5, "Amount", C.dim); at(34, 5, "Memo",   C.dim)
-    at(1,  6, string.rep("-", W-1), C.border)
+    -- Column headers
+    fill(1, 5, W, 1, C.bg)
+    at(2,  5, "Reference",  C.dim, C.bg)
+    at(13, 5, "Type",       C.dim, C.bg)
+    at(22, 5, "Amount",     C.dim, C.bg)
+    at(33, 5, "Note",       C.dim, C.bg)
+
+    hline(6, C.sep, C.bg)
 
     if #history == 0 then
-      centre(10, "No transactions yet", C.dim)
+      centre(9, "No transactions yet.", C.dim, C.bg)
     else
       for i, tx in ipairs(history) do
         local row = 6 + i
-        if row >= H-2 then break end
-        local col = tx.direction=="IN" and C.money or C.err
+        if row >= H-1 then break end
+        local col = tx.direction=="IN" and C.ok or C.err
         local dir = tx.direction=="IN" and "+" or "-"
-        at(2,  row, tostring(tx.tx_id or ""):sub(1,9),           C.dim)
-        at(12, row, tostring(tx.type  or ""):sub(1,9),           C.dim)
-        at(22, row, dir .. tostring(tx.amount or 0) .. "q",      col)
-        at(34, row, tostring(tx.memo  or ""):sub(1, W-34),       C.dim)
+        fill(1, row, W, 1, i%2==0 and C.card or C.bg)
+        local rbg = i%2==0 and C.card or C.bg
+        at(2,  row, tostring(tx.tx_id or ""):sub(1,10),         C.dim,    rbg)
+        at(13, row, tostring(tx.type  or ""):sub(1,8),          C.dim,    rbg)
+        at(22, row, dir .. tostring(tx.amount or 0) .. "q",     col,      rbg)
+        at(33, row, tostring(tx.memo  or ""):sub(1, W-33),      C.dim,    rbg)
       end
     end
-
-    at(2, H-2, "Balance: " .. tostring(res.balance or 0) .. " Quid", C.money)
   end
+
+  statusBar()
 
   while true do
     local ev, p1, p2, p3 = os.pullEvent("mouse_click")
@@ -609,9 +760,11 @@ end
 -- -----------------------------------------------------------------------
 local function screenTimeout()
   cls()
-  header("Session Expired")
-  centre(8,  "Logged out due to inactivity.", C.dim)
-  centre(10, "Click anywhere to continue.", C.body)
+  topBar()
+  fill(1, 2, W, H-2, C.bg)
+  centre(math.floor(H/2)-1, "Session Expired", C.err, C.bg)
+  centre(math.floor(H/2)+1, "You were signed out due to inactivity.", C.dim, C.bg)
+  centre(math.floor(H/2)+3, "Click anywhere to continue.", C.body, C.bg)
   os.pullEvent("mouse_click")
   session.logged_in = false
   return "login"
@@ -623,7 +776,8 @@ end
 local function main()
   if not openModem() then
     cls()
-    print("ERROR: No modem found. Attach an Ender Modem and reboot.")
+    print("ERROR: No modem found.")
+    print("Attach an Ender Modem and reboot.")
     return
   end
 
@@ -640,7 +794,7 @@ local function main()
     if screen == "quit"      then break end
   end
   cls()
-  print("Terminal closed.")
+  print("Goodbye.")
 end
 
 main()
