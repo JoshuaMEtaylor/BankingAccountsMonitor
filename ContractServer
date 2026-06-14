@@ -51,7 +51,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION            = "1.0.0"
+local VERSION            = "1.0.1"
 local LABEL              = "Quid-Contracts"
 local PROTOCOL           = "quid_contracts"
 local PROTOCOL_BROADCAST = "quid_contracts_discovery"
@@ -181,7 +181,7 @@ end
 -- =============================================================================
 -- CONTRACT OPERATIONS
 -- =============================================================================
-local function postContract(req, sender_id)
+local function postContract(sender_id, req)
   local title = trim(req.title or "")
   local poster = trim(req.poster or req.source_account or "")
   local reward = tonumber(req.reward) or 0
@@ -228,7 +228,7 @@ local function postContract(req, sender_id)
   return true, { contract = publicContract(c), message = "Contract posted" }
 end
 
-local function listContracts(req)
+local function listContracts(sender_id, req)
   local status = req.status or "open"
   local out = {}
 
@@ -245,7 +245,7 @@ local function listContracts(req)
   return true, { contracts = out, count = #out }
 end
 
-local function getContract(req)
+local function getContract(sender_id, req)
   local id = req.contract_id
   if not id then return false, "Missing contract_id" end
   local c = contracts[id]
@@ -253,7 +253,7 @@ local function getContract(req)
   return true, { contract = publicContract(c) }
 end
 
-local function claimContract(req, sender_id)
+local function claimContract(sender_id, req)
   local id = req.contract_id
   local claimant = trim(req.claimant or "")
   local claimant_type = req.claimant_type or "company"
@@ -277,7 +277,7 @@ local function claimContract(req, sender_id)
   return true, { contract = publicContract(c), message = "Contract claimed" }
 end
 
-local function unclaimContract(req, sender_id)
+local function unclaimContract(sender_id, req)
   local id = req.contract_id
   if not id then return false, "Missing contract_id" end
 
@@ -299,7 +299,7 @@ local function unclaimContract(req, sender_id)
   return true, { contract = publicContract(c), message = "Contract reopened" }
 end
 
-local function markFulfilled(req, sender_id)
+local function markFulfilled(sender_id, req)
   local id = req.contract_id
   if not id then return false, "Missing contract_id" end
 
@@ -317,7 +317,7 @@ local function markFulfilled(req, sender_id)
   return true, { contract = publicContract(c), message = "Contract marked fulfilled" }
 end
 
-local function cancelContract(req, sender_id)
+local function cancelContract(sender_id, req)
   local id = req.contract_id
   if not id then return false, "Missing contract_id" end
 
@@ -440,9 +440,7 @@ local function drawStatus()
   term.setCursorPos(1, 1)
   local w = term.getSize()
 
-  local status = handlers["status"](os.getComputerID(), {})
-  local ok, s = status, nil
-  if ok then _, s = handlers["status"](os.getComputerID(), {}) end
+  local _, s = handlers["status"](os.getComputerID(), {})
 
   term.setBackgroundColor(colors.black)
   term.setTextColor(colors.yellow)
