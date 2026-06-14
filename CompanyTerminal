@@ -3,10 +3,14 @@
 -- QUID COMPANY TERMINAL
 -- CompanyTerminal
 --
--- Styled to match the Quid Bank client terminal look and feel.
+-- Clean, compact company registration terminal.
+--
 -- Purpose:
---   * Register player-made companies
---   * Look up company information
+--   * Register player-made companies with the Quid Bank server
+--   * Look up existing company info
+--
+-- ServerSideAccounts already handles register_company and company_info.
+-- This client is just the terminal interface.
 -- =============================================================================
 
 local args = {...}
@@ -45,23 +49,23 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION      = "1.0.1"
-local PROTOCOL     = "quid_bank"
-local DB_TIMEOUT   = 5
+local VERSION    = "1.0.2"
+local PROTOCOL   = "quid_bank"
+local DB_TIMEOUT = 5
 
 local W, H = term.getSize()
 
 -- =============================================================================
--- COLOUR PALETTE - aligned to ClientTerminal styling
+-- COLOURS - matched to ClientTerminal
 -- =============================================================================
 local C = {
   bg        = colors.lightGray,
   card      = colors.white,
   card_fg   = colors.black,
-  accent    = colors.purple,
-  accent_fg = colors.white,
   header    = colors.purple,
   hdr_fg    = colors.white,
+  accent    = colors.purple,
+  accent_fg = colors.white,
   label     = colors.gray,
   body      = colors.black,
   dim       = colors.gray,
@@ -88,52 +92,24 @@ local modem_name = nil
 local last_message = ""
 local last_message_colour = C.dim
 
+local mode = "register"
+local focused = 1
+
+local reg = {
+  name  = "",
+  ticker = "",
+  owner = "",
+}
+
+local lookup = {
+  company = "",
+}
+
 -- =============================================================================
--- HELPERS
+-- BASIC HELPERS
 -- =============================================================================
 local function refreshSize()
   W, H = term.getSize()
-end
-
-local function cls()
-  refreshSize()
-  term.setCursorBlink(false)
-  term.setBackgroundColor(C.bg)
-  term.setTextColor(C.body)
-  term.clear()
-  term.setCursorPos(1, 1)
-end
-
-local function at(x, y, text, fg, bg)
-  refreshSize()
-  if y < 1 or y > H or x > W then return end
-  if x < 1 then x = 1 end
-  term.setCursorPos(x, y)
-  if bg then term.setBackgroundColor(bg) end
-  if fg then term.setTextColor(fg) end
-  local maxw = W - x + 1
-  if maxw > 0 then
-    term.write(tostring(text or ""):sub(1, maxw))
-  end
-end
-
-local function fill(x, y, w, h, bg)
-  refreshSize()
-  if w <= 0 or h <= 0 then return end
-  term.setBackgroundColor(bg or C.card)
-  local row = string.rep(" ", math.max(0, w))
-  for yy = y, y + h - 1 do
-    if yy >= 1 and yy <= H then
-      term.setCursorPos(x, yy)
-      term.write(row:sub(1, math.max(0, W - x + 1)))
-    end
-  end
-end
-
-local function centre(y, text, fg, bg)
-  text = tostring(text or "")
-  local x = math.max(1, math.floor((W - #text) / 2) + 1)
-  at(x, y, text, fg, bg)
 end
 
 local function trim(s)
@@ -161,18 +137,14 @@ local function normaliseOwner(s)
   return "citizen:" .. string.lower(s):gsub("%s+", "_")
 end
 
-local function positiveIntOrDefault(v, default)
-  local n = tonumber(v)
-  if not n then return default end
-  n = math.floor(n)
-  if n < 0 then return default end
-  return n
-end
-
 local function money(n)
   n = tonumber(n) or 0
   local sign = ""
-  if n < 0 then sign = "-"; n = math.abs(n) end
+  if n < 0 then
+    sign = "-"
+    n = math.abs(n)
+  end
+
   local s = tostring(math.floor(n))
   local out = ""
   while #s > 3 do
@@ -182,9 +154,58 @@ local function money(n)
   return sign .. s .. out .. " Quid"
 end
 
-local function setMessage(msg, col)
+local function setMessage(msg, colour)
   last_message = tostring(msg or "")
-  last_message_colour = col or C.dim
+  last_message_colour = colour or C.dim
+end
+
+-- =============================================================================
+-- DRAWING
+-- =============================================================================
+local function cls()
+  refreshSize()
+  term.setCursorBlink(false)
+  term.setBackgroundColor(C.bg)
+  term.setTextColor(C.body)
+  term.clear()
+  term.setCursorPos(1, 1)
+end
+
+local function at(x, y, text, fg, bg)
+  refreshSize()
+  if y < 1 or y > H or x > W then return end
+  if x < 1 then x = 1 end
+
+  term.setCursorPos(x, y)
+  if bg then term.setBackgroundColor(bg) end
+  if fg then term.setTextColor(fg) end
+
+  local maxw = W - x + 1
+  if maxw > 0 then
+    term.write(tostring(text or ""):sub(1, maxw))
+  end
+end
+
+local function fill(x, y, w, h, bg)
+  refreshSize()
+  if w <= 0 or h <= 0 then return end
+  if x < 1 then x = 1 end
+
+  term.setBackgroundColor(bg or C.card)
+  local row = string.rep(" ", math.max(0, w))
+
+  for yy = y, y + h - 1 do
+    if yy >= 1 and yy <= H then
+      term.setCursorPos(x, yy)
+      term.write(row:sub(1, math.max(0, W - x + 1)))
+    end
+  end
+end
+
+local function centre(y, text, fg, bg)
+  text = tostring(text or "")
+  local x = math.max(1, math.floor((W - #text) / 2) + 1)
+  at(x, y, text, fg, bg)
 end
 
 local function topBar()
@@ -193,58 +214,72 @@ local function topBar()
   at(W - #VERSION, 1, VERSION, C.dim, C.header)
 end
 
+local function statusBar()
+  fill(1, H, W, 1, C.bg)
+  if last_message ~= "" then
+    at(2, H, last_message:sub(1, W - 12), last_message_colour, C.bg)
+  end
+
+  local q = "[Q] Quit"
+  at(W - #q, H, q, C.dim, C.bg)
+end
+
 local function card(x, y, w, h)
   fill(x, y, w, h, C.card)
 end
 
-local function btn(x, y, w, label, col, fg)
-  col = col or C.btn_pri
-  fg  = fg  or C.btn_fg
-  fill(x, y, w, 1, col)
+local function button(x, y, w, label, bg, fg)
+  bg = bg or C.btn_pri
+  fg = fg or C.btn_fg
+
+  fill(x, y, w, 1, bg)
   local tx = x + math.floor((w - #label) / 2)
-  at(tx, y, label, fg, col)
-  return {x1=x, y1=y, x2=x+w-1, y2=y}
+  at(tx, y, label, fg, bg)
+
+  return { x1 = x, x2 = x + w - 1, y1 = y, y2 = y }
 end
 
 local function hit(b, mx, my)
   return b and mx >= b.x1 and mx <= b.x2 and my >= b.y1 and my <= b.y2
 end
 
-local function tabStrip(y, tabs, active)
-  fill(2, y, W - 2, 1, C.bg)
-  local tw = math.floor((W - 2) / #tabs)
-  local btns = {}
-  for i, label in ipairs(tabs) do
-    local x = (i - 1) * tw + 2
-    local active_tab = i == active
-    local col = active_tab and C.tab_act or C.tab_bg
-    local fg  = active_tab and C.tab_fg_a or C.tab_fg_i
-    fill(x, y, tw, 1, col)
-    at(x + math.floor((tw - #label) / 2), y, label, fg, col)
-    btns[i] = {x1=x, y1=y, x2=x+tw-1, y2=y}
-  end
-  return btns
-end
+local function inputField(x, y, w, value)
+  value = tostring(value or "")
 
-local function statusBar()
-  fill(1, H, W, 1, C.bg)
-  if last_message ~= "" then
-    at(2, H, last_message:sub(1, W - 10), last_message_colour, C.bg)
-  end
-  local quit = "[Q] Quit"
-  at(W - #quit, H, quit, C.dim, C.bg)
-end
+  fill(x, y, w, 1, C.input_bg)
+  at(x, y, (value .. string.rep(" ", w)):sub(1, w), C.input_fg, C.input_bg)
 
-local function inputField(x, y, w, value, focused)
-  local bg = C.input_bg
-  fill(x, y, w, 1, bg)
-  local display = tostring(value or "")
-  at(x, y, (display .. string.rep(" ", w)):sub(1, w), C.input_fg, bg)
   return {
-    x1 = x, y1 = y, x2 = x + w - 1, y2 = y,
-    cursor_x = x + math.min(#display, w - 1),
-    cursor_y = y
+    x1 = x,
+    x2 = x + w - 1,
+    y1 = y,
+    y2 = y,
+    cursor_x = x + math.min(#value, w - 1),
+    cursor_y = y,
   }
+end
+
+local function tabStrip(y)
+  local tabs = { "  Register  ", "  Company Info  " }
+  local active = mode == "register" and 1 or 2
+  local tw = math.floor((W - 2) / 2)
+  local buttons = {}
+
+  fill(2, y, W - 2, 1, C.bg)
+
+  for i, label in ipairs(tabs) do
+    local x = 2 + ((i - 1) * tw)
+    local is_active = i == active
+    local bg = is_active and C.tab_act or C.tab_bg
+    local fg = is_active and C.tab_fg_a or C.tab_fg_i
+
+    fill(x, y, tw, 1, bg)
+    at(x + math.floor((tw - #label) / 2), y, label, fg, bg)
+
+    buttons[i] = { x1 = x, x2 = x + tw - 1, y1 = y, y2 = y }
+  end
+
+  return buttons
 end
 
 -- =============================================================================
@@ -261,6 +296,7 @@ local function openModem()
       end
     end
   end
+
   for _, name in ipairs(peripheral.getNames()) do
     if peripheral.getType(name) == "modem" then
       rednet.open(name)
@@ -268,6 +304,7 @@ local function openModem()
       return true
     end
   end
+
   return false
 end
 
@@ -277,7 +314,9 @@ local function connectServer()
   centre(math.floor(H / 2) - 1, "Connecting to Quid Bank...", C.dim, C.bg)
 
   for attempt = 1, 8 do
+    fill(1, math.floor(H / 2) + 1, W, 1, C.bg)
     centre(math.floor(H / 2) + 1, "Attempt " .. attempt .. " of 8", C.dim, C.bg)
+
     rednet.broadcast({ type = "ping" }, PROTOCOL)
     local sender, msg = rednet.receive(PROTOCOL, 4)
 
@@ -317,207 +356,254 @@ local function dbRequest(request, timeout)
 end
 
 -- =============================================================================
--- RESULT POPUP
+-- POPUPS
 -- =============================================================================
 local function resultScreen(title, lines, colour)
   cls()
   topBar()
   card(2, 4, W - 2, H - 5)
+
   at(4, 5, title, colour or C.card_fg, C.card)
+
   local y = 7
-  for _, line in ipairs(lines) do
+  for _, line in ipairs(lines or {}) do
+    if y > H - 3 then break end
     at(4, y, tostring(line), colour or C.card_fg, C.card)
     y = y + 1
-    if y > H - 3 then break end
   end
-  at(4, H - 2, "Click anywhere or press any key to continue.", C.dim, C.card)
+
+  local b = button(4, H - 2, W - 6, "Continue", C.btn_pri, C.btn_fg)
+  term.setCursorBlink(false)
 
   while true do
-    local ev = os.pullEvent()
-    if ev == "mouse_click" or ev == "key" or ev == "char" then return end
+    local ev, p1, p2, p3 = os.pullEvent()
+    if ev == "mouse_click" and hit(b, p2, p3) then return end
+    if ev == "key" or ev == "char" then return end
+  end
+end
+
+local function confirmRegister(summary)
+  cls()
+  topBar()
+  card(2, 4, W - 2, H - 5)
+
+  at(4, 5, "Confirm company registration", C.card_fg, C.card)
+  at(4, 7, "Name:    " .. summary.name, C.card_fg, C.card)
+  at(4, 8, "Ticker:  " .. summary.ticker, C.card_fg, C.card)
+  at(4, 9, "Account: " .. summary.company_id, C.card_fg, C.card)
+  at(4,10, "Owner:   " .. summary.owner_id, C.card_fg, C.card)
+  at(4,12, "This creates a separate company bank account.", C.label, C.card)
+
+  local bw = math.floor((W - 8) / 2)
+  local b_yes = button(4, H - 2, bw, "Register", C.btn_pri, C.btn_fg)
+  local b_no  = button(5 + bw, H - 2, bw, "Back", C.btn_sec, C.card_fg)
+
+  term.setCursorBlink(false)
+
+  while true do
+    local ev, p1, p2, p3 = os.pullEvent()
+    if ev == "mouse_click" then
+      if hit(b_yes, p2, p3) then return true end
+      if hit(b_no,  p2, p3) then return false end
+    elseif ev == "key" then
+      if p1 == keys.enter then return true end
+      if p1 == keys.escape or p1 == keys.backspace or p1 == keys.b then return false end
+    end
   end
 end
 
 -- =============================================================================
--- MAIN SCREEN
+-- DRAW MAIN
+-- =============================================================================
+local function drawMain()
+  cls()
+  topBar()
+
+  local tabs = tabStrip(3)
+
+  local card_y = 5
+  local card_h = H - 6
+  card(2, card_y, W - 2, card_h)
+
+  local fields = {}
+  local b_primary = nil
+  local b_secondary = nil
+
+  if mode == "register" then
+    at(4, card_y + 1, "Register a player-made corporation.", C.label, C.card)
+    at(4, card_y + 2, "It becomes its own bank account.", C.label, C.card)
+
+    at(4, card_y + 4, "Company Name", C.card_fg, C.card)
+    fields[1] = inputField(4, card_y + 5, W - 6, reg.name)
+
+    at(4, card_y + 7, "Ticker", C.card_fg, C.card)
+    fields[2] = inputField(4, card_y + 8, W - 6, reg.ticker)
+
+    at(4, card_y + 10, "Owner Username", C.card_fg, C.card)
+    fields[3] = inputField(4, card_y + 11, W - 6, reg.owner)
+
+    local preview = companyIdFromTicker(reg.ticker)
+    if preview == "" then preview = "company:<ticker>" end
+    at(4, H - 5, "Account: " .. preview, C.label, C.card)
+
+    b_secondary = button(4, H - 3, W - 6, "Clear", C.btn_sec, C.card_fg)
+    b_primary   = button(4, H - 2, W - 6, "Register Company", C.btn_pri, C.btn_fg)
+  else
+    at(4, card_y + 1, "Look up a registered company.", C.label, C.card)
+
+    at(4, card_y + 4, "Ticker or Company ID", C.card_fg, C.card)
+    fields[1] = inputField(4, card_y + 5, W - 6, lookup.company)
+
+    b_secondary = button(4, H - 3, W - 6, "Clear", C.btn_sec, C.card_fg)
+    b_primary   = button(4, H - 2, W - 6, "Lookup Company", C.btn_pri, C.btn_fg)
+  end
+
+  statusBar()
+
+  local active = fields[focused]
+  if active then
+    term.setCursorPos(active.cursor_x, active.cursor_y)
+    term.setCursorBlink(true)
+  else
+    term.setCursorBlink(false)
+  end
+
+  return tabs, fields, b_primary, b_secondary
+end
+
+-- =============================================================================
+-- ACTIONS
+-- =============================================================================
+local function clearRegister()
+  reg.name = ""
+  reg.ticker = ""
+  reg.owner = ""
+  focused = 1
+end
+
+local function clearLookup()
+  lookup.company = ""
+  focused = 1
+end
+
+local function doRegister()
+  local name = trim(reg.name)
+  local ticker = cleanTicker(reg.ticker)
+  local owner_id = normaliseOwner(reg.owner)
+  local company_id = companyIdFromTicker(ticker)
+
+  if name == "" then setMessage("Missing company name.", C.err); return end
+  if ticker == "" then setMessage("Invalid ticker.", C.err); return end
+  if owner_id == "" then setMessage("Missing owner username.", C.err); return end
+
+  local summary = {
+    name = name,
+    ticker = ticker,
+    owner_id = owner_id,
+    company_id = company_id,
+  }
+
+  if not confirmRegister(summary) then
+    setMessage("Registration cancelled.", C.dim)
+    return
+  end
+
+  local ok, res = dbRequest({
+    type = "register_company",
+    name = name,
+    ticker = ticker,
+    biz_type = "general",
+    owner_id = owner_id,
+    shares_total = 1000,
+    shares_public = 0,
+  })
+
+  if ok and type(res) == "table" then
+    local id = tostring(res.company_id or company_id)
+    setMessage("Registered " .. id, C.ok)
+    resultScreen("COMPANY REGISTERED", {
+      "Name:    " .. tostring(res.name or name),
+      "Ticker:  " .. tostring(res.ticker or ticker),
+      "Account: " .. id,
+      "Owner:   " .. owner_id,
+      "",
+      "Citizens can now transfer funds to:",
+      id,
+    }, C.ok)
+    clearRegister()
+  else
+    setMessage("Registration failed: " .. tostring(res), C.err)
+    resultScreen("REGISTRATION FAILED", {
+      tostring(res or "Unknown error"),
+      "",
+      "Check whether that ticker already exists.",
+    }, C.err)
+  end
+end
+
+local function doLookup()
+  local company_id = trim(lookup.company)
+  if company_id == "" then setMessage("Enter a ticker or company ID.", C.err); return end
+
+  if not company_id:find(":") then
+    company_id = companyIdFromTicker(company_id)
+  end
+
+  local ok, res = dbRequest({
+    type = "company_info",
+    company_id = company_id,
+  })
+
+  if ok and type(res) == "table" then
+    setMessage("Loaded " .. company_id, C.ok)
+    resultScreen("COMPANY INFO", {
+      "Name:      " .. tostring(res.name or "?"),
+      "Ticker:    " .. tostring(res.ticker or "?"),
+      "Account:   " .. tostring(res.company_id or company_id),
+      "Owner:     " .. tostring(res.owner_id or "?"),
+      "Type:      " .. tostring(res.biz_type or "?"),
+      "Status:    " .. tostring(res.status or "?"),
+      "Balance:   " .. money(res.cash_balance or 0),
+      "Shares:    " .. tostring(res.shares_total or 0),
+    }, C.card_fg)
+  else
+    setMessage("Lookup failed: " .. tostring(res), C.err)
+    resultScreen("LOOKUP FAILED", {
+      tostring(res or "Unknown error"),
+    }, C.err)
+  end
+end
+
+local function fieldCount()
+  if mode == "register" then return 3 end
+  return 1
+end
+
+local function appendChar(ch)
+  if mode == "register" then
+    if focused == 1 and #reg.name < 32 then reg.name = reg.name .. ch end
+    if focused == 2 and #reg.ticker < 8 then reg.ticker = reg.ticker .. ch end
+    if focused == 3 and #reg.owner < 40 then reg.owner = reg.owner .. ch end
+  else
+    if focused == 1 and #lookup.company < 40 then lookup.company = lookup.company .. ch end
+  end
+end
+
+local function backspaceField()
+  if mode == "register" then
+    if focused == 1 then reg.name = reg.name:sub(1, -2) end
+    if focused == 2 then reg.ticker = reg.ticker:sub(1, -2) end
+    if focused == 3 then reg.owner = reg.owner:sub(1, -2) end
+  else
+    lookup.company = lookup.company:sub(1, -2)
+  end
+end
+
+-- =============================================================================
+-- MAIN LOOP
 -- =============================================================================
 local function screenMain()
-  local mode = "register"
-
-  local register_fields = {
-    { label = "Company Name", key = "name", value = "", required = true, max = 32 },
-    { label = "Ticker", key = "ticker", value = "", required = true, max = 8 },
-    { label = "Owner Username", key = "owner", value = "", required = true, max = 40 },
-    { label = "Business Type", key = "biz_type", value = "general", required = false, max = 24 },
-    { label = "Total Shares", key = "shares_total", value = "1000", required = false, max = 12 },
-    { label = "Public Shares", key = "shares_public", value = "0", required = false, max = 12 },
-  }
-
-  local lookup_fields = {
-    { label = "Ticker / Company ID", key = "company", value = "", required = true, max = 40 },
-  }
-
-  local focused = 1
-  local reg_tab_btns, b_submit, b_secondary
-  local field_hits = {}
-
-  local function activeFields()
-    return mode == "register" and register_fields or lookup_fields
-  end
-
-  local function draw()
-    cls()
-    topBar()
-    reg_tab_btns = tabStrip(3, {"  Register  ", "  Company Info  "}, mode == "register" and 1 or 2)
-
-    local card_y = 5
-    local card_h = H - 6
-    card(2, card_y, W - 2, card_h)
-
-    if mode == "register" then
-      at(4, card_y + 1, "Register a player-made corporation as a separate bank account.", C.label, C.card)
-    else
-      at(4, card_y + 1, "Look up an existing company by ticker or company ID.", C.label, C.card)
-    end
-
-    local fields = activeFields()
-    field_hits = {}
-    local y = card_y + 3
-    for i, f in ipairs(fields) do
-      at(4, y, f.label, C.label, C.card)
-      field_hits[i] = inputField(4, y + 1, W - 6, f.value, focused == i)
-      y = y + 3
-    end
-
-    local submit_label = mode == "register" and "Register Company" or "Lookup Company"
-    local secondary_label = mode == "register" and "Clear" or "Back"
-    b_submit = btn(4, H - 2, W - 6, submit_label, C.btn_pri, C.btn_fg)
-    b_secondary = btn(4, H - 3, W - 6, secondary_label, C.btn_sec, C.card_fg)
-
-    local active = field_hits[focused]
-    if active then
-      term.setCursorPos(active.cursor_x, active.cursor_y)
-      term.setCursorBlink(true)
-    else
-      term.setCursorBlink(false)
-    end
-
-    statusBar()
-  end
-
-  local function clearCurrent()
-    for _, f in ipairs(activeFields()) do
-      f.value = ""
-    end
-    if mode == "register" then
-      register_fields[4].value = "general"
-      register_fields[5].value = "1000"
-      register_fields[6].value = "0"
-    end
-    focused = 1
-  end
-
-  local function validateFields(fields)
-    local out = {}
-    for _, f in ipairs(fields) do
-      local v = trim(f.value)
-      if f.required and v == "" then
-        setMessage("Missing: " .. f.label, C.err)
-        return nil
-      end
-      out[f.key] = v
-    end
-    return out
-  end
-
-  local function doRegister()
-    local data = validateFields(register_fields)
-    if not data then return end
-
-    local name = trim(data.name)
-    local ticker = cleanTicker(data.ticker)
-    local owner_id = normaliseOwner(data.owner)
-    local biz_type = trim(data.biz_type)
-    local shares_total = positiveIntOrDefault(data.shares_total, 1000)
-    local shares_public = positiveIntOrDefault(data.shares_public, 0)
-    local company_id = companyIdFromTicker(ticker)
-
-    if name == "" then setMessage("Missing company name.", C.err); return end
-    if ticker == "" then setMessage("Invalid ticker.", C.err); return end
-    if owner_id == "" then setMessage("Missing owner username.", C.err); return end
-    if biz_type == "" then biz_type = "general" end
-    if shares_public > shares_total then
-      setMessage("Public shares cannot exceed total shares.", C.err)
-      return
-    end
-
-    local ok, res = dbRequest({
-      type = "register_company",
-      name = name,
-      ticker = ticker,
-      biz_type = biz_type,
-      owner_id = owner_id,
-      shares_total = shares_total,
-      shares_public = shares_public,
-    })
-
-    if ok and type(res) == "table" then
-      setMessage("Registered " .. tostring(res.company_id or company_id), C.ok)
-      resultScreen("COMPANY REGISTERED", {
-        "Name:    " .. tostring(res.name or name),
-        "Ticker:  " .. tostring(res.ticker or ticker),
-        "Account: " .. tostring(res.company_id or company_id),
-        "Owner:   " .. owner_id,
-        "",
-        "This company can now receive funds as a separate bank account."
-      }, C.ok)
-      clearCurrent()
-    else
-      setMessage("Registration failed: " .. tostring(res), C.err)
-      resultScreen("REGISTRATION FAILED", {
-        tostring(res or "Unknown error"),
-        "",
-        "Check whether the ticker already exists."
-      }, C.err)
-    end
-  end
-
-  local function doLookup()
-    local data = validateFields(lookup_fields)
-    if not data then return end
-
-    local company_id = trim(data.company)
-    if not company_id:find(":") then
-      company_id = companyIdFromTicker(company_id)
-    end
-
-    local ok, res = dbRequest({
-      type = "company_info",
-      company_id = company_id,
-    })
-
-    if ok and type(res) == "table" then
-      setMessage("Loaded " .. company_id, C.ok)
-      resultScreen("COMPANY INFO", {
-        "Name:      " .. tostring(res.name or "?"),
-        "Ticker:    " .. tostring(res.ticker or "?"),
-        "Account:   " .. tostring(res.company_id or company_id),
-        "Owner:     " .. tostring(res.owner_id or "?"),
-        "Type:      " .. tostring(res.biz_type or "?"),
-        "Status:    " .. tostring(res.status or "?"),
-        "Balance:   " .. money(res.cash_balance or 0),
-        "Shares:    " .. tostring(res.shares_total or 0),
-        "Public:    " .. tostring(res.shares_public or 0),
-      }, C.card_fg)
-    else
-      setMessage("Lookup failed: " .. tostring(res), C.err)
-      resultScreen("LOOKUP FAILED", {
-        tostring(res or "Unknown error")
-      }, C.err)
-    end
-  end
-
-  draw()
+  local tabs, fields, b_primary, b_secondary = drawMain()
 
   while true do
     local ev, p1, p2, p3 = os.pullEvent()
@@ -525,86 +611,59 @@ local function screenMain()
     if ev == "mouse_click" then
       local mx, my = p2, p3
 
-      if hit(reg_tab_btns[1], mx, my) and mode ~= "register" then
+      if hit(tabs[1], mx, my) then
         mode = "register"
         focused = 1
-        draw()
-      elseif hit(reg_tab_btns[2], mx, my) and mode ~= "lookup" then
+      elseif hit(tabs[2], mx, my) then
         mode = "lookup"
         focused = 1
-        draw()
-      elseif hit(b_submit, mx, my) then
-        if mode == "register" then
-          doRegister()
-        else
-          doLookup()
-        end
-        draw()
+      elseif hit(b_primary, mx, my) then
+        if mode == "register" then doRegister() else doLookup() end
       elseif hit(b_secondary, mx, my) then
         if mode == "register" then
-          clearCurrent()
+          clearRegister()
           setMessage("Form cleared.", C.dim)
         else
-          lookup_fields[1].value = ""
-          focused = 1
+          clearLookup()
           setMessage("Lookup cleared.", C.dim)
         end
-        draw()
       else
-        for i, box in ipairs(field_hits) do
+        for i, box in ipairs(fields) do
           if hit(box, mx, my) then
             focused = i
-            draw()
             break
           end
         end
       end
 
+      tabs, fields, b_primary, b_secondary = drawMain()
+
     elseif ev == "char" then
-      local fields = activeFields()
-      local f = fields[focused]
-      if f and #f.value < (f.max or 40) then
-        f.value = f.value .. p1
-        draw()
-      end
+      appendChar(p1)
+      tabs, fields, b_primary, b_secondary = drawMain()
 
     elseif ev == "key" then
       if p1 == keys.q then
         return
-      end
-
-      local fields = activeFields()
-      local f = fields[focused]
-
-      if p1 == keys.backspace then
-        if f then
-          f.value = tostring(f.value):sub(1, -2)
-          draw()
-        end
+      elseif p1 == keys.backspace then
+        backspaceField()
       elseif p1 == keys.tab then
-        focused = focused % #fields + 1
-        draw()
+        focused = focused % fieldCount() + 1
       elseif p1 == keys.enter then
-        if focused < #fields then
+        if focused < fieldCount() then
           focused = focused + 1
-          draw()
         else
-          if mode == "register" then
-            doRegister()
-          else
-            doLookup()
-          end
-          draw()
+          if mode == "register" then doRegister() else doLookup() end
         end
       elseif p1 == keys.r then
         mode = "register"
         focused = 1
-        draw()
       elseif p1 == keys.i then
         mode = "lookup"
         focused = 1
-        draw()
       end
+
+      tabs, fields, b_primary, b_secondary = drawMain()
     end
   end
 end
