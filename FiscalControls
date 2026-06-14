@@ -2,36 +2,57 @@
 -- FISCAL CONTROLS
 -- Quid state treasury controller
 --
--- Manual install/update only:
---   delete startup
---   wget <your raw github url> startup.lua
---   startup.lua
---
--- This file does NOT self-update and does NOT care what the GitHub file is named.
---
 -- Purpose:
---   - Connect to the Quid Bank server
---   - View treasury and supply status
+--   Control the state treasury account and core state finance actions:
+--   - View treasury / supply status
 --   - Print money into treasury
 --   - Grant treasury funds to an account
 --   - Burn money from treasury
 --   - View account balances
 --
--- Required existing server handlers:
---   ping, status, mint, grant, burn, list_accounts
+-- This is intentionally NOT the citizen terminal and NOT the economic dashboard.
 -- =============================================================================
+
+local args = {...}
+
+-- =============================================================================
+-- SELF UPDATE
+-- =============================================================================
+if args[1] ~= "--updated" then
+  print("[ Fiscal Controls ]")
+  print("Deleting old version...")
+  fs.delete("startup.lua")
+
+  print("Downloading latest from GitHub...")
+  shell.run("wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/FiscalControls startup.lua")
+
+  if not fs.exists("startup.lua") then
+    print("")
+    print("Download failed.")
+    print("Expected GitHub file:")
+    print("FiscalControls")
+    print("")
+    print("Run manually after uploading:")
+    print("delete startup")
+    print("wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/FiscalControls startup.lua")
+    print("startup.lua")
+    return
+  end
+
+  print("Relaunching...")
+  sleep(0.5)
+  shell.run("startup.lua", "--updated")
+  return
+end
 
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION          = "1.0.1"
+local VERSION          = "1.0.0"
 local PROTOCOL         = "quid_bank"
 local TREASURY_ACCOUNT = "treasury:quid_bank"
 local DB_TIMEOUT       = 5
 
--- =============================================================================
--- STATE
--- =============================================================================
 local db_id = nil
 local modem_name = nil
 local last_status = nil
@@ -41,8 +62,9 @@ local last_message_colour = colors.lightGray
 -- =============================================================================
 -- BASIC HELPERS
 -- =============================================================================
-local function termSize()
-  return term.getSize()
+local function size()
+  local w, h = term.getSize()
+  return w, h
 end
 
 local function clear(bg)
@@ -54,42 +76,47 @@ local function clear(bg)
 end
 
 local function writeAt(x, y, text, fg, bg)
-  local w, h = termSize()
+  local w, h = size()
   if y < 1 or y > h or x > w then return end
-
-  x = math.max(1, x)
-  term.setCursorPos(x, y)
-
+  term.setCursorPos(math.max(1, x), y)
   if bg then term.setBackgroundColor(bg) end
   if fg then term.setTextColor(fg) end
-
-  local maxWidth = w - x + 1
-  if maxWidth > 0 then
-    term.write(tostring(text or ""):sub(1, maxWidth))
+  local max = w - x + 1
+  if max > 0 then
+    term.write(tostring(text or ""):sub(1, max))
   end
 end
 
-local function fill(x, y, width, height, bg)
-  local sw, sh = termSize()
-  if width <= 0 or height <= 0 then return end
-
-  x = math.max(1, x)
+local function fill(x, y, w, h, bg)
+  local sw, sh = size()
   term.setBackgroundColor(bg or colors.black)
-
-  local row = string.rep(" ", width)
-  for yy = y, y + height - 1 do
+  local row = string.rep(" ", math.max(0, w))
+  for yy = y, y + h - 1 do
     if yy >= 1 and yy <= sh then
-      term.setCursorPos(x, yy)
-      term.write(row:sub(1, sw - x + 1))
+      term.setCursorPos(math.max(1, x), yy)
+      term.write(row:sub(1, sw - math.max(1, x) + 1))
     end
   end
 end
 
 local function center(y, text, fg, bg)
-  local w = termSize()
+  local w = size()
   text = tostring(text or "")
   local x = math.floor((w - #text) / 2) + 1
   writeAt(x, y, text, fg, bg)
+end
+
+local function money(n)
+  n = tonumber(n) or 0
+  local sign = ""
+  if n < 0 then sign = "-"; n = math.abs(n) end
+  local s = tostring(math.floor(n))
+  local out = ""
+  while #s > 3 do
+    out = "," .. s:sub(-3) .. out
+    s = s:sub(1, -4)
+  end
+  return sign .. s .. out .. " Q"
 end
 
 local function trim(s)
@@ -97,79 +124,35 @@ local function trim(s)
   return s:match("^%s*(.-)%s*$")
 end
 
-local function money(n)
-  n = tonumber(n) or 0
-
-  local sign = ""
-  if n < 0 then
-    sign = "-"
-    n = math.abs(n)
-  end
-
-  local s = tostring(math.floor(n))
-  local out = ""
-
-  while #s > 3 do
-    out = "," .. s:sub(-3) .. out
-    s = s:sub(1, -4)
-  end
-
-  return sign .. s .. out .. " Q"
-end
-
 local function normaliseAccountId(s)
   s = trim(s)
-
-  if s == "" then
-    return ""
-  end
-
-  if s:find(":") then
-    return s
-  end
-
+  if s == "" then return "" end
+  if s:find(":") then return s end
   return "citizen:" .. string.lower(s):gsub("%s+", "_")
 end
 
-local function setMessage(msg, colour)
+local function setMessage(msg, col)
   last_message = tostring(msg or "")
-  last_message_colour = colour or colors.lightGray
+  last_message_colour = col or colors.lightGray
 end
 
-local function button(x, y, width, label, bg, fg)
-  bg = bg or colors.gray
-  fg = fg or colors.white
-
-  fill(x, y, width, 1, bg)
-
-  local tx = x + math.floor((width - #label) / 2)
-  writeAt(tx, y, label, fg, bg)
-
-  return {
-    x1 = x,
-    x2 = x + width - 1,
-    y1 = y,
-    y2 = y
-  }
+local function button(x, y, w, label, bg, fg)
+  fill(x, y, w, 1, bg or colors.gray)
+  local tx = x + math.floor((w - #label) / 2)
+  writeAt(tx, y, label, fg or colors.white, bg or colors.gray)
+  return {x1=x, x2=x+w-1, y1=y, y2=y}
 end
 
-local function hit(box, mx, my)
-  return box
-    and mx >= box.x1
-    and mx <= box.x2
-    and my >= box.y1
-    and my <= box.y2
+local function hit(b, mx, my)
+  return b and mx >= b.x1 and mx <= b.x2 and my >= b.y1 and my <= b.y2
 end
 
-local function pause()
-  local w, h = termSize()
-  writeAt(2, h, "Click or press any key to continue.", colors.lightGray, colors.black)
-
+local function pauseClick()
+  local w, h = size()
+  writeAt(2, h, "Click / press any key to continue.", colors.lightGray, colors.black)
   while true do
-    local event = os.pullEvent()
-    if event == "mouse_click" or event == "key" or event == "char" then
-      return
-    end
+    local ev = os.pullEvent()
+    if ev == "mouse_click" or ev == "key" or ev == "char" then return end
   end
 end
 
@@ -180,7 +163,6 @@ local function openModem()
   for _, name in ipairs(peripheral.getNames()) do
     if peripheral.getType(name) == "modem" then
       local modem = peripheral.wrap(name)
-
       if modem and modem.isWireless and modem.isWireless() then
         rednet.open(name)
         modem_name = name
@@ -202,17 +184,14 @@ end
 
 local function connectServer()
   clear(colors.black)
-
   center(3, "FISCAL CONTROLS", colors.yellow, colors.black)
   center(5, "Connecting to Quid Bank server...", colors.white, colors.black)
   center(7, "Modem: " .. tostring(modem_name or "none"), colors.lightGray, colors.black)
 
   for attempt = 1, 8 do
-    fill(1, 9, termSize(), 1, colors.black)
     center(9, "Attempt " .. attempt .. " of 8", colors.lightGray, colors.black)
 
     rednet.broadcast({ type = "ping" }, PROTOCOL)
-
     local sender, msg = rednet.receive(PROTOCOL, 4)
 
     if sender and type(msg) == "table" then
@@ -233,31 +212,25 @@ local function connectServer()
   end
 
   center(11, "Connection failed.", colors.red, colors.black)
-  center(13, "Check the server is running and the modem is open.", colors.lightGray, colors.black)
+  center(13, "Check server is running and modem is open.", colors.lightGray, colors.black)
   sleep(3)
   return false
 end
 
 local function dbRequest(request, timeout)
   timeout = timeout or DB_TIMEOUT
-
-  if not db_id then
-    return false, "No server connected"
-  end
+  if not db_id then return false, "No server connected" end
 
   rednet.send(db_id, request, PROTOCOL)
 
   local deadline = os.clock() + timeout
-
   while true do
     local remaining = deadline - os.clock()
-
     if remaining <= 0 then
       return false, "No response from server"
     end
 
     local sender, msg = rednet.receive(PROTOCOL, remaining)
-
     if sender == db_id and type(msg) == "table" and msg.success ~= nil then
       return msg.success, msg.response
     end
@@ -269,35 +242,26 @@ end
 -- =============================================================================
 local function refreshStatus()
   local ok, res = dbRequest({ type = "status" })
-
   if ok and type(res) == "table" then
     last_status = res
     return true, res
   end
-
   return false, res
 end
 
 local function requestAccounts()
   local ok, res = dbRequest({ type = "list_accounts" })
-
   if ok and type(res) == "table" then
     return true, res.accounts or {}
   end
-
   return false, res
 end
 
--- =============================================================================
--- ACTION SCREENS
--- =============================================================================
 local function actionPrintMoney()
   clear(colors.black)
-
   center(2, "PRINT MONEY", colors.yellow, colors.black)
   writeAt(2, 4, "This creates new Quid into:", colors.white, colors.black)
   writeAt(2, 5, TREASURY_ACCOUNT, colors.cyan, colors.black)
-
   writeAt(2, 7, "Amount: ", colors.white, colors.black)
   local amount = tonumber(read())
 
@@ -305,24 +269,18 @@ local function actionPrintMoney()
     setMessage("Invalid print amount.", colors.red)
     return
   end
-
   amount = math.floor(amount)
 
   writeAt(2, 9, "Memo: ", colors.white, colors.black)
   local memo = read()
-
-  if trim(memo) == "" then
-    memo = "Treasury monetary issue"
-  end
+  if trim(memo) == "" then memo = "Treasury monetary issue" end
 
   clear(colors.black)
-
   center(2, "CONFIRM PRINT", colors.red, colors.black)
   writeAt(2, 5, "Amount:      " .. money(amount), colors.white, colors.black)
   writeAt(2, 6, "Destination: " .. TREASURY_ACCOUNT, colors.white, colors.black)
   writeAt(2, 7, "Memo:        " .. memo, colors.white, colors.black)
   writeAt(2, 10, "Type YES to print this money: ", colors.orange, colors.black)
-
   local confirm = read()
 
   if confirm ~= "YES" then
@@ -347,9 +305,7 @@ end
 
 local function actionGrantFunds()
   clear(colors.black)
-
   center(2, "GRANT TREASURY FUNDS", colors.yellow, colors.black)
-
   writeAt(2, 4, "Recipient account or username:", colors.white, colors.black)
   writeAt(2, 5, "> ", colors.cyan, colors.black)
   local recipient = normaliseAccountId(read())
@@ -366,25 +322,19 @@ local function actionGrantFunds()
     setMessage("Invalid grant amount.", colors.red)
     return
   end
-
   amount = math.floor(amount)
 
   writeAt(2, 9, "Memo: ", colors.white, colors.black)
   local memo = read()
-
-  if trim(memo) == "" then
-    memo = "Treasury grant"
-  end
+  if trim(memo) == "" then memo = "Treasury grant" end
 
   clear(colors.black)
-
   center(2, "CONFIRM GRANT", colors.yellow, colors.black)
   writeAt(2, 5, "From:   " .. TREASURY_ACCOUNT, colors.white, colors.black)
   writeAt(2, 6, "To:     " .. recipient, colors.white, colors.black)
   writeAt(2, 7, "Amount: " .. money(amount), colors.white, colors.black)
   writeAt(2, 8, "Memo:   " .. memo, colors.white, colors.black)
   writeAt(2, 11, "Type YES to grant funds: ", colors.orange, colors.black)
-
   local confirm = read()
 
   if confirm ~= "YES" then
@@ -409,11 +359,9 @@ end
 
 local function actionBurnMoney()
   clear(colors.black)
-
   center(2, "BURN MONEY", colors.red, colors.black)
   writeAt(2, 4, "This destroys Quid from:", colors.white, colors.black)
   writeAt(2, 5, TREASURY_ACCOUNT, colors.cyan, colors.black)
-
   writeAt(2, 7, "Amount: ", colors.white, colors.black)
   local amount = tonumber(read())
 
@@ -421,24 +369,18 @@ local function actionBurnMoney()
     setMessage("Invalid burn amount.", colors.red)
     return
   end
-
   amount = math.floor(amount)
 
   writeAt(2, 9, "Memo: ", colors.white, colors.black)
   local memo = read()
-
-  if trim(memo) == "" then
-    memo = "Treasury monetary burn"
-  end
+  if trim(memo) == "" then memo = "Treasury monetary burn" end
 
   clear(colors.black)
-
   center(2, "CONFIRM BURN", colors.red, colors.black)
   writeAt(2, 5, "Amount: " .. money(amount), colors.white, colors.black)
   writeAt(2, 6, "Source: " .. TREASURY_ACCOUNT, colors.white, colors.black)
   writeAt(2, 7, "Memo:   " .. memo, colors.white, colors.black)
   writeAt(2, 10, "Type YES to burn this money: ", colors.orange, colors.black)
-
   local confirm = read()
 
   if confirm ~= "YES" then
@@ -463,51 +405,40 @@ end
 
 local function screenAccounts()
   clear(colors.black)
-
   center(1, "STATE ACCOUNTS", colors.yellow, colors.black)
   writeAt(2, 3, "Loading accounts...", colors.lightGray, colors.black)
 
   local ok, accounts = requestAccounts()
-
   if not ok then
     clear(colors.black)
     center(3, "Could not load accounts.", colors.red, colors.black)
     writeAt(2, 5, tostring(accounts), colors.lightGray, colors.black)
-    pause()
+    pauseClick()
     return
   end
 
-  table.sort(accounts, function(a, b)
-    return tostring(a.account_id or "") < tostring(b.account_id or "")
-  end)
-
   local page = 1
+  local perPage = select(2, size()) - 6
+  if perPage < 5 then perPage = 5 end
 
   while true do
-    local w, h = termSize()
-    local perPage = h - 6
+    clear(colors.black)
+    local w, h = size()
+    center(1, "STATE ACCOUNTS", colors.yellow, colors.black)
 
-    if perPage < 5 then
-      perPage = 5
-    end
+    table.sort(accounts, function(a, b)
+      return tostring(a.account_id or "") < tostring(b.account_id or "")
+    end)
 
     local totalPages = math.max(1, math.ceil(#accounts / perPage))
-
-    if page > totalPages then
-      page = totalPages
-    end
-
-    clear(colors.black)
-
-    center(1, "STATE ACCOUNTS", colors.yellow, colors.black)
+    if page > totalPages then page = totalPages end
 
     writeAt(2, 3, "Account", colors.cyan, colors.black)
     writeAt(math.floor(w * 0.58), 3, "Balance", colors.cyan, colors.black)
 
-    local startIndex = ((page - 1) * perPage) + 1
+    local start = ((page - 1) * perPage) + 1
     local y = 4
-
-    for i = startIndex, math.min(#accounts, startIndex + perPage - 1) do
+    for i = start, math.min(#accounts, start + perPage - 1) do
       local acc = accounts[i]
       writeAt(2, y, tostring(acc.account_id or "?"), colors.white, colors.black)
       writeAt(math.floor(w * 0.58), y, money(acc.balance or 0), colors.lime, colors.black)
@@ -517,7 +448,6 @@ local function screenAccounts()
     writeAt(2, h - 1, "Page " .. page .. "/" .. totalPages .. "  [N]ext [P]rev [B]ack", colors.lightGray, colors.black)
 
     local ev, key = os.pullEvent("key")
-
     if key == keys.b or key == keys.backspace or key == keys.enter then
       return
     elseif key == keys.n or key == keys.right then
@@ -533,44 +463,36 @@ end
 -- =============================================================================
 local function drawMain()
   clear(colors.black)
-
-  local w, h = termSize()
+  local w, h = size()
 
   fill(1, 1, w, 1, colors.gray)
   writeAt(2, 1, "FISCAL CONTROLS", colors.yellow, colors.gray)
   writeAt(w - #VERSION - 1, 1, VERSION, colors.white, colors.gray)
 
-  local status = last_status or {}
-  local supply = status.supply or {}
+  local s = last_status or {}
+  local supply = s.supply or {}
 
   writeAt(2, 3, "Server:   " .. tostring(db_id or "?"), colors.lightGray, colors.black)
   writeAt(2, 4, "Modem:    " .. tostring(modem_name or "?"), colors.lightGray, colors.black)
-  writeAt(2, 5, "Economy:  " .. tostring(status.economy_status or "?"), colors.white, colors.black)
+  writeAt(2, 5, "Economy:  " .. tostring(s.economy_status or "?"), colors.white, colors.black)
 
-  writeAt(2, 7,  "Treasury:       " .. money(supply.treasury_balance or 0), colors.lime, colors.black)
-  writeAt(2, 8,  "In circulation: " .. money(supply.in_circulation or 0), colors.white, colors.black)
-  writeAt(2, 9,  "Total minted:   " .. money(supply.total_minted or 0), colors.white, colors.black)
-  writeAt(2, 10, "Total burned:   " .. money(supply.total_burned or 0), colors.white, colors.black)
+  writeAt(2, 7, "Treasury:       " .. money(supply.treasury_balance or 0), colors.lime, colors.black)
+  writeAt(2, 8, "In circulation: " .. money(supply.in_circulation or 0), colors.white, colors.black)
+  writeAt(2, 9, "Total minted:   " .. money(supply.total_minted or 0), colors.white, colors.black)
+  writeAt(2,10, "Total burned:   " .. money(supply.total_burned or 0), colors.white, colors.black)
 
-  writeAt(
-    2,
-    12,
-    "Accounts: " .. tostring(status.account_count or "?")
-      .. "   Citizens: " .. tostring(status.citizen_count or "?")
-      .. "   Companies: " .. tostring(status.company_count or "?"),
-    colors.lightGray,
-    colors.black
-  )
+  writeAt(2,12, "Accounts: " .. tostring(s.account_count or "?")
+      .. "   Citizens: " .. tostring(s.citizen_count or "?")
+      .. "   Companies: " .. tostring(s.company_count or "?"), colors.lightGray, colors.black)
 
   local bw = math.floor((w - 6) / 2)
-
   local buttons = {}
-  buttons.refresh  = button(2,      14, bw, "Refresh",     colors.gray)
-  buttons.print    = button(4 + bw, 14, bw, "Print Money", colors.green, colors.black)
-  buttons.grant    = button(2,      16, bw, "Grant Funds", colors.blue)
-  buttons.burn     = button(4 + bw, 16, bw, "Burn Money",  colors.red)
-  buttons.accounts = button(2,      18, bw, "Accounts",    colors.gray)
-  buttons.reconnect= button(4 + bw, 18, bw, "Reconnect",   colors.gray)
+  buttons.refresh = button(2, 14, bw, "Refresh", colors.gray)
+  buttons.print   = button(4 + bw, 14, bw, "Print Money", colors.green, colors.black)
+  buttons.grant   = button(2, 16, bw, "Grant Funds", colors.blue)
+  buttons.burn    = button(4 + bw, 16, bw, "Burn Money", colors.red)
+  buttons.accounts= button(2, 18, bw, "Accounts", colors.gray)
+  buttons.recon   = button(4 + bw, 18, bw, "Reconnect", colors.gray)
 
   if h >= 20 then
     writeAt(2, h, last_message, last_message_colour, colors.black)
@@ -581,45 +503,27 @@ local function drawMain()
 end
 
 local function mainLoop()
-  local ok, res = refreshStatus()
-
-  if ok then
-    setMessage("Connected.", colors.lime)
-  else
-    setMessage("Status failed: " .. tostring(res), colors.red)
-  end
-
+  refreshStatus()
   local buttons = drawMain()
 
   while true do
     local ev, p1, p2, p3 = os.pullEvent()
 
     if ev == "mouse_click" then
-      local mx = p2
-      local my = p3
+      local mx, my = p2, p3
 
       if hit(buttons.refresh, mx, my) then
-        local refreshOk, refreshRes = refreshStatus()
-
-        if refreshOk then
-          setMessage("Status refreshed.", colors.lime)
-        else
-          setMessage("Status failed: " .. tostring(refreshRes), colors.red)
-        end
-
+        local ok, res = refreshStatus()
+        if ok then setMessage("Status refreshed.", colors.lime) else setMessage(tostring(res), colors.red) end
       elseif hit(buttons.print, mx, my) then
         actionPrintMoney()
-
       elseif hit(buttons.grant, mx, my) then
         actionGrantFunds()
-
       elseif hit(buttons.burn, mx, my) then
         actionBurnMoney()
-
       elseif hit(buttons.accounts, mx, my) then
         screenAccounts()
-
-      elseif hit(buttons.reconnect, mx, my) then
+      elseif hit(buttons.recon, mx, my) then
         connectServer()
         refreshStatus()
       end
@@ -629,25 +533,15 @@ local function mainLoop()
     elseif ev == "key" then
       if p1 == keys.q then
         return
-
       elseif p1 == keys.r then
-        local refreshOk, refreshRes = refreshStatus()
-
-        if refreshOk then
-          setMessage("Status refreshed.", colors.lime)
-        else
-          setMessage("Status failed: " .. tostring(refreshRes), colors.red)
-        end
-
+        local ok, res = refreshStatus()
+        if ok then setMessage("Status refreshed.", colors.lime) else setMessage(tostring(res), colors.red) end
       elseif p1 == keys.p then
         actionPrintMoney()
-
       elseif p1 == keys.g then
         actionGrantFunds()
-
       elseif p1 == keys.b then
         actionBurnMoney()
-
       elseif p1 == keys.a then
         screenAccounts()
       end
@@ -670,6 +564,17 @@ local function main()
 
   while not connectServer() do
     sleep(2)
+  end
+
+  local ok, res = refreshStatus()
+  if not ok then
+    clear(colors.black)
+    center(3, "Fiscal Controls connected,", colors.yellow, colors.black)
+    center(4, "but the server rejected status.", colors.yellow, colors.black)
+    writeAt(2, 7, tostring(res), colors.red, colors.black)
+    writeAt(2, 9, "The controller will still open.", colors.lightGray, colors.black)
+    writeAt(2,10, "Actions will show server errors if refused.", colors.lightGray, colors.black)
+    sleep(3)
   end
 
   mainLoop()
