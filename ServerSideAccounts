@@ -64,7 +64,7 @@ end
 -- MAIN PROGRAM
 -- =============================================================================
 
-local VERSION  = "1.1.0"
+local VERSION  = "1.1.1"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -1051,4 +1051,3 @@ local function main()
 end
 
 main()
--- THIS IS A MARKER - WILL BE REPLACED
