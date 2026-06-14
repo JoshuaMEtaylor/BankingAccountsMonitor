@@ -16,7 +16,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.2.0"
+local VERSION  = "1.2.6"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -968,7 +968,7 @@ end
 local function serverLoop()
   local request_count = 0
   while true do
-    local sender_id, message, protocol = rednet.receive(PROTOCOL, 30)
+    local sender_id, message, protocol = rednet.receive(PROTOCOL, 5)
     if sender_id then
       request_count = request_count + 1
       local success, response = handleRequest(sender_id, message)
