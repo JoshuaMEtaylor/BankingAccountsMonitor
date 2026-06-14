@@ -12,10 +12,10 @@
 --   COMPANIES
 --   TRANSACTIONS PER DAY
 --
--- Read-only. No banking controls. No trade panel. Contract GDP + money-supply inflation.
+-- Read-only. No banking controls. No trade panel. Contract GDP + tapered money-supply inflation.
 -- =============================================================================
 
-local VERSION         = "0.5.1-MONEY-INFLATION"
+local VERSION         = "0.5.2-TAPERED-INFLATION"
 local PROTOCOL        = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT      = 5
@@ -25,6 +25,7 @@ local REFRESH_SECONDS = 5
 local TEXT_SCALE      = 0.5
 local HISTORY_FILE    = "data/economy_core_monitor_history.db"
 local INFLATION_BASE_FILE = "data/economy_monetary_inflation_base.db"
+local INFLATION_HALF_LIFE_MS = 24 * 60 * 60 * 1000 -- no new printing: inflation pressure halves every 24h
 local MAX_HISTORY     = 120
 
 local native_term = term.current()
@@ -253,32 +254,64 @@ local function growthPct(current, previous)
   return ((current / previous) - 1) * 100
 end
 
-local function getInflationBase(issued)
+local function getAdaptiveInflationBase(issued)
   issued = tonumber(issued)
   if not issued or issued <= 0 then
     return nil, "Awaiting issued money supply"
   end
 
-  local base = readTable(INFLATION_BASE_FILE)
-  if type(base) ~= "table" or not tonumber(base.issued_supply) or tonumber(base.issued_supply) <= 0 then
-    base = {
-      issued_supply = issued,
-      created = nowMs(),
-      note = "First observed issued supply. Inflation = issued supply growth from this baseline.",
-    }
-    writeTable(INFLATION_BASE_FILE, base)
+  local now = nowMs()
+  local state = readTable(INFLATION_BASE_FILE)
+
+  -- Backwards-compatible with v0.5.1, which stored issued_supply as a fixed baseline.
+  local baseIssued = nil
+  if type(state) == "table" then
+    baseIssued = tonumber(state.base_issued_supply or state.issued_supply)
   end
 
-  return tonumber(base.issued_supply), nil
+  if type(state) ~= "table" or not baseIssued or baseIssued <= 0 then
+    state = {
+      base_issued_supply = issued,
+      last_issued_supply = issued,
+      created = now,
+      updated = now,
+      half_life_ms = INFLATION_HALF_LIFE_MS,
+      note = "Adaptive inflation baseline. Without new printing, the current supply slowly becomes the baseline.",
+    }
+    writeTable(INFLATION_BASE_FILE, state)
+    return issued, "Adaptive monetary inflation baseline created"
+  end
+
+  local lastUpdate = tonumber(state.updated or state.created or now) or now
+  local elapsed = math.max(0, now - lastUpdate)
+
+  -- Exponential taper: after each half-life, half of the remaining inflation pressure fades.
+  local alpha = 0
+  if elapsed > 0 then
+    alpha = 1 - math.pow(0.5, elapsed / INFLATION_HALF_LIFE_MS)
+    alpha = clamp(alpha, 0, 1)
+  end
+
+  local newBase = baseIssued + ((issued - baseIssued) * alpha)
+  if newBase <= 0 then newBase = issued end
+
+  state.base_issued_supply = newBase
+  state.last_issued_supply = issued
+  state.updated = now
+  state.half_life_ms = INFLATION_HALF_LIFE_MS
+  state.note = "Adaptive inflation baseline. Without new printing, current supply slowly becomes the baseline."
+  writeTable(INFLATION_BASE_FILE, state)
+
+  return newBase, nil
 end
 
 local function calculateMonetaryInflation(issued)
   issued = tonumber(issued)
-  local base, err = getInflationBase(issued)
-  if not base then return nil, err or "Awaiting monetary baseline" end
+  local base, err = getAdaptiveInflationBase(issued)
+  if not base then return nil, err or "Awaiting adaptive monetary baseline" end
 
   local inflation = ((issued / base) - 1) * 100
-  return inflation, "Monetary inflation: issued supply vs baseline"
+  return inflation, "Adaptive money-supply inflation, 24h half-life"
 end
 
 -- =============================================================================
