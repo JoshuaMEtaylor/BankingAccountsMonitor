@@ -1,29 +1,44 @@
 -- =============================================================================
--- QUID BANK OF PLENTY - TREASURY CONTROL TERMINAL
--- FiscalControls
--- =============================================================================
+-- FISCAL CONTROLS
+-- Quid state treasury controller
+--
 -- Purpose:
---   State-side control terminal for the Quid treasury and national finance system.
---   This is NOT a citizen banking terminal. It relies on ServerSideAccounts'
---   trusted management-terminal authority model.
+--   Control the state treasury account and core state finance actions:
+--   - View treasury / supply status
+--   - Print money into treasury
+--   - Grant treasury funds to an account
+--   - Burn money from treasury
+--   - View account balances
 --
--- Works with existing server handlers:
---   status, supply, mint, burn, grant, list_accounts, list_citizens,
---   suspend_account, unsuspend_account, register_citizen, register_company,
---   company_info, set_price
---
--- Install/update pattern:
---   wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/FiscalControls startup.lua
---   startup.lua
+-- This is intentionally NOT the citizen terminal and NOT the economic dashboard.
 -- =============================================================================
 
 local args = {...}
+
+-- =============================================================================
+-- SELF UPDATE
+-- =============================================================================
 if args[1] ~= "--updated" then
-  print("[ Quid Treasury Control ]")
+  print("[ Fiscal Controls ]")
   print("Deleting old version...")
   fs.delete("startup.lua")
+
   print("Downloading latest from GitHub...")
   shell.run("wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/FiscalControls startup.lua")
+
+  if not fs.exists("startup.lua") then
+    print("")
+    print("Download failed.")
+    print("Expected GitHub file:")
+    print("FiscalControls")
+    print("")
+    print("Run manually after uploading:")
+    print("delete startup")
+    print("wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/FiscalControls startup.lua")
+    print("startup.lua")
+    return
+  end
+
   print("Relaunching...")
   sleep(0.5)
   shell.run("startup.lua", "--updated")
@@ -31,1129 +46,541 @@ if args[1] ~= "--updated" then
 end
 
 -- =============================================================================
--- MAIN PROGRAM
+-- CONFIG
 -- =============================================================================
+local VERSION          = "1.0.0"
+local PROTOCOL         = "quid_bank"
+local TREASURY_ACCOUNT = "treasury:quid_bank"
+local DB_TIMEOUT       = 5
 
-local VERSION      = "1.0.1"
-local TERMINAL_NAME= "QUID TREASURY CONTROL"
-local PROTOCOL     = "quid_bank"
-local DB_TIMEOUT   = 5
-local REFRESH_SECS = 5
-
-local W, H = term.getSize()
-
--- =============================================================================
--- COLOUR PALETTE - state/treasury control aesthetic
--- =============================================================================
-local C = {
-  bg        = colors.gray,
-  panel     = colors.black,
-  card      = colors.white,
-  card_fg   = colors.black,
-  header    = colors.black,
-  hdr_fg    = colors.yellow,
-  accent    = colors.yellow,
-  accent_fg = colors.black,
-  label     = colors.lightGray,
-  body      = colors.white,
-  dim       = colors.lightGray,
-  muted     = colors.gray,
-  ok        = colors.lime,
-  warn      = colors.orange,
-  err       = colors.red,
-  info      = colors.cyan,
-  money     = colors.lime,
-  btn       = colors.yellow,
-  btn_fg    = colors.black,
-  btn2      = colors.lightGray,
-  btn2_fg   = colors.black,
-  danger    = colors.red,
-  input_bg  = colors.lightGray,
-  input_fg  = colors.black,
-  row_a     = colors.black,
-  row_b     = colors.gray,
-}
-
--- =============================================================================
--- STATE
--- =============================================================================
 local db_id = nil
-local modemName = nil
-local lastStatus = nil
-local lastError = ""
-local capsLock = false
+local modem_name = nil
+local last_status = nil
+local last_message = ""
+local last_message_colour = colors.lightGray
 
 -- =============================================================================
--- BASIC UTILS
+-- BASIC HELPERS
 -- =============================================================================
-local function refreshSize()
-  W, H = term.getSize()
+local function size()
+  local w, h = term.getSize()
+  return w, h
 end
 
-local function clamp(n, minv, maxv)
-  if n < minv then return minv end
-  if n > maxv then return maxv end
-  return n
-end
-
-local function trim(s)
-  return tostring(s or ""):match("^%s*(.-)%s*$")
-end
-
-local function compactSpaces(s)
-  return trim(tostring(s or "")):gsub("%s+", "_")
-end
-
-local function normaliseAccountId(raw)
-  raw = trim(raw)
-  if raw == "" then return raw end
-  if raw:find(":") then return raw end
-  return "citizen:" .. string.lower(compactSpaces(raw))
-end
-
-local function parseAmount(raw)
-  raw = trim(raw)
-  local n = tonumber(raw)
-  if not n then return nil end
-  n = math.floor(n)
-  if n <= 0 then return nil end
-  return n
-end
-
-local function fmtQ(n)
-  n = tonumber(n) or 0
-  local sign = ""
-  if n < 0 then sign = "-"; n = -n end
-  local s = tostring(math.floor(n))
-  local left, num, right = string.match(s, "^([^%d]*%d)(%d*)(.-)$")
-  if not left then return sign .. s .. " Q" end
-  return sign .. left .. (num:reverse():gsub("(%d%d%d)", "%1,"):reverse()) .. right .. " Q"
-end
-
-local function short(s, width)
-  s = tostring(s or "")
-  if #s <= width then return s end
-  if width <= 3 then return s:sub(1, width) end
-  return s:sub(1, width-3) .. "..."
-end
-
-local function contains(list, value)
-  if type(list) ~= "table" then return false end
-  for _, v in ipairs(list) do
-    if tonumber(v) == tonumber(value) then return true end
-  end
-  return false
-end
-
-local function statusText()
-  if lastError and lastError ~= "" then return lastError end
-  if db_id then return "Server " .. tostring(db_id) .. " via " .. tostring(modemName or "modem") end
-  return "Not connected"
-end
-
--- =============================================================================
--- DRAWING PRIMITIVES
--- =============================================================================
-local function set(fg, bg)
-  if fg then term.setTextColor(fg) end
-  if bg then term.setBackgroundColor(bg) end
-end
-
-local function cls(bg)
-  refreshSize()
-  set(C.body, bg or C.bg)
+local function clear(bg)
+  term.setCursorBlink(false)
+  term.setBackgroundColor(bg or colors.black)
+  term.setTextColor(colors.white)
   term.clear()
   term.setCursorPos(1, 1)
-  term.setCursorBlink(false)
 end
 
-local function at(x, y, text, fg, bg)
-  if y < 1 or y > H or x > W then return end
-  x = math.max(1, x)
-  local maxw = W - x + 1
-  if maxw <= 0 then return end
-  set(fg or C.body, bg)
-  term.setCursorPos(x, y)
-  term.write(tostring(text):sub(1, maxw))
+local function writeAt(x, y, text, fg, bg)
+  local w, h = size()
+  if y < 1 or y > h or x > w then return end
+  term.setCursorPos(math.max(1, x), y)
+  if bg then term.setBackgroundColor(bg) end
+  if fg then term.setTextColor(fg) end
+  local max = w - x + 1
+  if max > 0 then
+    term.write(tostring(text or ""):sub(1, max))
+  end
 end
 
 local function fill(x, y, w, h, bg)
-  if w <= 0 or h <= 0 then return end
-  set(nil, bg or C.bg)
+  local sw, sh = size()
+  term.setBackgroundColor(bg or colors.black)
   local row = string.rep(" ", math.max(0, w))
-  for yy = y, y+h-1 do
-    if yy >= 1 and yy <= H then
+  for yy = y, y + h - 1 do
+    if yy >= 1 and yy <= sh then
       term.setCursorPos(math.max(1, x), yy)
-      term.write(row:sub(1, W - math.max(1, x) + 1))
+      term.write(row:sub(1, sw - math.max(1, x) + 1))
     end
   end
 end
 
-local function centre(y, text, fg, bg)
+local function center(y, text, fg, bg)
+  local w = size()
   text = tostring(text or "")
-  local x = math.floor((W - #text) / 2) + 1
-  at(math.max(1, x), y, text, fg, bg)
+  local x = math.floor((w - #text) / 2) + 1
+  writeAt(x, y, text, fg, bg)
 end
 
-local function topBar()
-  fill(1, 1, W, 1, C.header)
-  at(2, 1, TERMINAL_NAME, C.hdr_fg, C.header)
-  local right = "v" .. VERSION
-  at(W - #right, 1, right, C.dim, C.header)
-end
-
-local function bottomBar(msg, col)
-  fill(1, H, W, 1, C.panel)
-  at(2, H, short(msg or statusText(), W-3), col or C.dim, C.panel)
-end
-
-local function panel(x, y, w, h, title)
-  fill(x, y, w, h, C.panel)
-  if title and title ~= "" then
-    at(x+1, y, " " .. title .. " ", C.accent, C.panel)
+local function money(n)
+  n = tonumber(n) or 0
+  local sign = ""
+  if n < 0 then sign = "-"; n = math.abs(n) end
+  local s = tostring(math.floor(n))
+  local out = ""
+  while #s > 3 do
+    out = "," .. s:sub(-3) .. out
+    s = s:sub(1, -4)
   end
+  return sign .. s .. out .. " Q"
 end
 
-local function card(x, y, w, h, title)
-  fill(x, y, w, h, C.card)
-  if title and title ~= "" then
-    at(x+1, y, title, C.label, C.card)
-  end
+local function trim(s)
+  s = tostring(s or "")
+  return s:match("^%s*(.-)%s*$")
 end
 
-local function btn(x, y, w, label, bg, fg)
-  bg = bg or C.btn
-  fg = fg or C.btn_fg
-  fill(x, y, w, 1, bg)
+local function normaliseAccountId(s)
+  s = trim(s)
+  if s == "" then return "" end
+  if s:find(":") then return s end
+  return "citizen:" .. string.lower(s):gsub("%s+", "_")
+end
+
+local function setMessage(msg, col)
+  last_message = tostring(msg or "")
+  last_message_colour = col or colors.lightGray
+end
+
+local function button(x, y, w, label, bg, fg)
+  fill(x, y, w, 1, bg or colors.gray)
   local tx = x + math.floor((w - #label) / 2)
-  at(tx, y, label, fg, bg)
-  return {x1=x, y1=y, x2=x+w-1, y2=y, label=label}
+  writeAt(tx, y, label, fg or colors.white, bg or colors.gray)
+  return {x1=x, x2=x+w-1, y1=y, y2=y}
 end
 
 local function hit(b, mx, my)
-  return b and mx >= b.x1 and mx <= b.x2 and my >= b.y1 and my <= (b.y2 or b.y1)
+  return b and mx >= b.x1 and mx <= b.x2 and my >= b.y1 and my <= b.y2
 end
 
-local function inputBox(x, y, w, value, focused, masked)
-  local bg = C.input_bg
-  local display = masked and string.rep("*", #tostring(value or "")) or tostring(value or "")
-  fill(x, y, w, 1, bg)
-  at(x, y, short(display, w), C.input_fg, bg)
-  if focused then
-    if capsLock and w > 8 then
-      at(x+w-5, y, "CAPS", C.warn, bg)
-    end
-    term.setCursorPos(x + math.min(#display, w-1), y)
-    term.setCursorBlink(true)
+local function pauseClick()
+  local w, h = size()
+  writeAt(2, h, "Click / press any key to continue.", colors.lightGray, colors.black)
+  while true do
+    local ev = os.pullEvent()
+    if ev == "mouse_click" or ev == "key" or ev == "char" then return end
   end
-  return {x1=x, y1=y, x2=x+w-1, y2=y}
-end
-
-local function labelValue(x, y, label, value, valCol)
-  at(x, y, label, C.label, C.panel)
-  at(x, y+1, tostring(value or ""), valCol or C.body, C.panel)
 end
 
 -- =============================================================================
--- NETWORK
+-- MODEM / NETWORK
 -- =============================================================================
 local function openModem()
   for _, name in ipairs(peripheral.getNames()) do
     if peripheral.getType(name) == "modem" then
-      local m = peripheral.wrap(name)
-      if m and m.isWireless and m.isWireless() then
+      local modem = peripheral.wrap(name)
+      if modem and modem.isWireless and modem.isWireless() then
         rednet.open(name)
-        modemName = name
+        modem_name = name
         return true
       end
     end
   end
+
   for _, name in ipairs(peripheral.getNames()) do
     if peripheral.getType(name) == "modem" then
       rednet.open(name)
-      modemName = name
+      modem_name = name
       return true
     end
   end
+
   return false
 end
 
-local function dbRequest(req, timeout)
-  timeout = timeout or DB_TIMEOUT
-  if not db_id then return false, "Not connected" end
+local function connectServer()
+  clear(colors.black)
+  center(3, "FISCAL CONTROLS", colors.yellow, colors.black)
+  center(5, "Connecting to Quid Bank server...", colors.white, colors.black)
+  center(7, "Modem: " .. tostring(modem_name or "none"), colors.lightGray, colors.black)
 
-  rednet.send(db_id, req, PROTOCOL)
-  local timer = os.startTimer(timeout)
-
-  while true do
-    local ev, a, b, c = os.pullEvent()
-    if ev == "rednet_message" and a == db_id and c == PROTOCOL and type(b) == "table" then
-      return b.success, b.response
-    elseif ev == "timer" and a == timer then
-      return false, "No response from server"
-    elseif ev == "terminate" then
-      error("Terminated", 0)
-    end
-  end
-end
-
-local function discoverServer()
-  db_id = nil
   for attempt = 1, 8 do
-    cls()
-    topBar()
-    centre(math.floor(H/2)-2, "Connecting to Quid Bank server...", C.body, C.bg)
-    centre(math.floor(H/2), "Attempt " .. attempt .. " of 8", C.dim, C.bg)
-    if modemName then centre(math.floor(H/2)+1, "Modem: " .. modemName, C.dim, C.bg) end
-    rednet.broadcast({ type = "ping" }, PROTOCOL)
+    center(9, "Attempt " .. attempt .. " of 8", colors.lightGray, colors.black)
 
-    local timer = os.startTimer(4)
-    while true do
-      local ev, a, b, c = os.pullEvent()
-      if ev == "rednet_message" and c == PROTOCOL and type(b) == "table" then
-        if (b.success and type(b.response) == "table") or b.type == "treasury_online" then
-          db_id = a
-          centre(math.floor(H/2)+3, "Connected to server " .. tostring(db_id), C.ok, C.bg)
-          sleep(0.4)
-          return true
-        end
-      elseif ev == "timer" and a == timer then
-        break
-      elseif ev == "terminate" then
-        error("Terminated", 0)
+    rednet.broadcast({ type = "ping" }, PROTOCOL)
+    local sender, msg = rednet.receive(PROTOCOL, 4)
+
+    if sender and type(msg) == "table" then
+      if msg.type == "treasury_online" then
+        db_id = sender
+        center(11, "Connected to server " .. tostring(db_id), colors.lime, colors.black)
+        sleep(0.5)
+        return true
+      end
+
+      if msg.success == true and type(msg.response) == "table" then
+        db_id = sender
+        center(11, "Connected to server " .. tostring(db_id), colors.lime, colors.black)
+        sleep(0.5)
+        return true
       end
     end
   end
+
+  center(11, "Connection failed.", colors.red, colors.black)
+  center(13, "Check server is running and modem is open.", colors.lightGray, colors.black)
+  sleep(3)
   return false
 end
 
+local function dbRequest(request, timeout)
+  timeout = timeout or DB_TIMEOUT
+  if not db_id then return false, "No server connected" end
+
+  rednet.send(db_id, request, PROTOCOL)
+
+  local deadline = os.clock() + timeout
+  while true do
+    local remaining = deadline - os.clock()
+    if remaining <= 0 then
+      return false, "No response from server"
+    end
+
+    local sender, msg = rednet.receive(PROTOCOL, remaining)
+    if sender == db_id and type(msg) == "table" and msg.success ~= nil then
+      return msg.success, msg.response
+    end
+  end
+end
+
+-- =============================================================================
+-- SERVER ACTIONS
+-- =============================================================================
 local function refreshStatus()
-  local ok, res = dbRequest({ type = "status" }, DB_TIMEOUT)
+  local ok, res = dbRequest({ type = "status" })
   if ok and type(res) == "table" then
-    lastStatus = res
-    lastError = ""
+    last_status = res
     return true, res
   end
-  lastError = tostring(res or "Status request failed")
   return false, res
 end
 
-local function requireAuthority()
-  cls()
-  topBar()
-  centre(math.floor(H/2)-1, "Checking treasury authority...", C.dim, C.bg)
-  local ok, res = refreshStatus()
-  if ok then return true end
-
-  while true do
-    cls()
-    topBar()
-    centre(4, "UNAUTHORISED TREASURY TERMINAL", C.err, C.bg)
-    centre(6, "This computer is not registered as management.", C.body, C.bg)
-    centre(8, "Computer ID: " .. tostring(os.getComputerID()), C.accent, C.bg)
-    centre(10, "Register this ID on the bank server first.", C.dim, C.bg)
-    centre(12, "Server reply: " .. short(tostring(res), W-16), C.err, C.bg)
-    local b_retry = btn(math.floor(W/2)-13, H-3, 12, "Retry", C.btn, C.btn_fg)
-    local b_exit  = btn(math.floor(W/2)+2,  H-3, 12, "Exit",  C.btn2, C.btn2_fg)
-    bottomBar("Physical access alone is not enough. Server must trust this computer ID.")
-
-    local ev, _, x, y = os.pullEvent()
-    if ev == "mouse_click" then
-      if hit(b_retry, x, y) then
-        local ok2 = refreshStatus()
-        if ok2 then return true end
-      elseif hit(b_exit, x, y) then
-        return false
-      end
-    elseif ev == "key" then
-      return false
-    elseif ev == "terminate" then
-      error("Terminated", 0)
-    end
+local function requestAccounts()
+  local ok, res = dbRequest({ type = "list_accounts" })
+  if ok and type(res) == "table" then
+    return true, res.accounts or {}
   end
+  return false, res
 end
 
--- =============================================================================
--- GENERIC SCREENS
--- =============================================================================
-local function messageScreen(title, lines, colour)
-  cls()
-  topBar()
-  centre(3, title, colour or C.body, C.bg)
-  local y = 5
-  for _, line in ipairs(lines or {}) do
-    centre(y, tostring(line), C.body, C.bg)
-    y = y + 1
-  end
-  local b = btn(math.floor(W/2)-7, H-2, 14, "Continue", C.btn, C.btn_fg)
-  bottomBar()
-  while true do
-    local ev, _, x, yy = os.pullEvent()
-    if ev == "mouse_click" and hit(b, x, yy) then return end
-    if ev == "key" then return end
-    if ev == "terminate" then error("Terminated", 0) end
-  end
-end
-
-local function confirmScreen(title, lines, danger)
-  while true do
-    cls()
-    topBar()
-    centre(3, title, danger and C.err or C.accent, C.bg)
-    local y = 5
-    for _, line in ipairs(lines or {}) do
-      centre(y, tostring(line), C.body, C.bg)
-      y = y + 1
-    end
-    local bw = math.min(20, math.floor((W-8)/2))
-    local b_yes = btn(math.floor(W/2)-bw-2, H-3, bw, "Confirm", danger and C.danger or C.btn, danger and C.body or C.btn_fg)
-    local b_no  = btn(math.floor(W/2)+2,    H-3, bw, "Cancel", C.btn2, C.btn2_fg)
-    bottomBar(danger and "Dangerous state action: confirmation required." or "Confirm action.")
-
-    local ev, p1, x, yy = os.pullEvent()
-    if ev == "mouse_click" then
-      if hit(b_yes, x, yy) then return true end
-      if hit(b_no,  x, yy) then return false end
-    elseif ev == "key" then
-      if p1 == keys.enter then return true end
-      if p1 == keys.backspace or p1 == keys.escape then return false end
-    elseif ev == "terminate" then
-      error("Terminated", 0)
-    end
-  end
-end
-
-local function formScreen(title, fields, submitLabel, danger)
-  local focused = 1
-  local err = ""
-  for _, f in ipairs(fields) do
-    if f.value == nil then f.value = "" end
-  end
-
-  local function draw()
-    cls()
-    topBar()
-    term.setCursorBlink(false)
-    centre(3, title, C.accent, C.bg)
-
-    local startY = 5
-    local boxes = {}
-    for i, f in ipairs(fields) do
-      local y = startY + (i-1)*2
-      at(4, y, f.label, C.label, C.bg)
-      boxes[i] = inputBox(22, y, W-25, f.value, focused == i, f.masked)
-    end
-
-    local b_submit = btn(4, H-3, math.floor((W-10)/2), submitLabel or "Submit", danger and C.danger or C.btn, danger and C.body or C.btn_fg)
-    local b_cancel = btn(6 + math.floor((W-10)/2), H-3, math.floor((W-10)/2), "Cancel", C.btn2, C.btn2_fg)
-    if err ~= "" then at(4, H-5, short(err, W-6), C.err, C.bg) end
-    bottomBar("Tab/Enter moves fields. Click fields and buttons normally.")
-    return boxes, b_submit, b_cancel
-  end
-
-  local boxes, b_submit, b_cancel = draw()
-
-  local function values()
-    local out = {}
-    for _, f in ipairs(fields) do out[f.key] = trim(f.value) end
-    return out
-  end
-
-  while true do
-    local ev, p1, p2, p3 = os.pullEvent()
-    if ev == "char" then
-      local f = fields[focused]
-      if #(f.value or "") < (f.max or 48) then
-        local ch = capsLock and p1:upper() or p1
-        f.value = (f.value or "") .. ch
-        boxes, b_submit, b_cancel = draw()
-      end
-    elseif ev == "key" then
-      if keys.capsLock and p1 == keys.capsLock then
-        capsLock = not capsLock
-        boxes, b_submit, b_cancel = draw()
-      elseif p1 == keys.backspace then
-        local f = fields[focused]
-        if #(f.value or "") > 0 then
-          f.value = f.value:sub(1, -2)
-          boxes, b_submit, b_cancel = draw()
-        end
-      elseif p1 == keys.tab then
-        focused = focused % #fields + 1
-        boxes, b_submit, b_cancel = draw()
-      elseif p1 == keys.enter then
-        if focused < #fields then
-          focused = focused + 1
-          boxes, b_submit, b_cancel = draw()
-        else
-          return values()
-        end
-      elseif p1 == keys.escape then
-        return nil
-      end
-    elseif ev == "mouse_click" then
-      local mx, my = p2, p3
-      if hit(b_cancel, mx, my) then return nil end
-      if hit(b_submit, mx, my) then return values() end
-      for i, box in ipairs(boxes) do
-        if hit(box, mx, my) then
-          focused = i
-          boxes, b_submit, b_cancel = draw()
-          break
-        end
-      end
-    elseif ev == "terminate" then
-      error("Terminated", 0)
-    end
-  end
-end
-
--- =============================================================================
--- TREASURY ACTIONS
--- =============================================================================
 local function actionPrintMoney()
-  local vals = formScreen("PRINT MONEY INTO TREASURY", {
-    { label="Amount", key="amount", max=12 },
-    { label="Memo",   key="memo", value="Treasury monetary issue", max=48 },
-  }, "Review Print", true)
-  if not vals then return "dashboard" end
+  clear(colors.black)
+  center(2, "PRINT MONEY", colors.yellow, colors.black)
+  writeAt(2, 4, "This creates new Quid into:", colors.white, colors.black)
+  writeAt(2, 5, TREASURY_ACCOUNT, colors.cyan, colors.black)
+  writeAt(2, 7, "Amount: ", colors.white, colors.black)
+  local amount = tonumber(read())
 
-  local amount = parseAmount(vals.amount)
-  if not amount then
-    messageScreen("Invalid Amount", {"Enter a whole number greater than zero."}, C.err)
-    return "dashboard"
+  if not amount or amount <= 0 then
+    setMessage("Invalid print amount.", colors.red)
+    return
+  end
+  amount = math.floor(amount)
+
+  writeAt(2, 9, "Memo: ", colors.white, colors.black)
+  local memo = read()
+  if trim(memo) == "" then memo = "Treasury monetary issue" end
+
+  clear(colors.black)
+  center(2, "CONFIRM PRINT", colors.red, colors.black)
+  writeAt(2, 5, "Amount:      " .. money(amount), colors.white, colors.black)
+  writeAt(2, 6, "Destination: " .. TREASURY_ACCOUNT, colors.white, colors.black)
+  writeAt(2, 7, "Memo:        " .. memo, colors.white, colors.black)
+  writeAt(2, 10, "Type YES to print this money: ", colors.orange, colors.black)
+  local confirm = read()
+
+  if confirm ~= "YES" then
+    setMessage("Money print cancelled.", colors.lightGray)
+    return
   end
 
-  local okConfirm = confirmScreen("CONFIRM MONETARY ISSUE", {
-    "This will create new Quid.",
-    "Destination: treasury:quid_bank",
-    "Amount: " .. fmtQ(amount),
-    "Memo: " .. short(vals.memo, W-14),
-  }, true)
-  if not okConfirm then return "dashboard" end
+  local ok, res = dbRequest({
+    type = "mint",
+    to_id = TREASURY_ACCOUNT,
+    amount = amount,
+    memo = memo
+  })
 
-  local ok, res = dbRequest({ type="mint", to_id="treasury:quid_bank", amount=amount, memo=vals.memo })
-  if ok and type(res) == "table" then
+  if ok then
+    setMessage("Printed " .. money(amount) .. " into treasury.", colors.lime)
     refreshStatus()
-    messageScreen("Money Printed", {"Treasury credited: " .. fmtQ(amount), "Transaction: " .. tostring(res.tx_id or "unknown")}, C.ok)
   else
-    messageScreen("Print Failed", {tostring(res or "Unknown error")}, C.err)
+    setMessage("Print failed: " .. tostring(res), colors.red)
   end
-  return "dashboard"
 end
 
-local function actionGrantFunds(prefill)
-  local vals = formScreen("GRANT TREASURY FUNDS", {
-    { label="Recipient", key="to_id", value=prefill or "", max=48 },
-    { label="Amount",    key="amount", max=12 },
-    { label="Memo",      key="memo", value="Treasury grant", max=48 },
-  }, "Review Grant", false)
-  if not vals then return "dashboard" end
+local function actionGrantFunds()
+  clear(colors.black)
+  center(2, "GRANT TREASURY FUNDS", colors.yellow, colors.black)
+  writeAt(2, 4, "Recipient account or username:", colors.white, colors.black)
+  writeAt(2, 5, "> ", colors.cyan, colors.black)
+  local recipient = normaliseAccountId(read())
 
-  local to_id = normaliseAccountId(vals.to_id)
-  local amount = parseAmount(vals.amount)
-  if to_id == "" then
-    messageScreen("Missing Recipient", {"Enter citizen:josh, company:ticker, or a username."}, C.err)
-    return "dashboard"
-  end
-  if not amount then
-    messageScreen("Invalid Amount", {"Enter a whole number greater than zero."}, C.err)
-    return "dashboard"
+  if recipient == "" then
+    setMessage("No recipient entered.", colors.red)
+    return
   end
 
-  local okConfirm = confirmScreen("CONFIRM TREASURY GRANT", {
-    "This spends existing treasury funds.",
-    "From: treasury:quid_bank",
-    "To: " .. to_id,
-    "Amount: " .. fmtQ(amount),
-    "Memo: " .. short(vals.memo, W-14),
-  }, false)
-  if not okConfirm then return "dashboard" end
+  writeAt(2, 7, "Amount: ", colors.white, colors.black)
+  local amount = tonumber(read())
 
-  local ok, res = dbRequest({ type="grant", to_id=to_id, amount=amount, memo=vals.memo })
-  if ok and type(res) == "table" then
+  if not amount or amount <= 0 then
+    setMessage("Invalid grant amount.", colors.red)
+    return
+  end
+  amount = math.floor(amount)
+
+  writeAt(2, 9, "Memo: ", colors.white, colors.black)
+  local memo = read()
+  if trim(memo) == "" then memo = "Treasury grant" end
+
+  clear(colors.black)
+  center(2, "CONFIRM GRANT", colors.yellow, colors.black)
+  writeAt(2, 5, "From:   " .. TREASURY_ACCOUNT, colors.white, colors.black)
+  writeAt(2, 6, "To:     " .. recipient, colors.white, colors.black)
+  writeAt(2, 7, "Amount: " .. money(amount), colors.white, colors.black)
+  writeAt(2, 8, "Memo:   " .. memo, colors.white, colors.black)
+  writeAt(2, 11, "Type YES to grant funds: ", colors.orange, colors.black)
+  local confirm = read()
+
+  if confirm ~= "YES" then
+    setMessage("Grant cancelled.", colors.lightGray)
+    return
+  end
+
+  local ok, res = dbRequest({
+    type = "grant",
+    to_id = recipient,
+    amount = amount,
+    memo = memo
+  })
+
+  if ok then
+    setMessage("Granted " .. money(amount) .. " to " .. recipient .. ".", colors.lime)
     refreshStatus()
-    messageScreen("Grant Complete", {"Recipient: " .. to_id, "Amount: " .. fmtQ(amount), "Transaction: " .. tostring(res.tx_id or "unknown")}, C.ok)
   else
-    messageScreen("Grant Failed", {tostring(res or "Unknown error")}, C.err)
+    setMessage("Grant failed: " .. tostring(res), colors.red)
   end
-  return "dashboard"
 end
 
 local function actionBurnMoney()
-  local vals = formScreen("BURN TREASURY MONEY", {
-    { label="Amount", key="amount", max=12 },
-    { label="Memo",   key="memo", value="Treasury burn", max=48 },
-  }, "Review Burn", true)
-  if not vals then return "dashboard" end
+  clear(colors.black)
+  center(2, "BURN MONEY", colors.red, colors.black)
+  writeAt(2, 4, "This destroys Quid from:", colors.white, colors.black)
+  writeAt(2, 5, TREASURY_ACCOUNT, colors.cyan, colors.black)
+  writeAt(2, 7, "Amount: ", colors.white, colors.black)
+  local amount = tonumber(read())
 
-  local amount = parseAmount(vals.amount)
-  if not amount then
-    messageScreen("Invalid Amount", {"Enter a whole number greater than zero."}, C.err)
-    return "dashboard"
+  if not amount or amount <= 0 then
+    setMessage("Invalid burn amount.", colors.red)
+    return
   end
+  amount = math.floor(amount)
 
-  local okConfirm = confirmScreen("CONFIRM MONEY BURN", {
-    "This will destroy Quid from the treasury.",
-    "Source: treasury:quid_bank",
-    "Amount: " .. fmtQ(amount),
-    "Memo: " .. short(vals.memo, W-14),
-  }, true)
-  if not okConfirm then return "dashboard" end
+  writeAt(2, 9, "Memo: ", colors.white, colors.black)
+  local memo = read()
+  if trim(memo) == "" then memo = "Treasury monetary burn" end
 
-  local ok, res = dbRequest({ type="burn", from_id="treasury:quid_bank", amount=amount, memo=vals.memo })
-  if ok and type(res) == "table" then
-    refreshStatus()
-    messageScreen("Money Burned", {"Destroyed: " .. fmtQ(amount), "Transaction: " .. tostring(res.tx_id or "unknown")}, C.ok)
-  else
-    messageScreen("Burn Failed", {tostring(res or "Unknown error")}, C.err)
+  clear(colors.black)
+  center(2, "CONFIRM BURN", colors.red, colors.black)
+  writeAt(2, 5, "Amount: " .. money(amount), colors.white, colors.black)
+  writeAt(2, 6, "Source: " .. TREASURY_ACCOUNT, colors.white, colors.black)
+  writeAt(2, 7, "Memo:   " .. memo, colors.white, colors.black)
+  writeAt(2, 10, "Type YES to burn this money: ", colors.orange, colors.black)
+  local confirm = read()
+
+  if confirm ~= "YES" then
+    setMessage("Burn cancelled.", colors.lightGray)
+    return
   end
-  return "dashboard"
-end
-
-local function actionRegisterCitizen()
-  local vals = formScreen("REGISTER CITIZEN ACCOUNT", {
-    { label="Username", key="username", max=32 },
-    { label="Password", key="password", value="changeme", max=32 },
-    { label="Title",    key="title", value="Account Holder", max=32 },
-  }, "Create Citizen", false)
-  if not vals then return "dashboard" end
-
-  if vals.username == "" then
-    messageScreen("Missing Username", {"Citizen username is required."}, C.err)
-    return "dashboard"
-  end
-  if #vals.password < 4 then
-    messageScreen("Weak Password", {"Password must be at least 4 characters."}, C.err)
-    return "dashboard"
-  end
-
-  local okConfirm = confirmScreen("CONFIRM CITIZEN REGISTRATION", {
-    "Username: " .. vals.username,
-    "Account ID: citizen:" .. string.lower(compactSpaces(vals.username)),
-    "Temporary Password: " .. vals.password,
-  }, false)
-  if not okConfirm then return "dashboard" end
 
   local ok, res = dbRequest({
-    type="register_citizen",
-    display_name=vals.username, -- server currently requires this field; we mirror username
-    username=vals.username,
-    password=vals.password,
-    title=vals.title ~= "" and vals.title or "Account Holder"
+    type = "burn",
+    from_id = TREASURY_ACCOUNT,
+    amount = amount,
+    memo = memo
   })
 
-  if ok and type(res) == "table" then
+  if ok then
+    setMessage("Burned " .. money(amount) .. " from treasury.", colors.lime)
     refreshStatus()
-    messageScreen("Citizen Registered", {tostring(res.citizen_id or "created"), tostring(res.message or "")}, C.ok)
   else
-    messageScreen("Registration Failed", {tostring(res or "Unknown error")}, C.err)
-  end
-  return "dashboard"
-end
-
-local function actionRegisterCompany()
-  local vals = formScreen("REGISTER STATE COMPANY", {
-    { label="Name",       key="name", max=32 },
-    { label="Ticker",     key="ticker", max=8 },
-    { label="Type",       key="biz_type", value="general", max=20 },
-    { label="Owner",      key="owner_id", value="treasury:quid_bank", max=40 },
-    { label="Shares",     key="shares_total", value="1000", max=10 },
-    { label="Public",     key="shares_public", value="0", max=10 },
-  }, "Create Company", false)
-  if not vals then return "dashboard" end
-
-  if vals.name == "" or vals.ticker == "" then
-    messageScreen("Missing Company Data", {"Company name and ticker are required."}, C.err)
-    return "dashboard"
-  end
-
-  local shares = parseAmount(vals.shares_total) or 1000
-  local public = tonumber(vals.shares_public) or 0
-  local owner = normaliseAccountId(vals.owner_id ~= "" and vals.owner_id or "treasury:quid_bank")
-
-  local okConfirm = confirmScreen("CONFIRM COMPANY REGISTRATION", {
-    "Name: " .. vals.name,
-    "Ticker: " .. string.upper(vals.ticker),
-    "Company ID: company:" .. string.lower(vals.ticker),
-    "Owner: " .. owner,
-    "Shares: " .. tostring(shares) .. " total / " .. tostring(public) .. " public",
-  }, false)
-  if not okConfirm then return "dashboard" end
-
-  local ok, res = dbRequest({
-    type="register_company",
-    name=vals.name,
-    ticker=vals.ticker,
-    biz_type=vals.biz_type ~= "" and vals.biz_type or "general",
-    owner_id=owner,
-    shares_total=shares,
-    shares_public=public
-  })
-
-  if ok and type(res) == "table" then
-    refreshStatus()
-    messageScreen("Company Registered", {tostring(res.company_id or "created"), tostring(res.message or "")}, C.ok)
-  else
-    messageScreen("Company Registration Failed", {tostring(res or "Unknown error")}, C.err)
-  end
-  return "dashboard"
-end
-
-local function actionSetPrice()
-  local vals = formScreen("SET STATE PRICE", {
-    { label="Item",  key="item", max=40 },
-    { label="Price", key="price", max=12 },
-  }, "Set Price", false)
-  if not vals then return "dashboard" end
-
-  local price = parseAmount(vals.price)
-  if vals.item == "" or not price then
-    messageScreen("Invalid Price", {"Enter an item name and a whole-number price."}, C.err)
-    return "dashboard"
-  end
-
-  local okConfirm = confirmScreen("CONFIRM PRICE UPDATE", {
-    "Item: " .. vals.item,
-    "New price: " .. fmtQ(price),
-  }, false)
-  if not okConfirm then return "dashboard" end
-
-  local ok, res = dbRequest({ type="set_price", item=vals.item, price=price })
-  if ok and type(res) == "table" then
-    messageScreen("Price Updated", {vals.item .. " = " .. fmtQ(price), "Old price: " .. tostring(res.old_price or "none")}, C.ok)
-  else
-    messageScreen("Price Update Failed", {tostring(res or "Unknown error")}, C.err)
-  end
-  return "dashboard"
-end
-
--- =============================================================================
--- LIST / DETAIL SCREENS
--- =============================================================================
-local function accountDetail(acc, backScreen)
-  while true do
-    cls()
-    topBar()
-    centre(3, "ACCOUNT CONTROL", C.accent, C.bg)
-    panel(2, 5, W-2, 8, "Account")
-    at(4, 6, "ID:      " .. tostring(acc.account_id or ""), C.body, C.panel)
-    at(4, 7, "Type:    " .. tostring(acc.type or ""), C.body, C.panel)
-    at(4, 8, "Status:  " .. tostring(acc.status or ""), acc.status == "active" and C.ok or C.err, C.panel)
-    at(4, 9, "Balance: " .. fmtQ(acc.balance or 0), C.money, C.panel)
-    at(4,10, "Name:    " .. short(tostring(acc.display_name or ""), W-14), C.dim, C.panel)
-
-    local bw = math.floor((W-8)/2)
-    local b_grant = btn(4, H-5, bw, "Grant Funds", C.btn, C.btn_fg)
-    local b_back  = btn(6+bw, H-5, bw, "Back", C.btn2, C.btn2_fg)
-    bottomBar()
-
-    local ev, _, x, y = os.pullEvent()
-    if ev == "mouse_click" then
-      if hit(b_grant, x, y) then return actionGrantFunds(acc.account_id) end
-      if hit(b_back, x, y) then return backScreen or "dashboard" end
-    elseif ev == "key" then
-      return backScreen or "dashboard"
-    elseif ev == "terminate" then
-      error("Terminated", 0)
-    end
-  end
-end
-
-local function citizenDetail(cit)
-  while true do
-    cls()
-    topBar()
-    centre(3, "CITIZEN CONTROL", C.accent, C.bg)
-    panel(2, 5, W-2, 9, "Citizen")
-    at(4, 6, "ID:      " .. tostring(cit.citizen_id or ""), C.body, C.panel)
-    at(4, 7, "Username:" .. tostring(cit.username or ""), C.body, C.panel)
-    at(4, 8, "Title:   " .. tostring(cit.title or ""), C.dim, C.panel)
-    at(4, 9, "Status:  " .. tostring(cit.status or ""), cit.status == "active" and C.ok or C.err, C.panel)
-    at(4,10, "Balance: " .. fmtQ(cit.balance or 0), C.money, C.panel)
-
-    local bw = math.floor((W-10)/3)
-    local b_grant = btn(3, H-5, bw, "Grant", C.btn, C.btn_fg)
-    local actionLabel = cit.status == "active" and "Suspend" or "Unsuspend"
-    local b_susp  = btn(5+bw, H-5, bw, actionLabel, cit.status == "active" and C.danger or C.btn, cit.status == "active" and C.body or C.btn_fg)
-    local b_back  = btn(7+bw*2, H-5, bw, "Back", C.btn2, C.btn2_fg)
-    bottomBar()
-
-    local ev, _, x, y = os.pullEvent()
-    if ev == "mouse_click" then
-      if hit(b_grant, x, y) then
-        return actionGrantFunds(cit.citizen_id)
-      elseif hit(b_susp, x, y) then
-        local typeName = cit.status == "active" and "suspend_account" or "unsuspend_account"
-        local confirmTitle = cit.status == "active" and "CONFIRM ACCOUNT SUSPENSION" or "CONFIRM ACCOUNT REINSTATEMENT"
-        local okConfirm = confirmScreen(confirmTitle, {"Citizen: " .. tostring(cit.citizen_id), "Status change: " .. actionLabel}, cit.status == "active")
-        if okConfirm then
-          local ok, res = dbRequest({ type=typeName, citizen_id=cit.citizen_id })
-          if ok then
-            messageScreen("Account Updated", {type(res)=="table" and tostring(res.message or "Done") or "Done"}, C.ok)
-          else
-            messageScreen("Update Failed", {tostring(res or "Unknown error")}, C.err)
-          end
-          return "citizens"
-        end
-      elseif hit(b_back, x, y) then
-        return "citizens"
-      end
-    elseif ev == "key" then
-      return "citizens"
-    elseif ev == "terminate" then
-      error("Terminated", 0)
-    end
-  end
-end
-
-local function companyDetail(acc)
-  cls()
-  topBar()
-  centre(3, "Loading company...", C.dim, C.bg)
-  local ok, res = dbRequest({ type="company_info", company_id=acc.account_id })
-  local company = ok and type(res)=="table" and res or nil
-
-  while true do
-    cls()
-    topBar()
-    centre(3, "COMPANY CONTROL", C.accent, C.bg)
-    panel(2, 5, W-2, 10, "Company")
-    at(4, 6, "ID:      " .. tostring(acc.account_id or ""), C.body, C.panel)
-    at(4, 7, "Name:    " .. short(tostring(company and company.name or acc.display_name or ""), W-14), C.body, C.panel)
-    at(4, 8, "Ticker:  " .. tostring(company and company.ticker or ""), C.dim, C.panel)
-    at(4, 9, "Type:    " .. tostring(company and company.biz_type or acc.type or ""), C.dim, C.panel)
-    at(4,10, "Owner:   " .. short(tostring(company and company.owner_id or ""), W-14), C.dim, C.panel)
-    at(4,11, "Cash:    " .. fmtQ(company and company.cash_balance or acc.balance or 0), C.money, C.panel)
-    at(4,12, "Shares:  " .. tostring(company and company.shares_total or "?"), C.body, C.panel)
-
-    local bw = math.floor((W-8)/2)
-    local b_grant = btn(4, H-5, bw, "Grant Funds", C.btn, C.btn_fg)
-    local b_back  = btn(6+bw, H-5, bw, "Back", C.btn2, C.btn2_fg)
-    bottomBar(ok and "Company loaded." or tostring(res or "Company info unavailable"), ok and C.dim or C.err)
-
-    local ev, _, x, y = os.pullEvent()
-    if ev == "mouse_click" then
-      if hit(b_grant, x, y) then return actionGrantFunds(acc.account_id) end
-      if hit(b_back, x, y) then return "companies" end
-    elseif ev == "key" then
-      return "companies"
-    elseif ev == "terminate" then
-      error("Terminated", 0)
-    end
-  end
-end
-
-local function pagedList(title, rows, columns, onSelect, backScreen)
-  local page = 1
-  local rowsPerPage = math.max(4, H - 9)
-  local maxPage = math.max(1, math.ceil(#rows / rowsPerPage))
-
-  while true do
-    page = clamp(page, 1, maxPage)
-    cls()
-    topBar()
-    centre(3, title, C.accent, C.bg)
-
-    local y = 5
-    fill(1, y, W, 1, C.panel)
-    for _, col in ipairs(columns) do
-      at(col.x, y, col.label, C.accent, C.panel)
-    end
-
-    local hitRows = {}
-    local start = (page-1) * rowsPerPage + 1
-    for i = 0, rowsPerPage-1 do
-      local row = rows[start+i]
-      local yy = y + 1 + i
-      if row and yy <= H-4 then
-        local bg = (i % 2 == 0) and C.row_a or C.row_b
-        fill(1, yy, W, 1, bg)
-        for _, col in ipairs(columns) do
-          local val = col.get(row)
-          local fg = col.colour and col.colour(row) or C.body
-          at(col.x, yy, short(val, col.w or 12), fg, bg)
-        end
-        hitRows[#hitRows+1] = { x1=1, x2=W, y1=yy, y2=yy, row=row }
-      end
-    end
-
-    local b_prev = btn(2, H-2, 10, "Prev", C.btn2, C.btn2_fg)
-    local b_next = btn(14, H-2, 10, "Next", C.btn2, C.btn2_fg)
-    local b_back = btn(W-12, H-2, 10, "Back", C.btn, C.btn_fg)
-    centre(H-2, "Page " .. page .. "/" .. maxPage, C.dim, C.bg)
-    bottomBar("Click a row to manage it.")
-
-    local ev, _, x, yy = os.pullEvent()
-    if ev == "mouse_click" then
-      if hit(b_prev, x, yy) then page = page - 1
-      elseif hit(b_next, x, yy) then page = page + 1
-      elseif hit(b_back, x, yy) then return backScreen or "dashboard"
-      else
-        for _, hr in ipairs(hitRows) do
-          if hit(hr, x, yy) then
-            return onSelect(hr.row)
-          end
-        end
-      end
-    elseif ev == "key" then
-      return backScreen or "dashboard"
-    elseif ev == "terminate" then
-      error("Terminated", 0)
-    end
+    setMessage("Burn failed: " .. tostring(res), colors.red)
   end
 end
 
 local function screenAccounts()
-  cls(); topBar(); centre(math.floor(H/2), "Loading accounts...", C.dim, C.bg)
-  local ok, res = dbRequest({ type="list_accounts" })
-  if not ok or type(res) ~= "table" then
-    messageScreen("Accounts Unavailable", {tostring(res or "Unknown error")}, C.err)
-    return "dashboard"
-  end
-  local rows = res.accounts or {}
-  return pagedList("ALL ACCOUNTS", rows, {
-    {x=2,  label="Account", w=24, get=function(r) return r.account_id end},
-    {x=28, label="Type",    w=10, get=function(r) return r.type end},
-    {x=39, label="Status",  w=8,  get=function(r) return r.status end, colour=function(r) return r.status=="active" and C.ok or C.err end},
-    {x=48, label="Balance", w=12, get=function(r) return fmtQ(r.balance) end, colour=function() return C.money end},
-  }, function(row) return accountDetail(row, "accounts") end, "dashboard")
-end
+  clear(colors.black)
+  center(1, "STATE ACCOUNTS", colors.yellow, colors.black)
+  writeAt(2, 3, "Loading accounts...", colors.lightGray, colors.black)
 
-local function screenCitizens()
-  cls(); topBar(); centre(math.floor(H/2), "Loading citizens...", C.dim, C.bg)
-  local ok, res = dbRequest({ type="list_citizens" })
-  if not ok or type(res) ~= "table" then
-    messageScreen("Citizens Unavailable", {tostring(res or "Unknown error")}, C.err)
-    return "dashboard"
+  local ok, accounts = requestAccounts()
+  if not ok then
+    clear(colors.black)
+    center(3, "Could not load accounts.", colors.red, colors.black)
+    writeAt(2, 5, tostring(accounts), colors.lightGray, colors.black)
+    pauseClick()
+    return
   end
-  local rows = res.citizens or {}
-  return pagedList("CITIZENS", rows, {
-    {x=2,  label="Citizen", w=24, get=function(r) return r.citizen_id end},
-    {x=28, label="User",    w=10, get=function(r) return r.username end},
-    {x=39, label="Status",  w=8,  get=function(r) return r.status end, colour=function(r) return r.status=="active" and C.ok or C.err end},
-    {x=48, label="Balance", w=12, get=function(r) return fmtQ(r.balance) end, colour=function() return C.money end},
-  }, function(row) return citizenDetail(row) end, "dashboard")
-end
 
-local function screenCompanies()
-  cls(); topBar(); centre(math.floor(H/2), "Loading companies...", C.dim, C.bg)
-  local ok, res = dbRequest({ type="list_accounts" })
-  if not ok or type(res) ~= "table" then
-    messageScreen("Companies Unavailable", {tostring(res or "Unknown error")}, C.err)
-    return "dashboard"
-  end
-  local rows = {}
-  for _, acc in ipairs(res.accounts or {}) do
-    if acc.type == "company" then rows[#rows+1] = acc end
-  end
-  return pagedList("COMPANIES", rows, {
-    {x=2,  label="Company", w=24, get=function(r) return r.account_id end},
-    {x=28, label="Name",    w=18, get=function(r) return r.display_name end},
-    {x=48, label="Balance", w=12, get=function(r) return fmtQ(r.balance) end, colour=function() return C.money end},
-  }, function(row) return companyDetail(row) end, "dashboard")
-end
+  local page = 1
+  local perPage = select(2, size()) - 6
+  if perPage < 5 then perPage = 5 end
 
-local function screenTools()
   while true do
-    cls()
-    topBar()
-    centre(3, "STATE FINANCE TOOLS", C.accent, C.bg)
-    panel(2, 5, W-2, H-7, "Tools")
+    clear(colors.black)
+    local w, h = size()
+    center(1, "STATE ACCOUNTS", colors.yellow, colors.black)
 
-    local bw = math.floor((W-8)/2)
-    local b_citizen = btn(4, 7,  bw, "Register Citizen", C.btn, C.btn_fg)
-    local b_company = btn(6+bw, 7, bw, "Register Company", C.btn, C.btn_fg)
-    local b_price   = btn(4, 9,  bw, "Set State Price", C.btn2, C.btn2_fg)
-    local b_back    = btn(6+bw, 9, bw, "Back", C.btn2, C.btn2_fg)
+    table.sort(accounts, function(a, b)
+      return tostring(a.account_id or "") < tostring(b.account_id or "")
+    end)
 
-    at(4, 12, "These tools change national finance records.", C.dim, C.panel)
-    at(4, 13, "Use citizen/company screens for account controls.", C.dim, C.panel)
-    bottomBar()
+    local totalPages = math.max(1, math.ceil(#accounts / perPage))
+    if page > totalPages then page = totalPages end
 
-    local ev, _, x, y = os.pullEvent()
-    if ev == "mouse_click" then
-      if hit(b_citizen, x, y) then return actionRegisterCitizen() end
-      if hit(b_company, x, y) then return actionRegisterCompany() end
-      if hit(b_price,   x, y) then return actionSetPrice() end
-      if hit(b_back,    x, y) then return "dashboard" end
-    elseif ev == "key" then
-      return "dashboard"
-    elseif ev == "terminate" then
-      error("Terminated", 0)
+    writeAt(2, 3, "Account", colors.cyan, colors.black)
+    writeAt(math.floor(w * 0.58), 3, "Balance", colors.cyan, colors.black)
+
+    local start = ((page - 1) * perPage) + 1
+    local y = 4
+    for i = start, math.min(#accounts, start + perPage - 1) do
+      local acc = accounts[i]
+      writeAt(2, y, tostring(acc.account_id or "?"), colors.white, colors.black)
+      writeAt(math.floor(w * 0.58), y, money(acc.balance or 0), colors.lime, colors.black)
+      y = y + 1
+    end
+
+    writeAt(2, h - 1, "Page " .. page .. "/" .. totalPages .. "  [N]ext [P]rev [B]ack", colors.lightGray, colors.black)
+
+    local ev, key = os.pullEvent("key")
+    if key == keys.b or key == keys.backspace or key == keys.enter then
+      return
+    elseif key == keys.n or key == keys.right then
+      page = math.min(totalPages, page + 1)
+    elseif key == keys.p or key == keys.left then
+      page = math.max(1, page - 1)
     end
   end
 end
 
 -- =============================================================================
--- DASHBOARD
+-- MAIN UI
 -- =============================================================================
-local function drawDashboard(status)
-  cls()
-  topBar()
+local function drawMain()
+  clear(colors.black)
+  local w, h = size()
 
-  status = status or lastStatus or {}
-  local supply = status.supply or {}
+  fill(1, 1, w, 1, colors.gray)
+  writeAt(2, 1, "FISCAL CONTROLS", colors.yellow, colors.gray)
+  writeAt(w - #VERSION - 1, 1, VERSION, colors.white, colors.gray)
 
-  at(2, 3, "State Treasury", C.accent, C.bg)
-  at(W-20, 3, "Computer " .. tostring(os.getComputerID()), C.dim, C.bg)
+  local s = last_status or {}
+  local supply = s.supply or {}
 
-  panel(2, 5, W-2, 5, "Core Reserves")
-  local col2 = math.floor(W/2) + 1
-  labelValue(4,    6, "Treasury Balance", fmtQ(supply.treasury_balance or 0), C.money)
-  labelValue(col2, 6, "In Circulation",   fmtQ(supply.in_circulation or 0), C.money)
-  labelValue(4,    8, "Total Minted",     fmtQ(supply.total_minted or 0), C.ok)
-  labelValue(col2, 8, "Total Burned",     fmtQ(supply.total_burned or 0), C.err)
+  writeAt(2, 3, "Server:   " .. tostring(db_id or "?"), colors.lightGray, colors.black)
+  writeAt(2, 4, "Modem:    " .. tostring(modem_name or "?"), colors.lightGray, colors.black)
+  writeAt(2, 5, "Economy:  " .. tostring(s.economy_status or "?"), colors.white, colors.black)
 
-  panel(2, 11, W-2, 4, "Economy Counts")
-  at(4, 12, "Accounts:  " .. tostring(status.account_count or 0), C.body, C.panel)
-  at(22,12, "Citizens:  " .. tostring(status.citizen_count or 0), C.body, C.panel)
-  at(40,12, "Companies: " .. tostring(status.company_count or 0), C.body, C.panel)
-  at(4, 13, "TX:        " .. tostring(status.tx_count or 0), C.dim, C.panel)
-  at(22,13, "Audits:    " .. tostring(status.audit_count or 0), C.dim, C.panel)
-  at(40,13, "Server:    " .. tostring(status.computer_id or db_id), C.dim, C.panel)
+  writeAt(2, 7, "Treasury:       " .. money(supply.treasury_balance or 0), colors.lime, colors.black)
+  writeAt(2, 8, "In circulation: " .. money(supply.in_circulation or 0), colors.white, colors.black)
+  writeAt(2, 9, "Total minted:   " .. money(supply.total_minted or 0), colors.white, colors.black)
+  writeAt(2,10, "Total burned:   " .. money(supply.total_burned or 0), colors.white, colors.black)
 
-  local bw = math.floor((W-8)/2)
-  local y0 = 16
+  writeAt(2,12, "Accounts: " .. tostring(s.account_count or "?")
+      .. "   Citizens: " .. tostring(s.citizen_count or "?")
+      .. "   Companies: " .. tostring(s.company_count or "?"), colors.lightGray, colors.black)
+
+  local bw = math.floor((w - 6) / 2)
   local buttons = {}
-  buttons.print    = btn(4,      y0,   bw, "Print Money", C.danger, C.body)
-  buttons.grant    = btn(6+bw,   y0,   bw, "Grant Funds", C.btn, C.btn_fg)
+  buttons.refresh = button(2, 14, bw, "Refresh", colors.gray)
+  buttons.print   = button(4 + bw, 14, bw, "Print Money", colors.green, colors.black)
+  buttons.grant   = button(2, 16, bw, "Grant Funds", colors.blue)
+  buttons.burn    = button(4 + bw, 16, bw, "Burn Money", colors.red)
+  buttons.accounts= button(2, 18, bw, "Accounts", colors.gray)
+  buttons.recon   = button(4 + bw, 18, bw, "Reconnect", colors.gray)
 
-  if H >= 21 then
-    buttons.burn     = btn(4,      y0+2, bw, "Burn Money", C.danger, C.body)
-    buttons.accounts = btn(6+bw,   y0+2, bw, "Accounts", C.btn2, C.btn2_fg)
-    buttons.citizens = btn(4,      y0+4, bw, "Citizens", C.btn2, C.btn2_fg)
-    buttons.companies= btn(6+bw,   y0+4, bw, "Companies", C.btn2, C.btn2_fg)
-    buttons.tools    = btn(4,      y0+6, bw, "Tools", C.btn2, C.btn2_fg)
-    buttons.refresh  = btn(6+bw,   y0+6, bw, "Refresh", C.btn2, C.btn2_fg)
-    buttons.exit     = btn(4,      y0+8, bw, "Exit", C.btn2, C.btn2_fg)
-  else
-    -- Compact 51x19 terminal layout
-    buttons.burn     = btn(4,      17, bw, "Burn Money", C.danger, C.body)
-    buttons.menu     = btn(6+bw,   17, bw, "More", C.btn2, C.btn2_fg)
+  if h >= 20 then
+    writeAt(2, h, last_message, last_message_colour, colors.black)
+    writeAt(w - 22, h, "[Q] Quit", colors.lightGray, colors.black)
   end
 
-  bottomBar("Live refresh every " .. tostring(REFRESH_SECS) .. "s | " .. statusText())
   return buttons
 end
 
-local function screenCompactMore()
-  while true do
-    cls()
-    topBar()
-    centre(3, "TREASURY CONTROL MENU", C.accent, C.bg)
-    local bw = math.floor((W-8)/2)
-    local buttons = {}
-    buttons.accounts = btn(4,      6,  bw, "Accounts", C.btn2, C.btn2_fg)
-    buttons.citizens = btn(6+bw,   6,  bw, "Citizens", C.btn2, C.btn2_fg)
-    buttons.companies= btn(4,      8,  bw, "Companies", C.btn2, C.btn2_fg)
-    buttons.tools    = btn(6+bw,   8,  bw, "Tools", C.btn2, C.btn2_fg)
-    buttons.refresh  = btn(4,      10, bw, "Refresh", C.btn2, C.btn2_fg)
-    buttons.exit     = btn(6+bw,   10, bw, "Exit", C.danger, C.body)
-    buttons.back     = btn(4,      13, W-6, "Back to Dashboard", C.btn, C.btn_fg)
-    bottomBar()
-
-    local ev, _, x, y = os.pullEvent()
-    if ev == "mouse_click" then
-      if hit(buttons.accounts, x, y) then return "accounts" end
-      if hit(buttons.citizens, x, y) then return "citizens" end
-      if hit(buttons.companies,x, y) then return "companies" end
-      if hit(buttons.tools,    x, y) then return "tools" end
-      if hit(buttons.refresh,  x, y) then return "dashboard" end
-      if hit(buttons.exit,     x, y) then return "exit" end
-      if hit(buttons.back,     x, y) then return "dashboard" end
-    elseif ev == "key" then
-      return "dashboard"
-    elseif ev == "terminate" then
-      error("Terminated", 0)
-    end
-  end
-end
-
-local function screenDashboard()
+local function mainLoop()
   refreshStatus()
-  local buttons = drawDashboard(lastStatus)
-  local timer = os.startTimer(REFRESH_SECS)
+  local buttons = drawMain()
 
   while true do
     local ev, p1, p2, p3 = os.pullEvent()
-    if ev == "timer" and p1 == timer then
-      refreshStatus()
-      buttons = drawDashboard(lastStatus)
-      timer = os.startTimer(REFRESH_SECS)
-    elseif ev == "mouse_click" then
-      local x, y = p2, p3
-      if hit(buttons.print, x, y) then return "print" end
-      if hit(buttons.grant, x, y) then return "grant" end
-      if hit(buttons.burn,  x, y) then return "burn" end
-      if buttons.accounts and hit(buttons.accounts, x, y) then return "accounts" end
-      if buttons.citizens and hit(buttons.citizens, x, y) then return "citizens" end
-      if buttons.companies and hit(buttons.companies, x, y) then return "companies" end
-      if buttons.tools and hit(buttons.tools, x, y) then return "tools" end
-      if buttons.refresh and hit(buttons.refresh, x, y) then return "dashboard" end
-      if buttons.exit and hit(buttons.exit, x, y) then return "exit" end
-      if buttons.menu and hit(buttons.menu, x, y) then return "more" end
+
+    if ev == "mouse_click" then
+      local mx, my = p2, p3
+
+      if hit(buttons.refresh, mx, my) then
+        local ok, res = refreshStatus()
+        if ok then setMessage("Status refreshed.", colors.lime) else setMessage(tostring(res), colors.red) end
+      elseif hit(buttons.print, mx, my) then
+        actionPrintMoney()
+      elseif hit(buttons.grant, mx, my) then
+        actionGrantFunds()
+      elseif hit(buttons.burn, mx, my) then
+        actionBurnMoney()
+      elseif hit(buttons.accounts, mx, my) then
+        screenAccounts()
+      elseif hit(buttons.recon, mx, my) then
+        connectServer()
+        refreshStatus()
+      end
+
+      buttons = drawMain()
+
     elseif ev == "key" then
-      if p1 == keys.r then return "dashboard" end
-      if p1 == keys.q then return "exit" end
-    elseif ev == "terminate" then
-      error("Terminated", 0)
+      if p1 == keys.q then
+        return
+      elseif p1 == keys.r then
+        local ok, res = refreshStatus()
+        if ok then setMessage("Status refreshed.", colors.lime) else setMessage(tostring(res), colors.red) end
+      elseif p1 == keys.p then
+        actionPrintMoney()
+      elseif p1 == keys.g then
+        actionGrantFunds()
+      elseif p1 == keys.b then
+        actionBurnMoney()
+      elseif p1 == keys.a then
+        screenAccounts()
+      end
+
+      buttons = drawMain()
     end
   end
 end
 
 -- =============================================================================
--- MAIN
+-- ENTRY
 -- =============================================================================
 local function main()
-  cls()
-  topBar()
-  centre(math.floor(H/2)-1, "Booting treasury controller...", C.dim, C.bg)
-
-  if os.getComputerLabel() ~= "QuidTreasury" then
-    os.setComputerLabel("QuidTreasury")
-  end
-
   if not openModem() then
-    cls()
-    topBar()
-    centre(math.floor(H/2)-1, "ERROR: No modem found.", C.err, C.bg)
-    centre(math.floor(H/2)+1, "Attach an Ender Modem and reboot.", C.body, C.bg)
+    clear(colors.black)
+    print("ERROR: No modem found.")
+    print("Attach an Ender Modem and reboot.")
     return
   end
 
-  while not discoverServer() do
-    cls()
-    topBar()
-    centre(math.floor(H/2)-1, "Connection Failed", C.err, C.bg)
-    centre(math.floor(H/2)+1, "Could not reach the bank server.", C.body, C.bg)
-    centre(math.floor(H/2)+2, "Retrying in 5 seconds...", C.dim, C.bg)
-    sleep(5)
+  while not connectServer() do
+    sleep(2)
   end
 
-  if not requireAuthority() then
-    cls()
-    topBar()
-    centre(math.floor(H/2), "Treasury terminal closed.", C.dim, C.bg)
-    return
+  local ok, res = refreshStatus()
+  if not ok then
+    clear(colors.black)
+    center(3, "Fiscal Controls connected,", colors.yellow, colors.black)
+    center(4, "but the server rejected status.", colors.yellow, colors.black)
+    writeAt(2, 7, tostring(res), colors.red, colors.black)
+    writeAt(2, 9, "The controller will still open.", colors.lightGray, colors.black)
+    writeAt(2,10, "Actions will show server errors if refused.", colors.lightGray, colors.black)
+    sleep(3)
   end
 
-  local screen = "dashboard"
-  while true do
-    if screen == "dashboard" then screen = screenDashboard() end
-    if screen == "print"     then screen = actionPrintMoney() end
-    if screen == "grant"     then screen = actionGrantFunds() end
-    if screen == "burn"      then screen = actionBurnMoney() end
-    if screen == "accounts"  then screen = screenAccounts() end
-    if screen == "citizens"  then screen = screenCitizens() end
-    if screen == "companies" then screen = screenCompanies() end
-    if screen == "tools"     then screen = screenTools() end
-    if screen == "more"      then screen = screenCompactMore() end
-    if screen == "exit"      then break end
-  end
+  mainLoop()
 
-  cls()
-  print("Treasury control terminal closed.")
+  clear(colors.black)
+  print("Fiscal Controls closed.")
 end
 
 main()
