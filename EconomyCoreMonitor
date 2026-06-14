@@ -15,7 +15,7 @@
 -- Read-only. No banking controls. No trade panel. No CPI/policy clutter.
 -- =============================================================================
 
-local VERSION         = "0.4.1-WEALTH"
+local VERSION         = "0.4.2-COMPANY"
 local PROTOCOL        = "quid_bank"
 local DB_TIMEOUT      = 5
 local REFRESH_SECONDS = 5
@@ -361,31 +361,47 @@ local function inequalityFromAccounts(accounts)
   end
 
   local total = 0
-  local highest = balances[1]
-  local lowest = balances[1]
   for _, v in ipairs(balances) do
     total = total + v
-    if v > highest then highest = v end
-    if v < lowest then lowest = v end
   end
 
   local average = total / #balances
-  local median = calculateMedian(copyList(balances))
-  local top10 = calculateTopShare(copyList(balances), 0.1)
-  local highLowRatio = nil
-  if lowest and lowest > 0 then highLowRatio = highest / lowest end
+  -- This is account-balance inequality, not income inequality.
+  -- With small Minecraft populations, top 1% effectively means the richest citizen account.
+  local top1 = calculateTopShare(copyList(balances), 0.01)
 
   return {
-    top10_share = top10,
-    median_balance = median,
+    top1_share = top1,
     average_balance = average,
-    highest_balance = highest,
-    lowest_balance = lowest,
-    high_low_ratio = highLowRatio,
     total_balance = total,
     observations = #balances,
-    status = "Live account-balance distribution",
+    status = "Live citizen balance distribution",
   }
+end
+
+local function topCompaniesFromAccounts(accounts)
+  local companies = {}
+  if type(accounts) ~= "table" then return companies end
+
+  for _, acc in ipairs(accounts) do
+    if type(acc) == "table" and acc.type == "company" and acc.status ~= "suspended" then
+      companies[#companies + 1] = {
+        id = tostring(acc.account_id or acc.display_name or "company"),
+        name = tostring(acc.display_name or acc.account_id or "company"),
+        balance = tonumber(acc.balance) or 0,
+      }
+    end
+  end
+
+  table.sort(companies, function(a, b)
+    return (tonumber(a.balance) or 0) > (tonumber(b.balance) or 0)
+  end)
+
+  local out = {}
+  for i = 1, math.min(10, #companies) do
+    out[#out + 1] = companies[i]
+  end
+  return out
 end
 
 local function trimTxSamples()
@@ -448,15 +464,11 @@ local function normaliseNationalStats(raw)
     output_status = outputRaw.status or (gdp and "Live" or "Awaiting GDP output data"),
     inflation_status = pricesRaw.status or (pricesRaw.inflation and "Live" or "Awaiting inflation data"),
     inequality = {
-      top10_share = num(inequalityRaw.top10_share),
-      median_balance = num(inequalityRaw.median_balance or inequalityRaw.median),
+      top1_share = num(inequalityRaw.top1_share or inequalityRaw.top_1_share),
       average_balance = num(inequalityRaw.average_balance or inequalityRaw.mean),
-      highest_balance = num(inequalityRaw.highest_balance or inequalityRaw.max_balance),
-      lowest_balance = num(inequalityRaw.lowest_balance or inequalityRaw.min_balance),
-      high_low_ratio = num(inequalityRaw.high_low_ratio or inequalityRaw.max_min_ratio),
       total_balance = num(inequalityRaw.total_balance),
       observations = num(inequalityRaw.observations),
-      status = inequalityRaw.status or "Awaiting account-balance distribution",
+      status = inequalityRaw.status or "Awaiting citizen balance distribution",
     },
     monetary = {
       issued_supply = issued,
@@ -472,6 +484,7 @@ local function normaliseNationalStats(raw)
       transactions_total = totalTx,
       transactions_per_day = txDay,
       tx_day_status = txStatus,
+      top_companies = scaleRaw.top_companies or scaleRaw.company_top10 or raw.top_companies or {},
       source = raw.source or "national_statistics",
     },
   }
@@ -521,6 +534,7 @@ local function fallbackSnapshot()
       transactions_total = num(status.tx_count),
       transactions_per_day = txDay,
       tx_day_status = txStatus,
+      top_companies = topCompaniesFromAccounts(accounts),
       source = "current_server",
     },
   }
@@ -656,25 +670,19 @@ local function drawInequalityCard(x, y, w, h, snap)
   local q = snap and snap.inequality or {}
   card(x, y, w, h, "INEQUALITY", C.inequality)
 
-  metric(x + 2, y + 2, "Top 10% share", q.top10_share and fmtPct(q.top10_share, 1) or "Awaiting data", q.top10_share and colors.white or C.warn)
-  metric(x + 2, y + 3, "Median balance", fmtMoney(q.median_balance), q.median_balance and colors.white or C.warn)
-  metric(x + 2, y + 4, "Average balance", fmtMoney(q.average_balance), q.average_balance and colors.white or C.warn)
-  metric(x + 2, y + 5, "Highest balance", fmtMoney(q.highest_balance), q.highest_balance and colors.white or C.warn)
-  metric(x + 2, y + 6, "Lowest balance", fmtMoney(q.lowest_balance), q.lowest_balance and colors.white or C.warn)
-
-  local ratioText = "Awaiting data"
-  if q.high_low_ratio then ratioText = fmtNum(q.high_low_ratio, 2) .. "x" end
-  metric(x + 2, y + 7, "High / low", ratioText, q.high_low_ratio and colors.white or C.warn)
-  metric(x + 2, y + 8, "Accounts", tostring(q.observations or "Awaiting data"), q.observations and colors.white or C.warn)
+  metric(x + 2, y + 2, "Top 1% share", q.top1_share and fmtPct(q.top1_share, 1) or "Awaiting data", q.top1_share and colors.white or C.warn)
+  metric(x + 2, y + 3, "Average balance", fmtMoney(q.average_balance), q.average_balance and colors.white or C.warn)
+  metric(x + 2, y + 4, "Citizen wealth", fmtMoney(q.total_balance), q.total_balance and colors.white or C.warn)
+  metric(x + 2, y + 5, "Accounts", tostring(q.observations or "Awaiting data"), q.observations and colors.white or C.warn)
 
   local barW = math.max(10, w - 6)
   local filled = 0
-  if q.top10_share then filled = math.floor(clamp(q.top10_share / 100, 0, 1) * barW) end
-  local barY = math.min(y + 10, y + h - 3)
+  if q.top1_share then filled = math.floor(clamp(q.top1_share / 100, 0, 1) * barW) end
+  local barY = math.min(y + 7, y + h - 3)
   fill(x + 2, barY, barW, 1, colors.gray)
   if filled > 0 then fill(x + 2, barY, filled, 1, C.inequality) end
   if barY + 1 <= y + h - 2 then
-    writeAt(x + 2, barY + 1, "Top 10% of account balances", C.dim, C.bg)
+    writeAt(x + 2, barY + 1, "Top 1% share of citizen balances", C.dim, C.bg)
   end
 
   writeAt(x + 2, y + h - 1, shortText(q.status or "Awaiting account aggregation", w - 4), q.status and q.status:find("Live") and C.good or C.warn, C.bg)
@@ -686,8 +694,7 @@ local function drawMonetaryCard(x, y, w, h, snap)
   metric(x + 2, y + 2, "Issued supply", fmtMoney(m.issued_supply), m.issued_supply and C.good or C.warn)
   metric(x + 2, y + 3, "Private supply", fmtMoney(m.private_supply), m.private_supply and colors.white or C.warn)
   metric(x + 2, y + 4, "Treasury reserve", fmtMoney(m.treasury_reserve), m.treasury_reserve and colors.white or C.warn)
-  metric(x + 2, y + 5, "Reserve share", fmtPct(m.reserve_share, 2), m.reserve_share and colors.white or C.warn)
-  metric(x + 2, y + 6, "Supply growth", fmtPct(m.supply_growth, 2), m.supply_growth and colors.white or C.warn)
+  metric(x + 2, y + 5, "Treasury Control", fmtPct(m.reserve_share, 2), m.reserve_share and colors.white or C.warn)
   writeAt(x + 2, y + h - 1, shortText(m.status or "Awaiting supply data", w - 4), m.status and C.good or C.warn, C.bg)
 end
 
@@ -697,6 +704,23 @@ local function drawScaleCard(x, y, w, h, snap)
   metric(x + 2, y + 2, "Population", tostring(s.population or "Awaiting data"), s.population and colors.white or C.warn)
   metric(x + 2, y + 3, "Companies", tostring(s.companies or "Awaiting data"), s.companies and colors.white or C.warn)
   metric(x + 2, y + 4, "Transactions / day", s.transactions_per_day and (fmtNum(s.transactions_per_day, 1) .. " / day") or "Collecting baseline", s.transactions_per_day and colors.white or C.warn)
+
+  writeAt(x + 2, y + 6, "Top companies", colors.white, C.bg)
+  local top = s.top_companies or {}
+  if type(top) ~= "table" or #top == 0 then
+    writeAt(x + 2, y + 7, "No company account data", C.warn, C.bg)
+  else
+    local maxRows = math.min(10, #top, math.max(1, h - 9))
+    for i = 1, maxRows do
+      local company = top[i] or {}
+      local name = shortText(company.name or company.id or ("Company " .. i), math.max(8, w - 18))
+      local bal = fmtMoney(company.balance)
+      local line = tostring(i) .. ". " .. name
+      writeAt(x + 2, y + 6 + i, shortText(line, w - 18), C.text, C.bg)
+      writeAt(x + w - #bal - 2, y + 6 + i, bal, colors.white, C.bg)
+    end
+  end
+
   writeAt(x + 2, y + h - 1, shortText(s.tx_day_status or "Awaiting tx counter", w - 4), C.dim, C.bg)
 end
 
@@ -717,7 +741,7 @@ local function drawFooter()
   local w, h = getSize()
   fill(1, h - 1, w, 2, C.bg)
   writeAt(1, h - 1, string.rep("-", w), C.dim, C.bg)
-  local text = "Refresh: " .. REFRESH_SECONDS .. "s   CORE WEALTH ONLY   Monitor: " .. (monitor and "attached" or "terminal") .. "   [Q] Quit"
+  local text = "Refresh: " .. REFRESH_SECONDS .. "s   CORE COMPANY BUILD   Monitor: " .. (monitor and "attached" or "terminal") .. "   [Q] Quit"
   writeAt(2, h, text, C.dim, C.bg)
   if last_error ~= "" then writeAt(math.max(2, w - #last_error - 2), h, last_error, C.bad, C.bg) end
 end
