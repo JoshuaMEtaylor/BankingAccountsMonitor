@@ -3,14 +3,17 @@
 -- QUID COMPANY TERMINAL
 -- CompanyTerminal
 --
--- Clean, compact company registration terminal.
+-- Company registration terminal tied to citizen banking login.
 --
--- Purpose:
---   * Register player-made companies with the Quid Bank server
---   * Look up existing company info
+-- Flow:
+--   1. Connect to ServerSideAccounts
+--   2. Citizen logs in with normal bank username/password
+--   3. Company registration uses that citizen_id as owner_id automatically
 --
--- ServerSideAccounts already handles register_company and company_info.
--- This client is just the terminal interface.
+-- ServerSideAccounts already provides:
+--   * login
+--   * register_company
+--   * company_info
 -- =============================================================================
 
 local args = {...}
@@ -49,7 +52,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION    = "1.0.2"
+local VERSION    = "1.1.0"
 local PROTOCOL   = "quid_bank"
 local DB_TIMEOUT = 5
 
@@ -92,13 +95,24 @@ local modem_name = nil
 local last_message = ""
 local last_message_colour = C.dim
 
+local session = {
+  logged_in = false,
+  username = nil,
+  citizen_id = nil,
+  title = nil,
+}
+
+local login = {
+  username = "",
+  password = "",
+}
+
 local mode = "register"
 local focused = 1
 
 local reg = {
   name  = "",
   ticker = "",
-  owner = "",
 }
 
 local lookup = {
@@ -128,13 +142,6 @@ local function companyIdFromTicker(ticker)
   ticker = cleanTicker(ticker)
   if ticker == "" then return "" end
   return "company:" .. string.lower(ticker)
-end
-
-local function normaliseOwner(s)
-  s = trim(s)
-  if s == "" then return "" end
-  if s:find(":") then return s end
-  return "citizen:" .. string.lower(s):gsub("%s+", "_")
 end
 
 local function money(n)
@@ -214,14 +221,17 @@ local function topBar()
   at(W - #VERSION, 1, VERSION, C.dim, C.header)
 end
 
-local function statusBar()
+local function statusBar(show_quit)
   fill(1, H, W, 1, C.bg)
   if last_message ~= "" then
-    at(2, H, last_message:sub(1, W - 12), last_message_colour, C.bg)
+    local reserve = show_quit and 12 or 2
+    at(2, H, last_message:sub(1, W - reserve), last_message_colour, C.bg)
   end
 
-  local q = "[Q] Quit"
-  at(W - #q, H, q, C.dim, C.bg)
+  if show_quit then
+    local q = "[Q] Quit"
+    at(W - #q, H, q, C.dim, C.bg)
+  end
 end
 
 local function card(x, y, w, h)
@@ -243,20 +253,31 @@ local function hit(b, mx, my)
   return b and mx >= b.x1 and mx <= b.x2 and my >= b.y1 and my <= b.y2
 end
 
-local function inputField(x, y, w, value)
+local function inputField(x, y, w, value, masked)
   value = tostring(value or "")
+  local display = masked and string.rep("*", #value) or value
 
   fill(x, y, w, 1, C.input_bg)
-  at(x, y, (value .. string.rep(" ", w)):sub(1, w), C.input_fg, C.input_bg)
+  at(x, y, (display .. string.rep(" ", w)):sub(1, w), C.input_fg, C.input_bg)
 
   return {
     x1 = x,
     x2 = x + w - 1,
     y1 = y,
     y2 = y,
-    cursor_x = x + math.min(#value, w - 1),
+    cursor_x = x + math.min(#display, w - 1),
     cursor_y = y,
   }
+end
+
+local function placeCursor(fields)
+  local active = fields and fields[focused]
+  if active then
+    term.setCursorPos(active.cursor_x, active.cursor_y)
+    term.setCursorBlink(true)
+  else
+    term.setCursorBlink(false)
+  end
 end
 
 local function tabStrip(y)
@@ -373,6 +394,7 @@ local function resultScreen(title, lines, colour)
   end
 
   local b = button(4, H - 2, W - 6, "Continue", C.btn_pri, C.btn_fg)
+  statusBar(false)
   term.setCursorBlink(false)
 
   while true do
@@ -392,12 +414,13 @@ local function confirmRegister(summary)
   at(4, 8, "Ticker:  " .. summary.ticker, C.card_fg, C.card)
   at(4, 9, "Account: " .. summary.company_id, C.card_fg, C.card)
   at(4,10, "Owner:   " .. summary.owner_id, C.card_fg, C.card)
-  at(4,12, "This creates a separate company bank account.", C.label, C.card)
+  at(4,12, "Owner comes from your bank login.", C.label, C.card)
 
   local bw = math.floor((W - 8) / 2)
   local b_yes = button(4, H - 2, bw, "Register", C.btn_pri, C.btn_fg)
   local b_no  = button(5 + bw, H - 2, bw, "Back", C.btn_sec, C.card_fg)
 
+  statusBar(false)
   term.setCursorBlink(false)
 
   while true do
@@ -413,62 +436,164 @@ local function confirmRegister(summary)
 end
 
 -- =============================================================================
--- DRAW MAIN
+-- LOGIN SCREEN
+-- =============================================================================
+local function drawLogin()
+  cls()
+  topBar()
+
+  card(2, 4, W - 2, H - 5)
+  at(4, 5, "Company registration requires a bank login.", C.label, C.card)
+  at(4, 6, "The company owner is tied to your account.", C.label, C.card)
+
+  at(4, 8, "Username", C.card_fg, C.card)
+  local fields = {}
+  fields[1] = inputField(4, 9, W - 6, login.username, false)
+
+  at(4, 11, "Password", C.card_fg, C.card)
+  fields[2] = inputField(4, 12, W - 6, login.password, true)
+
+  local b_login = button(4, 15, W - 6, "Log In", C.btn_pri, C.btn_fg)
+
+  statusBar(false)
+  placeCursor(fields)
+  return fields, b_login
+end
+
+local function doLogin()
+  if trim(login.username) == "" or trim(login.password) == "" then
+    setMessage("Enter username and password.", C.err)
+    return false
+  end
+
+  setMessage("Authenticating...", C.dim)
+  local ok, res = dbRequest({
+    type = "login",
+    username = login.username,
+    password = login.password,
+  })
+
+  if ok and type(res) == "table" then
+    session.logged_in = true
+    session.username = login.username
+    session.citizen_id = res.citizen_id
+    session.title = res.title or "Account Holder"
+    setMessage("Logged in as " .. tostring(session.citizen_id), C.ok)
+    login.password = ""
+    return true
+  end
+
+  setMessage(tostring(res or "Login failed"), C.err)
+  return false
+end
+
+local function screenLogin()
+  focused = 1
+  local fields, b_login = drawLogin()
+
+  while true do
+    local ev, p1, p2, p3 = os.pullEvent()
+
+    if ev == "mouse_click" then
+      local mx, my = p2, p3
+
+      if hit(b_login, mx, my) then
+        if doLogin() then return "main" end
+      else
+        for i, box in ipairs(fields) do
+          if hit(box, mx, my) then
+            focused = i
+            break
+          end
+        end
+      end
+
+      fields, b_login = drawLogin()
+
+    elseif ev == "char" then
+      if focused == 1 and #login.username < 32 then
+        login.username = login.username .. p1
+      elseif focused == 2 and #login.password < 32 then
+        login.password = login.password .. p1
+      end
+      fields, b_login = drawLogin()
+
+    elseif ev == "key" then
+      if p1 == keys.backspace then
+        if focused == 1 then login.username = login.username:sub(1, -2) end
+        if focused == 2 then login.password = login.password:sub(1, -2) end
+      elseif p1 == keys.tab then
+        focused = focused % 2 + 1
+      elseif p1 == keys.enter then
+        if focused == 1 then
+          focused = 2
+        else
+          if doLogin() then return "main" end
+        end
+      end
+
+      fields, b_login = drawLogin()
+    end
+  end
+end
+
+-- =============================================================================
+-- MAIN SCREEN
 -- =============================================================================
 local function drawMain()
   cls()
   topBar()
 
-  local tabs = tabStrip(3)
+  fill(1, 2, W, 2, C.card)
+  at(3, 2, session.username or "", C.card_fg, C.card)
+  at(3, 3, session.title or "Account Holder", C.label, C.card)
+  at(W - #(session.citizen_id or "") - 1, 2, session.citizen_id or "", C.label, C.card)
 
-  local card_y = 5
-  local card_h = H - 6
+  local tabs = tabStrip(4)
+
+  local card_y = 6
+  local card_h = H - 7
   card(2, card_y, W - 2, card_h)
 
   local fields = {}
   local b_primary = nil
   local b_secondary = nil
+  local b_logout = nil
 
   if mode == "register" then
     at(4, card_y + 1, "Register a player-made corporation.", C.label, C.card)
-    at(4, card_y + 2, "It becomes its own bank account.", C.label, C.card)
 
-    at(4, card_y + 4, "Company Name", C.card_fg, C.card)
-    fields[1] = inputField(4, card_y + 5, W - 6, reg.name)
+    at(4, card_y + 3, "Company Name", C.card_fg, C.card)
+    fields[1] = inputField(4, card_y + 4, W - 6, reg.name, false)
 
-    at(4, card_y + 7, "Ticker", C.card_fg, C.card)
-    fields[2] = inputField(4, card_y + 8, W - 6, reg.ticker)
-
-    at(4, card_y + 10, "Owner Username", C.card_fg, C.card)
-    fields[3] = inputField(4, card_y + 11, W - 6, reg.owner)
+    at(4, card_y + 6, "Ticker", C.card_fg, C.card)
+    fields[2] = inputField(4, card_y + 7, W - 6, reg.ticker, false)
 
     local preview = companyIdFromTicker(reg.ticker)
     if preview == "" then preview = "company:<ticker>" end
-    at(4, H - 5, "Account: " .. preview, C.label, C.card)
+    at(4, card_y + 9, "Account: " .. preview, C.label, C.card)
+    at(4, card_y + 10, "Owner:   " .. tostring(session.citizen_id or "?"), C.label, C.card)
 
-    b_secondary = button(4, H - 3, W - 6, "Clear", C.btn_sec, C.card_fg)
+    local bw = math.floor((W - 8) / 2)
+    b_secondary = button(4, H - 3, bw, "Clear", C.btn_sec, C.card_fg)
+    b_logout    = button(5 + bw, H - 3, bw, "Sign Out", C.btn_dan, C.btn_fg)
     b_primary   = button(4, H - 2, W - 6, "Register Company", C.btn_pri, C.btn_fg)
   else
     at(4, card_y + 1, "Look up a registered company.", C.label, C.card)
 
-    at(4, card_y + 4, "Ticker or Company ID", C.card_fg, C.card)
-    fields[1] = inputField(4, card_y + 5, W - 6, lookup.company)
+    at(4, card_y + 3, "Ticker or Company ID", C.card_fg, C.card)
+    fields[1] = inputField(4, card_y + 4, W - 6, lookup.company, false)
 
-    b_secondary = button(4, H - 3, W - 6, "Clear", C.btn_sec, C.card_fg)
+    local bw = math.floor((W - 8) / 2)
+    b_secondary = button(4, H - 3, bw, "Clear", C.btn_sec, C.card_fg)
+    b_logout    = button(5 + bw, H - 3, bw, "Sign Out", C.btn_dan, C.btn_fg)
     b_primary   = button(4, H - 2, W - 6, "Lookup Company", C.btn_pri, C.btn_fg)
   end
 
-  statusBar()
+  statusBar(true)
+  placeCursor(fields)
 
-  local active = fields[focused]
-  if active then
-    term.setCursorPos(active.cursor_x, active.cursor_y)
-    term.setCursorBlink(true)
-  else
-    term.setCursorBlink(false)
-  end
-
-  return tabs, fields, b_primary, b_secondary
+  return tabs, fields, b_primary, b_secondary, b_logout
 end
 
 -- =============================================================================
@@ -477,7 +602,6 @@ end
 local function clearRegister()
   reg.name = ""
   reg.ticker = ""
-  reg.owner = ""
   focused = 1
 end
 
@@ -489,12 +613,15 @@ end
 local function doRegister()
   local name = trim(reg.name)
   local ticker = cleanTicker(reg.ticker)
-  local owner_id = normaliseOwner(reg.owner)
+  local owner_id = session.citizen_id
   local company_id = companyIdFromTicker(ticker)
 
+  if not session.logged_in or not owner_id then
+    setMessage("You must be logged in.", C.err)
+    return
+  end
   if name == "" then setMessage("Missing company name.", C.err); return end
   if ticker == "" then setMessage("Invalid ticker.", C.err); return end
-  if owner_id == "" then setMessage("Missing owner username.", C.err); return end
 
   local summary = {
     name = name,
@@ -575,7 +702,7 @@ local function doLookup()
 end
 
 local function fieldCount()
-  if mode == "register" then return 3 end
+  if mode == "register" then return 2 end
   return 1
 end
 
@@ -583,7 +710,6 @@ local function appendChar(ch)
   if mode == "register" then
     if focused == 1 and #reg.name < 32 then reg.name = reg.name .. ch end
     if focused == 2 and #reg.ticker < 8 then reg.ticker = reg.ticker .. ch end
-    if focused == 3 and #reg.owner < 40 then reg.owner = reg.owner .. ch end
   else
     if focused == 1 and #lookup.company < 40 then lookup.company = lookup.company .. ch end
   end
@@ -593,17 +719,28 @@ local function backspaceField()
   if mode == "register" then
     if focused == 1 then reg.name = reg.name:sub(1, -2) end
     if focused == 2 then reg.ticker = reg.ticker:sub(1, -2) end
-    if focused == 3 then reg.owner = reg.owner:sub(1, -2) end
   else
     lookup.company = lookup.company:sub(1, -2)
   end
+end
+
+local function signOut()
+  session.logged_in = false
+  session.username = nil
+  session.citizen_id = nil
+  session.title = nil
+  login.password = ""
+  mode = "register"
+  focused = 1
+  setMessage("Signed out.", C.dim)
 end
 
 -- =============================================================================
 -- MAIN LOOP
 -- =============================================================================
 local function screenMain()
-  local tabs, fields, b_primary, b_secondary = drawMain()
+  focused = 1
+  local tabs, fields, b_primary, b_secondary, b_logout = drawMain()
 
   while true do
     local ev, p1, p2, p3 = os.pullEvent()
@@ -627,6 +764,9 @@ local function screenMain()
           clearLookup()
           setMessage("Lookup cleared.", C.dim)
         end
+      elseif hit(b_logout, mx, my) then
+        signOut()
+        return "login"
       else
         for i, box in ipairs(fields) do
           if hit(box, mx, my) then
@@ -636,15 +776,15 @@ local function screenMain()
         end
       end
 
-      tabs, fields, b_primary, b_secondary = drawMain()
+      tabs, fields, b_primary, b_secondary, b_logout = drawMain()
 
     elseif ev == "char" then
       appendChar(p1)
-      tabs, fields, b_primary, b_secondary = drawMain()
+      tabs, fields, b_primary, b_secondary, b_logout = drawMain()
 
     elseif ev == "key" then
       if p1 == keys.q then
-        return
+        return "quit"
       elseif p1 == keys.backspace then
         backspaceField()
       elseif p1 == keys.tab then
@@ -663,7 +803,7 @@ local function screenMain()
         focused = 1
       end
 
-      tabs, fields, b_primary, b_secondary = drawMain()
+      tabs, fields, b_primary, b_secondary, b_logout = drawMain()
     end
   end
 end
@@ -673,7 +813,7 @@ end
 -- =============================================================================
 local function main()
   if not openModem() then
-    clear(colors.black)
+    cls()
     print("ERROR: No modem found.")
     print("Attach an Ender Modem and reboot.")
     return
@@ -684,7 +824,13 @@ local function main()
   end
 
   setMessage("Connected.", C.ok)
-  screenMain()
+
+  local screen = "login"
+  while true do
+    if screen == "login" then screen = screenLogin() end
+    if screen == "main" then screen = screenMain() end
+    if screen == "quit" then break end
+  end
 
   cls()
   print("Company Terminal closed.")
