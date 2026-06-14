@@ -1,0 +1,1176 @@
+-- =============================================================================
+-- TreasuryDB.lua
+-- =============================================================================
+-- Runs as startup.lua on a dedicated Advanced Computer with Ender Modem.
+-- This is the single source of truth for the entire Ascendancy economy.
+-- All citizen terminals, company terminals, and management terminals are
+-- CLIENTS. They send requests. This server decides what happens.
+--
+-- Install:
+--   wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/main/TreasuryDB.lua startup.lua
+-- =============================================================================
+
+local VERSION = "1.0.0"
+local DB_LABEL = "Treasury-DB"
+local PROTOCOL = "ascendancy_bank"
+local PROTOCOL_BROADCAST = "ascendancy_bank_discovery"
+
+-- =============================================================================
+-- FILE PATHS
+-- All persistent data lives here. Never delete these manually.
+-- =============================================================================
+local FILE = {
+  ledger        = "data/ledger.log",        -- append-only transaction log
+  share_ledger  = "data/shares.log",         -- append-only share transfer log
+  audit         = "data/audit.log",          -- every action, every access attempt
+  accounts      = "data/accounts.db",        -- account registry
+  citizens      = "data/citizens.db",        -- citizen identity + terminal map
+  companies     = "data/companies.db",       -- company registry
+  contracts     = "data/contracts.db",       -- contract registry
+  prices        = "data/prices.db",          -- commodity price index
+  snapshot      = "data/snapshot.db",        -- fast-boot cached state
+  config        = "data/config.db",          -- system config (trusted terminals etc)
+}
+
+-- =============================================================================
+-- RUNTIME STATE
+-- Rebuilt from disk on boot. Never the authoritative source — disk is.
+-- =============================================================================
+local accounts   = {}   -- [account_id] = { type, display_name, owner_id, created, status }
+local citizens   = {}   -- [citizen_id] = { display_name, computer_id, joined, status, title }
+local companies  = {}   -- [company_id] = { name, ticker, type, owner_id, terminal_id, ... }
+local contracts  = {}   -- [contract_id] = { ... }
+local prices     = {}   -- [item_name] = { unit_price, last_updated, history={} }
+local config     = {}   -- system-level config flags
+
+local tx_counter    = 0   -- increments with every transaction
+local sh_counter    = 0   -- increments with every share transfer
+local audit_counter = 0   -- increments with every audit entry
+local cnt_counter   = 0   -- increments with every contract
+
+-- =============================================================================
+-- UTILITIES
+-- =============================================================================
+local function pad(n, width)
+  local s = tostring(n)
+  while #s < width do s = "0" .. s end
+  return s
+end
+
+local function timestamp()
+  return os.epoch("utc")
+end
+
+local function formatTime(epoch)
+  -- Returns a readable time string from epoch ms
+  local t = math.floor(epoch / 1000)
+  local s = t % 60; t = math.floor(t / 60)
+  local m = t % 60; t = math.floor(t / 60)
+  local h = t % 24
+  return string.format("%02d:%02d:%02d", h, m, s)
+end
+
+local function ensureDir(path)
+  local parts = {}
+  for part in string.gmatch(path, "[^/]+") do
+    parts[#parts + 1] = part
+  end
+  -- Remove filename
+  table.remove(parts)
+  local current = ""
+  for _, part in ipairs(parts) do
+    current = current == "" and part or (current .. "/" .. part)
+    if not fs.exists(current) then
+      fs.makeDir(current)
+    end
+  end
+end
+
+local function writeFile(path, data)
+  ensureDir(path)
+  local f = fs.open(path, "w")
+  if f then
+    f.write(textutils.serialize(data))
+    f.close()
+    return true
+  end
+  return false
+end
+
+local function readFile(path)
+  if not fs.exists(path) then return nil end
+  local f = fs.open(path, "r")
+  if not f then return nil end
+  local text = f.readAll()
+  f.close()
+  if not text or text == "" then return nil end
+  local ok, data = pcall(textutils.unserialize, text)
+  if ok then return data end
+  return nil
+end
+
+local function appendLine(path, line)
+  ensureDir(path)
+  local f = fs.open(path, "a")
+  if f then
+    f.writeLine(line)
+    f.close()
+    return true
+  end
+  return false
+end
+
+local function readLines(path)
+  if not fs.exists(path) then return {} end
+  local f = fs.open(path, "r")
+  if not f then return {} end
+  local lines = {}
+  local line = f.readLine()
+  while line do
+    if line ~= "" then lines[#lines + 1] = line end
+    line = f.readLine()
+  end
+  f.close()
+  return lines
+end
+
+-- =============================================================================
+-- AUDIT LOG
+-- Every action on the system gets recorded here. Non-negotiable.
+-- =============================================================================
+local function audit(action_type, actor, terminal, action, result)
+  audit_counter = audit_counter + 1
+  local id = "AUDIT-" .. pad(audit_counter, 6)
+  local ts = timestamp()
+  local line = string.format(
+    "%s | %d | %-8s | %-20s | %-15s | %-20s | %s",
+    id, ts, action_type, tostring(actor), tostring(terminal), tostring(action), tostring(result)
+  )
+  appendLine(FILE.audit, line)
+end
+
+-- =============================================================================
+-- LEDGER
+-- Every Quid movement is one line. Balances are always DERIVED from this.
+-- =============================================================================
+local function nextTxId()
+  tx_counter = tx_counter + 1
+  return "TX-" .. pad(tx_counter, 6)
+end
+
+local function writeTx(tx_id, tx_type, from_id, to_id, amount, memo, status)
+  local ts = timestamp()
+  local line = string.format(
+    "%s | %d | %-12s | %-25s | %-25s | %d | %s | %s",
+    tx_id, ts, tx_type, tostring(from_id), tostring(to_id),
+    amount, tostring(memo), tostring(status)
+  )
+  appendLine(FILE.ledger, line)
+end
+
+-- Derive balance from ledger for a given account_id
+-- This is the AUTHORITATIVE balance. Cache is only for display speed.
+local function deriveBalance(account_id)
+  if not fs.exists(FILE.ledger) then return 0 end
+  local lines = readLines(FILE.ledger)
+  local balance = 0
+  for _, line in ipairs(lines) do
+    -- Parse: TX-000001 | ts | type | from | to | amount | memo | status
+    local tx_id, ts, tx_type, from_id, to_id, amount, memo, status =
+      line:match("(TX%-%d+)%s*|%s*(%d+)%s*|%s*(%S+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*(%d+)%s*|%s*([^|]+)%s*|%s*(.+)")
+    if tx_id and status then
+      status = status:match("^%s*(.-)%s*$")
+      from_id = from_id:match("^%s*(.-)%s*$")
+      to_id = to_id:match("^%s*(.-)%s*$")
+      amount = tonumber(amount) or 0
+      if status == "settled" then
+        if to_id == account_id then
+          balance = balance + amount
+        end
+        if from_id == account_id then
+          balance = balance - amount
+        end
+      end
+    end
+  end
+  return balance
+end
+
+-- =============================================================================
+-- MONETARY SUPPLY
+-- Derived from ledger. Called when management terminal requests macro view.
+-- =============================================================================
+local function deriveMonetarySupply()
+  if not fs.exists(FILE.ledger) then
+    return {
+      total_minted = 0, total_burned = 0,
+      in_circulation = 0, treasury_balance = 0,
+      citizen_holdings = 0, company_holdings = 0,
+      escrow_held = 0
+    }
+  end
+
+  local lines = readLines(FILE.ledger)
+  local total_minted = 0
+  local total_burned = 0
+
+  for _, line in ipairs(lines) do
+    local tx_id, ts, tx_type, from_id, to_id, amount, memo, status =
+      line:match("(TX%-%d+)%s*|%s*(%d+)%s*|%s*(%S+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*(%d+)%s*|%s*([^|]+)%s*|%s*(.+)")
+    if tx_id and status then
+      status = status:match("^%s*(.-)%s*$")
+      tx_type = tx_type:match("^%s*(.-)%s*$")
+      amount = tonumber(amount) or 0
+      if status == "settled" then
+        if tx_type == "MINT" then total_minted = total_minted + amount end
+        if tx_type == "BURN" then total_burned = total_burned + amount end
+      end
+    end
+  end
+
+  local treasury_balance = deriveBalance("treasury:ascendancy")
+  local citizen_holdings = 0
+  local company_holdings = 0
+  local escrow_held = 0
+
+  for id, acc in pairs(accounts) do
+    if acc.status == "active" then
+      local bal = deriveBalance(id)
+      if acc.type == "citizen" then
+        citizen_holdings = citizen_holdings + bal
+      elseif acc.type == "company" then
+        company_holdings = company_holdings + bal
+      elseif acc.type == "escrow" then
+        escrow_held = escrow_held + bal
+      end
+    end
+  end
+
+  return {
+    total_minted     = total_minted,
+    total_burned     = total_burned,
+    in_circulation   = total_minted - total_burned,
+    treasury_balance = treasury_balance,
+    citizen_holdings = citizen_holdings,
+    company_holdings = company_holdings,
+    escrow_held      = escrow_held,
+  }
+end
+
+-- =============================================================================
+-- SHARE LEDGER
+-- =============================================================================
+local function nextShId()
+  sh_counter = sh_counter + 1
+  return "SH-" .. pad(sh_counter, 6)
+end
+
+local function writeShareTx(sh_id, company_id, from_id, to_id, shares, tx_type, memo)
+  local ts = timestamp()
+  local line = string.format(
+    "%s | %d | %-20s | %-25s | %-25s | %d | %-20s | %s",
+    sh_id, ts, tostring(company_id), tostring(from_id), tostring(to_id),
+    shares, tostring(tx_type), tostring(memo)
+  )
+  appendLine(FILE.share_ledger, line)
+end
+
+local function deriveShareHoldings(company_id)
+  if not fs.exists(FILE.share_ledger) then return {} end
+  local lines = readLines(FILE.share_ledger)
+  local holdings = {}
+  for _, line in ipairs(lines) do
+    local sh_id, ts, cid, from_id, to_id, shares, tx_type, memo =
+      line:match("(SH%-%d+)%s*|%s*(%d+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*(%d+)%s*|%s*([^|]+)%s*|%s*(.+)")
+    if sh_id then
+      cid = cid:match("^%s*(.-)%s*$")
+      if cid == company_id then
+        from_id = from_id:match("^%s*(.-)%s*$")
+        to_id = to_id:match("^%s*(.-)%s*$")
+        shares = tonumber(shares) or 0
+        if to_id ~= "SYSTEM" then
+          holdings[to_id] = (holdings[to_id] or 0) + shares
+        end
+        if from_id ~= "SYSTEM" then
+          holdings[from_id] = (holdings[from_id] or 0) - shares
+        end
+      end
+    end
+  end
+  return holdings
+end
+
+-- =============================================================================
+-- AUTHENTICATION
+-- Terminal ID → citizen identity. No cards, no passwords.
+-- The physical terminal IS the credential.
+-- =============================================================================
+local function authenticate(computer_id)
+  for citizen_id, citizen in pairs(citizens) do
+    if tonumber(citizen.computer_id) == tonumber(computer_id) then
+      if citizen.status == "active" then
+        return citizen_id, citizen
+      else
+        return nil, "Account suspended"
+      end
+    end
+  end
+  return nil, "Unregistered terminal"
+end
+
+local function isTrustedManagement(computer_id)
+  if not config.management_terminals then return false end
+  for _, id in ipairs(config.management_terminals) do
+    if tonumber(id) == tonumber(computer_id) then return true end
+  end
+  return false
+end
+
+-- =============================================================================
+-- ACCOUNT OPERATIONS
+-- =============================================================================
+local function saveAccounts()
+  writeFile(FILE.accounts, accounts)
+end
+
+local function saveCitizens()
+  writeFile(FILE.citizens, citizens)
+end
+
+local function saveCompanies()
+  writeFile(FILE.companies, companies)
+end
+
+local function saveContracts()
+  writeFile(FILE.contracts, contracts)
+end
+
+local function savePrices()
+  writeFile(FILE.prices, prices)
+end
+
+local function saveConfig()
+  writeFile(FILE.config, config)
+end
+
+local function accountExists(account_id)
+  return accounts[account_id] ~= nil
+end
+
+local function createAccount(account_id, acc_type, display_name, owner_id)
+  if accountExists(account_id) then
+    return false, "Account already exists"
+  end
+  accounts[account_id] = {
+    type         = acc_type,
+    display_name = display_name,
+    owner_id     = owner_id or "SYSTEM",
+    created      = timestamp(),
+    status       = "active"
+  }
+  saveAccounts()
+  return true, account_id
+end
+
+-- Transfer Quid between accounts. This is THE core operation.
+local function transfer(from_id, to_id, amount, tx_type, memo, actor)
+  amount = tonumber(amount)
+  if not amount or amount <= 0 then
+    return false, "Invalid amount"
+  end
+  if not accountExists(from_id) and from_id ~= "SYSTEM" then
+    return false, "Source account does not exist: " .. tostring(from_id)
+  end
+  if not accountExists(to_id) and to_id ~= "SYSTEM" then
+    return false, "Destination account does not exist: " .. tostring(to_id)
+  end
+
+  -- Check funds (SYSTEM and MINT bypass this)
+  if from_id ~= "SYSTEM" and tx_type ~= "MINT" then
+    local balance = deriveBalance(from_id)
+    if balance < amount then
+      return false, "Insufficient funds. Balance: " .. balance .. " Quid, Required: " .. amount .. " Quid"
+    end
+  end
+
+  local tx_id = nextTxId()
+  writeTx(tx_id, tx_type or "TRANSFER", from_id, to_id, amount, memo or "", "settled")
+  audit("ACTION", actor or "SYSTEM", "treasury_db", tx_type or "TRANSFER", tx_id .. " " .. amount .. "q " .. tostring(from_id) .. "->" .. tostring(to_id))
+
+  return true, {
+    tx_id  = tx_id,
+    from   = from_id,
+    to     = to_id,
+    amount = amount,
+    type   = tx_type,
+    memo   = memo,
+    status = "settled"
+  }
+end
+
+-- =============================================================================
+-- REQUEST HANDLERS
+-- Each handler receives (sender_id, request) and returns (success, response)
+-- =============================================================================
+local handlers = {}
+
+-- PING — discovery / health check
+handlers["ping"] = function(sender_id, req)
+  return true, {
+    message  = "Ascendancy Treasury DB online",
+    version  = VERSION,
+    time     = timestamp(),
+    computer = os.getComputerID(),
+    label    = os.getComputerLabel()
+  }
+end
+
+-- AUTH — terminal identifies itself, gets back citizen info + balance
+handlers["auth"] = function(sender_id, req)
+  local citizen_id, citizen = authenticate(sender_id)
+  if not citizen_id then
+    audit("ACCESS", "UNKNOWN", sender_id, "LOGIN", "failed: " .. tostring(citizen))
+    return false, tostring(citizen)
+  end
+
+  local balance = deriveBalance(citizen_id)
+  audit("ACCESS", citizen_id, sender_id, "LOGIN", "success")
+
+  return true, {
+    citizen_id   = citizen_id,
+    display_name = citizen.display_name,
+    title        = citizen.title or "Citizen",
+    status       = citizen.status,
+    balance      = balance,
+    account_id   = citizen_id,
+  }
+end
+
+-- BALANCE — get current balance for an account
+handlers["balance"] = function(sender_id, req)
+  local citizen_id, citizen = authenticate(sender_id)
+  if not citizen_id then
+    audit("ACCESS", "UNKNOWN", sender_id, "BALANCE", "rejected: unregistered")
+    return false, "Unregistered terminal"
+  end
+
+  -- Citizens can only see their own balance unless they're management
+  local target = req.account_id or citizen_id
+  if target ~= citizen_id and not isTrustedManagement(sender_id) then
+    audit("ACTION", citizen_id, sender_id, "BALANCE:" .. target, "rejected: unauthorised")
+    return false, "Unauthorised"
+  end
+
+  if not accountExists(target) then
+    return false, "Account not found: " .. tostring(target)
+  end
+
+  local balance = deriveBalance(target)
+  audit("ACTION", citizen_id, sender_id, "BALANCE:" .. target, "ok:" .. balance)
+
+  return true, {
+    account_id   = target,
+    display_name = accounts[target] and accounts[target].display_name or target,
+    balance      = balance,
+    time         = timestamp()
+  }
+end
+
+-- TRANSFER — send Quid from one account to another
+handlers["transfer"] = function(sender_id, req)
+  local citizen_id, citizen = authenticate(sender_id)
+  if not citizen_id then
+    audit("ACCESS", "UNKNOWN", sender_id, "TRANSFER", "rejected: unregistered")
+    return false, "Unregistered terminal"
+  end
+
+  local from_id = req.from_id or citizen_id
+  local to_id   = req.to_id
+  local amount  = tonumber(req.amount)
+  local memo    = req.memo or ""
+
+  if not to_id then return false, "Missing destination account" end
+  if not amount or amount <= 0 then return false, "Invalid amount" end
+
+  -- Citizens can only send from their own account
+  if from_id ~= citizen_id and not isTrustedManagement(sender_id) then
+    audit("ACTION", citizen_id, sender_id, "TRANSFER", "rejected: not owner of " .. from_id)
+    return false, "You can only transfer from your own account"
+  end
+
+  if not accountExists(to_id) then
+    return false, "Destination account not found: " .. tostring(to_id)
+  end
+
+  local ok, result = transfer(from_id, to_id, amount, "TRANSFER", memo, citizen_id)
+  return ok, result
+end
+
+-- REGISTER_CITIZEN — admin registers a new citizen (management terminal only)
+handlers["register_citizen"] = function(sender_id, req)
+  if not isTrustedManagement(sender_id) then
+    audit("ACCESS", "UNKNOWN", sender_id, "REGISTER_CITIZEN", "rejected: not management")
+    return false, "Management terminal required"
+  end
+
+  local name        = req.display_name
+  local computer_id = tonumber(req.computer_id)
+  local title       = req.title or "Citizen"
+
+  if not name or not computer_id then
+    return false, "Missing display_name or computer_id"
+  end
+
+  -- Check not already registered
+  for _, c in pairs(citizens) do
+    if tonumber(c.computer_id) == computer_id then
+      return false, "Terminal " .. computer_id .. " is already registered"
+    end
+  end
+
+  -- Build citizen ID from name
+  local citizen_id = "citizen:" .. string.lower(name):gsub("%s+", "_")
+  if citizens[citizen_id] then
+    return false, "Citizen ID already exists: " .. citizen_id
+  end
+
+  citizens[citizen_id] = {
+    display_name = name,
+    computer_id  = computer_id,
+    joined       = timestamp(),
+    status       = "active",
+    title        = title
+  }
+  saveCitizens()
+
+  -- Create their bank account
+  local ok, result = createAccount(citizen_id, "citizen", name, citizen_id)
+  if not ok then
+    return false, "Citizen registered but account creation failed: " .. tostring(result)
+  end
+
+  audit("ACTION", "MANAGEMENT", sender_id, "REGISTER_CITIZEN", citizen_id .. " terminal:" .. computer_id)
+
+  return true, {
+    citizen_id   = citizen_id,
+    display_name = name,
+    computer_id  = computer_id,
+    title        = title,
+    account_id   = citizen_id,
+    message      = "Citizen registered successfully"
+  }
+end
+
+-- MINT — create new Quid and deposit to an account (management only)
+handlers["mint"] = function(sender_id, req)
+  if not isTrustedManagement(sender_id) then
+    audit("ACCESS", "UNKNOWN", sender_id, "MINT", "rejected: not management")
+    return false, "Management terminal required"
+  end
+
+  local to_id  = req.to_id or "treasury:ascendancy"
+  local amount = tonumber(req.amount)
+  local memo   = req.memo or "Treasury mint"
+
+  if not amount or amount <= 0 then return false, "Invalid amount" end
+  if not accountExists(to_id) then return false, "Destination account not found" end
+
+  local ok, result = transfer("SYSTEM", to_id, amount, "MINT", memo, "MANAGEMENT:" .. sender_id)
+  return ok, result
+end
+
+-- BURN — destroy Quid from an account (management only)
+handlers["burn"] = function(sender_id, req)
+  if not isTrustedManagement(sender_id) then
+    audit("ACCESS", "UNKNOWN", sender_id, "BURN", "rejected: not management")
+    return false, "Management terminal required"
+  end
+
+  local from_id = req.from_id or "treasury:ascendancy"
+  local amount  = tonumber(req.amount)
+  local memo    = req.memo or "Treasury burn"
+
+  if not amount or amount <= 0 then return false, "Invalid amount" end
+  if not accountExists(from_id) then return false, "Source account not found" end
+
+  local ok, result = transfer(from_id, "SYSTEM", amount, "BURN", memo, "MANAGEMENT:" .. sender_id)
+  return ok, result
+end
+
+-- GRANT — treasury sends Quid to a citizen/company (management only)
+handlers["grant"] = function(sender_id, req)
+  if not isTrustedManagement(sender_id) then
+    return false, "Management terminal required"
+  end
+
+  local to_id  = req.to_id
+  local amount = tonumber(req.amount)
+  local memo   = req.memo or "Treasury grant"
+
+  if not to_id or not amount then return false, "Missing to_id or amount" end
+
+  local ok, result = transfer("treasury:ascendancy", to_id, amount, "GRANT", memo, "MANAGEMENT:" .. sender_id)
+  return ok, result
+end
+
+-- SUPPLY — get full monetary supply overview (management only)
+handlers["supply"] = function(sender_id, req)
+  if not isTrustedManagement(sender_id) then
+    audit("ACCESS", "UNKNOWN", sender_id, "SUPPLY", "rejected: not management")
+    return false, "Management terminal required"
+  end
+
+  local supply = deriveMonetarySupply()
+  audit("ACTION", "MANAGEMENT", sender_id, "SUPPLY", "ok")
+  return true, supply
+end
+
+-- LIST_ACCOUNTS — get all accounts and balances (management only)
+handlers["list_accounts"] = function(sender_id, req)
+  if not isTrustedManagement(sender_id) then
+    return false, "Management terminal required"
+  end
+
+  local result = {}
+  for id, acc in pairs(accounts) do
+    result[#result + 1] = {
+      account_id   = id,
+      type         = acc.type,
+      display_name = acc.display_name,
+      status       = acc.status,
+      balance      = deriveBalance(id)
+    }
+  end
+
+  table.sort(result, function(a, b)
+    return (a.balance or 0) > (b.balance or 0)
+  end)
+
+  audit("ACTION", "MANAGEMENT", sender_id, "LIST_ACCOUNTS", tostring(#result) .. " accounts")
+  return true, { accounts = result, count = #result }
+end
+
+-- REGISTER_COMPANY — register a new company
+handlers["register_company"] = function(sender_id, req)
+  if not isTrustedManagement(sender_id) then
+    return false, "Management terminal required"
+  end
+
+  local name        = req.name
+  local ticker      = req.ticker and string.upper(req.ticker)
+  local biz_type    = req.biz_type or "general"
+  local owner_id    = req.owner_id or "treasury:ascendancy"
+  local terminal_id = tonumber(req.terminal_id)
+  local shares      = tonumber(req.shares_total) or 1000
+  local public_float= tonumber(req.shares_public) or 0
+
+  if not name or not ticker then
+    return false, "Missing name or ticker"
+  end
+
+  local company_id = "company:" .. string.lower(ticker)
+  if companies[company_id] then
+    return false, "Company already exists: " .. company_id
+  end
+
+  companies[company_id] = {
+    name          = name,
+    ticker        = ticker,
+    biz_type      = biz_type,
+    owner_id      = owner_id,
+    terminal_id   = terminal_id,
+    founded       = timestamp(),
+    status        = "active",
+    shares_total  = shares,
+    shares_public = public_float
+  }
+  saveCompanies()
+
+  -- Create company bank account
+  local ok, result = createAccount(company_id, "company", name, owner_id)
+  if not ok then
+    return false, "Company registered but account failed: " .. tostring(result)
+  end
+
+  -- Record founding shares to owner
+  if shares > 0 then
+    local sh_id = nextShId()
+    writeShareTx(sh_id, company_id, "SYSTEM", owner_id, shares, "FOUNDER_GRANT", "Founding shares")
+  end
+
+  audit("ACTION", "MANAGEMENT", sender_id, "REGISTER_COMPANY", company_id .. " ticker:" .. ticker)
+
+  return true, {
+    company_id  = company_id,
+    name        = name,
+    ticker      = ticker,
+    account_id  = company_id,
+    message     = "Company registered successfully"
+  }
+end
+
+-- COMPANY_INFO — get company details and shareholdings
+handlers["company_info"] = function(sender_id, req)
+  local citizen_id, _ = authenticate(sender_id)
+  -- Allow management OR registered citizens
+  if not citizen_id and not isTrustedManagement(sender_id) then
+    return false, "Unregistered terminal"
+  end
+
+  local company_id = req.company_id
+  if not company_id then return false, "Missing company_id" end
+
+  local company = companies[company_id]
+  if not company then return false, "Company not found: " .. tostring(company_id) end
+
+  local balance  = deriveBalance(company_id)
+  local holdings = deriveShareHoldings(company_id)
+
+  return true, {
+    company_id    = company_id,
+    name          = company.name,
+    ticker        = company.ticker,
+    biz_type      = company.biz_type,
+    owner_id      = company.owner_id,
+    status        = company.status,
+    shares_total  = company.shares_total,
+    shares_public = company.shares_public,
+    cash_balance  = balance,
+    shareholders  = holdings,
+    founded       = company.founded
+  }
+end
+
+-- SET_PRICE — update commodity reference price (management only)
+handlers["set_price"] = function(sender_id, req)
+  if not isTrustedManagement(sender_id) then
+    return false, "Management terminal required"
+  end
+
+  local item  = req.item
+  local price = tonumber(req.price)
+  if not item or not price then return false, "Missing item or price" end
+
+  local old_price = prices[item] and prices[item].unit_price or nil
+  prices[item] = prices[item] or { history = {} }
+
+  if old_price then
+    local history = prices[item].history or {}
+    history[#history + 1] = { price = old_price, time = timestamp() }
+    -- Keep last 30 price points
+    while #history > 30 do table.remove(history, 1) end
+    prices[item].history = history
+  end
+
+  prices[item].unit_price   = price
+  prices[item].last_updated = timestamp()
+  savePrices()
+
+  audit("ACTION", "MANAGEMENT", sender_id, "SET_PRICE:" .. item, tostring(old_price) .. "->" .. tostring(price))
+
+  return true, {
+    item      = item,
+    price     = price,
+    old_price = old_price,
+    message   = "Price updated"
+  }
+end
+
+-- GET_PRICES — get commodity price index
+handlers["get_prices"] = function(sender_id, req)
+  local citizen_id, _ = authenticate(sender_id)
+  if not citizen_id and not isTrustedManagement(sender_id) then
+    return false, "Unregistered terminal"
+  end
+
+  return true, { prices = prices, time = timestamp() }
+end
+
+-- LEDGER_HISTORY — get recent transactions for an account
+handlers["ledger_history"] = function(sender_id, req)
+  local citizen_id, _ = authenticate(sender_id)
+  if not citizen_id and not isTrustedManagement(sender_id) then
+    return false, "Unregistered terminal"
+  end
+
+  local target = req.account_id or citizen_id
+  local limit  = tonumber(req.limit) or 20
+
+  -- Citizens can only see their own history
+  if target ~= citizen_id and not isTrustedManagement(sender_id) then
+    return false, "Unauthorised"
+  end
+
+  if not accountExists(target) then
+    return false, "Account not found"
+  end
+
+  local lines = readLines(FILE.ledger)
+  local results = {}
+
+  for _, line in ipairs(lines) do
+    local tx_id, ts, tx_type, from_id, to_id, amount, memo, status =
+      line:match("(TX%-%d+)%s*|%s*(%d+)%s*|%s*(%S+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*(%d+)%s*|%s*([^|]+)%s*|%s*(.+)")
+    if tx_id then
+      from_id = from_id:match("^%s*(.-)%s*$")
+      to_id   = to_id:match("^%s*(.-)%s*$")
+      if from_id == target or to_id == target then
+        results[#results + 1] = {
+          tx_id    = tx_id,
+          time     = tonumber(ts),
+          type     = tx_type:match("^%s*(.-)%s*$"),
+          from     = from_id,
+          to       = to_id,
+          amount   = tonumber(amount) or 0,
+          memo     = memo:match("^%s*(.-)%s*$"),
+          status   = status:match("^%s*(.-)%s*$"),
+          direction = (to_id == target) and "IN" or "OUT"
+        }
+      end
+    end
+  end
+
+  -- Return most recent first, up to limit
+  local out = {}
+  local start = math.max(1, #results - limit + 1)
+  for i = #results, start, -1 do
+    out[#out + 1] = results[i]
+  end
+
+  return true, {
+    account_id = target,
+    balance    = deriveBalance(target),
+    history    = out,
+    count      = #out
+  }
+end
+
+-- ADD_MANAGEMENT_TERMINAL — register a trusted management terminal (bootstrap only)
+handlers["add_management_terminal"] = function(sender_id, req)
+  -- Only the DB computer itself can call this via direct local call
+  -- OR an existing management terminal
+  if not isTrustedManagement(sender_id) and tonumber(sender_id) ~= os.getComputerID() then
+    return false, "Unauthorised"
+  end
+
+  local terminal_id = tonumber(req.terminal_id)
+  if not terminal_id then return false, "Missing terminal_id" end
+
+  config.management_terminals = config.management_terminals or {}
+  for _, id in ipairs(config.management_terminals) do
+    if id == terminal_id then
+      return false, "Already a management terminal"
+    end
+  end
+
+  config.management_terminals[#config.management_terminals + 1] = terminal_id
+  saveConfig()
+
+  audit("ACTION", "SYSTEM", sender_id, "ADD_MANAGEMENT_TERMINAL", tostring(terminal_id))
+  return true, { message = "Management terminal registered: " .. terminal_id }
+end
+
+-- STATUS — full system status for management display
+handlers["status"] = function(sender_id, req)
+  if not isTrustedManagement(sender_id) then
+    return false, "Management terminal required"
+  end
+
+  local supply = deriveMonetarySupply()
+
+  return true, {
+    version             = VERSION,
+    computer_id         = os.getComputerID(),
+    label               = os.getComputerLabel(),
+    time                = timestamp(),
+    uptime              = os.clock(),
+    economy_status      = config.economy_status or "active",
+    mint_authority      = config.mint_authority or "locked",
+    account_count       = (function() local n=0 for _ in pairs(accounts) do n=n+1 end return n end)(),
+    citizen_count       = (function() local n=0 for _ in pairs(citizens) do n=n+1 end return n end)(),
+    company_count       = (function() local n=0 for _ in pairs(companies) do n=n+1 end return n end)(),
+    tx_count            = tx_counter,
+    audit_count         = audit_counter,
+    supply              = supply,
+    management_terminals= config.management_terminals or {}
+  }
+end
+
+-- =============================================================================
+-- BOOT / INITIALISATION
+-- =============================================================================
+local function initFiles()
+  print("  Initialising data files...")
+
+  -- Load or create accounts
+  local loaded_accounts = readFile(FILE.accounts)
+  if loaded_accounts then
+    accounts = loaded_accounts
+    print("  Accounts loaded: " .. (function() local n=0 for _ in pairs(accounts) do n=n+1 end return n end)())
+  else
+    print("  No accounts file found. Starting fresh.")
+  end
+
+  -- Load or create citizens
+  local loaded_citizens = readFile(FILE.citizens)
+  if loaded_citizens then
+    citizens = loaded_citizens
+    print("  Citizens loaded: " .. (function() local n=0 for _ in pairs(citizens) do n=n+1 end return n end)())
+  else
+    print("  No citizens file found.")
+  end
+
+  -- Load or create companies
+  local loaded_companies = readFile(FILE.companies)
+  if loaded_companies then
+    companies = loaded_companies
+    print("  Companies loaded: " .. (function() local n=0 for _ in pairs(companies) do n=n+1 end return n end)())
+  else
+    print("  No companies file found.")
+  end
+
+  -- Load contracts
+  local loaded_contracts = readFile(FILE.contracts)
+  if loaded_contracts then contracts = loaded_contracts end
+
+  -- Load prices
+  local loaded_prices = readFile(FILE.prices)
+  if loaded_prices then
+    prices = loaded_prices
+    print("  Price index loaded: " .. (function() local n=0 for _ in pairs(prices) do n=n+1 end return n end)() .. " commodities")
+  end
+
+  -- Load config
+  local loaded_config = readFile(FILE.config)
+  if loaded_config then
+    config = loaded_config
+    print("  Config loaded.")
+  else
+    config = {
+      economy_status       = "active",
+      mint_authority       = "locked",
+      management_terminals = {}
+    }
+    saveConfig()
+    print("  Default config created.")
+  end
+end
+
+local function initCounters()
+  -- Replay ledger to get current TX counter
+  if fs.exists(FILE.ledger) then
+    local lines = readLines(FILE.ledger)
+    for _, line in ipairs(lines) do
+      local num = line:match("TX%-(%d+)")
+      if num then
+        local n = tonumber(num) or 0
+        if n > tx_counter then tx_counter = n end
+      end
+    end
+    print("  Ledger replayed. Last TX: TX-" .. pad(tx_counter, 6))
+  end
+
+  -- Replay share ledger counter
+  if fs.exists(FILE.share_ledger) then
+    local lines = readLines(FILE.share_ledger)
+    for _, line in ipairs(lines) do
+      local num = line:match("SH%-(%d+)")
+      if num then
+        local n = tonumber(num) or 0
+        if n > sh_counter then sh_counter = n end
+      end
+    end
+  end
+
+  -- Replay audit counter
+  if fs.exists(FILE.audit) then
+    local lines = readLines(FILE.audit)
+    for _, line in ipairs(lines) do
+      local num = line:match("AUDIT%-(%d+)")
+      if num then
+        local n = tonumber(num) or 0
+        if n > audit_counter then audit_counter = n end
+      end
+    end
+  end
+end
+
+local function initTreasury()
+  -- Create the core system accounts if they don't exist
+  if not accountExists("treasury:ascendancy") then
+    createAccount("treasury:ascendancy", "treasury", "Ascendancy Treasury", "SYSTEM")
+    print("  Created treasury:ascendancy account")
+  end
+  if not accountExists("market:escrow") then
+    createAccount("market:escrow", "escrow", "Market Escrow", "SYSTEM")
+    print("  Created market:escrow account")
+  end
+  if not accountExists("contract:escrow") then
+    createAccount("contract:escrow", "escrow", "Contract Escrow", "SYSTEM")
+    print("  Created contract:escrow account")
+  end
+end
+
+local function openModem()
+  for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.getType(name) == "modem" then
+      rednet.open(name)
+      print("  Modem opened: " .. name)
+      return true
+    end
+  end
+  print("  ERROR: No modem found!")
+  return false
+end
+
+-- =============================================================================
+-- DISPLAY (terminal status while server runs)
+-- =============================================================================
+local function drawStatus()
+  term.clear()
+  term.setCursorPos(1, 1)
+  print("=" .. string.rep("=", 50))
+  print("  ASCENDANCY TREASURY DATABASE  v" .. VERSION)
+  print("=" .. string.rep("=", 50))
+  print("  ID:      " .. os.getComputerID())
+  print("  Label:   " .. (os.getComputerLabel() or "unlabelled"))
+  print("  Status:  " .. (config.economy_status or "active"):upper())
+  print("  Uptime:  " .. string.format("%.0f", os.clock()) .. "s")
+  print("  TX Log:  TX-" .. pad(tx_counter, 6))
+  print("  Audits:  " .. audit_counter)
+  print("-" .. string.rep("-", 50))
+
+  local n_acc = 0
+  local n_cit = 0
+  local n_com = 0
+  for _ in pairs(accounts) do n_acc = n_acc + 1 end
+  for _ in pairs(citizens) do n_cit = n_cit + 1 end
+  for _ in pairs(companies) do n_com = n_com + 1 end
+
+  print("  Accounts:  " .. n_acc)
+  print("  Citizens:  " .. n_cit)
+  print("  Companies: " .. n_com)
+
+  local treasury_bal = deriveBalance("treasury:ascendancy")
+  print("  Treasury:  " .. treasury_bal .. " Quid")
+  print("-" .. string.rep("-", 50))
+  print("  Listening on: " .. PROTOCOL)
+  print("  [Running. Ctrl+T to terminate]")
+end
+
+-- =============================================================================
+-- MAIN SERVER LOOP
+-- =============================================================================
+local function handleRequest(sender_id, request)
+  if type(request) ~= "table" then
+    return false, "Invalid request format"
+  end
+
+  local req_type = request.type
+  if not req_type then
+    return false, "Missing request type"
+  end
+
+  local handler = handlers[req_type]
+  if not handler then
+    audit("ACTION", "UNKNOWN", sender_id, req_type, "rejected: unknown request type")
+    return false, "Unknown request type: " .. tostring(req_type)
+  end
+
+  local ok, result = pcall(handler, sender_id, request)
+  if not ok then
+    -- Handler crashed — log it, return safe error
+    audit("ERROR", "SYSTEM", sender_id, req_type, "handler error: " .. tostring(result))
+    return false, "Internal error processing request"
+  end
+
+  return result  -- result here is (success, data) from the handler
+end
+
+local function serverLoop()
+  local request_count = 0
+
+  while true do
+    local sender_id, message, protocol = rednet.receive(PROTOCOL, 30)
+
+    if sender_id then
+      request_count = request_count + 1
+
+      local success, response = handleRequest(sender_id, message)
+
+      -- Send reply directly to the sender
+      rednet.send(sender_id, {
+        success  = success,
+        response = response,
+        time     = timestamp(),
+        server   = os.getComputerID()
+      }, PROTOCOL)
+
+      -- Refresh display every 10 requests
+      if request_count % 10 == 0 then
+        drawStatus()
+      end
+
+    else
+      -- Timeout: refresh display and broadcast presence
+      drawStatus()
+      rednet.broadcast({
+        type    = "treasury_online",
+        version = VERSION,
+        id      = os.getComputerID(),
+        label   = os.getComputerLabel(),
+        time    = timestamp()
+      }, PROTOCOL_BROADCAST)
+    end
+  end
+end
+
+-- =============================================================================
+-- ENTRY POINT
+-- =============================================================================
+local function main()
+  term.clear()
+  term.setCursorPos(1, 1)
+
+  print("ASCENDANCY TREASURY DB v" .. VERSION)
+  print("Booting...")
+  print("")
+
+  -- Set label
+  if os.getComputerLabel() ~= DB_LABEL then
+    os.setComputerLabel(DB_LABEL)
+  end
+
+  -- Init
+  initFiles()
+  initCounters()
+  initTreasury()
+
+  local modemOk = openModem()
+  if not modemOk then
+    print("FATAL: Cannot open modem. Halting.")
+    return
+  end
+
+  -- Log boot
+  audit("SYSTEM", "SYSTEM", os.getComputerID(), "BOOT", "Treasury DB online v" .. VERSION)
+
+  print("")
+  print("Boot complete.")
+  sleep(1)
+
+  drawStatus()
+
+  -- Announce presence
+  rednet.broadcast({
+    type    = "treasury_online",
+    version = VERSION,
+    id      = os.getComputerID(),
+    label   = os.getComputerLabel(),
+    time    = timestamp()
+  }, PROTOCOL_BROADCAST)
+
+  serverLoop()
+end
+
+main()
