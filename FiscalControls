@@ -24,8 +24,8 @@ if args[1] ~= "--updated" then
 
   print("Downloading latest from GitHub...")
 
-  -- Cache-bust GitHub raw/CDN so the controller does not keep pulling
-  -- an older cached copy after the GitHub file has visibly changed.
+  -- Cache-bust GitHub raw/CDN so ComputerCraft does not keep pulling
+  -- an older copy after the GitHub file has visibly changed.
   local cache_bust = tostring(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
   local update_url = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/FiscalControls?cb=" .. cache_bust
 
@@ -52,7 +52,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION          = "1.0.4"
+local VERSION          = "1.0.6"
 local PROTOCOL         = "quid_bank"
 local TREASURY_ACCOUNT = "treasury:quid_bank"
 local DB_TIMEOUT       = 5
@@ -295,11 +295,15 @@ local function inputBox(x, y, w, value, focused)
   value = tostring(value or "")
   fill(x, y, w, 1, colors.gray)
   writeAt(x, y, (value .. string.rep(" ", w)):sub(1, w), colors.white, colors.gray)
-  if focused then
-    term.setCursorPos(x + math.min(#value, w - 1), y)
-    term.setCursorBlink(true)
-  end
-  return { x1 = x, x2 = x + w - 1, y1 = y, y2 = y }
+
+  return {
+    x1 = x,
+    x2 = x + w - 1,
+    y1 = y,
+    y2 = y,
+    cursor_x = x + math.min(#value, w - 1),
+    cursor_y = y
+  }
 end
 
 local function formScreen(title, help, fields, submitLabel)
@@ -335,6 +339,17 @@ local function formScreen(title, help, fields, submitLabel)
     local bw = math.floor((w - 6) / 2)
     local bSubmit = button(2, h - 1, bw, submitLabel or "Submit", colors.blue, colors.white)
     local bBack = button(4 + bw, h - 1, bw, "Back", colors.gray, colors.white)
+
+    -- Cursor belongs only inside the selected input field.
+    -- It is positioned after buttons are drawn, so it cannot blink on Back/Review.
+    local active = fieldHits[focused]
+    if active then
+      term.setCursorPos(active.cursor_x, active.cursor_y)
+      term.setCursorBlink(true)
+    else
+      term.setCursorBlink(false)
+    end
+
     return fieldHits, bSubmit, bBack
   end
 
