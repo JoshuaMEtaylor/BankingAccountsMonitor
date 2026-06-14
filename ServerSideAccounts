@@ -3,8 +3,8 @@
 -- ServerSideAccounts
 -- =============================================================================
 
-if not _UPDATED then
-  _UPDATED = true
+local args = {...}
+if args[1] ~= "--updated" then
   print("[ Quid Bank of Plenty ]")
   print("Deleting old version...")
   fs.delete("startup.lua")
@@ -12,11 +12,11 @@ if not _UPDATED then
   shell.run("wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/ServerSideAccounts startup.lua")
   print("Relaunching...")
   sleep(0.5)
-  shell.run("startup.lua")
+  shell.run("startup.lua", "--updated")
   return
 end
 
-local VERSION  = "1.2.1"
+local VERSION  = "1.2.2"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
