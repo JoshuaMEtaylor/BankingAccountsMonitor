@@ -16,7 +16,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.2.2"
+local VERSION  = "1.2.3"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -862,10 +862,22 @@ local function initSystemAccounts()
 end
 
 local function openModem()
+  -- First pass: prefer wireless/ender modem
+  for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.getType(name) == "modem" then
+      local modem = peripheral.wrap(name)
+      if modem and modem.isWireless and modem.isWireless() then
+        rednet.open(name)
+        print("  Modem: " .. name .. " (wireless)")
+        return true
+      end
+    end
+  end
+  -- Second pass: fallback to any modem
   for _, name in ipairs(peripheral.getNames()) do
     if peripheral.getType(name) == "modem" then
       rednet.open(name)
-      print("  Modem: " .. name)
+      print("  Modem: " .. name .. " (wired fallback)")
       return true
     end
   end
@@ -974,6 +986,12 @@ local function serverLoop()
         version = VERSION,
         id      = os.getComputerID(),
         time    = timestamp()
+      }, PROTOCOL)
+      rednet.broadcast({
+        type    = "treasury_online",
+        version = VERSION,
+        id      = os.getComputerID(),
+        time    = timestamp()
       }, PROTOCOL_BROADCAST)
     end
   end
@@ -998,6 +1016,7 @@ local function main()
   print("Boot complete.")
   sleep(1)
   drawStatus()
+  rednet.broadcast({ type="treasury_online", version=VERSION, id=os.getComputerID() }, PROTOCOL)
   rednet.broadcast({ type="treasury_online", version=VERSION, id=os.getComputerID() }, PROTOCOL_BROADCAST)
   serverLoop()
 end
