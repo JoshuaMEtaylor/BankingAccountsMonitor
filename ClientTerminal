@@ -20,7 +20,7 @@ end
 -- MAIN PROGRAM
 -- =============================================================================
 
-local VERSION      = "1.2.0"
+local VERSION      = "1.2.6"
 local PROTOCOL     = "quid_bank"
 local DB_TIMEOUT   = 5
 local IDLE_TIMEOUT = 60
@@ -259,11 +259,11 @@ local function screenConnecting()
   fill(1, 2, W, H-1, C.bg)
   centre(math.floor(H/2)-1, "Connecting to Quid Bank...", C.dim, C.bg)
 
-  for attempt = 1, 5 do
+  for attempt = 1, 8 do
     fill(1, math.floor(H/2)+1, W, 1, C.bg)
-    centre(math.floor(H/2)+1, "Attempt " .. attempt .. " of 5", C.dim, C.bg)
+    centre(math.floor(H/2)+1, "Attempt " .. attempt .. " of 8", C.dim, C.bg)
     rednet.broadcast({ type = "ping" }, PROTOCOL)
-    local sender, msg = rednet.receive(PROTOCOL, 3)
+    local sender, msg = rednet.receive(PROTOCOL, 4)
     if sender and type(msg) == "table" then
       if (msg.success and type(msg.response) == "table") or msg.type == "treasury_online" then
         db_id = sender
