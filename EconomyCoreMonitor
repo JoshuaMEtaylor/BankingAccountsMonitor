@@ -12,10 +12,10 @@
 --   COMPANIES
 --   TRANSACTIONS PER DAY
 --
--- Read-only. No banking controls. No trade panel. Starts looking for contract/GDP data.
+-- Read-only. No banking controls. No trade panel. Contract GDP + money-supply inflation.
 -- =============================================================================
 
-local VERSION         = "0.5.0-CONTRACT-GDP"
+local VERSION         = "0.5.1-MONEY-INFLATION"
 local PROTOCOL        = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT      = 5
@@ -24,6 +24,7 @@ local GDP_PERIOD_MS   = 24 * 60 * 60 * 1000
 local REFRESH_SECONDS = 5
 local TEXT_SCALE      = 0.5
 local HISTORY_FILE    = "data/economy_core_monitor_history.db"
+local INFLATION_BASE_FILE = "data/economy_monetary_inflation_base.db"
 local MAX_HISTORY     = 120
 
 local native_term = term.current()
@@ -252,6 +253,34 @@ local function growthPct(current, previous)
   return ((current / previous) - 1) * 100
 end
 
+local function getInflationBase(issued)
+  issued = tonumber(issued)
+  if not issued or issued <= 0 then
+    return nil, "Awaiting issued money supply"
+  end
+
+  local base = readTable(INFLATION_BASE_FILE)
+  if type(base) ~= "table" or not tonumber(base.issued_supply) or tonumber(base.issued_supply) <= 0 then
+    base = {
+      issued_supply = issued,
+      created = nowMs(),
+      note = "First observed issued supply. Inflation = issued supply growth from this baseline.",
+    }
+    writeTable(INFLATION_BASE_FILE, base)
+  end
+
+  return tonumber(base.issued_supply), nil
+end
+
+local function calculateMonetaryInflation(issued)
+  issued = tonumber(issued)
+  local base, err = getInflationBase(issued)
+  if not base then return nil, err or "Awaiting monetary baseline" end
+
+  local inflation = ((issued / base) - 1) * 100
+  return inflation, "Monetary inflation: issued supply vs baseline"
+end
+
 -- =============================================================================
 -- DISPLAY SETUP
 -- =============================================================================
@@ -475,55 +504,6 @@ local function estimateTxPerDay(currentTx)
   return perDay, "Estimated from local monitor history"
 end
 
-local function getPriceValue(entry)
-  if type(entry) == "table" then
-    return tonumber(entry.unit_price or entry.price or entry.value)
-  end
-  return tonumber(entry)
-end
-
-local function estimateInflationFromPrices(prices)
-  if type(prices) ~= "table" then
-    return nil, "Awaiting official prices"
-  end
-
-  local total = 0
-  local count = 0
-  for _, entry in pairs(prices) do
-    if type(entry) == "table" then
-      local current = getPriceValue(entry)
-      local historyList = entry.history
-      local previous = nil
-      if type(historyList) == "table" and #historyList > 0 then
-        local latest = historyList[#historyList]
-        if type(latest) == "table" then
-          previous = tonumber(latest.price or latest.unit_price or latest.value)
-        else
-          previous = tonumber(latest)
-        end
-      end
-      if current and previous and previous > 0 then
-        total = total + (((current / previous) - 1) * 100)
-        count = count + 1
-      end
-    end
-  end
-
-  if count <= 0 then
-    return nil, "Awaiting price history / CPI source"
-  end
-
-  return total / count, "Estimated from official price changes"
-end
-
-local function fetchPriceInflation()
-  local okPrices, priceRes = dbRequest({ type = "get_prices" }, 3)
-  if okPrices and type(priceRes) == "table" then
-    return estimateInflationFromPrices(priceRes.prices or {})
-  end
-  return nil, "Awaiting get_prices"
-end
-
 local function analyseContracts(contracts, status)
   local now = nowMs()
   local gdp = 0
@@ -629,6 +609,8 @@ local function normaliseNationalStats(raw)
   local reserveShare = nil
   if issued and issued > 0 and treasury then reserveShare = (treasury / issued) * 100 end
 
+  local monetaryInflation, monetaryInflationStatus = calculateMonetaryInflation(issued)
+
   local population = num(scaleRaw.active_citizens or scaleRaw.citizens or raw.citizen_count)
   local companies = num(scaleRaw.companies or raw.company_count)
   local totalTx = num(scaleRaw.transactions or raw.tx_count or activityRaw.transactions)
@@ -646,9 +628,9 @@ local function normaliseNationalStats(raw)
     time = raw.time or nowMs(),
     gdp = gdp,
     gdp_per_capita = gdpCap,
-    inflation = num(pricesRaw.inflation or pricesRaw.inflation_rate or pricesRaw.inflation_period),
+    inflation = monetaryInflation,
     output_status = outputRaw.status or (gdp and "Live" or "Awaiting GDP output data"),
-    inflation_status = pricesRaw.status or (pricesRaw.inflation and "Live" or "Awaiting inflation data"),
+    inflation_status = monetaryInflationStatus or "Awaiting monetary supply baseline",
     inequality = {
       top1_share = num(inequalityRaw.top1_share or inequalityRaw.top_1_share),
       average_balance = num(inequalityRaw.average_balance or inequalityRaw.mean),
@@ -695,7 +677,7 @@ local function fallbackSnapshot()
   if issued and issued > 0 and treasury then reserveShare = (treasury / issued) * 100 end
 
   local txDay, txStatus = estimateTxPerDay(status.tx_count)
-  local inflation, inflationStatus = fetchPriceInflation()
+  local inflation, inflationStatus = calculateMonetaryInflation(issued)
   local contractEco = fetchContractEconomy()
 
   local gdp = nil
@@ -756,8 +738,8 @@ local function refreshSnapshot()
       if pop and pop > 0 then snap.gdp_per_capita = snap.gdp / pop end
     end
 
-    if not snap.inflation then
-      local inf, infStatus = fetchPriceInflation()
+    if snap.inflation == nil then
+      local inf, infStatus = calculateMonetaryInflation(snap.monetary and snap.monetary.issued_supply)
       snap.inflation = inf
       snap.inflation_status = infStatus
     end
