@@ -10,55 +10,65 @@
 --   reboot
 -- =============================================================================
 
-local GITHUB_URL = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/main/ClientTerminal"
-local SELF = "startup.lua"
-local TEMP = "startup_update.tmp"
+local GITHUB_URL   = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/main/ClientTerminal"
+local SELF         = "startup.lua"
+local UPDATE_STAMP = "client_version.db"
 
-local function selfUpdate()
+local bootArgs    = {...}
+local SKIP_UPDATE = (bootArgs[1] == "--updated")
+
+-- Delete-and-rebuild from GitHub every boot via http.get (CC's wget has no -q
+-- flag, which broke the old updater) with a cache-buster so the CDN can't serve
+-- a stale copy. Relaunches with --updated so the fresh code runs exactly once.
+local function selfRebuild()
+  if SKIP_UPDATE then return false end
+
+  if not http then
+    print("HTTP API disabled. Running local copy.")
+    return false
+  end
+
   print("[ Quid Bank of Plenty ]")
-  print("Checking for updates...")
-  local ok = shell.run("wget", "-q", GITHUB_URL, TEMP)
-  if not ok or not fs.exists(TEMP) then
-    print("Update check failed. Running existing version.")
-    if fs.exists(TEMP) then fs.delete(TEMP) end
-    return false
-  end
-  local f = fs.open(TEMP, "r")
-  local content = f and f.readAll() or ""
-  if f then f.close() end
-  if #content < 200 or not content:find("VERSION") then
-    print("Download invalid. Running existing version.")
-    fs.delete(TEMP)
-    return false
-  end
-  if fs.exists(SELF) then fs.delete(SELF) end
-  fs.move(TEMP, SELF)
+  print("Rebuilding from GitHub...")
 
-  -- Record update timestamp
-  local vf = fs.open("client_version.db", "w")
+  local url  = GITHUB_URL .. "?cb=" .. tostring(os.epoch("utc"))
+  local resp = http.get(url)
+  if not resp then
+    print("GitHub unreachable. Running local copy.")
+    return false
+  end
+  local data = resp.readAll()
+  resp.close()
+
+  if not data or #data < 200 or not data:find("VERSION") then
+    print("Download looked invalid. Running local copy.")
+    return false
+  end
+
+  if fs.exists(SELF) then fs.delete(SELF) end
+  local f = fs.open(SELF, "w")
+  f.write(data)
+  f.close()
+
+  local vf = fs.open(UPDATE_STAMP, "w")
   if vf then
-    vf.write(textutils.serialize({
-      version      = VERSION,
-      last_updated = os.epoch("utc"),
-      source       = GITHUB_URL
-    }))
+    vf.write(textutils.serialize({ last_updated = os.epoch("utc"), source = GITHUB_URL }))
     vf.close()
   end
 
-  print("Updated. Relaunching...")
-  sleep(0.5)
-  os.reboot()
+  print("Rebuilt from GitHub. Launching latest...")
+  sleep(0.3)
+  shell.run(SELF, "--updated")
   return true
 end
 
-local bootArgs = {...}
-if bootArgs[1] ~= "--skip-update" then selfUpdate() end
+if selfRebuild() then return end
 
 -- =============================================================================
 -- MAIN PROGRAM
 -- =============================================================================
 
-local VERSION  = "1.0.0"
+local VERSION  = "1.1.0"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
 local DB_TIMEOUT = 5
@@ -249,14 +259,29 @@ local function openModem()
 end
 
 local function findDB()
-  -- Broadcast discovery, wait for treasury to respond
-  rednet.broadcast({ type = "ping" }, PROTOCOL)
-  local deadline = os.clock() + 4
-  while os.clock() < deadline do
-    local sender, msg, proto = rednet.receive(PROTOCOL, 2)
-    if sender and type(msg) == "table" and msg.success and type(msg.response) == "table" then
-      if msg.response.version then
-        return sender
+  -- Try up to 3 times with increasing patience
+  for attempt = 1, 3 do
+    -- Broadcast ping on the bank protocol
+    rednet.broadcast({ type = "ping" }, PROTOCOL)
+
+    local deadline = os.clock() + 3
+    while os.clock() < deadline do
+      local sender, msg, proto = rednet.receive(PROTOCOL, 1)
+      if sender and type(msg) == "table" then
+        -- Server replies wrap responses as {success=bool, response={...}}
+        if msg.success == true and type(msg.response) == "table" and msg.response.version then
+          return sender
+        end
+        -- Also accept the raw treasury_online broadcast the server sends periodically
+        if msg.type == "treasury_online" and msg.version then
+          -- Send a direct ping to confirm it's alive
+          rednet.send(sender, { type = "ping" }, PROTOCOL)
+          local s2, m2 = rednet.receive(PROTOCOL, 2)
+          if s2 == sender and type(m2) == "table" and m2.success then
+            return sender
+          end
+          return sender  -- accept it anyway, broadcast proves it's online
+        end
       end
     end
   end
@@ -333,22 +358,55 @@ end
 local function screenConnecting()
   cls()
   drawHeader("Connecting...")
-  centreText(7, "Locating Quid Bank server...", COL.dim_txt)
-  centreText(9, "Please wait", COL.dim_txt)
 
-  db_id = findDB()
+  centreText(7,  "Locating Quid Bank server...", COL.dim_txt)
+  centreText(9,  "Sending discovery ping...", COL.dim_txt)
+  centreText(11, "Attempt 1 of 3", COL.dim_txt)
 
-  if not db_id then
-    cls()
-    drawHeader("Connection Failed")
-    centreText(7, "Could not reach bank server.", COL.error_txt)
-    centreText(9, "Check the server is online", COL.dim_txt)
-    centreText(10, "and modems are connected.", COL.dim_txt)
-    centreText(12, "Retrying in 5 seconds...", COL.dim_txt)
-    sleep(5)
-    return false
+  -- Show attempt progress on screen
+  local function showAttempt(n, status)
+    drawRect(1, 11, W, 1, COL.bg)
+    centreText(11, "Attempt " .. n .. " of 3  " .. status, COL.dim_txt)
   end
-  return true
+
+  for attempt = 1, 3 do
+    showAttempt(attempt, "pinging...")
+    rednet.broadcast({ type = "ping" }, PROTOCOL)
+
+    local deadline = os.clock() + 3
+    while os.clock() < deadline do
+      local sender, msg, proto = rednet.receive(PROTOCOL, 1)
+      if sender and type(msg) == "table" then
+        if msg.success == true and type(msg.response) == "table" and msg.response.version then
+          db_id = sender
+          centreText(11, "Connected! Server ID: " .. sender, COL.success_txt)
+          sleep(0.5)
+          return true
+        end
+        if msg.type == "treasury_online" and msg.version then
+          db_id = sender
+          centreText(11, "Connected! Server ID: " .. sender, COL.success_txt)
+          sleep(0.5)
+          return true
+        end
+      end
+    end
+
+    showAttempt(attempt, "no response")
+    sleep(0.3)
+  end
+
+  -- Failed
+  cls()
+  drawHeader("Connection Failed")
+  centreText(7,  "Could not reach bank server.", COL.error_txt)
+  centreText(9,  "Check that:", COL.dim_txt)
+  centreText(10, "- Treasury DB computer is on", COL.dim_txt)
+  centreText(11, "- Both computers have modems", COL.dim_txt)
+  centreText(12, "- Modems are Ender modems", COL.dim_txt)
+  centreText(14, "Retrying in 5 seconds...", COL.dim_txt)
+  sleep(5)
+  return false
 end
 
 -- -----------------------------------------------------------------------
