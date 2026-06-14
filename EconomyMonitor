@@ -1,0 +1,801 @@
+-- =============================================================================
+-- NATIONAL ECONOMIC MONITOR
+-- Quid national statistics display
+--
+-- Install manually:
+--   delete startup
+--   wget <your raw github url> startup.lua
+--   startup.lua
+--
+-- This is a read-only national statistics monitor.
+-- It does not show account lists, rankings, citizen balances, or bank UI.
+--
+-- Current-server mode:
+--   Uses existing handlers: ping, status, get_prices.
+--   Displays official monetary/statistical figures that can be derived now.
+--   Marks GDP/CPI/inflation/fiscal/policy figures as awaiting source data.
+--
+-- Future-server mode:
+--   If the server later adds a national_statistics handler, this monitor will
+--   automatically prefer it and display those official GDP/CPI/fiscal values.
+-- =============================================================================
+
+-- =============================================================================
+-- CONFIG
+-- =============================================================================
+local VERSION          = "0.1.0"
+local PROTOCOL         = "quid_bank"
+local DB_TIMEOUT       = 4
+local REFRESH_SECONDS  = 5
+local MONITOR_SCALE    = 0.5
+
+-- =============================================================================
+-- STATE
+-- =============================================================================
+local native_term = term.current and term.current() or term.native()
+local using_monitor = false
+local monitor_name = nil
+local modem_name = nil
+local db_id = nil
+
+local last_snapshot = nil
+local previous_snapshot = nil
+local last_error = ""
+local last_mode = "BOOT"
+local running = true
+
+-- =============================================================================
+-- BASIC HELPERS
+-- =============================================================================
+local function n(v)
+  return tonumber(v) or 0
+end
+
+local function safeDiv(a, b)
+  a = tonumber(a) or 0
+  b = tonumber(b) or 0
+  if b == 0 then return nil end
+  return a / b
+end
+
+local function clamp(v, lo, hi)
+  if v < lo then return lo end
+  if v > hi then return hi end
+  return v
+end
+
+local function pct(part, whole)
+  local v = safeDiv(part, whole)
+  if not v then return nil end
+  return v * 100
+end
+
+local function fmtPct(v)
+  if v == nil then return "Awaiting data" end
+  return string.format("%.2f%%", tonumber(v) or 0)
+end
+
+local function fmtNum(v, decimals)
+  if v == nil then return "Awaiting data" end
+  decimals = decimals or 0
+  return string.format("%." .. tostring(decimals) .. "f", tonumber(v) or 0)
+end
+
+local function money(v)
+  if v == nil then return "Awaiting data" end
+  v = tonumber(v) or 0
+  local sign = ""
+  if v < 0 then
+    sign = "-"
+    v = math.abs(v)
+  end
+  local s = tostring(math.floor(v + 0.000001))
+  local out = ""
+  while #s > 3 do
+    out = "," .. s:sub(-3) .. out
+    s = s:sub(1, -4)
+  end
+  return sign .. s .. out .. " Q"
+end
+
+local function shortMoney(v)
+  if v == nil then return "Awaiting data" end
+  v = tonumber(v) or 0
+  local sign = ""
+  if v < 0 then sign = "-"; v = math.abs(v) end
+  if v >= 1000000000 then return sign .. string.format("%.2fb Q", v / 1000000000) end
+  if v >= 1000000 then return sign .. string.format("%.2fm Q", v / 1000000) end
+  if v >= 10000 then return sign .. string.format("%.1fk Q", v / 1000) end
+  return money(sign == "-" and -v or v)
+end
+
+local function cleanText(s)
+  s = tostring(s or "")
+  s = s:gsub("\n", " ")
+  s = s:gsub("\r", " ")
+  return s
+end
+
+local function timeNowMs()
+  if os.epoch then return os.epoch("utc") end
+  return math.floor(os.time() * 1000)
+end
+
+local function formatTime(ms)
+  ms = tonumber(ms) or timeNowMs()
+  local ok, out = pcall(os.date, "!%H:%M:%S", math.floor(ms / 1000))
+  if ok and out then return out .. " UTC" end
+  return tostring(ms)
+end
+
+local function getSize()
+  return term.getSize()
+end
+
+local function clear(bg)
+  term.setCursorBlink(false)
+  term.setBackgroundColor(bg or colors.black)
+  term.setTextColor(colors.white)
+  term.clear()
+  term.setCursorPos(1, 1)
+end
+
+local function writeAt(x, y, text, fg, bg)
+  local w, h = getSize()
+  if y < 1 or y > h or x > w then return end
+  if x < 1 then x = 1 end
+  text = cleanText(text)
+  term.setCursorPos(x, y)
+  if bg then term.setBackgroundColor(bg) end
+  if fg then term.setTextColor(fg) end
+  local maxw = w - x + 1
+  if maxw > 0 then term.write(text:sub(1, maxw)) end
+end
+
+local function fill(x, y, w, h, bg)
+  local sw, sh = getSize()
+  if w <= 0 or h <= 0 then return end
+  x = math.max(1, x)
+  term.setBackgroundColor(bg or colors.black)
+  local row = string.rep(" ", math.max(0, w))
+  for yy = y, y + h - 1 do
+    if yy >= 1 and yy <= sh then
+      term.setCursorPos(x, yy)
+      term.write(row:sub(1, sw - x + 1))
+    end
+  end
+end
+
+local function center(y, text, fg, bg)
+  local w = getSize()
+  text = cleanText(text)
+  local x = math.floor((w - #text) / 2) + 1
+  writeAt(x, y, text, fg, bg)
+end
+
+local function bar(x, y, w, value, maxValue, fg, bg)
+  value = tonumber(value) or 0
+  maxValue = tonumber(maxValue) or 100
+  if maxValue <= 0 then maxValue = 100 end
+  local filled = math.floor(clamp(value / maxValue, 0, 1) * w)
+  if filled > 0 then fill(x, y, filled, 1, fg or colors.lime) end
+  if w - filled > 0 then fill(x + filled, y, w - filled, 1, bg or colors.gray) end
+end
+
+local function valueColour(value, goodIfPositive)
+  if value == nil then return colors.lightGray end
+  value = tonumber(value) or 0
+  if value == 0 then return colors.white end
+  if goodIfPositive == false then
+    return value > 0 and colors.red or colors.lime
+  end
+  return value > 0 and colors.lime or colors.red
+end
+
+-- =============================================================================
+-- DISPLAY / MODEM
+-- =============================================================================
+local function selectDisplay()
+  local names = peripheral.getNames()
+  for _, name in ipairs(names) do
+    if peripheral.getType(name) == "monitor" then
+      local mon = peripheral.wrap(name)
+      if mon then
+        if mon.setTextScale then mon.setTextScale(MONITOR_SCALE) end
+        term.redirect(mon)
+        using_monitor = true
+        monitor_name = name
+        return true
+      end
+    end
+  end
+  using_monitor = false
+  monitor_name = nil
+  return false
+end
+
+local function openModem()
+  for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.getType(name) == "modem" then
+      local modem = peripheral.wrap(name)
+      if modem and modem.isWireless and modem.isWireless() then
+        rednet.open(name)
+        modem_name = name
+        return true
+      end
+    end
+  end
+
+  for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.getType(name) == "modem" then
+      rednet.open(name)
+      modem_name = name
+      return true
+    end
+  end
+
+  return false
+end
+
+local function connectServer()
+  db_id = nil
+  clear(colors.black)
+  center(3, "NATIONAL ECONOMIC MONITOR", colors.yellow, colors.black)
+  center(5, "Connecting to Quid Bank server...", colors.white, colors.black)
+  center(7, "Modem: " .. tostring(modem_name or "none"), colors.lightGray, colors.black)
+
+  for attempt = 1, 8 do
+    fill(1, 9, getSize(), 1, colors.black)
+    center(9, "Attempt " .. attempt .. " of 8", colors.lightGray, colors.black)
+
+    rednet.broadcast({ type = "ping" }, PROTOCOL)
+    local sender, msg = rednet.receive(PROTOCOL, 4)
+
+    if sender and type(msg) == "table" then
+      if msg.type == "treasury_online" then
+        db_id = sender
+        center(11, "Connected to server " .. tostring(db_id), colors.lime, colors.black)
+        sleep(0.4)
+        return true
+      end
+
+      if msg.success == true and type(msg.response) == "table" then
+        db_id = sender
+        center(11, "Connected to server " .. tostring(db_id), colors.lime, colors.black)
+        sleep(0.4)
+        return true
+      end
+    end
+  end
+
+  last_error = "Connection failed. Check server/modem."
+  return false
+end
+
+local function dbRequest(req, timeout)
+  timeout = timeout or DB_TIMEOUT
+  if not db_id then return false, "No server connected" end
+
+  rednet.send(db_id, req, PROTOCOL)
+  local deadline = os.clock() + timeout
+
+  while true do
+    local remaining = deadline - os.clock()
+    if remaining <= 0 then return false, "No response from server" end
+
+    local sender, msg = rednet.receive(PROTOCOL, remaining)
+    if sender == db_id and type(msg) == "table" and msg.success ~= nil then
+      return msg.success, msg.response
+    end
+  end
+end
+
+-- =============================================================================
+-- SNAPSHOT MATH
+-- =============================================================================
+local function countPrices(priceTable)
+  local count = 0
+  local changed = 0
+  local driftTotal = 0
+
+  if type(priceTable) ~= "table" then
+    return 0, 0, nil
+  end
+
+  for _, rec in pairs(priceTable) do
+    if type(rec) == "table" and tonumber(rec.unit_price) then
+      count = count + 1
+      local hist = rec.history
+      if type(hist) == "table" and #hist > 0 then
+        local old = tonumber(hist[#hist].price)
+        local now = tonumber(rec.unit_price)
+        if old and old > 0 and now then
+          changed = changed + 1
+          driftTotal = driftTotal + (((now / old) - 1) * 100)
+        end
+      end
+    end
+  end
+
+  if changed == 0 then return count, changed, nil end
+  return count, changed, driftTotal / changed
+end
+
+local function deriveFromExisting(status, priceResponse)
+  local s = status or {}
+  local supply = s.supply or {}
+  local citizens = n(s.citizen_count)
+  local companies = n(s.company_count)
+  local accounts = n(s.account_count)
+
+  local issued = n(supply.in_circulation)
+  local treasury = n(supply.treasury_balance)
+  local private = issued - treasury
+  if private < 0 then private = 0 end
+
+  local priceTable = nil
+  if type(priceResponse) == "table" then priceTable = priceResponse.prices end
+  local priceCount, changedPrices, unweightedDrift = countPrices(priceTable)
+
+  local snap = {
+    source = "current_server",
+    time = s.time or timeNowMs(),
+    updated = timeNowMs(),
+    status = s.economy_status or "unknown",
+    server_version = s.version or "?",
+    db_label = s.label or "?",
+
+    monetary = {
+      issued_supply = issued,
+      total_minted = n(supply.total_minted),
+      total_burned = n(supply.total_burned),
+      treasury_reserve = treasury,
+      private_supply = private,
+      citizen_money = n(supply.citizen_holdings),
+      company_money = n(supply.company_holdings),
+      escrow_money = n(supply.escrow_held),
+      reserve_share = pct(treasury, issued),
+      private_share = pct(private, issued),
+      issued_per_capita = citizens > 0 and (issued / citizens) or nil,
+      private_per_capita = citizens > 0 and (private / citizens) or nil,
+    },
+
+    scale = {
+      population = citizens,
+      companies = companies,
+      accounts = accounts,
+      companies_per_100_citizens = citizens > 0 and ((companies / citizens) * 100) or nil,
+      transactions_recorded = n(s.tx_count),
+    },
+
+    prices = {
+      price_records = priceCount,
+      changed_price_records = changedPrices,
+      unweighted_price_drift = unweightedDrift,
+      cpi = nil,
+      inflation = nil,
+      basket_cost = nil,
+      purchasing_power = nil,
+      status = "Awaiting official CPI basket",
+    },
+
+    output = {
+      nominal_gdp = nil,
+      real_gdp = nil,
+      gdp_per_capita = nil,
+      real_growth = nil,
+      velocity = nil,
+      status = "Awaiting economic output ledger",
+    },
+
+    fiscal = {
+      revenue = nil,
+      spending = nil,
+      balance = nil,
+      balance_to_gdp = nil,
+      status = "Awaiting classified fiscal events",
+    },
+
+    trade = {
+      exports = nil,
+      imports = nil,
+      balance = nil,
+      status = "Awaiting import/export events",
+    },
+
+    policy = {
+      base_rate = nil,
+      inflation_target = nil,
+      target_growth = nil,
+      suggested_rate = nil,
+      stance = "Awaiting policy config",
+    },
+
+    data = {
+      level = "PARTIAL",
+      note = "Monetary statistics live. GDP/CPI/fiscal/trade need official event data.",
+    }
+  }
+
+  return snap
+end
+
+local function normaliseNationalStats(ns)
+  ns = ns or {}
+  ns.source = "national_statistics"
+  ns.updated = timeNowMs()
+
+  ns.monetary = ns.monetary or ns.supply or {}
+  ns.scale = ns.scale or ns.population or {}
+  ns.prices = ns.prices or {}
+  ns.output = ns.output or {}
+  ns.fiscal = ns.fiscal or {}
+  ns.trade = ns.trade or {}
+  ns.policy = ns.policy or {}
+  ns.data = ns.data or { level = "OFFICIAL", note = "Server national_statistics handler active." }
+
+  -- Allow either naming convention from a future server handler.
+  if ns.monetary.in_circulation and not ns.monetary.issued_supply then
+    ns.monetary.issued_supply = ns.monetary.in_circulation
+  end
+  if ns.monetary.treasury_balance and not ns.monetary.treasury_reserve then
+    ns.monetary.treasury_reserve = ns.monetary.treasury_balance
+  end
+  if ns.scale.citizens and not ns.scale.population then
+    ns.scale.population = ns.scale.citizens
+  end
+
+  local issued = n(ns.monetary.issued_supply)
+  local treasury = n(ns.monetary.treasury_reserve)
+  if not ns.monetary.private_supply then ns.monetary.private_supply = math.max(0, issued - treasury) end
+  if not ns.monetary.reserve_share then ns.monetary.reserve_share = pct(treasury, issued) end
+  if not ns.monetary.private_share then ns.monetary.private_share = pct(ns.monetary.private_supply, issued) end
+
+  local pop = n(ns.scale.population)
+  if pop > 0 then
+    if not ns.monetary.issued_per_capita then ns.monetary.issued_per_capita = issued / pop end
+    if not ns.monetary.private_per_capita then ns.monetary.private_per_capita = n(ns.monetary.private_supply) / pop end
+    if ns.output.real_gdp and not ns.output.gdp_per_capita then ns.output.gdp_per_capita = n(ns.output.real_gdp) / pop end
+  end
+
+  return ns
+end
+
+local function fetchSnapshot()
+  -- Prefer future official server-side national accounting when it exists.
+  local okNs, ns = dbRequest({ type = "national_statistics" }, 2)
+  if okNs and type(ns) == "table" then
+    last_mode = "OFFICIAL NATIONAL STATISTICS"
+    last_error = ""
+    return normaliseNationalStats(ns)
+  end
+
+  -- Current server fallback.
+  local okStatus, status = dbRequest({ type = "status" }, DB_TIMEOUT)
+  if not okStatus or type(status) ~= "table" then
+    last_mode = "NO STATISTICS"
+    last_error = "Status unavailable: " .. tostring(status)
+    return nil
+  end
+
+  local okPrices, prices = dbRequest({ type = "get_prices" }, 2)
+  if not okPrices then prices = nil end
+
+  last_mode = "CURRENT DATA FALLBACK"
+  last_error = ""
+  return deriveFromExisting(status, prices)
+end
+
+local function enrichTrends(current, previous)
+  if not current then return current end
+  current.trend = current.trend or {}
+
+  if previous and previous.monetary and current.monetary then
+    current.trend.supply_change = n(current.monetary.issued_supply) - n(previous.monetary.issued_supply)
+    current.trend.supply_change_pct = pct(current.trend.supply_change, n(previous.monetary.issued_supply))
+
+    current.trend.private_change = n(current.monetary.private_supply) - n(previous.monetary.private_supply)
+    current.trend.private_change_pct = pct(current.trend.private_change, n(previous.monetary.private_supply))
+  end
+
+  if previous and previous.output and current.output then
+    local prevReal = previous.output.real_gdp
+    local nowReal = current.output.real_gdp
+    if prevReal and nowReal then current.trend.real_gdp_change_pct = pct(n(nowReal) - n(prevReal), n(prevReal)) end
+  end
+
+  return current
+end
+
+-- =============================================================================
+-- DRAWING COMPONENTS
+-- =============================================================================
+local C = {
+  bg = colors.black,
+  panel = colors.gray,
+  panel2 = colors.lightGray,
+  header = colors.blue,
+  title = colors.yellow,
+  text = colors.white,
+  label = colors.lightGray,
+  muted = colors.gray,
+  good = colors.lime,
+  warn = colors.orange,
+  bad = colors.red,
+  cyan = colors.cyan,
+  purple = colors.purple,
+}
+
+local function card(x, y, w, h, title, titleCol)
+  fill(x, y, w, h, colors.black)
+  fill(x, y, w, 1, titleCol or colors.gray)
+  writeAt(x + 1, y, title, colors.white, titleCol or colors.gray)
+  -- simple dark body, no borders, so it works on any monitor character set
+end
+
+local function row(x, y, w, label, value, valueCol)
+  label = cleanText(label)
+  value = cleanText(value)
+  local labelWidth = math.floor(w * 0.52)
+  if labelWidth < 12 then labelWidth = 12 end
+  writeAt(x, y, label:sub(1, labelWidth), C.label, colors.black)
+  writeAt(x + labelWidth, y, value, valueCol or C.text, colors.black)
+end
+
+local function statusValue(v)
+  if v == nil then return "Awaiting data", C.muted end
+  return tostring(v), C.text
+end
+
+local function trendText(v, isPct)
+  if v == nil then return "--", C.muted end
+  local col = valueColour(v, true)
+  local prefix = v > 0 and "+" or ""
+  if isPct then return prefix .. fmtPct(v), col end
+  return prefix .. money(v), col
+end
+
+local function drawTop(snap)
+  local w = getSize()
+  fill(1, 1, w, 2, C.header)
+  writeAt(2, 1, "NATIONAL ECONOMIC MONITOR", C.title, C.header)
+  writeAt(w - #("v" .. VERSION) - 1, 1, "v" .. VERSION, colors.white, C.header)
+
+  local mode = last_mode or "BOOT"
+  local updated = snap and formatTime(snap.updated or snap.time) or "--"
+  local source = snap and (snap.source or "unknown") or "none"
+  writeAt(2, 2, "Mode: " .. mode .. "   Source: " .. source .. "   Updated: " .. updated, colors.white, C.header)
+end
+
+local function drawFooter(snap)
+  local w, h = getSize()
+  fill(1, h - 1, w, 2, colors.black)
+
+  local note = ""
+  if snap and snap.data and snap.data.note then note = snap.data.note end
+  if last_error ~= "" then note = last_error end
+
+  writeAt(2, h - 1, "Data: " .. tostring((snap and snap.data and snap.data.level) or "UNKNOWN") .. " | " .. note, last_error ~= "" and C.bad or C.label, colors.black)
+  writeAt(2, h, "Refresh: " .. tostring(REFRESH_SECONDS) .. "s   Monitor: " .. tostring(monitor_name or "terminal") .. "   Server: " .. tostring(db_id or "?") .. "   [Q] Quit", C.muted, colors.black)
+end
+
+local function drawOutput(x, y, w, h, snap)
+  local o = (snap and snap.output) or {}
+  card(x, y, w, h, "OUTPUT & GROWTH", colors.blue)
+  row(x + 1, y + 2, w - 2, "Nominal GDP", money(o.nominal_gdp), o.nominal_gdp and C.good or C.muted)
+  row(x + 1, y + 3, w - 2, "Real GDP", money(o.real_gdp), o.real_gdp and C.good or C.muted)
+  row(x + 1, y + 4, w - 2, "GDP / Capita", money(o.gdp_per_capita), o.gdp_per_capita and C.good or C.muted)
+  row(x + 1, y + 5, w - 2, "Real Growth", fmtPct(o.real_growth), o.real_growth and valueColour(o.real_growth, true) or C.muted)
+  row(x + 1, y + 6, w - 2, "Money Velocity", o.velocity and (fmtNum(o.velocity, 2) .. "x") or "Awaiting data", o.velocity and C.cyan or C.muted)
+  row(x + 1, y + 8, w - 2, "Status", o.status or "Live", o.nominal_gdp and C.good or C.warn)
+end
+
+local function drawPrices(x, y, w, h, snap)
+  local p = (snap and snap.prices) or {}
+  card(x, y, w, h, "PRICES & PURCHASING POWER", colors.purple)
+  row(x + 1, y + 2, w - 2, "CPI", p.cpi and fmtNum(p.cpi, 2) or "Awaiting basket", p.cpi and C.good or C.muted)
+  row(x + 1, y + 3, w - 2, "Inflation", fmtPct(p.inflation), p.inflation and valueColour(p.inflation, false) or C.muted)
+  row(x + 1, y + 4, w - 2, "Basket Cost", money(p.basket_cost), p.basket_cost and C.good or C.muted)
+  row(x + 1, y + 5, w - 2, "Purchasing Power", p.purchasing_power and fmtNum(p.purchasing_power, 2) or "Awaiting CPI", p.purchasing_power and C.cyan or C.muted)
+  row(x + 1, y + 7, w - 2, "Official Prices", tostring(p.price_records or 0), C.text)
+  row(x + 1, y + 8, w - 2, "Price Drift", p.unweighted_price_drift and fmtPct(p.unweighted_price_drift) or "No history", p.unweighted_price_drift and valueColour(p.unweighted_price_drift, false) or C.muted)
+  row(x + 1, y + 9, w - 2, "Status", p.status or "Live", p.cpi and C.good or C.warn)
+end
+
+local function drawMonetary(x, y, w, h, snap)
+  local m = (snap and snap.monetary) or {}
+  local t = (snap and snap.trend) or {}
+  card(x, y, w, h, "MONETARY CONDITIONS", colors.green)
+  row(x + 1, y + 2, w - 2, "Issued Supply", money(m.issued_supply), C.good)
+  row(x + 1, y + 3, w - 2, "Private Supply", money(m.private_supply), C.text)
+  row(x + 1, y + 4, w - 2, "Treasury Reserve", money(m.treasury_reserve), C.cyan)
+  row(x + 1, y + 5, w - 2, "Reserve Share", fmtPct(m.reserve_share), C.cyan)
+  row(x + 1, y + 6, w - 2, "Issued / Capita", money(m.issued_per_capita), m.issued_per_capita and C.text or C.muted)
+  row(x + 1, y + 7, w - 2, "Private / Capita", money(m.private_per_capita), m.private_per_capita and C.text or C.muted)
+
+  local txt, col = trendText(t.supply_change, false)
+  row(x + 1, y + 9, w - 2, "Supply Change", txt, col)
+  txt, col = trendText(t.supply_change_pct, true)
+  row(x + 1, y + 10, w - 2, "Supply Growth", txt, col)
+
+  if m.reserve_share then
+    writeAt(x + 1, y + h - 2, "Reserve Share", C.muted, colors.black)
+    bar(x + 15, y + h - 2, math.max(5, w - 17), m.reserve_share, 100, colors.cyan, colors.gray)
+  end
+end
+
+local function drawFiscal(x, y, w, h, snap)
+  local f = (snap and snap.fiscal) or {}
+  card(x, y, w, h, "FISCAL POSITION", colors.red)
+  row(x + 1, y + 2, w - 2, "Revenue", money(f.revenue), f.revenue and C.good or C.muted)
+  row(x + 1, y + 3, w - 2, "Spending", money(f.spending), f.spending and C.warn or C.muted)
+  row(x + 1, y + 4, w - 2, "Balance", money(f.balance), f.balance and valueColour(f.balance, true) or C.muted)
+  row(x + 1, y + 5, w - 2, "Balance / GDP", fmtPct(f.balance_to_gdp), f.balance_to_gdp and valueColour(f.balance_to_gdp, true) or C.muted)
+  row(x + 1, y + 7, w - 2, "Status", f.status or "Live", f.revenue and C.good or C.warn)
+end
+
+local function drawTrade(x, y, w, h, snap)
+  local tr = (snap and snap.trade) or {}
+  card(x, y, w, h, "TRADE BALANCE", colors.cyan)
+  row(x + 1, y + 2, w - 2, "Exports", money(tr.exports), tr.exports and C.good or C.muted)
+  row(x + 1, y + 3, w - 2, "Imports", money(tr.imports), tr.imports and C.warn or C.muted)
+  row(x + 1, y + 4, w - 2, "Trade Balance", money(tr.balance), tr.balance and valueColour(tr.balance, true) or C.muted)
+  row(x + 1, y + 6, w - 2, "Status", tr.status or "Live", tr.balance and C.good or C.warn)
+end
+
+local function drawScalePolicy(x, y, w, h, snap)
+  local sc = (snap and snap.scale) or {}
+  local pol = (snap and snap.policy) or {}
+  card(x, y, w, h, "NATIONAL SCALE & POLICY", colors.brown)
+  row(x + 1, y + 2, w - 2, "Population", tostring(sc.population or "Awaiting data"), sc.population and C.text or C.muted)
+  row(x + 1, y + 3, w - 2, "Companies", tostring(sc.companies or "Awaiting data"), sc.companies and C.text or C.muted)
+  row(x + 1, y + 4, w - 2, "Transactions", tostring(sc.transactions_recorded or "Awaiting data"), sc.transactions_recorded and C.text or C.muted)
+  row(x + 1, y + 6, w - 2, "Base Rate", fmtPct(pol.base_rate), pol.base_rate and C.cyan or C.muted)
+  row(x + 1, y + 7, w - 2, "Inflation Target", fmtPct(pol.inflation_target), pol.inflation_target and C.cyan or C.muted)
+  row(x + 1, y + 8, w - 2, "Suggested Rate", fmtPct(pol.suggested_rate), pol.suggested_rate and C.warn or C.muted)
+  row(x + 1, y + 9, w - 2, "Policy Stance", pol.stance or "Awaiting policy config", pol.stance and C.warn or C.muted)
+end
+
+local function drawCompact(snap)
+  clear(C.bg)
+  drawTop(snap)
+
+  local w, h = getSize()
+  local y = 4
+  local m = (snap and snap.monetary) or {}
+  local p = (snap and snap.prices) or {}
+  local o = (snap and snap.output) or {}
+  local sc = (snap and snap.scale) or {}
+
+  row(2, y, w - 2, "Issued Supply", money(m.issued_supply), C.good); y = y + 1
+  row(2, y, w - 2, "Private Supply", money(m.private_supply), C.text); y = y + 1
+  row(2, y, w - 2, "Treasury Reserve", money(m.treasury_reserve), C.cyan); y = y + 1
+  row(2, y, w - 2, "Population", tostring(sc.population or "Awaiting data"), C.text); y = y + 1
+  row(2, y, w - 2, "CPI", p.cpi and fmtNum(p.cpi, 2) or "Awaiting basket", p.cpi and C.good or C.muted); y = y + 1
+  row(2, y, w - 2, "Inflation", fmtPct(p.inflation), p.inflation and C.warn or C.muted); y = y + 1
+  row(2, y, w - 2, "Nominal GDP", money(o.nominal_gdp), o.nominal_gdp and C.good or C.muted); y = y + 1
+  row(2, y, w - 2, "Real GDP", money(o.real_gdp), o.real_gdp and C.good or C.muted); y = y + 1
+  row(2, y, w - 2, "GDP / Capita", money(o.gdp_per_capita), o.gdp_per_capita and C.good or C.muted)
+
+  drawFooter(snap)
+end
+
+local function drawDashboard(snap)
+  local w, h = getSize()
+  if w < 70 or h < 24 then
+    drawCompact(snap)
+    return
+  end
+
+  clear(C.bg)
+  drawTop(snap)
+
+  local margin = 2
+  local gap = 2
+  local top = 4
+  local footer = 2
+  local usableH = h - top - footer
+  local rowH = math.floor((usableH - 2) / 2)
+  if rowH < 10 then rowH = 10 end
+
+  local colW = math.floor((w - (margin * 2) - (gap * 2)) / 3)
+  local x1 = margin
+  local x2 = x1 + colW + gap
+  local x3 = x2 + colW + gap
+  local y1 = top
+  local y2 = y1 + rowH + 1
+
+  drawOutput(x1, y1, colW, rowH, snap)
+  drawPrices(x2, y1, colW, rowH, snap)
+  drawMonetary(x3, y1, colW, rowH, snap)
+
+  drawFiscal(x1, y2, colW, rowH, snap)
+  drawTrade(x2, y2, colW, rowH, snap)
+  drawScalePolicy(x3, y2, colW, rowH, snap)
+
+  drawFooter(snap)
+end
+
+-- =============================================================================
+-- MAIN LOOP
+-- =============================================================================
+local function refresh()
+  if not db_id then
+    connectServer()
+  end
+
+  local snap = fetchSnapshot()
+  if snap then
+    previous_snapshot = last_snapshot
+    snap = enrichTrends(snap, previous_snapshot)
+    last_snapshot = snap
+  end
+
+  drawDashboard(last_snapshot)
+end
+
+local function mainLoop()
+  refresh()
+  local timer = os.startTimer(REFRESH_SECONDS)
+
+  while running do
+    local ev, p1 = os.pullEvent()
+
+    if ev == "timer" and p1 == timer then
+      refresh()
+      timer = os.startTimer(REFRESH_SECONDS)
+
+    elseif ev == "key" then
+      if p1 == keys.q then
+        running = false
+      elseif p1 == keys.r then
+        refresh()
+        timer = os.startTimer(REFRESH_SECONDS)
+      end
+
+    elseif ev == "monitor_touch" then
+      -- Touching the monitor forces a refresh; no controls, no actions.
+      refresh()
+      timer = os.startTimer(REFRESH_SECONDS)
+
+    elseif ev == "terminate" then
+      running = false
+    end
+  end
+end
+
+-- =============================================================================
+-- ENTRY
+-- =============================================================================
+local function main()
+  selectDisplay()
+
+  if not openModem() then
+    clear(colors.black)
+    center(3, "NATIONAL ECONOMIC MONITOR", colors.yellow, colors.black)
+    center(5, "ERROR: No modem found.", colors.red, colors.black)
+    center(7, "Attach an Ender Modem or network modem and reboot.", colors.lightGray, colors.black)
+    sleep(5)
+    if using_monitor then term.redirect(native_term) end
+    return
+  end
+
+  connectServer()
+  mainLoop()
+
+  clear(colors.black)
+  center(3, "National Economic Monitor closed.", colors.lightGray, colors.black)
+  sleep(0.5)
+
+  if using_monitor then
+    term.redirect(native_term)
+    term.setCursorBlink(false)
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+    term.clear()
+    term.setCursorPos(1, 1)
+    print("National Economic Monitor closed.")
+  end
+end
+
+main()
