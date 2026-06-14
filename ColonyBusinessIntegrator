@@ -1,0 +1,710 @@
+-- =============================================================================
+-- COLONY BUSINESS INTEGRATOR
+-- ColonyBusinessIntegrator
+-- MineColonies colony-integrator -> Quid companies + ContractServer job postings
+-- =============================================================================
+
+local args = {...}
+if args[1] ~= "--updated" then
+  print("[ Colony Business Integrator ]")
+  print("Deleting old version...")
+  fs.delete("startup.lua")
+  print("Downloading latest from GitHub...")
+  local cb = tostring(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
+  local url = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/ColonyBusinessIntegrator?cb=" .. cb
+  shell.run("wget " .. url .. " startup.lua")
+  if not fs.exists("startup.lua") then
+    print("")
+    print("Download failed.")
+    print("Expected GitHub file: ColonyBusinessIntegrator")
+    print("Manual install:")
+    print("delete startup")
+    print("wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/ColonyBusinessIntegrator?cb=001 startup.lua")
+    print("startup.lua")
+    return
+  end
+  print("Relaunching...")
+  sleep(0.5)
+  shell.run("startup.lua", "--updated")
+  return
+end
+
+-- =============================================================================
+-- CONFIG
+-- =============================================================================
+local VERSION = "1.0.0"
+local BANK_PROTOCOL = "quid_bank"
+local CONTRACT_PROTOCOL = "quid_contracts"
+local DB_TIMEOUT = 5
+local SCAN_INTERVAL = 30
+
+local STARTING_CAPITAL = 5000
+local AUTO_GRANT_CAPITAL = true
+local DEFAULT_OWNER_ID = "treasury:quid_bank"
+
+local INFLATION = 1.00
+local BASE_CONTRACT_FEE = 10
+local SPEND_LIMIT = 0.25       -- max % of business balance per job
+local MIN_FAIR_RATIO = 0.75    -- don't post if affordable price is under this share of fair value
+
+local FILE_BUSINESSES = "data/building_companies.db"
+local FILE_POSTED = "data/posted_requests.db"
+local FILE_CONFIG = "data/colony_business_config.db"
+
+local colony = nil
+local colony_name = "Colony"
+local modem_name = nil
+local bank_id = nil
+local contract_id = nil
+local businesses = {}
+local posted = {}
+local config = {}
+local prices = {}
+local auto_mode = true
+local last_message = "Booting..."
+local last_colour = colors.lightGray
+local W, H = term.getSize()
+
+local stats = {
+  buildings_seen = 0,
+  businesses_registered = 0,
+  requests_seen = 0,
+  contracts_posted = 0,
+  skipped_unfunded = 0,
+  skipped_unmapped = 0,
+  last_scan = 0,
+}
+
+-- =============================================================================
+-- BASIC HELPERS
+-- =============================================================================
+local function now()
+  return os.epoch("utc")
+end
+
+local function setMsg(msg, col)
+  last_message = tostring(msg or "")
+  last_colour = col or colors.lightGray
+end
+
+local function trim(s)
+  s = tostring(s or "")
+  return s:match("^%s*(.-)%s*$")
+end
+
+local function lower(s)
+  return string.lower(tostring(s or ""))
+end
+
+local function countTable(t)
+  local n = 0
+  for _ in pairs(t or {}) do n = n + 1 end
+  return n
+end
+
+local function safeCall(obj, method, ...)
+  if not obj or type(obj[method]) ~= "function" then return false, nil end
+  local ok, res = pcall(obj[method], ...)
+  if ok then return true, res end
+  return false, nil
+end
+
+local function ensureDir(path)
+  local parts = {}
+  for p in string.gmatch(path, "[^/]+") do parts[#parts + 1] = p end
+  table.remove(parts)
+  local cur = ""
+  for _, p in ipairs(parts) do
+    cur = cur == "" and p or (cur .. "/" .. p)
+    if not fs.exists(cur) then fs.makeDir(cur) end
+  end
+end
+
+local function readFile(path)
+  if not fs.exists(path) then return nil end
+  local f = fs.open(path, "r")
+  if not f then return nil end
+  local text = f.readAll()
+  f.close()
+  if not text or text == "" then return nil end
+  local ok, data = pcall(textutils.unserialize, text)
+  if ok then return data end
+  return nil
+end
+
+local function writeFile(path, data)
+  ensureDir(path)
+  local f = fs.open(path, "w")
+  if not f then return false end
+  f.write(textutils.serialize(data))
+  f.close()
+  return true
+end
+
+local function money(n)
+  n = tonumber(n) or 0
+  local sign = ""
+  if n < 0 then sign = "-"; n = math.abs(n) end
+  local s = tostring(math.floor(n))
+  local out = ""
+  while #s > 3 do
+    out = "," .. s:sub(-3) .. out
+    s = s:sub(1, -4)
+  end
+  return sign .. s .. " Q"
+end
+
+local function round5(n)
+  n = tonumber(n) or 0
+  return math.max(1, math.floor((n + 2.5) / 5) * 5)
+end
+
+-- =============================================================================
+-- DISPLAY
+-- =============================================================================
+local function cls()
+  W, H = term.getSize()
+  term.setCursorBlink(false)
+  term.setBackgroundColor(colors.black)
+  term.setTextColor(colors.white)
+  term.clear()
+  term.setCursorPos(1, 1)
+end
+
+local function at(x, y, text, fg, bg)
+  W, H = term.getSize()
+  if y < 1 or y > H or x > W then return end
+  if x < 1 then x = 1 end
+  term.setCursorPos(x, y)
+  term.setTextColor(fg or colors.white)
+  term.setBackgroundColor(bg or colors.black)
+  local maxw = W - x + 1
+  if maxw > 0 then term.write(tostring(text or ""):sub(1, maxw)) end
+end
+
+local function fill(x, y, w, h, bg)
+  W, H = term.getSize()
+  if w <= 0 or h <= 0 then return end
+  term.setBackgroundColor(bg or colors.black)
+  local row = string.rep(" ", w)
+  for yy = y, y + h - 1 do
+    if yy >= 1 and yy <= H then
+      term.setCursorPos(math.max(1, x), yy)
+      term.write(row:sub(1, math.max(0, W - x + 1)))
+    end
+  end
+end
+
+local function button(x, y, w, label, bg, fg)
+  fill(x, y, w, 1, bg or colors.gray)
+  local tx = x + math.floor((w - #label) / 2)
+  at(tx, y, label, fg or colors.white, bg or colors.gray)
+  return {x1=x, x2=x+w-1, y1=y, y2=y}
+end
+
+local function hit(b, mx, my)
+  return b and mx >= b.x1 and mx <= b.x2 and my >= b.y1 and my <= b.y2
+end
+
+local function draw()
+  cls()
+  fill(1, 1, W, 1, colors.purple)
+  at(2, 1, "COLONY BUSINESS INTEGRATOR", colors.white, colors.purple)
+  at(W - #VERSION, 1, VERSION, colors.lightGray, colors.purple)
+
+  at(2, 3, "Colony:    " .. tostring(colony_name), colors.white)
+  at(2, 4, "Bank:      " .. tostring(bank_id or "not connected"), bank_id and colors.lime or colors.red)
+  at(2, 5, "Contracts: " .. tostring(contract_id or "not connected"), contract_id and colors.lime or colors.red)
+  at(2, 6, "Auto:      " .. (auto_mode and "ON" or "OFF"), auto_mode and colors.lime or colors.orange)
+
+  at(2, 8,  "Buildings seen:    " .. tostring(stats.buildings_seen), colors.lightGray)
+  at(2, 9,  "Businesses mapped: " .. tostring(countTable(businesses)), colors.lightGray)
+  at(2, 10, "New registrations: " .. tostring(stats.businesses_registered), colors.lightGray)
+  at(2, 11, "Requests seen:     " .. tostring(stats.requests_seen), colors.lightGray)
+  at(2, 12, "Contracts posted:  " .. tostring(stats.contracts_posted), colors.lime)
+  at(2, 13, "Skipped unfunded:  " .. tostring(stats.skipped_unfunded), colors.orange)
+  at(2, 14, "Skipped unmapped:  " .. tostring(stats.skipped_unmapped), colors.orange)
+
+  local last = "never"
+  if stats.last_scan > 0 then last = tostring(math.floor((now() - stats.last_scan) / 1000)) .. "s ago" end
+  at(2, 16, "Last scan: " .. last, colors.lightGray)
+
+  local bw = math.floor((W - 8) / 3)
+  local bScan = button(2, H - 3, bw, "Scan Now", colors.purple)
+  local bAuto = button(4 + bw, H - 3, bw, auto_mode and "Auto Off" or "Auto On", colors.gray)
+  local bRecon = button(6 + (bw * 2), H - 3, bw, "Reconnect", colors.gray)
+
+  at(2, H - 1, tostring(last_message):sub(1, W - 2), last_colour)
+  return bScan, bAuto, bRecon
+end
+
+-- =============================================================================
+-- NETWORK / PERIPHERALS
+-- =============================================================================
+local function findColony()
+  colony = peripheral.find("colonyIntegrator") or peripheral.find("colony_integrator")
+  if not colony then return false end
+  local ok, name = safeCall(colony, "getColonyName")
+  if ok and name then colony_name = tostring(name) end
+  return true
+end
+
+local function openModem()
+  for _, n in ipairs(peripheral.getNames()) do
+    if peripheral.getType(n) == "modem" then
+      local m = peripheral.wrap(n)
+      if m and m.isWireless and m.isWireless() then rednet.open(n); modem_name = n; return true end
+    end
+  end
+  for _, n in ipairs(peripheral.getNames()) do
+    if peripheral.getType(n) == "modem" then rednet.open(n); modem_name = n; return true end
+  end
+  return false
+end
+
+local function discover(protocol, online_type)
+  for _ = 1, 5 do
+    rednet.broadcast({type="ping"}, protocol)
+    local sender, msg = rednet.receive(protocol, 3)
+    if sender and type(msg) == "table" then
+      if msg.type == online_type then return sender end
+      if msg.success == true and type(msg.response) == "table" then return sender end
+    end
+  end
+  return nil
+end
+
+local function reconnect()
+  bank_id = discover(BANK_PROTOCOL, "treasury_online")
+  contract_id = discover(CONTRACT_PROTOCOL, "contract_server_online")
+  if bank_id and contract_id then setMsg("Connected to bank and contract server.", colors.lime); return true end
+  if not bank_id then setMsg("Bank server not found.", colors.red) end
+  if bank_id and not contract_id then setMsg("Contract server not found.", colors.red) end
+  return false
+end
+
+local function bankReq(req, timeout)
+  timeout = timeout or DB_TIMEOUT
+  if not bank_id then return false, "No bank server" end
+  rednet.send(bank_id, req, BANK_PROTOCOL)
+  local deadline = os.clock() + timeout
+  while true do
+    local rem = deadline - os.clock()
+    if rem <= 0 then return false, "No response from bank" end
+    local sender, msg = rednet.receive(BANK_PROTOCOL, rem)
+    if sender == bank_id and type(msg) == "table" and msg.success ~= nil then return msg.success, msg.response end
+  end
+end
+
+local function contractReq(req, timeout)
+  timeout = timeout or DB_TIMEOUT
+  if not contract_id then return false, "No contract server" end
+  rednet.send(contract_id, req, CONTRACT_PROTOCOL)
+  local deadline = os.clock() + timeout
+  while true do
+    local rem = deadline - os.clock()
+    if rem <= 0 then return false, "No response from contracts" end
+    local sender, msg = rednet.receive(CONTRACT_PROTOCOL, rem)
+    if sender == contract_id and type(msg) == "table" and msg.success ~= nil then return msg.success, msg.response end
+  end
+end
+
+-- =============================================================================
+-- BUSINESS REGISTRATION
+-- =============================================================================
+local IGNORE_TYPES = { townhall=true, residence=true, home=true, citizen=true, decoration=true, decorations=true, graveyard=true }
+local ECONOMIC_TYPES = {
+  builder=true, cook=true, restaurant=true, deliveryman=true, courier=true, warehouse=true,
+  miner=true, mine=true, lumberjack=true, forester=true, farmer=true, farm=true, sawmill=true,
+  blacksmith=true, smeltery=true, crusher=true, composter=true, baker=true, bakery=true,
+  fisher=true, university=true, guardtower=true,
+}
+local SUFFIX = {
+  builder={"Builders","Construction","Works"}, cook={"Kitchens","Catering","Hearthworks"}, restaurant={"Kitchens","Catering","Hearthworks"},
+  deliveryman={"Logistics","Carriers","Dispatch"}, courier={"Logistics","Carriers","Dispatch"}, warehouse={"Storage","Logistics","Warehousing"},
+  miner={"Mining","Quarry","Excavation"}, mine={"Mining","Quarry","Excavation"}, lumberjack={"Timberworks","Forestry","Timber"}, forester={"Timberworks","Forestry","Timber"},
+  farmer={"Produce","Agriculture","Farms"}, farm={"Produce","Agriculture","Farms"}, sawmill={"Milling","Timber","Sawmills"},
+  blacksmith={"Smithing","Foundry","Forge"}, smeltery={"Foundry","Smelting","Metals"}, crusher={"Crushing","Materials","Stoneworks"},
+  composter={"Composting","Soils","Organics"}, baker={"Bakery","Baking","Ovens"}, bakery={"Bakery","Baking","Ovens"}, fisher={"Fisheries","Fishery","Harbour"},
+  university={"Research","Institute","Studies"}, guardtower={"Security","Watch","Defence"},
+}
+local PREFIX = {"Plenty","Muppet","Northgate","Eastmere","Oakmere","Hearthline","Greyford","Redbridge","Highwall","Deepwell","Ashford","Stoneford","Greenridge","Ironmere","Westbrook","Rookwell","Clearwater","Longfield","Southmere","Blackfen","Whitehill","Kingswell","Brindle","Holloway"}
+local RESERVED = { QUID=true, BANK=true, TRSY=true, GOVT=true, STAT=true, MRKT=true, CNTR=true, CNCL=true, CASH=true, MINT=true }
+
+local function normalType(t)
+  t = tostring(t or "")
+  t = t:gsub("com%.minecolonies%.building%.", "")
+  t = t:gsub("com%.minecolonies%.job%.", "")
+  t = t:gsub("[^%w_%-]", "")
+  return lower(t)
+end
+
+local function locString(loc)
+  if type(loc) ~= "table" then return "0,0,0" end
+  local x = loc.x or loc[1] or 0
+  local y = loc.y or loc[2] or 0
+  local z = loc.z or loc[3] or 0
+  return tostring(x) .. "," .. tostring(y) .. "," .. tostring(z)
+end
+
+local function buildingKey(b)
+  return normalType(b.type or b.name) .. "@" .. locString(b.location)
+end
+
+local function workKey(w)
+  return normalType(w.type or w.name) .. "@" .. locString(w.location)
+end
+
+local function isEconomic(b)
+  if not b then return false end
+  local t = normalType(b.type or b.name)
+  local n = lower(b.name or "")
+  if IGNORE_TYPES[t] then return false end
+  if n:find("townhall",1,true) or n:find("residence",1,true) or n:find("graveyard",1,true) then return false end
+  if ECONOMIC_TYPES[t] then return true end
+  if type(b.citizens) == "table" and #b.citizens > 0 then return true end
+  return false
+end
+
+local function usedName(name)
+  for _, r in pairs(businesses) do if r.name == name then return true end end
+  return false
+end
+
+local function usedTicker(t)
+  if RESERVED[t] then return true end
+  for _, r in pairs(businesses) do if r.ticker == t then return true end end
+  return false
+end
+
+local function padTicker(s)
+  s = tostring(s or ""):upper():gsub("[^A-Z0-9]", "")
+  if #s >= 4 then return s:sub(1,4) end
+  while #s < 4 do s = s .. string.char(math.random(65,90)) end
+  return s
+end
+
+local function tickerFromName(name, typ)
+  local words = {}
+  for w in tostring(name):gmatch("%w+") do words[#words+1] = w:upper() end
+  local s = ""
+  if #words >= 2 then s = words[1]:sub(1,2) .. words[2]:sub(1,2)
+  elseif #words == 1 then s = words[1]:sub(1,4) end
+  if #s < 4 then s = s .. tostring(typ or "BIZ"):upper():sub(1, 4 - #s) end
+  return padTicker(s)
+end
+
+local function generateIdentity(typ)
+  typ = normalType(typ)
+  local suffixes = SUFFIX[typ] or {"Works","Services","Trading"}
+  for _ = 1, 50 do
+    local name = PREFIX[math.random(1,#PREFIX)] .. " " .. suffixes[math.random(1,#suffixes)]
+    local ticker = tickerFromName(name, typ)
+    if not usedName(name) and not usedTicker(ticker) then return name, ticker end
+  end
+  local ticker
+  repeat ticker = padTicker(string.char(math.random(65,90)) .. string.char(math.random(65,90)) .. string.char(math.random(65,90)) .. string.char(math.random(65,90))) until not usedTicker(ticker)
+  return "Colony " .. ticker .. " Works", ticker
+end
+
+local function registerBuilding(b)
+  local key = buildingKey(b)
+  if businesses[key] then return false end
+  local typ = normalType(b.type or b.name)
+  for _ = 1, 20 do
+    local name, ticker = generateIdentity(typ)
+    local ok, res = bankReq({ type="register_company", name=name, ticker=ticker, biz_type=typ, owner_id=DEFAULT_OWNER_ID, shares_total=1000, shares_public=0 })
+    if ok and type(res) == "table" then
+      businesses[key] = { key=key, company_id=res.company_id or ("company:"..lower(ticker)), name=name, ticker=ticker, building_type=typ, building_name=b.name or typ, location=b.location, level=b.level or 0, built=true, enabled=true, registered_at=now() }
+      writeFile(FILE_BUSINESSES, businesses)
+      if AUTO_GRANT_CAPITAL and STARTING_CAPITAL > 0 then
+        bankReq({ type="grant", to_id=businesses[key].company_id, amount=STARTING_CAPITAL, memo="Starting capital for " .. name }, DB_TIMEOUT)
+      end
+      stats.businesses_registered = stats.businesses_registered + 1
+      setMsg("Registered " .. name .. " (" .. ticker .. ")", colors.lime)
+      return true
+    end
+    if not tostring(res or ""):find("Company already exists", 1, true) then return false end
+  end
+  return false
+end
+
+local function scanBusinesses(buildings)
+  for _, b in ipairs(buildings or {}) do
+    if b.built and isEconomic(b) then
+      local key = buildingKey(b)
+      if not businesses[key] then registerBuilding(b)
+      else
+        businesses[key].level = b.level or businesses[key].level
+        businesses[key].updated_at = now()
+      end
+    end
+  end
+  writeFile(FILE_BUSINESSES, businesses)
+end
+
+-- =============================================================================
+-- PRICING
+-- =============================================================================
+local function refreshPrices()
+  local ok, res = bankReq({ type="get_prices" })
+  if ok and type(res) == "table" and type(res.prices) == "table" then prices = res.prices end
+end
+
+local function officialPrice(id)
+  local p = prices[id]
+  if type(p) == "table" then return tonumber(p.unit_price) end
+  if type(p) == "number" then return p end
+  return nil
+end
+
+local function fallbackPrice(id)
+  id = lower(id)
+  if id:find("netherite",1,true) then return 100 end
+  if id:find("diamond",1,true) then return 50 end
+  if id:find("emerald",1,true) then return 45 end
+  if id:find("gold",1,true) then return 12 end
+  if id:find("iron",1,true) then return 8 end
+  if id:find("redstone",1,true) then return 5 end
+  if id:find("copper",1,true) then return 4 end
+  if id:find("brick",1,true) or id:find("glass",1,true) then return 3 end
+  if id:find("coal",1,true) or id:find("charcoal",1,true) then return 2 end
+  if id:find("pickaxe",1,true) or id:find("shovel",1,true) or id:find("axe",1,true) or id:find("tool",1,true) then return 25 end
+  if id:find("sword",1,true) or id:find("armor",1,true) or id:find("helmet",1,true) or id:find("chestplate",1,true) then return 35 end
+  if id:find("log",1,true) or id:find("plank",1,true) or id:find("stair",1,true) or id:find("slab",1,true) then return 1 end
+  if id:find("cobble",1,true) or id:find("stone",1,true) or id:find("dirt",1,true) then return 1 end
+  if id:find("bread",1,true) or id:find("wheat",1,true) or id:find("potato",1,true) or id:find("food",1,true) then return 2 end
+  return 2
+end
+
+local function unitPrice(id)
+  return officialPrice(id) or fallbackPrice(id)
+end
+
+local function companyBalance(company_id)
+  local ok, res = bankReq({ type="company_info", company_id=company_id })
+  if ok and type(res) == "table" then return tonumber(res.cash_balance) or 0 end
+  return 0
+end
+
+local function wealthMult(balance)
+  balance = tonumber(balance) or 0
+  return 1.0 + math.min(0.50, balance / 20000)
+end
+
+local function extractItems(req)
+  local out = {}
+  if type(req.items) ~= "table" then return out end
+  for _, item in pairs(req.items) do
+    if type(item) == "table" then
+      local id = trim(item.name or item.item or item.id or "")
+      local display = trim(item.displayName or item.display or item.label or id)
+      local count = tonumber(item.count or item.amount or req.count or req.minCount or 1) or 1
+      count = math.floor(count)
+      if id ~= "" and count > 0 then out[#out+1] = { item=id, display=display ~= "" and display or id, count=count } end
+    end
+  end
+  return out
+end
+
+local function requestItemValue(items)
+  if #items <= 0 then return 0 end
+  -- MineColonies request.items are usually alternatives; price by cheapest valid option.
+  local cheapest = nil
+  for _, it in ipairs(items) do
+    local v = unitPrice(it.item) * (tonumber(it.count) or 1)
+    if not cheapest or v < cheapest then cheapest = v end
+  end
+  return cheapest or 0
+end
+
+local function priceJob(business, items)
+  local bal = companyBalance(business.company_id)
+  if bal <= 0 then return nil, "no funds", bal, 0 end
+  local fair = (BASE_CONTRACT_FEE + requestItemValue(items)) * INFLATION * wealthMult(bal)
+  local max_pay = math.floor(bal * SPEND_LIMIT)
+  if max_pay <= 0 then return nil, "unfunded", bal, fair end
+  if max_pay < fair * MIN_FAIR_RATIO then return nil, "cannot afford fair price", bal, fair end
+  local reward = round5(math.min(fair, max_pay))
+  if reward <= 0 or reward > bal then return nil, "cannot pay", bal, fair end
+  return reward, nil, bal, fair
+end
+
+-- =============================================================================
+-- REQUEST RESOLUTION / POSTING
+-- =============================================================================
+local function citizenMatches(z, target)
+  local name = lower(z and z.name or "")
+  local t = lower(target or "")
+  if name == "" or t == "" then return false end
+  return t:find(name,1,true) ~= nil or name:find(t,1,true) ~= nil
+end
+
+local function resolveBusiness(req, citizens)
+  local target = req and req.target
+  if type(target) == "string" then
+    for _, z in ipairs(citizens or {}) do
+      if citizenMatches(z, target) and type(z.work) == "table" then
+        local key = workKey(z.work)
+        if businesses[key] then return businesses[key] end
+      end
+    end
+  elseif type(target) == "table" then
+    local key = normalType(target.type or target.name) .. "@" .. locString(target.location or target)
+    if businesses[key] then return businesses[key] end
+  end
+  return nil
+end
+
+local function simpleHash(raw)
+  local h = 5381
+  raw = tostring(raw or "")
+  for i = 1, #raw do h = ((h * 33) + string.byte(raw, i)) % 2147483647 end
+  return tostring(h)
+end
+
+local function reqKey(req)
+  if req.id then return "request:" .. tostring(req.id) end
+  return "request_hash:" .. simpleHash(tostring(req.name or "") .. "|" .. tostring(req.desc or "") .. "|" .. tostring(req.target or "") .. "|" .. tostring(req.count or ""))
+end
+
+local function reqTitle(req)
+  local name = trim(req.name or req.desc or "Supply Request")
+  if name == "" then name = "Supply Request" end
+  return "Supply " .. name
+end
+
+local function itemDesc(items)
+  local out = {}
+  for _, it in ipairs(items) do out[#out+1] = tostring(it.count) .. "x " .. tostring(it.display or it.item) end
+  return table.concat(out, ", ")
+end
+
+local function postContract(req, business, items, reward)
+  local key = reqKey(req)
+  local desc = "MineColonies request from " .. tostring(req.target or "unknown") .. ". Accepted items: " .. itemDesc(items)
+  local ok, res = contractReq({
+    type = "post_contract",
+    title = reqTitle(req),
+    description = desc,
+    poster = business.company_id,
+    reward = reward,
+    source_type = "minecolonies_request",
+    source_company = business.company_id,
+    request_id = tostring(req.id or key),
+    building_id = business.key,
+    items = items,
+  })
+  if ok and type(res) == "table" then
+    local cid = res.contract and res.contract.contract_id or "unknown"
+    posted[key] = { contract_id=cid, request_id=req.id, business=business.company_id, reward=reward, posted_at=now(), title=reqTitle(req) }
+    writeFile(FILE_POSTED, posted)
+    stats.contracts_posted = stats.contracts_posted + 1
+    setMsg("Posted " .. reqTitle(req) .. " for " .. money(reward), colors.lime)
+    return true
+  end
+  setMsg("Post failed: " .. tostring(res), colors.red)
+  return false
+end
+
+local function scanRequests(requests, citizens)
+  for _, req in ipairs(requests or {}) do
+    stats.requests_seen = stats.requests_seen + 1
+    local key = reqKey(req)
+    if not posted[key] then
+      local business = resolveBusiness(req, citizens)
+      if not business then
+        stats.skipped_unmapped = stats.skipped_unmapped + 1
+      else
+        local items = extractItems(req)
+        if #items > 0 then
+          local reward, reason, bal = priceJob(business, items)
+          if reward then postContract(req, business, items, reward)
+          else
+            stats.skipped_unfunded = stats.skipped_unfunded + 1
+            setMsg("Skipped " .. reqTitle(req) .. ": " .. tostring(reason) .. " (" .. money(bal) .. ")", colors.orange)
+          end
+        end
+      end
+    end
+  end
+end
+
+-- =============================================================================
+-- SCAN LOOP
+-- =============================================================================
+local function scanOnce()
+  if not colony then setMsg("No Colony Integrator found.", colors.red); return false end
+  if not bank_id or not contract_id then reconnect() end
+  if not bank_id or not contract_id then return false end
+
+  refreshPrices()
+  local okB, buildings = safeCall(colony, "getBuildings")
+  local okC, citizens = safeCall(colony, "getCitizens")
+  local okR, requests = safeCall(colony, "getRequests")
+  if not okB then buildings = {} end
+  if not okC then citizens = {} end
+  if not okR then requests = {} end
+
+  stats.buildings_seen = #buildings
+  stats.requests_seen = 0
+  stats.skipped_unmapped = 0
+  stats.skipped_unfunded = 0
+
+  scanBusinesses(buildings)
+  scanRequests(requests, citizens)
+
+  stats.last_scan = now()
+  writeFile(FILE_BUSINESSES, businesses)
+  writeFile(FILE_POSTED, posted)
+  return true
+end
+
+local function loadState()
+  businesses = readFile(FILE_BUSINESSES) or {}
+  posted = readFile(FILE_POSTED) or {}
+  config = readFile(FILE_CONFIG) or {}
+  if config.inflation then INFLATION = tonumber(config.inflation) or INFLATION end
+  if config.starting_capital then STARTING_CAPITAL = tonumber(config.starting_capital) or STARTING_CAPITAL end
+end
+
+local function main()
+  math.randomseed((now() + os.getComputerID()) % 2147483647)
+  loadState()
+  cls()
+  fill(1, 1, W, 1, colors.purple)
+  at(2, 1, "COLONY BUSINESS INTEGRATOR", colors.white, colors.purple)
+  at(2, 3, "Starting...", colors.lightGray)
+
+  if not findColony() then
+    at(2, 5, "No Colony Integrator found.", colors.red)
+    at(2, 6, "Attach this computer to the integrator.", colors.lightGray)
+    return
+  end
+  if not openModem() then
+    at(2, 5, "No modem found.", colors.red)
+    at(2, 6, "Attach an Ender/Wireless modem.", colors.lightGray)
+    return
+  end
+
+  reconnect()
+  local bScan, bAuto, bRecon = draw()
+  local timer = os.startTimer(2)
+
+  while true do
+    local ev, p1, p2, p3 = os.pullEvent()
+    if ev == "timer" and p1 == timer then
+      if auto_mode then scanOnce() end
+      bScan, bAuto, bRecon = draw()
+      timer = os.startTimer(SCAN_INTERVAL)
+    elseif ev == "mouse_click" then
+      local mx, my = p2, p3
+      if hit(bScan, mx, my) then scanOnce()
+      elseif hit(bAuto, mx, my) then auto_mode = not auto_mode; setMsg("Auto mode " .. (auto_mode and "enabled" or "disabled"), auto_mode and colors.lime or colors.orange)
+      elseif hit(bRecon, mx, my) then reconnect() end
+      bScan, bAuto, bRecon = draw()
+    end
+  end
+end
+
+main()
