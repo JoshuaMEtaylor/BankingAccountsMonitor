@@ -4,6 +4,7 @@
 -- CompanyTerminal
 --
 -- Clean company registration client for the Quid banking system.
+-- Mouse-first UI: letter keys are never used as screen shortcuts while typing.
 --
 -- Flow:
 --   1. User logs in with normal citizen bank details
@@ -50,7 +51,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION    = "1.1.1"
+local VERSION    = "1.1.2"
 local PROTOCOL   = "quid_bank"
 local DB_TIMEOUT = 5
 
@@ -802,12 +803,6 @@ local function screenMain()
         else
           if mode == "register" then doRegister() else doLookup() end
         end
-      elseif p1 == keys.r then
-        mode = "register"
-        focused = 1
-      elseif p1 == keys.i then
-        mode = "lookup"
-        focused = 1
       end
 
       tabs, fields, b_primary, b_clear, b_signout = drawMain()
