@@ -2,45 +2,19 @@
 -- QUID BANK OF PLENTY - DATABASE SERVER
 -- ServerSideAccounts
 -- =============================================================================
--- Runs as startup.lua on a dedicated Advanced Computer with Ender Modem.
--- Single source of truth for the Quid Bank of Plenty economy.
--- Auth: username + password from any terminal. No terminal locking.
---
--- Install (one time only):
---   wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/main/ServerSideAccounts startup.lua
---   reboot
--- =============================================================================
 
--- =============================================================================
--- SELF-UPDATE BOOTLOADER
--- =============================================================================
-local GITHUB_URL = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/ServerSideAccounts"
-local SELF       = "startup.lua"
-
-local bootArgs   = {...}
-
-if bootArgs[1] ~= "--updated" then
+if not _UPDATED then
+  _UPDATED = true
   print("[ Quid Bank of Plenty ]")
-  print("Fetching latest from GitHub...")
-
-  if fs.exists(SELF) then fs.delete(SELF) end
-
-  shell.run("wget", GITHUB_URL, SELF)
-
-  if fs.exists(SELF) then
-    print("Done. Launching...")
-    sleep(0.3)
-    shell.run(SELF, "--updated")
-  else
-    print("Download failed. Check network/GitHub.")
-  end
-
+  print("Deleting old version...")
+  fs.delete("startup.lua")
+  print("Downloading latest from GitHub...")
+  shell.run("wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/ServerSideAccounts startup.lua")
+  print("Relaunching...")
+  sleep(0.5)
+  shell.run("startup.lua")
   return
 end
-
--- =============================================================================
--- MAIN PROGRAM  (only reached via --updated after a clean rebuild)
--- =============================================================================
 
 local VERSION  = "1.2.1"
 local DB_LABEL = "QuidBank-DB"
