@@ -42,7 +42,7 @@ end
 -- MAIN PROGRAM  (only reached via --updated after a clean rebuild)
 -- =============================================================================
 
-local VERSION  = "1.2.0"
+local VERSION  = "1.2.1"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
