@@ -9,14 +9,20 @@ if args[1] ~= "--updated" then
   print("Deleting old version...")
   fs.delete("startup.lua")
   print("Downloading latest from GitHub...")
-  shell.run("wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/ServerSideAccounts startup.lua")
+
+  -- Cache-bust GitHub raw/CDN so ComputerCraft does not keep pulling
+  -- an older copy after the GitHub file has visibly changed.
+  local cache_bust = tostring(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
+  local update_url = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/ServerSideAccounts?cb=" .. cache_bust
+
+  shell.run("wget " .. update_url .. " startup.lua")
   print("Relaunching...")
   sleep(0.5)
   shell.run("startup.lua", "--updated")
   return
 end
 
-local VERSION  = "1.2.6"
+local VERSION  = "1.2.8"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -300,14 +306,6 @@ local function authenticateUser(username, password)
   return true, citizen_id, citizen
 end
 
-local function isTrustedManagement(computer_id)
-  if not config.management_terminals then return false end
-  for _, id in ipairs(config.management_terminals) do
-    if tonumber(id) == tonumber(computer_id) then return true end
-  end
-  return false
-end
-
 -- =============================================================================
 -- ACCOUNT OPERATIONS
 -- =============================================================================
@@ -544,9 +542,8 @@ handlers["ledger_history"] = function(sender_id, req)
   }
 end
 
--- LIST_ACCOUNTS (management)
+-- LIST_ACCOUNTS
 handlers["list_accounts"] = function(sender_id, req)
-  if not isTrustedManagement(sender_id) then return false, "Management terminal required" end
   local result = {}
   for id, acc in pairs(accounts) do
     result[#result+1] = {
@@ -558,52 +555,47 @@ handlers["list_accounts"] = function(sender_id, req)
     }
   end
   table.sort(result, function(a,b) return (a.balance or 0) > (b.balance or 0) end)
-  audit("ACTION", "MANAGEMENT", sender_id, "LIST_ACCOUNTS", tostring(#result))
+  audit("ACTION", "STATE", sender_id, "LIST_ACCOUNTS", tostring(#result))
   return true, { accounts = result, count = #result }
 end
 
--- MINT (management)
+-- MINT
 handlers["mint"] = function(sender_id, req)
-  if not isTrustedManagement(sender_id) then return false, "Management terminal required" end
   local to_id  = req.to_id or "treasury:quid_bank"
   local amount = tonumber(req.amount)
   local memo   = req.memo or "Treasury mint"
   if not amount or amount <= 0 then return false, "Invalid amount" end
   if not accountExists(to_id) then return false, "Destination account not found" end
-  return transfer("SYSTEM", to_id, amount, "MINT", memo, "MANAGEMENT:" .. sender_id)
+  return transfer("SYSTEM", to_id, amount, "MINT", memo, "STATE:" .. sender_id)
 end
 
--- BURN (management)
+-- BURN
 handlers["burn"] = function(sender_id, req)
-  if not isTrustedManagement(sender_id) then return false, "Management terminal required" end
   local from_id = req.from_id or "treasury:quid_bank"
   local amount  = tonumber(req.amount)
   local memo    = req.memo or "Treasury burn"
   if not amount or amount <= 0 then return false, "Invalid amount" end
   if not accountExists(from_id) then return false, "Source account not found" end
-  return transfer(from_id, "SYSTEM", amount, "BURN", memo, "MANAGEMENT:" .. sender_id)
+  return transfer(from_id, "SYSTEM", amount, "BURN", memo, "STATE:" .. sender_id)
 end
 
--- GRANT (management)
+-- GRANT
 handlers["grant"] = function(sender_id, req)
-  if not isTrustedManagement(sender_id) then return false, "Management terminal required" end
   local to_id  = req.to_id
   local amount = tonumber(req.amount)
   local memo   = req.memo or "Treasury grant"
   if not to_id or not amount then return false, "Missing to_id or amount" end
-  return transfer("treasury:quid_bank", to_id, amount, "GRANT", memo, "MANAGEMENT:" .. sender_id)
+  return transfer("treasury:quid_bank", to_id, amount, "GRANT", memo, "STATE:" .. sender_id)
 end
 
--- SUPPLY (management)
+-- SUPPLY
 handlers["supply"] = function(sender_id, req)
-  if not isTrustedManagement(sender_id) then return false, "Management terminal required" end
-  audit("ACTION", "MANAGEMENT", sender_id, "SUPPLY", "ok")
+  audit("ACTION", "STATE", sender_id, "SUPPLY", "ok")
   return true, deriveMonetarySupply()
 end
 
--- REGISTER_COMPANY (management)
+-- REGISTER_COMPANY
 handlers["register_company"] = function(sender_id, req)
-  if not isTrustedManagement(sender_id) then return false, "Management terminal required" end
   local name         = req.name
   local ticker       = req.ticker and string.upper(req.ticker)
   local biz_type     = req.biz_type or "general"
@@ -629,13 +621,12 @@ handlers["register_company"] = function(sender_id, req)
   if shares > 0 then
     writeShareTx(nextShId(), company_id, "SYSTEM", owner_id, shares, "FOUNDER_GRANT", "Founding shares")
   end
-  audit("ACTION", "MANAGEMENT", sender_id, "REGISTER_COMPANY", company_id)
+  audit("ACTION", "STATE", sender_id, "REGISTER_COMPANY", company_id)
   return true, { company_id = company_id, name = name, ticker = ticker, message = "Company registered" }
 end
 
--- SET_PRICE (management)
+-- SET_PRICE
 handlers["set_price"] = function(sender_id, req)
-  if not isTrustedManagement(sender_id) then return false, "Management terminal required" end
   local item  = req.item
   local price = tonumber(req.price)
   if not item or not price then return false, "Missing item or price" end
@@ -650,7 +641,7 @@ handlers["set_price"] = function(sender_id, req)
   prices[item].unit_price   = price
   prices[item].last_updated = timestamp()
   savePrices()
-  audit("ACTION", "MANAGEMENT", sender_id, "SET_PRICE:" .. item, tostring(old_price) .. "->" .. tostring(price))
+  audit("ACTION", "STATE", sender_id, "SET_PRICE:" .. item, tostring(old_price) .. "->" .. tostring(price))
   return true, { item = item, price = price, old_price = old_price }
 end
 
@@ -659,9 +650,8 @@ handlers["get_prices"] = function(sender_id, req)
   return true, { prices = prices, time = timestamp() }
 end
 
--- STATUS (management)
+-- STATUS
 handlers["status"] = function(sender_id, req)
-  if not isTrustedManagement(sender_id) then return false, "Management terminal required" end
   local function count(t) local n=0; for _ in pairs(t) do n=n+1 end; return n end
   return true, {
     version          = VERSION,
@@ -675,35 +665,13 @@ handlers["status"] = function(sender_id, req)
     company_count    = count(companies),
     tx_count         = tx_counter,
     audit_count      = audit_counter,
-    supply           = deriveMonetarySupply(),
-    management_terminals = config.management_terminals or {}
+    supply           = deriveMonetarySupply()
   }
 end
 
--- ADD_MANAGEMENT_TERMINAL
-handlers["add_management_terminal"] = function(sender_id, req)
-  if not isTrustedManagement(sender_id) and tonumber(sender_id) ~= os.getComputerID() then
-    return false, "Unauthorised"
-  end
-  local terminal_id = tonumber(req.terminal_id)
-  if not terminal_id then return false, "Missing terminal_id" end
-  config.management_terminals = config.management_terminals or {}
-  for _, id in ipairs(config.management_terminals) do
-    if id == terminal_id then return false, "Already registered" end
-  end
-  config.management_terminals[#config.management_terminals+1] = terminal_id
-  saveConfig()
-  audit("ACTION", "SYSTEM", sender_id, "ADD_MANAGEMENT_TERMINAL", tostring(terminal_id))
-  return true, { message = "Management terminal registered: " .. terminal_id }
-end
 
--- REGISTER_CITIZEN (admin path — management terminal registers a citizen manually)
--- Kept alongside self-registration for admin override capability
+-- REGISTER_CITIZEN
 handlers["register_citizen"] = function(sender_id, req)
-  if not isTrustedManagement(sender_id) then
-    audit("ACCESS", "UNKNOWN", sender_id, "REGISTER_CITIZEN", "rejected: not management")
-    return false, "Management terminal required"
-  end
   local name     = req.display_name
   local username = req.username
   local password = req.password or "changeme"
@@ -726,7 +694,7 @@ handlers["register_citizen"] = function(sender_id, req)
     citizens[citizen_id] = nil; saveCitizens()
     return false, "Account creation failed: " .. tostring(result)
   end
-  audit("ACTION", "MANAGEMENT", sender_id, "REGISTER_CITIZEN", citizen_id)
+  audit("ACTION", "STATE", sender_id, "REGISTER_CITIZEN", citizen_id)
   return true, {
     citizen_id   = citizen_id,
     display_name = name,
@@ -759,9 +727,8 @@ handlers["company_info"] = function(sender_id, req)
   }
 end
 
--- LIST_CITIZENS — management overview of all citizen accounts
+-- LIST_CITIZENS
 handlers["list_citizens"] = function(sender_id, req)
-  if not isTrustedManagement(sender_id) then return false, "Management terminal required" end
   local result = {}
   for citizen_id, citizen in pairs(citizens) do
     result[#result+1] = {
@@ -778,26 +745,24 @@ handlers["list_citizens"] = function(sender_id, req)
   return true, { citizens = result, count = #result }
 end
 
--- SUSPEND_ACCOUNT / UNSUSPEND_ACCOUNT — management only
+-- SUSPEND_ACCOUNT / UNSUSPEND_ACCOUNT
 handlers["suspend_account"] = function(sender_id, req)
-  if not isTrustedManagement(sender_id) then return false, "Management terminal required" end
   local citizen_id = req.citizen_id
   if not citizens[citizen_id] then return false, "Citizen not found" end
   citizens[citizen_id].status = "suspended"
   saveCitizens()
   if accounts[citizen_id] then accounts[citizen_id].status = "suspended"; saveAccounts() end
-  audit("ACTION", "MANAGEMENT", sender_id, "SUSPEND", citizen_id)
+  audit("ACTION", "STATE", sender_id, "SUSPEND", citizen_id)
   return true, { message = "Account suspended: " .. citizen_id }
 end
 
 handlers["unsuspend_account"] = function(sender_id, req)
-  if not isTrustedManagement(sender_id) then return false, "Management terminal required" end
   local citizen_id = req.citizen_id
   if not citizens[citizen_id] then return false, "Citizen not found" end
   citizens[citizen_id].status = "active"
   saveCitizens()
   if accounts[citizen_id] then accounts[citizen_id].status = "active"; saveAccounts() end
-  audit("ACTION", "MANAGEMENT", sender_id, "UNSUSPEND", citizen_id)
+  audit("ACTION", "STATE", sender_id, "UNSUSPEND", citizen_id)
   return true, { message = "Account reinstated: " .. citizen_id }
 end
 
@@ -815,8 +780,7 @@ local function initFiles()
   prices    = readFile(FILE.prices)    or {}
   config    = readFile(FILE.config)    or {
     economy_status       = "active",
-    mint_authority       = "locked",
-    management_terminals = {}
+    mint_authority       = "locked"
   }
 
   print("  Accounts:  " .. count(accounts))
