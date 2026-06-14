@@ -23,7 +23,13 @@ if args[1] ~= "--updated" then
   fs.delete("startup.lua")
 
   print("Downloading latest from GitHub...")
-  shell.run("wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/FiscalControls startup.lua")
+
+  -- Cache-bust GitHub raw/CDN so the controller does not keep pulling
+  -- an older cached copy after the GitHub file has visibly changed.
+  local cache_bust = tostring(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
+  local update_url = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/FiscalControls?cb=" .. cache_bust
+
+  shell.run("wget " .. update_url .. " startup.lua")
 
   if not fs.exists("startup.lua") then
     print("")
@@ -32,7 +38,7 @@ if args[1] ~= "--updated" then
     print("")
     print("Manual install:")
     print("delete startup")
-    print("wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/FiscalControls startup.lua")
+    print("wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/FiscalControls?cb=001 startup.lua")
     print("startup.lua")
     return
   end
