@@ -20,7 +20,7 @@ end
 -- MAIN PROGRAM
 -- =============================================================================
 
-local VERSION      = "1.2.0"
+local VERSION      = "1.2.1"
 local PROTOCOL     = "quid_bank"
 local DB_TIMEOUT   = 5
 local IDLE_TIMEOUT = 60
