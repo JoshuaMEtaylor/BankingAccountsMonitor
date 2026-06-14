@@ -23,7 +23,7 @@
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION          = "0.1.0"
+local VERSION          = "0.1.1"
 local PROTOCOL         = "quid_bank"
 local DB_TIMEOUT       = 4
 local REFRESH_SECONDS  = 5
@@ -799,4 +799,3 @@ local function main()
 end
 
 main()
--- fart
