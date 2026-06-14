@@ -1,0 +1,613 @@
+
+-- =============================================================================
+-- QUID CONTRACT BOARD
+-- ContractBoard
+--
+-- Public contract posting browser for the Quid economy.
+--
+-- Purpose:
+--   * Browse open / claimed / fulfilled contracts
+--   * View contract details and required items
+--   * Claim contracts as a citizen or company
+--
+-- This does NOT pay contracts yet.
+-- Escrow/payment release comes after the posting/claim flow is proven.
+-- =============================================================================
+
+local args = {...}
+
+-- =============================================================================
+-- SELF UPDATE
+-- =============================================================================
+if args[1] ~= "--updated" then
+  print("[ Quid Contract Board ]")
+  print("Deleting old version...")
+  fs.delete("startup.lua")
+  print("Downloading latest from GitHub...")
+
+  local cache_bust = tostring(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
+  local update_url = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/ContractBoard?cb=" .. cache_bust
+  shell.run("wget " .. update_url .. " startup.lua")
+
+  if not fs.exists("startup.lua") then
+    print("")
+    print("Download failed.")
+    print("Expected GitHub file: ContractBoard")
+    print("")
+    print("Manual install:")
+    print("delete startup")
+    print("wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/ContractBoard?cb=001 startup.lua")
+    print("startup.lua")
+    return
+  end
+
+  print("Relaunching...")
+  sleep(0.5)
+  shell.run("startup.lua", "--updated")
+  return
+end
+
+-- =============================================================================
+-- CONFIG
+-- =============================================================================
+local VERSION    = "1.0.0"
+local PROTOCOL   = "quid_contracts"
+local DB_TIMEOUT = 5
+
+local W, H = term.getSize()
+
+local C = {
+  bg        = colors.lightGray,
+  card      = colors.white,
+  card_fg   = colors.black,
+  header    = colors.purple,
+  hdr_fg    = colors.white,
+  accent    = colors.purple,
+  accent_fg = colors.white,
+  label     = colors.gray,
+  body      = colors.black,
+  dim       = colors.gray,
+  ok        = colors.green,
+  err       = colors.red,
+  warn      = colors.orange,
+  btn_pri   = colors.purple,
+  btn_sec   = colors.lightGray,
+  btn_dan   = colors.red,
+  btn_fg    = colors.white,
+  input_bg  = colors.lightGray,
+  input_fg  = colors.black,
+  tab_act   = colors.purple,
+  tab_inact = colors.gray,
+  tab_fg_a  = colors.white,
+  tab_fg_i  = colors.white,
+}
+
+local contract_id = nil
+local modem_name = nil
+local last_message = ""
+local last_message_colour = C.dim
+
+local filter = "open"
+local contracts = {}
+local selected = 1
+local page = 1
+
+local claim = {
+  claimant = "",
+  claimant_type = "company",
+}
+
+-- =============================================================================
+-- HELPERS
+-- =============================================================================
+local function refreshSize()
+  W, H = term.getSize()
+end
+
+local function trim(s)
+  s = tostring(s or "")
+  return s:match("^%s*(.-)%s*$")
+end
+
+local function money(n)
+  n = tonumber(n) or 0
+  local sign = ""
+  if n < 0 then sign = "-"; n = math.abs(n) end
+  local s = tostring(math.floor(n))
+  local out = ""
+  while #s > 3 do
+    out = "," .. s:sub(-3) .. out
+    s = s:sub(1, -4)
+  end
+  return sign .. s .. " Q"
+end
+
+local function normaliseClaimant(s)
+  s = trim(s)
+  if s == "" then return "" end
+  if s:find(":") then return s end
+  return "company:" .. string.lower(s):gsub("%s+", "_")
+end
+
+local function setMessage(msg, colour)
+  last_message = tostring(msg or "")
+  last_message_colour = colour or C.dim
+end
+
+local function cls()
+  refreshSize()
+  term.setCursorBlink(false)
+  term.setBackgroundColor(C.bg)
+  term.setTextColor(C.body)
+  term.clear()
+  term.setCursorPos(1, 1)
+end
+
+local function at(x, y, text, fg, bg)
+  refreshSize()
+  if y < 1 or y > H or x > W then return end
+  if x < 1 then x = 1 end
+  term.setCursorPos(x, y)
+  if bg then term.setBackgroundColor(bg) end
+  if fg then term.setTextColor(fg) end
+  local maxw = W - x + 1
+  if maxw > 0 then
+    term.write(tostring(text or ""):sub(1, maxw))
+  end
+end
+
+local function fill(x, y, w, h, bg)
+  refreshSize()
+  if w <= 0 or h <= 0 then return end
+  if x < 1 then x = 1 end
+  term.setBackgroundColor(bg or C.card)
+  local row = string.rep(" ", math.max(0, w))
+  for yy = y, y + h - 1 do
+    if yy >= 1 and yy <= H then
+      term.setCursorPos(x, yy)
+      term.write(row:sub(1, math.max(0, W - x + 1)))
+    end
+  end
+end
+
+local function centre(y, text, fg, bg)
+  text = tostring(text or "")
+  at(math.max(1, math.floor((W - #text) / 2) + 1), y, text, fg, bg)
+end
+
+local function topBar()
+  fill(1, 1, W, 1, C.header)
+  at(2, 1, "QUID CONTRACT BOARD", C.hdr_fg, C.header)
+  at(W - #VERSION, 1, VERSION, C.dim, C.header)
+end
+
+local function statusBar()
+  fill(1, H, W, 1, C.bg)
+  if last_message ~= "" then
+    at(2, H, last_message:sub(1, W - 2), last_message_colour, C.bg)
+  end
+end
+
+local function card(x, y, w, h)
+  fill(x, y, w, h, C.card)
+end
+
+local function button(x, y, w, label, bg, fg)
+  bg = bg or C.btn_pri
+  fg = fg or C.btn_fg
+  fill(x, y, w, 1, bg)
+  local tx = x + math.floor((w - #label) / 2)
+  at(tx, y, label, fg, bg)
+  return { x1 = x, x2 = x + w - 1, y1 = y, y2 = y }
+end
+
+local function hit(b, mx, my)
+  return b and mx >= b.x1 and mx <= b.x2 and my >= b.y1 and my <= b.y2
+end
+
+local function inputField(x, y, w, value)
+  value = tostring(value or "")
+  fill(x, y, w, 1, C.input_bg)
+  at(x, y, (value .. string.rep(" ", w)):sub(1, w), C.input_fg, C.input_bg)
+  return {
+    x1 = x, x2 = x + w - 1, y1 = y, y2 = y,
+    cursor_x = x + math.min(#value, w - 1),
+    cursor_y = y,
+  }
+end
+
+-- =============================================================================
+-- NETWORK
+-- =============================================================================
+local function openModem()
+  for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.getType(name) == "modem" then
+      local m = peripheral.wrap(name)
+      if m and m.isWireless and m.isWireless() then
+        rednet.open(name)
+        modem_name = name
+        return true
+      end
+    end
+  end
+
+  for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.getType(name) == "modem" then
+      rednet.open(name)
+      modem_name = name
+      return true
+    end
+  end
+
+  return false
+end
+
+local function connectServer()
+  cls()
+  topBar()
+  centre(math.floor(H / 2) - 1, "Connecting to contract server...", C.dim, C.bg)
+
+  for attempt = 1, 8 do
+    fill(1, math.floor(H / 2) + 1, W, 1, C.bg)
+    centre(math.floor(H / 2) + 1, "Attempt " .. attempt .. " of 8", C.dim, C.bg)
+
+    rednet.broadcast({ type = "ping" }, PROTOCOL)
+    local sender, msg = rednet.receive(PROTOCOL, 4)
+
+    if sender and type(msg) == "table" then
+      if msg.type == "contract_server_online" or (msg.success == true and type(msg.response) == "table") then
+        contract_id = sender
+        centre(math.floor(H / 2) + 1, "Connected.", C.ok, C.bg)
+        sleep(0.4)
+        return true
+      end
+    end
+  end
+
+  centre(math.floor(H / 2) + 1, "Connection failed.", C.err, C.bg)
+  sleep(2)
+  return false
+end
+
+local function contractRequest(request, timeout)
+  timeout = timeout or DB_TIMEOUT
+  if not contract_id then return false, "No contract server connected" end
+
+  rednet.send(contract_id, request, PROTOCOL)
+
+  local deadline = os.clock() + timeout
+  while true do
+    local remaining = deadline - os.clock()
+    if remaining <= 0 then
+      return false, "No response from contract server"
+    end
+
+    local sender, msg = rednet.receive(PROTOCOL, remaining)
+    if sender == contract_id and type(msg) == "table" and msg.success ~= nil then
+      return msg.success, msg.response
+    end
+  end
+end
+
+-- =============================================================================
+-- DATA
+-- =============================================================================
+local function refreshContracts()
+  local ok, res = contractRequest({
+    type = "list_contracts",
+    status = filter,
+  })
+
+  if ok and type(res) == "table" then
+    contracts = res.contracts or {}
+    if selected > #contracts then selected = #contracts end
+    if selected < 1 then selected = 1 end
+    setMessage("Loaded " .. tostring(#contracts) .. " contracts.", C.ok)
+    return true
+  end
+
+  setMessage("Load failed: " .. tostring(res), C.err)
+  return false
+end
+
+local function currentContract()
+  return contracts[selected]
+end
+
+-- =============================================================================
+-- DETAIL / CLAIM
+-- =============================================================================
+local function detailScreen(c)
+  if not c then return end
+
+  local scroll = 0
+
+  while true do
+    cls()
+    topBar()
+
+    card(2, 3, W - 2, H - 4)
+
+    at(4, 4, c.contract_id .. " - " .. tostring(c.title or ""), C.card_fg, C.card)
+    at(4, 5, "Reward: " .. money(c.reward or 0) .. "    Status: " .. tostring(c.status or "?"), C.label, C.card)
+    at(4, 6, "Poster: " .. tostring(c.poster or "?"), C.label, C.card)
+
+    local y = 8
+    at(4, y, "Required Items", C.card_fg, C.card)
+    y = y + 1
+
+    local items = c.items or {}
+    local start = scroll + 1
+    local maxRows = H - 14
+
+    for i = start, math.min(#items, start + maxRows - 1) do
+      local item = items[i]
+      at(4, y, tostring(item.count or 0) .. "x " .. tostring(item.display or item.item), C.card_fg, C.card)
+      y = y + 1
+    end
+
+    if c.claimed_by then
+      at(4, H - 6, "Claimed by: " .. tostring(c.claimed_by), C.warn, C.card)
+    end
+
+    local third = math.floor((W - 10) / 3)
+    local bBack = button(4, H - 2, third, "Back", C.btn_sec, C.card_fg)
+    local bUp   = button(5 + third, H - 2, third, "Scroll", C.btn_sec, C.card_fg)
+    local bClaim = button(10 + (third * 2), H - 2, third, "Claim", C.btn_pri, C.btn_fg)
+
+    statusBar()
+
+    local ev, p1, p2, p3 = os.pullEvent()
+    if ev == "mouse_click" then
+      if hit(bBack, p2, p3) then return end
+      if hit(bUp, p2, p3) then
+        if #items > maxRows then
+          scroll = scroll + maxRows
+          if scroll >= #items then scroll = 0 end
+        end
+      end
+      if hit(bClaim, p2, p3) then
+        return "claim"
+      end
+    end
+  end
+end
+
+local function claimScreen(c)
+  if not c then return end
+  claim.claimant = ""
+
+  local focused = true
+  local input, bClaim, bBack
+
+  local function draw()
+    cls()
+    topBar()
+    card(2, 4, W - 2, H - 5)
+
+    at(4, 5, "Claim Contract", C.card_fg, C.card)
+    at(4, 7, c.contract_id .. " - " .. tostring(c.title or ""), C.label, C.card)
+    at(4, 8, "Reward: " .. money(c.reward or 0), C.label, C.card)
+
+    at(4, 10, "Company account / ticker", C.card_fg, C.card)
+    input = inputField(4, 11, W - 6, claim.claimant)
+
+    local preview = normaliseClaimant(claim.claimant)
+    if preview == "" then preview = "company:<ticker>" end
+    at(4, 13, "Claim as: " .. preview, C.label, C.card)
+
+    local bw = math.floor((W - 8) / 2)
+    bBack = button(4, H - 2, bw, "Back", C.btn_sec, C.card_fg)
+    bClaim = button(5 + bw, H - 2, bw, "Claim", C.btn_pri, C.btn_fg)
+
+    term.setCursorPos(input.cursor_x, input.cursor_y)
+    term.setCursorBlink(true)
+    statusBar()
+  end
+
+  draw()
+
+  while true do
+    local ev, p1, p2, p3 = os.pullEvent()
+
+    if ev == "mouse_click" then
+      if hit(bBack, p2, p3) then return end
+      if hit(input, p2, p3) then
+        focused = true
+      elseif hit(bClaim, p2, p3) then
+        local claimant = normaliseClaimant(claim.claimant)
+        if claimant == "" then
+          setMessage("Enter claimant company.", C.err)
+          draw()
+        else
+          local ok, res = contractRequest({
+            type = "claim_contract",
+            contract_id = c.contract_id,
+            claimant = claimant,
+            claimant_type = "company",
+          })
+
+          if ok then
+            setMessage("Claimed " .. c.contract_id .. " as " .. claimant, C.ok)
+            refreshContracts()
+            return
+          else
+            setMessage("Claim failed: " .. tostring(res), C.err)
+            draw()
+          end
+        end
+      end
+      draw()
+
+    elseif ev == "char" then
+      if focused and #claim.claimant < 40 then
+        claim.claimant = claim.claimant .. p1
+        draw()
+      end
+
+    elseif ev == "key" then
+      if p1 == keys.backspace and focused then
+        claim.claimant = claim.claimant:sub(1, -2)
+        draw()
+      end
+    end
+  end
+end
+
+-- =============================================================================
+-- MAIN DRAW
+-- =============================================================================
+local function drawTabs(y)
+  local tabs = { "Open", "Claimed", "Fulfilled", "All" }
+  local values = { "open", "claimed", "fulfilled", "all" }
+  local tw = math.floor((W - 2) / #tabs)
+  local buttons = {}
+
+  for i, label in ipairs(tabs) do
+    local x = 2 + ((i - 1) * tw)
+    local active = filter == values[i]
+    local bg = active and C.tab_act or C.tab_inact
+    local fg = active and C.tab_fg_a or C.tab_fg_i
+
+    fill(x, y, tw, 1, bg)
+    at(x + math.floor((tw - #label) / 2), y, label, fg, bg)
+    buttons[i] = { x1 = x, x2 = x + tw - 1, y1 = y, y2 = y, value = values[i] }
+  end
+
+  return buttons
+end
+
+local function drawMain()
+  cls()
+  topBar()
+
+  local tabs = drawTabs(3)
+
+  card(2, 5, W - 2, H - 6)
+
+  local listTop = 6
+  local listBottom = H - 5
+  local perPage = listBottom - listTop + 1
+  if perPage < 3 then perPage = 3 end
+
+  local totalPages = math.max(1, math.ceil(#contracts / perPage))
+  if page > totalPages then page = totalPages end
+
+  local start = ((page - 1) * perPage) + 1
+  local y = listTop
+
+  if #contracts == 0 then
+    at(4, y, "No contracts found.", C.label, C.card)
+  else
+    for i = start, math.min(#contracts, start + perPage - 1) do
+      local c = contracts[i]
+      local selectedRow = i == selected
+      local bg = selectedRow and C.input_bg or C.card
+      local fg = selectedRow and C.card_fg or C.card_fg
+      fill(3, y, W - 4, 1, bg)
+
+      local title = tostring(c.contract_id) .. "  " .. tostring(c.title or "Contract")
+      at(4, y, title, fg, bg)
+      local reward = money(c.reward or 0)
+      at(W - #reward - 2, y, reward, C.ok, bg)
+      y = y + 1
+    end
+  end
+
+  local third = math.floor((W - 10) / 3)
+  local bPrev = button(4, H - 3, third, "Prev", C.btn_sec, C.card_fg)
+  local bNext = button(5 + third, H - 3, third, "Next", C.btn_sec, C.card_fg)
+  local bOpen = button(10 + (third * 2), H - 3, third, "Open", C.btn_pri, C.btn_fg)
+
+  local bRefresh = button(4, H - 2, W - 6, "Refresh Contracts", C.btn_pri, C.btn_fg)
+
+  statusBar()
+  term.setCursorBlink(false)
+
+  return tabs, bPrev, bNext, bOpen, bRefresh, perPage
+end
+
+-- =============================================================================
+-- MAIN LOOP
+-- =============================================================================
+local function screenMain()
+  refreshContracts()
+  local tabs, bPrev, bNext, bOpen, bRefresh, perPage = drawMain()
+
+  while true do
+    local ev, p1, p2, p3 = os.pullEvent()
+
+    if ev == "mouse_click" then
+      local mx, my = p2, p3
+
+      for _, tab in ipairs(tabs) do
+        if hit(tab, mx, my) then
+          filter = tab.value
+          selected = 1
+          page = 1
+          refreshContracts()
+          tabs, bPrev, bNext, bOpen, bRefresh, perPage = drawMain()
+          break
+        end
+      end
+
+      if hit(bPrev, mx, my) then
+        if selected > 1 then
+          selected = selected - 1
+        end
+        local minForPage = ((page - 1) * perPage) + 1
+        if selected < minForPage then page = math.max(1, page - 1) end
+      elseif hit(bNext, mx, my) then
+        if selected < #contracts then
+          selected = selected + 1
+        end
+        local maxForPage = page * perPage
+        if selected > maxForPage then page = page + 1 end
+      elseif hit(bOpen, mx, my) then
+        local c = currentContract()
+        local next = detailScreen(c)
+        if next == "claim" then
+          claimScreen(c)
+        end
+      elseif hit(bRefresh, mx, my) then
+        refreshContracts()
+      else
+        -- row click selection
+        local listTop = 6
+        local start = ((page - 1) * perPage) + 1
+        local row = my - listTop + 1
+        local idx = start + row - 1
+        if idx >= 1 and idx <= #contracts then
+          selected = idx
+        end
+      end
+
+      tabs, bPrev, bNext, bOpen, bRefresh, perPage = drawMain()
+
+    elseif ev == "key" then
+      -- Keyboard only edits text fields in sub-screens.
+      -- Main board navigation is mouse-only.
+    end
+  end
+end
+
+-- =============================================================================
+-- ENTRY
+-- =============================================================================
+local function main()
+  if not openModem() then
+    cls()
+    print("ERROR: No modem found.")
+    print("Attach an Ender Modem and reboot.")
+    return
+  end
+
+  while not connectServer() do
+    sleep(2)
+  end
+
+  setMessage("Connected.", C.ok)
+  screenMain()
+end
+
+main()
