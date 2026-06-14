@@ -1,19 +1,78 @@
 -- =============================================================================
--- TreasuryDB.lua
+-- QUID BANK OF PLENTY - DATABASE SERVER
+-- ServerSideAccounts
 -- =============================================================================
 -- Runs as startup.lua on a dedicated Advanced Computer with Ender Modem.
--- This is the single source of truth for the entire Ascendancy economy.
+-- This is the single source of truth for the Quid Bank of Plenty economy.
 -- All citizen terminals, company terminals, and management terminals are
 -- CLIENTS. They send requests. This server decides what happens.
 --
--- Install:
---   wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/main/TreasuryDB.lua startup.lua
+-- Install (one time only):
+--   wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/main/ServerSideAccounts startup.lua
+--   reboot
+--
+-- After that it self-updates every boot from GitHub automatically.
+-- =============================================================================
+
+-- =============================================================================
+-- SELF-UPDATE BOOTLOADER
+-- Runs first, every single boot. Downloads latest from GitHub, overwrites
+-- this file, then relaunches. You only ever need to touch GitHub - never
+-- manually update the terminal again.
+-- =============================================================================
+local GITHUB_URL = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/main/ServerSideAccounts"
+local SELF       = "startup.lua"
+local TEMP       = "startup_update.tmp"
+
+local function selfUpdate()
+  print("[ Quid Bank of Plenty ]")
+  print("Checking for updates...")
+
+  -- Download latest into temp file first (never clobbers running file on failure)
+  local ok = shell.run("wget", "-q", GITHUB_URL, TEMP)
+
+  if not ok or not fs.exists(TEMP) then
+    print("Update check failed (no network?). Running existing version.")
+    if fs.exists(TEMP) then fs.delete(TEMP) end
+    return false
+  end
+
+  -- Sanity check the download
+  local f = fs.open(TEMP, "r")
+  local content = f and f.readAll() or ""
+  if f then f.close() end
+
+  if #content < 500 or not content:find("VERSION") then
+    print("Download looks invalid. Running existing version.")
+    fs.delete(TEMP)
+    return false
+  end
+
+  -- Swap in the new version
+  if fs.exists(SELF) then fs.delete(SELF) end
+  fs.move(TEMP, SELF)
+  print("Updated. Relaunching...")
+  sleep(0.5)
+  os.reboot()
+  return true  -- never actually reached
+end
+
+-- Run update check every boot. On success it reboots and never returns here.
+-- On failure (no network, bad download) it falls through to the main program.
+local bootArgs = {...}
+if bootArgs[1] ~= "--skip-update" then
+  selfUpdate()
+end
+
+-- =============================================================================
+-- MAIN PROGRAM BEGINS HERE
+-- Reached only after a failed update check, or if --skip-update was passed.
 -- =============================================================================
 
 local VERSION = "1.0.0"
-local DB_LABEL = "Treasury-DB"
-local PROTOCOL = "ascendancy_bank"
-local PROTOCOL_BROADCAST = "ascendancy_bank_discovery"
+local DB_LABEL = "QuidBank-DB"
+local PROTOCOL = "quid_bank"
+local PROTOCOL_BROADCAST = "quid_bank_discovery"
 
 -- =============================================================================
 -- FILE PATHS
@@ -228,7 +287,7 @@ local function deriveMonetarySupply()
     end
   end
 
-  local treasury_balance = deriveBalance("treasury:ascendancy")
+  local treasury_balance = deriveBalance("treasury:quid_bank")
   local citizen_holdings = 0
   local company_holdings = 0
   local escrow_held = 0
@@ -417,7 +476,7 @@ local handlers = {}
 -- PING — discovery / health check
 handlers["ping"] = function(sender_id, req)
   return true, {
-    message  = "Ascendancy Treasury DB online",
+    message  = "Quid Bank of Plenty DB online",
     version  = VERSION,
     time     = timestamp(),
     computer = os.getComputerID(),
@@ -568,7 +627,7 @@ handlers["mint"] = function(sender_id, req)
     return false, "Management terminal required"
   end
 
-  local to_id  = req.to_id or "treasury:ascendancy"
+  local to_id  = req.to_id or "treasury:quid_bank"
   local amount = tonumber(req.amount)
   local memo   = req.memo or "Treasury mint"
 
@@ -586,7 +645,7 @@ handlers["burn"] = function(sender_id, req)
     return false, "Management terminal required"
   end
 
-  local from_id = req.from_id or "treasury:ascendancy"
+  local from_id = req.from_id or "treasury:quid_bank"
   local amount  = tonumber(req.amount)
   local memo    = req.memo or "Treasury burn"
 
@@ -609,7 +668,7 @@ handlers["grant"] = function(sender_id, req)
 
   if not to_id or not amount then return false, "Missing to_id or amount" end
 
-  local ok, result = transfer("treasury:ascendancy", to_id, amount, "GRANT", memo, "MANAGEMENT:" .. sender_id)
+  local ok, result = transfer("treasury:quid_bank", to_id, amount, "GRANT", memo, "MANAGEMENT:" .. sender_id)
   return ok, result
 end
 
@@ -659,7 +718,7 @@ handlers["register_company"] = function(sender_id, req)
   local name        = req.name
   local ticker      = req.ticker and string.upper(req.ticker)
   local biz_type    = req.biz_type or "general"
-  local owner_id    = req.owner_id or "treasury:ascendancy"
+  local owner_id    = req.owner_id or "treasury:quid_bank"
   local terminal_id = tonumber(req.terminal_id)
   local shares      = tonumber(req.shares_total) or 1000
   local public_float= tonumber(req.shares_public) or 0
@@ -997,9 +1056,9 @@ end
 
 local function initTreasury()
   -- Create the core system accounts if they don't exist
-  if not accountExists("treasury:ascendancy") then
-    createAccount("treasury:ascendancy", "treasury", "Ascendancy Treasury", "SYSTEM")
-    print("  Created treasury:ascendancy account")
+  if not accountExists("treasury:quid_bank") then
+    createAccount("treasury:quid_bank", "treasury", "Quid Bank of Plenty", "SYSTEM")
+    print("  Created treasury:quid_bank account")
   end
   if not accountExists("market:escrow") then
     createAccount("market:escrow", "escrow", "Market Escrow", "SYSTEM")
@@ -1030,7 +1089,7 @@ local function drawStatus()
   term.clear()
   term.setCursorPos(1, 1)
   print("=" .. string.rep("=", 50))
-  print("  ASCENDANCY TREASURY DATABASE  v" .. VERSION)
+  print("  QUID BANK OF PLENTY DATABASE  v" .. VERSION)
   print("=" .. string.rep("=", 50))
   print("  ID:      " .. os.getComputerID())
   print("  Label:   " .. (os.getComputerLabel() or "unlabelled"))
@@ -1051,7 +1110,7 @@ local function drawStatus()
   print("  Citizens:  " .. n_cit)
   print("  Companies: " .. n_com)
 
-  local treasury_bal = deriveBalance("treasury:ascendancy")
+  local treasury_bal = deriveBalance("treasury:quid_bank")
   print("  Treasury:  " .. treasury_bal .. " Quid")
   print("-" .. string.rep("-", 50))
   print("  Listening on: " .. PROTOCOL)
@@ -1132,7 +1191,7 @@ local function main()
   term.clear()
   term.setCursorPos(1, 1)
 
-  print("ASCENDANCY TREASURY DB v" .. VERSION)
+  print("QUID BANK OF PLENTY DB v" .. VERSION)
   print("Booting...")
   print("")
 
