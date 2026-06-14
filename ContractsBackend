@@ -1,0 +1,569 @@
+
+-- =============================================================================
+-- QUID CONTRACT SERVER
+-- ContractServer
+--
+-- Central contract posting server for the Quid economy.
+--
+-- Purpose:
+--   * Store contract postings
+--   * Let site terminals / future colony terminals post contracts
+--   * Let public contract boards list contracts
+--   * Let citizens/companies claim contracts
+--
+-- This does NOT move money yet.
+-- Escrow/payment hooks come next once the posting/claim flow is proven.
+-- =============================================================================
+
+local args = {...}
+
+-- =============================================================================
+-- SELF UPDATE
+-- =============================================================================
+if args[1] ~= "--updated" then
+  print("[ Quid Contract Server ]")
+  print("Deleting old version...")
+  fs.delete("startup.lua")
+  print("Downloading latest from GitHub...")
+
+  local cache_bust = tostring(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
+  local update_url = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/ContractServer?cb=" .. cache_bust
+  shell.run("wget " .. update_url .. " startup.lua")
+
+  if not fs.exists("startup.lua") then
+    print("")
+    print("Download failed.")
+    print("Expected GitHub file: ContractServer")
+    print("")
+    print("Manual install:")
+    print("delete startup")
+    print("wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/ContractServer?cb=001 startup.lua")
+    print("startup.lua")
+    return
+  end
+
+  print("Relaunching...")
+  sleep(0.5)
+  shell.run("startup.lua", "--updated")
+  return
+end
+
+-- =============================================================================
+-- CONFIG
+-- =============================================================================
+local VERSION            = "1.0.0"
+local LABEL              = "Quid-Contracts"
+local PROTOCOL           = "quid_contracts"
+local PROTOCOL_BROADCAST = "quid_contracts_discovery"
+
+local FILE = {
+  contracts = "data/contracts.db",
+  audit     = "data/contract_audit.log",
+  config    = "data/config.db",
+}
+
+local contracts = {}
+local config = {}
+local contract_counter = 0
+local audit_counter = 0
+
+-- =============================================================================
+-- HELPERS
+-- =============================================================================
+local function timestamp()
+  return os.epoch("utc")
+end
+
+local function pad(n, width)
+  local s = tostring(n)
+  while #s < width do s = "0" .. s end
+  return s
+end
+
+local function ensureDir(path)
+  local parts = {}
+  for part in string.gmatch(path, "[^/]+") do
+    parts[#parts + 1] = part
+  end
+  table.remove(parts)
+
+  local current = ""
+  for _, part in ipairs(parts) do
+    current = current == "" and part or (current .. "/" .. part)
+    if not fs.exists(current) then fs.makeDir(current) end
+  end
+end
+
+local function readFile(path)
+  if not fs.exists(path) then return nil end
+  local f = fs.open(path, "r")
+  if not f then return nil end
+  local text = f.readAll()
+  f.close()
+  if not text or text == "" then return nil end
+
+  local ok, data = pcall(textutils.unserialize, text)
+  if ok then return data end
+  return nil
+end
+
+local function writeFile(path, data)
+  ensureDir(path)
+  local f = fs.open(path, "w")
+  if not f then return false end
+  f.write(textutils.serialize(data))
+  f.close()
+  return true
+end
+
+local function appendLine(path, line)
+  ensureDir(path)
+  local f = fs.open(path, "a")
+  if not f then return false end
+  f.writeLine(line)
+  f.close()
+  return true
+end
+
+local function countTable(t)
+  local n = 0
+  for _ in pairs(t or {}) do n = n + 1 end
+  return n
+end
+
+local function trim(s)
+  s = tostring(s or "")
+  return s:match("^%s*(.-)%s*$")
+end
+
+local function nextContractId()
+  contract_counter = contract_counter + 1
+  return "CON-" .. pad(contract_counter, 6)
+end
+
+local function audit(action, actor, terminal, result)
+  audit_counter = audit_counter + 1
+  local id = "CAUD-" .. pad(audit_counter, 6)
+  local line = string.format("%s | %d | %-20s | %-20s | %-10s | %s",
+    id, timestamp(), tostring(actor), tostring(action), tostring(terminal), tostring(result))
+  appendLine(FILE.audit, line)
+end
+
+local function normaliseItems(items)
+  if type(items) ~= "table" then return {} end
+  local out = {}
+  for _, item in ipairs(items) do
+    if type(item) == "table" then
+      local id = trim(item.item or item.id or item.name or "")
+      local display = trim(item.display or item.display_name or item.label or id)
+      local count = tonumber(item.count or item.needed or item.amount or item.qty) or 0
+      count = math.floor(count)
+      if id ~= "" and count > 0 then
+        out[#out + 1] = {
+          item = id,
+          display = display ~= "" and display or id,
+          count = count,
+        }
+      end
+    end
+  end
+  return out
+end
+
+local function publicContract(c)
+  local copy = {}
+  for k, v in pairs(c) do
+    if k ~= "_internal" then copy[k] = v end
+  end
+  return copy
+end
+
+-- =============================================================================
+-- CONTRACT OPERATIONS
+-- =============================================================================
+local function postContract(req, sender_id)
+  local title = trim(req.title or "")
+  local poster = trim(req.poster or req.source_account or "")
+  local reward = tonumber(req.reward) or 0
+  reward = math.floor(reward)
+
+  if title == "" then return false, "Missing title" end
+  if poster == "" then return false, "Missing poster/source account" end
+  if reward <= 0 then return false, "Invalid reward" end
+
+  local items = normaliseItems(req.items or {})
+  if #items <= 0 then return false, "Contract needs at least one item" end
+
+  local contract_id = req.contract_id or nextContractId()
+  if contracts[contract_id] then return false, "Contract already exists: " .. contract_id end
+
+  local c = {
+    contract_id     = contract_id,
+    title           = title,
+    description     = trim(req.description or ""),
+    poster          = poster,
+    reward          = reward,
+    currency        = "Q",
+    status          = "open",
+    items           = items,
+    created         = timestamp(),
+    updated         = timestamp(),
+    claimed_by      = nil,
+    claimed_type    = nil,
+    claimed_at      = nil,
+
+    source_type     = req.source_type or "manual",
+    source_terminal = sender_id,
+    source_company  = req.source_company or poster,
+    work_order_id   = req.work_order_id,
+    building_id     = req.building_id,
+    location        = req.location,
+    escrow_status   = req.escrow_status or "not_locked",
+  }
+
+  contracts[contract_id] = c
+  writeFile(FILE.contracts, contracts)
+  audit("POST", poster, sender_id, contract_id)
+
+  return true, { contract = publicContract(c), message = "Contract posted" }
+end
+
+local function listContracts(req)
+  local status = req.status or "open"
+  local out = {}
+
+  for _, c in pairs(contracts) do
+    if status == "all" or c.status == status then
+      out[#out + 1] = publicContract(c)
+    end
+  end
+
+  table.sort(out, function(a, b)
+    return (a.created or 0) > (b.created or 0)
+  end)
+
+  return true, { contracts = out, count = #out }
+end
+
+local function getContract(req)
+  local id = req.contract_id
+  if not id then return false, "Missing contract_id" end
+  local c = contracts[id]
+  if not c then return false, "Contract not found: " .. tostring(id) end
+  return true, { contract = publicContract(c) }
+end
+
+local function claimContract(req, sender_id)
+  local id = req.contract_id
+  local claimant = trim(req.claimant or "")
+  local claimant_type = req.claimant_type or "company"
+
+  if not id then return false, "Missing contract_id" end
+  if claimant == "" then return false, "Missing claimant" end
+
+  local c = contracts[id]
+  if not c then return false, "Contract not found: " .. tostring(id) end
+  if c.status ~= "open" then return false, "Contract is not open" end
+
+  c.status = "claimed"
+  c.claimed_by = claimant
+  c.claimed_type = claimant_type
+  c.claimed_at = timestamp()
+  c.updated = timestamp()
+
+  writeFile(FILE.contracts, contracts)
+  audit("CLAIM", claimant, sender_id, id)
+
+  return true, { contract = publicContract(c), message = "Contract claimed" }
+end
+
+local function unclaimContract(req, sender_id)
+  local id = req.contract_id
+  if not id then return false, "Missing contract_id" end
+
+  local c = contracts[id]
+  if not c then return false, "Contract not found: " .. tostring(id) end
+  if c.status ~= "claimed" then return false, "Contract is not claimed" end
+
+  local old = c.claimed_by or "unknown"
+
+  c.status = "open"
+  c.claimed_by = nil
+  c.claimed_type = nil
+  c.claimed_at = nil
+  c.updated = timestamp()
+
+  writeFile(FILE.contracts, contracts)
+  audit("UNCLAIM", old, sender_id, id)
+
+  return true, { contract = publicContract(c), message = "Contract reopened" }
+end
+
+local function markFulfilled(req, sender_id)
+  local id = req.contract_id
+  if not id then return false, "Missing contract_id" end
+
+  local c = contracts[id]
+  if not c then return false, "Contract not found: " .. tostring(id) end
+
+  c.status = "fulfilled"
+  c.fulfilled_at = timestamp()
+  c.updated = timestamp()
+  c.fulfillment_note = req.note or ""
+
+  writeFile(FILE.contracts, contracts)
+  audit("FULFILLED", c.claimed_by or "unknown", sender_id, id)
+
+  return true, { contract = publicContract(c), message = "Contract marked fulfilled" }
+end
+
+local function cancelContract(req, sender_id)
+  local id = req.contract_id
+  if not id then return false, "Missing contract_id" end
+
+  local c = contracts[id]
+  if not c then return false, "Contract not found: " .. tostring(id) end
+  if c.status == "fulfilled" then return false, "Cannot cancel fulfilled contract" end
+
+  c.status = "cancelled"
+  c.cancelled_at = timestamp()
+  c.updated = timestamp()
+  c.cancel_reason = req.reason or ""
+
+  writeFile(FILE.contracts, contracts)
+  audit("CANCEL", c.poster or "unknown", sender_id, id)
+
+  return true, { contract = publicContract(c), message = "Contract cancelled" }
+end
+
+-- =============================================================================
+-- HANDLERS
+-- =============================================================================
+local handlers = {}
+
+handlers["ping"] = function(sender_id, req)
+  return true, {
+    message = "Quid Contract Server online",
+    version = VERSION,
+    computer = os.getComputerID(),
+    label = os.getComputerLabel(),
+    time = timestamp(),
+  }
+end
+
+handlers["status"] = function(sender_id, req)
+  local open, claimed, fulfilled, cancelled = 0, 0, 0, 0
+  for _, c in pairs(contracts) do
+    if c.status == "open" then open = open + 1
+    elseif c.status == "claimed" then claimed = claimed + 1
+    elseif c.status == "fulfilled" then fulfilled = fulfilled + 1
+    elseif c.status == "cancelled" then cancelled = cancelled + 1 end
+  end
+
+  return true, {
+    version = VERSION,
+    computer_id = os.getComputerID(),
+    label = os.getComputerLabel(),
+    time = timestamp(),
+    uptime = os.clock(),
+    total = countTable(contracts),
+    open = open,
+    claimed = claimed,
+    fulfilled = fulfilled,
+    cancelled = cancelled,
+    audit_count = audit_counter,
+  }
+end
+
+handlers["post_contract"] = postContract
+handlers["list_contracts"] = listContracts
+handlers["get_contract"] = getContract
+handlers["claim_contract"] = claimContract
+handlers["unclaim_contract"] = unclaimContract
+handlers["mark_fulfilled"] = markFulfilled
+handlers["cancel_contract"] = cancelContract
+
+-- =============================================================================
+-- BOOT
+-- =============================================================================
+local function initFiles()
+  contracts = readFile(FILE.contracts) or {}
+  config = readFile(FILE.config) or {}
+
+  for id, _ in pairs(contracts) do
+    local n = tostring(id):match("CON%-(%d+)")
+    n = tonumber(n)
+    if n and n > contract_counter then contract_counter = n end
+  end
+
+  if fs.exists(FILE.audit) then
+    local f = fs.open(FILE.audit, "r")
+    if f then
+      local line = f.readLine()
+      while line do
+        local n = line:match("CAUD%-(%d+)")
+        n = tonumber(n)
+        if n and n > audit_counter then audit_counter = n end
+        line = f.readLine()
+      end
+      f.close()
+    end
+  end
+end
+
+local function openModem()
+  for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.getType(name) == "modem" then
+      local m = peripheral.wrap(name)
+      if m and m.isWireless and m.isWireless() then
+        rednet.open(name)
+        print("  Modem: " .. name .. " (wireless)")
+        return true
+      end
+    end
+  end
+
+  for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.getType(name) == "modem" then
+      rednet.open(name)
+      print("  Modem: " .. name .. " (wired fallback)")
+      return true
+    end
+  end
+
+  print("  ERROR: No modem found")
+  return false
+end
+
+local function drawStatus()
+  term.clear()
+  term.setCursorPos(1, 1)
+  local w = term.getSize()
+
+  local status = handlers["status"](os.getComputerID(), {})
+  local ok, s = status, nil
+  if ok then _, s = handlers["status"](os.getComputerID(), {}) end
+
+  term.setBackgroundColor(colors.black)
+  term.setTextColor(colors.yellow)
+  print(string.rep("=", w))
+  print("  QUID CONTRACT SERVER  v" .. VERSION)
+  print(string.rep("=", w))
+
+  term.setTextColor(colors.white)
+  print("  ID:       " .. os.getComputerID())
+  print("  Label:    " .. (os.getComputerLabel() or "unlabelled"))
+  print("  Protocol: " .. PROTOCOL)
+  print("  Uptime:   " .. string.format("%.0f", os.clock()) .. "s")
+  print("  Audits:   " .. tostring(audit_counter))
+
+  term.setTextColor(colors.yellow)
+  print(string.rep("-", w))
+  term.setTextColor(colors.lime)
+  print("  Open:      " .. tostring(s and s.open or "?"))
+  term.setTextColor(colors.orange)
+  print("  Claimed:   " .. tostring(s and s.claimed or "?"))
+  term.setTextColor(colors.cyan)
+  print("  Fulfilled: " .. tostring(s and s.fulfilled or "?"))
+  term.setTextColor(colors.red)
+  print("  Cancelled: " .. tostring(s and s.cancelled or "?"))
+  term.setTextColor(colors.white)
+  print("  Total:     " .. tostring(s and s.total or countTable(contracts)))
+
+  term.setTextColor(colors.yellow)
+  print(string.rep("-", w))
+  term.setTextColor(colors.lightGray)
+  print("  [Running. Ctrl+T to terminate]")
+  term.setTextColor(colors.white)
+end
+
+local function handleRequest(sender_id, request)
+  if type(request) ~= "table" then return false, "Invalid request format" end
+
+  local req_type = request.type
+  if not req_type then return false, "Missing request type" end
+
+  local handler = handlers[req_type]
+  if not handler then
+    audit("UNKNOWN", "UNKNOWN", sender_id, tostring(req_type))
+    return false, "Unknown request type: " .. tostring(req_type)
+  end
+
+  local ok, success, response = pcall(handler, sender_id, request)
+  if not ok then
+    audit("ERROR", "SYSTEM", sender_id, tostring(success))
+    return false, "Internal contract server error"
+  end
+
+  return success, response
+end
+
+local function serverLoop()
+  local request_count = 0
+
+  while true do
+    local sender_id, message, protocol = rednet.receive(PROTOCOL, 5)
+
+    if sender_id then
+      request_count = request_count + 1
+      local success, response = handleRequest(sender_id, message)
+      rednet.send(sender_id, {
+        success = success,
+        response = response,
+        time = timestamp(),
+        server = os.getComputerID(),
+      }, PROTOCOL)
+
+      if request_count % 5 == 0 then drawStatus() end
+    else
+      drawStatus()
+      rednet.broadcast({
+        type = "contract_server_online",
+        version = VERSION,
+        id = os.getComputerID(),
+        time = timestamp(),
+      }, PROTOCOL)
+
+      rednet.broadcast({
+        type = "contract_server_online",
+        version = VERSION,
+        id = os.getComputerID(),
+        time = timestamp(),
+      }, PROTOCOL_BROADCAST)
+    end
+  end
+end
+
+local function main()
+  term.clear()
+  term.setCursorPos(1, 1)
+
+  if os.getComputerLabel() ~= LABEL then
+    os.setComputerLabel(LABEL)
+  end
+
+  print("QUID CONTRACT SERVER v" .. VERSION)
+  print("Booting...")
+
+  initFiles()
+  print("  Contracts: " .. countTable(contracts))
+  print("  Next ID:   CON-" .. pad(contract_counter + 1, 6))
+
+  if not openModem() then
+    print("FATAL: No modem. Halting.")
+    return
+  end
+
+  audit("BOOT", "SYSTEM", os.getComputerID(), "v" .. VERSION)
+
+  print("Boot complete.")
+  sleep(1)
+
+  drawStatus()
+  rednet.broadcast({ type = "contract_server_online", version = VERSION, id = os.getComputerID() }, PROTOCOL)
+  rednet.broadcast({ type = "contract_server_online", version = VERSION, id = os.getComputerID() }, PROTOCOL_BROADCAST)
+
+  serverLoop()
+end
+
+main()
