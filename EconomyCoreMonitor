@@ -6,7 +6,7 @@
 --   GDP
 --   GDP / PER CAPITA
 --   INFLATION
---   INEQUALITY
+--   INEQUALITY (account balance distribution, not income)
 --   MONETARY CONDITIONS
 --   POPULATION
 --   COMPANIES
@@ -15,7 +15,7 @@
 -- Read-only. No banking controls. No trade panel. No CPI/policy clutter.
 -- =============================================================================
 
-local VERSION         = "0.4.0-CORE"
+local VERSION         = "0.4.1-WEALTH"
 local PROTOCOL        = "quid_bank"
 local DB_TIMEOUT      = 5
 local REFRESH_SECONDS = 5
@@ -227,20 +227,6 @@ local function calculateMedian(values)
   return ((values[n / 2] or 0) + (values[(n / 2) + 1] or 0)) / 2
 end
 
-local function calculateGini(values)
-  if type(values) ~= "table" or #values < 2 then return nil end
-  table.sort(values)
-  local n = #values
-  local total = 0
-  for _, v in ipairs(values) do total = total + (tonumber(v) or 0) end
-  if total <= 0 then return 0 end
-  local weighted = 0
-  for i, v in ipairs(values) do
-    weighted = weighted + (i * (tonumber(v) or 0))
-  end
-  return ((2 * weighted) / (n * total)) - ((n + 1) / n)
-end
-
 local function calculateTopShare(values, fraction)
   if type(values) ~= "table" or #values == 0 then return nil end
   fraction = fraction or 0.1
@@ -362,27 +348,43 @@ local function inequalityFromAccounts(accounts)
   if type(accounts) ~= "table" then
     return { status = "Awaiting account aggregation" }
   end
+
   local balances = {}
   for _, acc in ipairs(accounts) do
     if type(acc) == "table" and acc.type == "citizen" and acc.status ~= "suspended" then
       balances[#balances + 1] = tonumber(acc.balance) or 0
     end
   end
+
   if #balances < 2 then
-    return { status = "Need 2+ citizens", observations = #balances }
+    return { status = "Need 2+ citizen accounts", observations = #balances }
   end
+
   local total = 0
-  for _, v in ipairs(balances) do total = total + v end
-  local mean = total / #balances
+  local highest = balances[1]
+  local lowest = balances[1]
+  for _, v in ipairs(balances) do
+    total = total + v
+    if v > highest then highest = v end
+    if v < lowest then lowest = v end
+  end
+
+  local average = total / #balances
   local median = calculateMedian(copyList(balances))
-  local medianMean = nil
-  if mean and mean ~= 0 and median then medianMean = (median / mean) * 100 end
+  local top10 = calculateTopShare(copyList(balances), 0.1)
+  local highLowRatio = nil
+  if lowest and lowest > 0 then highLowRatio = highest / lowest end
+
   return {
-    gini = calculateGini(copyList(balances)),
-    top10_share = calculateTopShare(copyList(balances), 0.1),
-    median_mean_ratio = medianMean,
+    top10_share = top10,
+    median_balance = median,
+    average_balance = average,
+    highest_balance = highest,
+    lowest_balance = lowest,
+    high_low_ratio = highLowRatio,
+    total_balance = total,
     observations = #balances,
-    status = "Live aggregate",
+    status = "Live account-balance distribution",
   }
 end
 
@@ -446,11 +448,15 @@ local function normaliseNationalStats(raw)
     output_status = outputRaw.status or (gdp and "Live" or "Awaiting GDP output data"),
     inflation_status = pricesRaw.status or (pricesRaw.inflation and "Live" or "Awaiting inflation data"),
     inequality = {
-      gini = num(inequalityRaw.gini),
       top10_share = num(inequalityRaw.top10_share),
-      median_mean_ratio = num(inequalityRaw.median_mean_ratio),
+      median_balance = num(inequalityRaw.median_balance or inequalityRaw.median),
+      average_balance = num(inequalityRaw.average_balance or inequalityRaw.mean),
+      highest_balance = num(inequalityRaw.highest_balance or inequalityRaw.max_balance),
+      lowest_balance = num(inequalityRaw.lowest_balance or inequalityRaw.min_balance),
+      high_low_ratio = num(inequalityRaw.high_low_ratio or inequalityRaw.max_min_ratio),
+      total_balance = num(inequalityRaw.total_balance),
       observations = num(inequalityRaw.observations),
-      status = inequalityRaw.status or "Awaiting aggregation",
+      status = inequalityRaw.status or "Awaiting account-balance distribution",
     },
     monetary = {
       issued_supply = issued,
@@ -649,16 +655,29 @@ end
 local function drawInequalityCard(x, y, w, h, snap)
   local q = snap and snap.inequality or {}
   card(x, y, w, h, "INEQUALITY", C.inequality)
-  metric(x + 2, y + 2, "Gini coefficient", q.gini and fmtNum(q.gini, 3) or "Awaiting data", q.gini and colors.white or C.warn)
-  metric(x + 2, y + 3, "Top 10% share", q.top10_share and fmtPct(q.top10_share, 1) or "Awaiting data", q.top10_share and colors.white or C.warn)
-  metric(x + 2, y + 4, "Median / mean", q.median_mean_ratio and fmtPct(q.median_mean_ratio, 1) or "Awaiting data", q.median_mean_ratio and colors.white or C.warn)
-  metric(x + 2, y + 5, "Observations", tostring(q.observations or "Awaiting data"), q.observations and colors.white or C.warn)
+
+  metric(x + 2, y + 2, "Top 10% share", q.top10_share and fmtPct(q.top10_share, 1) or "Awaiting data", q.top10_share and colors.white or C.warn)
+  metric(x + 2, y + 3, "Median balance", fmtMoney(q.median_balance), q.median_balance and colors.white or C.warn)
+  metric(x + 2, y + 4, "Average balance", fmtMoney(q.average_balance), q.average_balance and colors.white or C.warn)
+  metric(x + 2, y + 5, "Highest balance", fmtMoney(q.highest_balance), q.highest_balance and colors.white or C.warn)
+  metric(x + 2, y + 6, "Lowest balance", fmtMoney(q.lowest_balance), q.lowest_balance and colors.white or C.warn)
+
+  local ratioText = "Awaiting data"
+  if q.high_low_ratio then ratioText = fmtNum(q.high_low_ratio, 2) .. "x" end
+  metric(x + 2, y + 7, "High / low", ratioText, q.high_low_ratio and colors.white or C.warn)
+  metric(x + 2, y + 8, "Accounts", tostring(q.observations or "Awaiting data"), q.observations and colors.white or C.warn)
+
   local barW = math.max(10, w - 6)
   local filled = 0
-  if q.gini then filled = math.floor(clamp(q.gini, 0, 1) * barW) end
-  fill(x + 2, y + 7, barW, 1, colors.gray)
-  if filled > 0 then fill(x + 2, y + 7, filled, 1, C.inequality) end
-  writeAt(x + 2, y + h - 1, shortText(q.status or "Awaiting aggregation", w - 4), q.status == "Live aggregate" and C.good or C.warn, C.bg)
+  if q.top10_share then filled = math.floor(clamp(q.top10_share / 100, 0, 1) * barW) end
+  local barY = math.min(y + 10, y + h - 3)
+  fill(x + 2, barY, barW, 1, colors.gray)
+  if filled > 0 then fill(x + 2, barY, filled, 1, C.inequality) end
+  if barY + 1 <= y + h - 2 then
+    writeAt(x + 2, barY + 1, "Top 10% of account balances", C.dim, C.bg)
+  end
+
+  writeAt(x + 2, y + h - 1, shortText(q.status or "Awaiting account aggregation", w - 4), q.status and q.status:find("Live") and C.good or C.warn, C.bg)
 end
 
 local function drawMonetaryCard(x, y, w, h, snap)
@@ -698,7 +717,7 @@ local function drawFooter()
   local w, h = getSize()
   fill(1, h - 1, w, 2, C.bg)
   writeAt(1, h - 1, string.rep("-", w), C.dim, C.bg)
-  local text = "Refresh: " .. REFRESH_SECONDS .. "s   CORE ONLY   Monitor: " .. (monitor and "attached" or "terminal") .. "   [Q] Quit"
+  local text = "Refresh: " .. REFRESH_SECONDS .. "s   CORE WEALTH ONLY   Monitor: " .. (monitor and "attached" or "terminal") .. "   [Q] Quit"
   writeAt(2, h, text, C.dim, C.bg)
   if last_error ~= "" then writeAt(math.max(2, w - #last_error - 2), h, last_error, C.bad, C.bg) end
 end
