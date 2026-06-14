@@ -14,57 +14,71 @@
 -- =============================================================================
 -- SELF-UPDATE BOOTLOADER
 -- =============================================================================
-local GITHUB_URL = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/main/ServerSideAccounts"
-local SELF = "startup.lua"
-local TEMP = "startup_update.tmp"
+local GITHUB_URL   = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/main/ServerSideAccounts"
+local SELF         = "startup.lua"
+local UPDATE_STAMP = "data/version.db"
 
-local function selfUpdate()
+local bootArgs   = {...}
+local SKIP_UPDATE = (bootArgs[1] == "--updated")
+
+-- Delete-and-rebuild from GitHub on every boot. Uses http.get directly (CC's
+-- wget program has no -q flag, which silently broke the old updater) and a
+-- cache-busting query so GitHub's CDN can't serve a stale copy. After a rebuild
+-- it relaunches itself with --updated so it runs the fresh code exactly once
+-- instead of looping forever.
+local function selfRebuild()
+  if SKIP_UPDATE then return false end
+
+  if not http then
+    print("HTTP API disabled. Running local copy.")
+    return false
+  end
+
   print("[ Quid Bank of Plenty ]")
-  print("Checking for updates...")
-  local ok = shell.run("wget", "-q", GITHUB_URL, TEMP)
-  if not ok or not fs.exists(TEMP) then
-    print("Update check failed. Running existing version.")
-    if fs.exists(TEMP) then fs.delete(TEMP) end
-    return false
-  end
-  local f = fs.open(TEMP, "r")
-  local content = f and f.readAll() or ""
-  if f then f.close() end
-  if #content < 500 or not content:find("VERSION") then
-    print("Download invalid. Running existing version.")
-    fs.delete(TEMP)
-    return false
-  end
-  if fs.exists(SELF) then fs.delete(SELF) end
-  fs.move(TEMP, SELF)
+  print("Rebuilding from GitHub...")
 
-  -- Record the update so the status panel can show when it last updated
-  local vf = fs.open("data/version.db", "w")
+  local url  = GITHUB_URL .. "?cb=" .. tostring(os.epoch("utc"))
+  local resp = http.get(url)
+  if not resp then
+    print("GitHub unreachable. Running local copy.")
+    return false
+  end
+  local data = resp.readAll()
+  resp.close()
+
+  -- Verify the download before trusting it
+  if not data or #data < 500 or not data:find("VERSION") then
+    print("Download looked invalid. Running local copy.")
+    return false
+  end
+
+  -- Delete and rebuild self
+  if fs.exists(SELF) then fs.delete(SELF) end
+  local f = fs.open(SELF, "w")
+  f.write(data)
+  f.close()
+
+  -- Stamp the rebuild time so the status panel can prove it happened this boot
+  if not fs.exists("data") then fs.makeDir("data") end
+  local vf = fs.open(UPDATE_STAMP, "w")
   if vf then
-    vf.write(textutils.serialize({
-      version      = VERSION,
-      last_updated = os.epoch("utc"),
-      source       = GITHUB_URL
-    }))
+    vf.write(textutils.serialize({ last_updated = os.epoch("utc"), source = GITHUB_URL }))
     vf.close()
   end
 
-  print("Updated to latest. Relaunching...")
-  sleep(0.5)
-  os.reboot()
-  return true
+  print("Rebuilt from GitHub. Launching latest...")
+  sleep(0.3)
+  shell.run(SELF, "--updated")  -- runs the fresh copy; blocks here while it runs
+  return true                    -- when it returns, this old copy stops
 end
 
-local bootArgs = {...}
-if bootArgs[1] ~= "--skip-update" then
-  selfUpdate()
-end
+if selfRebuild() then return end
 
 -- =============================================================================
--- MAIN PROGRAM
+-- MAIN PROGRAM  (runs after a clean relaunch, or if the update was skipped/failed)
 -- =============================================================================
 
-local VERSION  = "1.1.1"
+local VERSION  = "1.2.0"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
