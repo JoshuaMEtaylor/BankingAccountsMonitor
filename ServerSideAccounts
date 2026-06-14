@@ -16,7 +16,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.2.3"
+local VERSION  = "1.2.0"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -957,12 +957,12 @@ local function handleRequest(sender_id, request)
     audit("ACTION", "UNKNOWN", sender_id, req_type, "unknown request type")
     return false, "Unknown request type: " .. tostring(req_type)
   end
-  local ok, result = pcall(handler, sender_id, request)
+  local ok, success, response = pcall(handler, sender_id, request)
   if not ok then
-    audit("ERROR", "SYSTEM", sender_id, req_type, "handler error: " .. tostring(result))
+    audit("ERROR", "SYSTEM", sender_id, req_type, "handler error: " .. tostring(success))
     return false, "Internal server error"
   end
-  return result
+  return success, response
 end
 
 local function serverLoop()
