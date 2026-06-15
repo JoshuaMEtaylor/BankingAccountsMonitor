@@ -32,7 +32,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION = "1.0.2"
+local VERSION = "1.0.3"
 local BANK_PROTOCOL = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT = 5
@@ -42,7 +42,8 @@ local STARTING_CAPITAL = 5000
 local AUTO_GRANT_CAPITAL = true
 local DEFAULT_OWNER_ID = "treasury:quid_bank"
 
-local PRICE_INDEX = 1.00          -- accumulated price multiplier; external inflation system can write config.price_index
+local PRICE_INDEX = 1.00          -- central inflation price index from bank
+local INFLATION_RATE = 0.00       -- daily inflation/deflation rate from bank
 local BASE_CONTRACT_FEE = 1       -- deliberately low for early economy growth
 local SPEND_LIMIT = 0.10          -- max % of business balance per job
 local MIN_FAIR_RATIO = 0.50       -- don't post if affordable price is under this share of fair value
@@ -226,7 +227,7 @@ local function draw()
   at(2, 9,  "Citizens:  " .. tostring(stats.citizens_seen) .. "   Accounts: " .. tostring(countTable(citizens_map)) .. " (new " .. tostring(stats.citizens_registered) .. ")", colors.lightGray)
   at(2, 10, "Requests:  " .. tostring(stats.requests_seen) .. "   Contracts: " .. tostring(stats.contracts_posted), colors.lime)
   at(2, 11, "Skipped:   unmapped " .. tostring(stats.skipped_unmapped) .. " / unfunded " .. tostring(stats.skipped_unfunded), colors.orange)
-  at(2, 12, "Pricing:   base " .. tostring(BASE_CONTRACT_FEE) .. " Q, index x" .. tostring(PRICE_INDEX) .. ", spend cap " .. tostring(math.floor(SPEND_LIMIT * 100)) .. "%", colors.lightGray)
+  at(2, 12, "Pricing:   base " .. tostring(BASE_CONTRACT_FEE) .. " Q, index x" .. string.format("%.3f", PRICE_INDEX) .. ", rate " .. string.format("%.2f%%", INFLATION_RATE * 100), colors.lightGray)
 
   local last = "never"
   if stats.last_scan > 0 then last = tostring(math.floor((now() - stats.last_scan) / 1000)) .. "s ago" end
@@ -620,6 +621,33 @@ local function refreshPrices()
   if ok and type(res) == "table" and type(res.prices) == "table" then prices = res.prices end
 end
 
+
+local function refreshInflation()
+  local day = os.day and math.floor(tonumber(os.day()) or 0) or nil
+
+  local ok, res = bankReq({ type = "tick_inflation", day = day }, 4)
+  if ok and type(res) == "table" then
+    local st = res.state or res
+    PRICE_INDEX = tonumber(st.price_index) or PRICE_INDEX
+    INFLATION_RATE = tonumber(st.inflation_rate) or INFLATION_RATE
+    return true
+  end
+
+  ok, res = bankReq({ type = "get_inflation_state" }, 4)
+  if ok and type(res) == "table" then
+    local st = res.state or res
+    PRICE_INDEX = tonumber(st.price_index) or PRICE_INDEX
+    INFLATION_RATE = tonumber(st.inflation_rate) or INFLATION_RATE
+    return true
+  end
+
+  -- Backwards-compatible fallback for older bank server.
+  if config.price_index then PRICE_INDEX = tonumber(config.price_index) or PRICE_INDEX end
+  if config.inflation_multiplier then PRICE_INDEX = tonumber(config.inflation_multiplier) or PRICE_INDEX end
+  if config.inflation then PRICE_INDEX = tonumber(config.inflation) or PRICE_INDEX end
+  return false
+end
+
 local function officialPrice(id)
   local p = prices[id]
   if type(p) == "table" then return tonumber(p.unit_price) end
@@ -817,6 +845,7 @@ local function scanOnce()
   if not bank_id or not contract_id then return false end
 
   refreshPrices()
+  refreshInflation()
   local okB, buildings = safeCall(colony, "getBuildings")
   local okC, citizens = safeCall(colony, "getCitizens")
   local okR, requests = safeCall(colony, "getRequests")
