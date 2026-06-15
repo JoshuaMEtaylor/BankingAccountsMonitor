@@ -22,7 +22,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.2.9"
+local VERSION  = "1.3.0"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -749,6 +749,159 @@ handlers["set_inflation_policy"] = function(sender_id, req)
   audit("ACTION", "STATE", sender_id, "SET_INFLATION_POLICY", "ok")
   return true, { state = inflation_state }
 end
+
+
+-- FISCAL_HISTORY
+-- State-facing treasury transaction history and expenditure summary.
+-- This is intentionally unauthenticated like list_accounts/mint/grant/burn because
+-- fiscal terminals already operate as state controllers on the private rednet network.
+handlers["fiscal_history"] = function(sender_id, req)
+  local target = req.account_id or "treasury:quid_bank"
+  local limit  = tonumber(req.limit) or 50
+  if limit < 1 then limit = 50 end
+  if limit > 200 then limit = 200 end
+
+  if not accountExists(target) then
+    return false, "Account not found: " .. tostring(target)
+  end
+
+  local function clean(s)
+    return tostring(s or ""):match("^%s*(.-)%s*$")
+  end
+
+  local function accountName(id)
+    id = clean(id)
+    if accounts[id] and accounts[id].display_name then
+      return accounts[id].display_name
+    end
+    if id == "SYSTEM" then return "SYSTEM" end
+    return id
+  end
+
+  local nowTime = timestamp()
+  local dayMs = 24 * 60 * 60 * 1000
+
+  local all = {}
+  local summary = {
+    account_id = target,
+    display_name = accountName(target),
+    current_balance = deriveBalance(target),
+
+    total_in = 0,
+    total_out = 0,
+    net_change = 0,
+
+    expenditure_total = 0,
+    expenditure_24h = 0,
+    grants_total = 0,
+    grants_24h = 0,
+    payroll_total = 0,
+    payroll_24h = 0,
+
+    mint_total = 0,
+    mint_24h = 0,
+    burn_total = 0,
+    burn_24h = 0,
+
+    tx_count = 0,
+  }
+
+  local lines = readLines(FILE.ledger)
+  for _, line in ipairs(lines) do
+    local tx_id, ts, tx_type, from_id, to_id, amount, memo, status =
+      line:match("(TX%-%d+)%s*|%s*(%d+)%s*|%s*(%S+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*(%d+)%s*|%s*([^|]+)%s*|%s*(.+)")
+
+    if tx_id then
+      ts = tonumber(ts) or 0
+      tx_type = clean(tx_type)
+      from_id = clean(from_id)
+      to_id = clean(to_id)
+      amount = tonumber(amount) or 0
+      memo = clean(memo)
+      status = clean(status)
+
+      if status == "settled" and (from_id == target or to_id == target) then
+        local direction = (to_id == target) and "IN" or "OUT"
+        local counterparty_id = direction == "IN" and from_id or to_id
+        local recent24 = (nowTime - ts) <= dayMs
+
+        if direction == "IN" then
+          summary.total_in = summary.total_in + amount
+        else
+          summary.total_out = summary.total_out + amount
+        end
+
+        if tx_type == "MINT" and to_id == target then
+          summary.mint_total = summary.mint_total + amount
+          if recent24 then summary.mint_24h = summary.mint_24h + amount end
+        end
+
+        if tx_type == "BURN" and from_id == target then
+          summary.burn_total = summary.burn_total + amount
+          if recent24 then summary.burn_24h = summary.burn_24h + amount end
+        end
+
+        -- Expenditure is money spent out of treasury into the economy.
+        -- Burning is tracked separately because it is a monetary contraction,
+        -- not a purchase/payroll/grant expense.
+        if from_id == target and tx_type ~= "BURN" then
+          summary.expenditure_total = summary.expenditure_total + amount
+          if recent24 then summary.expenditure_24h = summary.expenditure_24h + amount end
+
+          if tx_type == "GRANT" then
+            summary.grants_total = summary.grants_total + amount
+            if recent24 then summary.grants_24h = summary.grants_24h + amount end
+          end
+
+          local lm = string.lower(memo)
+          if lm:find("payroll", 1, true) or lm:find("wage", 1, true) or lm:find("salary", 1, true) then
+            summary.payroll_total = summary.payroll_total + amount
+            if recent24 then summary.payroll_24h = summary.payroll_24h + amount end
+          end
+        end
+
+        all[#all + 1] = {
+          tx_id = tx_id,
+          time = ts,
+          type = tx_type,
+          from = from_id,
+          to = to_id,
+          from_name = accountName(from_id),
+          to_name = accountName(to_id),
+          counterparty_id = counterparty_id,
+          counterparty_name = accountName(counterparty_id),
+          direction = direction,
+          amount = amount,
+          memo = memo,
+          status = status,
+        }
+
+        summary.tx_count = summary.tx_count + 1
+      end
+    end
+  end
+
+  summary.net_change = summary.total_in - summary.total_out
+
+  table.sort(all, function(a, b)
+    return (tonumber(a.time) or 0) > (tonumber(b.time) or 0)
+  end)
+
+  local out = {}
+  for i = 1, math.min(limit, #all) do
+    out[#out + 1] = all[i]
+  end
+
+  audit("ACTION", "STATE", sender_id, "FISCAL_HISTORY:" .. target, tostring(#out))
+  return true, {
+    summary = summary,
+    transactions = out,
+    count = #out,
+    total_matching = #all,
+    limit = limit,
+  }
+end
+
 
 -- REGISTER_COMPANY
 handlers["register_company"] = function(sender_id, req)
