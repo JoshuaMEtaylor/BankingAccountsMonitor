@@ -32,7 +32,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION = "1.0.0"
+local VERSION = "1.0.2"
 local BANK_PROTOCOL = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT = 5
@@ -42,14 +42,15 @@ local STARTING_CAPITAL = 5000
 local AUTO_GRANT_CAPITAL = true
 local DEFAULT_OWNER_ID = "treasury:quid_bank"
 
-local INFLATION = 1.00
-local BASE_CONTRACT_FEE = 10
-local SPEND_LIMIT = 0.25       -- max % of business balance per job
-local MIN_FAIR_RATIO = 0.75    -- don't post if affordable price is under this share of fair value
+local PRICE_INDEX = 1.00          -- accumulated price multiplier; external inflation system can write config.price_index
+local BASE_CONTRACT_FEE = 1       -- deliberately low for early economy growth
+local SPEND_LIMIT = 0.10          -- max % of business balance per job
+local MIN_FAIR_RATIO = 0.50       -- don't post if affordable price is under this share of fair value
 
 local FILE_BUSINESSES = "data/building_companies.db"
 local FILE_POSTED = "data/posted_requests.db"
 local FILE_CONFIG = "data/colony_business_config.db"
+local FILE_CITIZENS = "data/colony_citizens.db"
 
 local colony = nil
 local colony_name = "Colony"
@@ -58,6 +59,7 @@ local bank_id = nil
 local contract_id = nil
 local businesses = {}
 local posted = {}
+local citizens_map = {}
 local config = {}
 local prices = {}
 local auto_mode = true
@@ -68,6 +70,9 @@ local W, H = term.getSize()
 local stats = {
   buildings_seen = 0,
   businesses_registered = 0,
+  citizens_seen = 0,
+  citizen_accounts = 0,
+  citizens_registered = 0,
   requests_seen = 0,
   contracts_posted = 0,
   skipped_unfunded = 0,
@@ -154,9 +159,9 @@ local function money(n)
   return sign .. s .. " Q"
 end
 
-local function round5(n)
+local function round1(n)
   n = tonumber(n) or 0
-  return math.max(1, math.floor((n + 2.5) / 5) * 5)
+  return math.max(1, math.floor(n + 0.5))
 end
 
 -- =============================================================================
@@ -217,17 +222,15 @@ local function draw()
   at(2, 5, "Contracts: " .. tostring(contract_id or "not connected"), contract_id and colors.lime or colors.red)
   at(2, 6, "Auto:      " .. (auto_mode and "ON" or "OFF"), auto_mode and colors.lime or colors.orange)
 
-  at(2, 8,  "Buildings seen:    " .. tostring(stats.buildings_seen), colors.lightGray)
-  at(2, 9,  "Businesses mapped: " .. tostring(countTable(businesses)), colors.lightGray)
-  at(2, 10, "New registrations: " .. tostring(stats.businesses_registered), colors.lightGray)
-  at(2, 11, "Requests seen:     " .. tostring(stats.requests_seen), colors.lightGray)
-  at(2, 12, "Contracts posted:  " .. tostring(stats.contracts_posted), colors.lime)
-  at(2, 13, "Skipped unfunded:  " .. tostring(stats.skipped_unfunded), colors.orange)
-  at(2, 14, "Skipped unmapped:  " .. tostring(stats.skipped_unmapped), colors.orange)
+  at(2, 8,  "Buildings: " .. tostring(stats.buildings_seen) .. "   Businesses: " .. tostring(countTable(businesses)) .. " (new " .. tostring(stats.businesses_registered) .. ")", colors.lightGray)
+  at(2, 9,  "Citizens:  " .. tostring(stats.citizens_seen) .. "   Accounts: " .. tostring(countTable(citizens_map)) .. " (new " .. tostring(stats.citizens_registered) .. ")", colors.lightGray)
+  at(2, 10, "Requests:  " .. tostring(stats.requests_seen) .. "   Contracts: " .. tostring(stats.contracts_posted), colors.lime)
+  at(2, 11, "Skipped:   unmapped " .. tostring(stats.skipped_unmapped) .. " / unfunded " .. tostring(stats.skipped_unfunded), colors.orange)
+  at(2, 12, "Pricing:   base " .. tostring(BASE_CONTRACT_FEE) .. " Q, index x" .. tostring(PRICE_INDEX) .. ", spend cap " .. tostring(math.floor(SPEND_LIMIT * 100)) .. "%", colors.lightGray)
 
   local last = "never"
   if stats.last_scan > 0 then last = tostring(math.floor((now() - stats.last_scan) / 1000)) .. "s ago" end
-  at(2, 16, "Last scan: " .. last, colors.lightGray)
+  at(2, 14, "Last scan: " .. last, colors.lightGray)
 
   local bw = math.floor((W - 8) / 3)
   local bScan = button(2, H - 3, bw, "Scan Now", colors.purple)
@@ -443,6 +446,172 @@ local function scanBusinesses(buildings)
   writeFile(FILE_BUSINESSES, businesses)
 end
 
+
+-- =============================================================================
+-- CITIZEN ACCOUNT SYNC
+-- =============================================================================
+local function citizenStableId(z)
+  if type(z) ~= "table" then return nil end
+  local id = z.id or z.citizen_id or z.citizenId or z.uuid or z.name
+  if id == nil then return nil end
+  return tostring(id)
+end
+
+local function citizenUsername(z)
+  local id = citizenStableId(z)
+  if not id then return nil end
+  id = id:gsub("[^%w_%-]", "_")
+  return "mc_" .. id
+end
+
+local function prettyJobName(raw)
+  raw = tostring(raw or "")
+  raw = raw:gsub("com%.minecolonies%.job%.", "")
+  raw = raw:gsub("com%.minecolonies%.building%.", "")
+  raw = raw:gsub("_", " ")
+  raw = raw:gsub("%-", " ")
+  raw = trim(raw)
+  if raw == "" then return "Citizen" end
+  return raw:sub(1,1):upper() .. raw:sub(2)
+end
+
+local function citizenJobRaw(z)
+  if type(z) ~= "table" then return "" end
+  if type(z.work) == "table" then
+    return tostring(z.work.job or z.work.type or z.work.name or "")
+  end
+  return tostring(z.job or z.work or "")
+end
+
+local function citizenTitle(z)
+  local raw = citizenJobRaw(z)
+  local title = prettyJobName(raw)
+  if title == "Citizen" and z.name then return "Citizen" end
+  return title
+end
+
+local function citizenPayRate(z)
+  local j = lower(citizenJobRaw(z))
+
+  -- Payroll terminal can use this same table:
+  -- researchers 3 Q/day, soldiers/guards 2 Q/day, couriers 1 Q/day.
+  if j:find("research", 1, true) or j:find("university", 1, true) or j:find("teacher", 1, true) then
+    return 3
+  end
+
+  if j:find("soldier", 1, true)
+    or j:find("guard", 1, true)
+    or j:find("knight", 1, true)
+    or j:find("archer", 1, true)
+    or j:find("ranger", 1, true)
+    or j:find("combat", 1, true)
+    or j:find("barracks", 1, true)
+    or j:find("tower", 1, true) then
+    return 2
+  end
+
+  if j:find("courier", 1, true) or j:find("delivery", 1, true) or j:find("deliveryman", 1, true) then
+    return 1
+  end
+
+  return 0
+end
+
+local function updateLocalCitizenRecord(z, created)
+  local stable = citizenStableId(z)
+  if not stable then return nil end
+
+  local username = citizenUsername(z)
+  local citizen_id = "citizen:" .. username
+  local work = type(z.work) == "table" and z.work or {}
+
+  citizens_map[stable] = citizens_map[stable] or {}
+  local rec = citizens_map[stable]
+
+  rec.citizen_id = citizen_id
+  rec.username = username
+  rec.display_name = tostring(z.name or z.display_name or ("Citizen " .. stable))
+  rec.title = citizenTitle(z)
+  rec.job = normalType(work.job or work.type or z.job or "citizen")
+  rec.work_type = normalType(work.type or work.name or "")
+  rec.work_name = tostring(work.name or "")
+  rec.work_location = work.location
+  rec.home_location = type(z.home) == "table" and z.home.location or nil
+  rec.pay_rate = citizenPayRate(z)
+  rec.pay_period = "minecraft_day"
+  rec.active = true
+  rec.seen_at = now()
+
+  if created then rec.registered_at = now() end
+  return rec
+end
+
+local function registerCitizen(z)
+  local stable = citizenStableId(z)
+  if not stable then return false, "missing citizen id" end
+
+  local username = citizenUsername(z)
+  local citizen_id = "citizen:" .. username
+  local display_name = tostring(z.name or z.display_name or ("Citizen " .. stable))
+  local title = citizenTitle(z)
+
+  if citizens_map[stable] and citizens_map[stable].citizen_id then
+    updateLocalCitizenRecord(z, false)
+    return false, "already mapped"
+  end
+
+  local ok, res = bankReq({
+    type = "register_citizen",
+    display_name = display_name,
+    username = username,
+    password = "mc" .. tostring(stable),
+    title = title,
+  })
+
+  if ok and type(res) == "table" then
+    updateLocalCitizenRecord(z, true)
+    stats.citizens_registered = stats.citizens_registered + 1
+    setMsg("Created citizen account " .. citizen_id, colors.lime)
+    return true, citizen_id
+  end
+
+  -- If the bank already has the account, rebuild our local map instead of failing forever.
+  local msg = tostring(res or "")
+  if msg:find("Username already exists", 1, true) or msg:find("Account already exists", 1, true) then
+    updateLocalCitizenRecord(z, false)
+    setMsg("Mapped existing citizen account " .. citizen_id, colors.lightGray)
+    return true, citizen_id
+  end
+
+  setMsg("Citizen account failed: " .. msg, colors.red)
+  return false, msg
+end
+
+local function scanCitizens(citizens)
+  local seen = {}
+  stats.citizens_seen = #(citizens or {})
+
+  for _, z in ipairs(citizens or {}) do
+    local stable = citizenStableId(z)
+    if stable then
+      seen[stable] = true
+      registerCitizen(z)
+    end
+  end
+
+  for stable, rec in pairs(citizens_map) do
+    if not seen[stable] then
+      rec.active = false
+      rec.missing_since = rec.missing_since or now()
+    else
+      rec.missing_since = nil
+    end
+  end
+
+  stats.citizen_accounts = countTable(citizens_map)
+  writeFile(FILE_CITIZENS, citizens_map)
+end
+
 -- =============================================================================
 -- PRICING
 -- =============================================================================
@@ -460,23 +629,30 @@ end
 
 local function fallbackPrice(id)
   id = lower(id)
-  if id:find("netherite",1,true) then return 100 end
-  if id:find("diamond",1,true) then return 50 end
-  if id:find("emerald",1,true) then return 45 end
-  if id:find("gold",1,true) then return 12 end
-  if id:find("iron",1,true) then return 8 end
-  if id:find("redstone",1,true) then return 5 end
-  if id:find("copper",1,true) then return 4 end
-  if id:find("brick",1,true) or id:find("glass",1,true) then return 3 end
-  if id:find("coal",1,true) or id:find("charcoal",1,true) then return 2 end
-  if id:find("pickaxe",1,true) or id:find("shovel",1,true) or id:find("axe",1,true) or id:find("tool",1,true) then return 25 end
-  if id:find("sword",1,true) or id:find("armor",1,true) or id:find("helmet",1,true) or id:find("chestplate",1,true) then return 35 end
-  if id:find("log",1,true) or id:find("plank",1,true) or id:find("stair",1,true) or id:find("slab",1,true) then return 1 end
-  if id:find("cobble",1,true) or id:find("stone",1,true) or id:find("dirt",1,true) then return 1 end
-  if id:find("bread",1,true) or id:find("wheat",1,true) or id:find("potato",1,true) or id:find("food",1,true) then return 2 end
-  return 2
-end
 
+  -- Early-economy fallback rates are intentionally tiny.
+  -- Official state price table still overrides these values through get_prices/set_price.
+  if id:find("netherite",1,true) then return 20 end
+  if id:find("diamond",1,true) then return 8 end
+  if id:find("emerald",1,true) then return 6 end
+  if id:find("gold",1,true) then return 2 end
+  if id:find("iron",1,true) then return 1 end
+  if id:find("redstone",1,true) then return 0.5 end
+  if id:find("lapis",1,true) then return 0.5 end
+  if id:find("copper",1,true) then return 0.3 end
+  if id:find("brick",1,true) or id:find("glass",1,true) then return 0.25 end
+  if id:find("coal",1,true) or id:find("charcoal",1,true) then return 0.2 end
+
+  if id:find("pickaxe",1,true) or id:find("shovel",1,true) or id:find("axe",1,true) or id:find("hoe",1,true) or id:find("tool",1,true) then return 3 end
+  if id:find("sword",1,true) or id:find("bow",1,true) or id:find("armor",1,true) or id:find("helmet",1,true) or id:find("chestplate",1,true) then return 4 end
+
+  if id:find("log",1,true) then return 0.08 end
+  if id:find("plank",1,true) or id:find("stair",1,true) or id:find("slab",1,true) then return 0.05 end
+  if id:find("cobble",1,true) or id:find("stone",1,true) or id:find("dirt",1,true) or id:find("sand",1,true) or id:find("gravel",1,true) then return 0.03 end
+  if id:find("bread",1,true) or id:find("wheat",1,true) or id:find("potato",1,true) or id:find("carrot",1,true) or id:find("food",1,true) then return 0.2 end
+
+  return 0.1
+end
 local function unitPrice(id)
   return officialPrice(id) or fallbackPrice(id)
 end
@@ -489,7 +665,9 @@ end
 
 local function wealthMult(balance)
   balance = tonumber(balance) or 0
-  return 1.0 + math.min(0.50, balance / 20000)
+  -- Slower wealth scaling: a 5,000 Q company only pays about +5% above base.
+  -- This stops early companies from overpaying before the economy has grown.
+  return 1.0 + math.min(0.35, balance / 100000)
 end
 
 local function extractItems(req)
@@ -521,11 +699,11 @@ end
 local function priceJob(business, items)
   local bal = companyBalance(business.company_id)
   if bal <= 0 then return nil, "no funds", bal, 0 end
-  local fair = (BASE_CONTRACT_FEE + requestItemValue(items)) * INFLATION * wealthMult(bal)
+  local fair = (BASE_CONTRACT_FEE + requestItemValue(items)) * PRICE_INDEX * wealthMult(bal)
   local max_pay = math.floor(bal * SPEND_LIMIT)
   if max_pay <= 0 then return nil, "unfunded", bal, fair end
   if max_pay < fair * MIN_FAIR_RATIO then return nil, "cannot afford fair price", bal, fair end
-  local reward = round5(math.min(fair, max_pay))
+  local reward = round1(math.min(fair, max_pay))
   if reward <= 0 or reward > bal then return nil, "cannot pay", bal, fair end
   return reward, nil, bal, fair
 end
@@ -651,6 +829,7 @@ local function scanOnce()
   stats.skipped_unmapped = 0
   stats.skipped_unfunded = 0
 
+  scanCitizens(citizens)
   scanBusinesses(buildings)
   scanRequests(requests, citizens)
 
@@ -663,8 +842,11 @@ end
 local function loadState()
   businesses = readFile(FILE_BUSINESSES) or {}
   posted = readFile(FILE_POSTED) or {}
+  citizens_map = readFile(FILE_CITIZENS) or {}
   config = readFile(FILE_CONFIG) or {}
-  if config.inflation then INFLATION = tonumber(config.inflation) or INFLATION end
+  if config.price_index then PRICE_INDEX = tonumber(config.price_index) or PRICE_INDEX end
+  if config.inflation_multiplier then PRICE_INDEX = tonumber(config.inflation_multiplier) or PRICE_INDEX end
+  if config.inflation then PRICE_INDEX = tonumber(config.inflation) or PRICE_INDEX end
   if config.starting_capital then STARTING_CAPITAL = tonumber(config.starting_capital) or STARTING_CAPITAL end
 end
 
