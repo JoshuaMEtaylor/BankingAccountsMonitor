@@ -52,7 +52,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION          = "1.0.7"
+local VERSION          = "1.0.8"
 local PROTOCOL         = "quid_bank"
 local TREASURY_ACCOUNT = "treasury:quid_bank"
 local DB_TIMEOUT       = 5
@@ -285,6 +285,22 @@ local function requestAccounts()
     return true, last_accounts
   end
   setMessage("Accounts unavailable: " .. tostring(res), colors.red)
+  return false, res
+end
+
+
+local function requestFiscalHistory()
+  local ok, res = dbRequest({
+    type = "fiscal_history",
+    account_id = TREASURY_ACCOUNT,
+    limit = 80,
+  })
+
+  if ok and type(res) == "table" then
+    return true, res
+  end
+
+  setMessage("Fiscal history unavailable: " .. tostring(res), colors.red)
   return false, res
 end
 
@@ -719,6 +735,108 @@ local function screenAccounts()
   end
 end
 
+
+local function screenFiscalHistory()
+  local ok, res = requestFiscalHistory()
+  if not ok then
+    local w, h = getSize()
+    clear(colors.black)
+    drawTop("GOVERNMENT HISTORY")
+    writeAt(2, 4, "Unable to load fiscal history.", colors.red, colors.black)
+    writeAt(2, 6, tostring(res), colors.lightGray, colors.black)
+    button(2, h - 1, w - 3, "Back", colors.gray, colors.white)
+    while true do
+      local ev, p1 = os.pullEvent()
+      if ev == "mouse_click" or ev == "key" then return end
+    end
+  end
+
+  local summary = res.summary or {}
+  local txs = res.transactions or {}
+  local page = 1
+
+  local function txSign(tx)
+    if tx.direction == "IN" then return "+", colors.lime end
+    return "-", colors.red
+  end
+
+  while true do
+    local w, h = getSize()
+    clear(colors.black)
+    drawTop("GOVERNMENT EXPENDITURE")
+
+    writeAt(2, 3, "Treasury balance: " .. money(summary.current_balance or 0), colors.lime, colors.black)
+    writeAt(2, 4, "Total expenditure: " .. money(summary.expenditure_total or 0), colors.white, colors.black)
+    writeAt(2, 5, "24h expenditure:   " .. money(summary.expenditure_24h or 0), colors.white, colors.black)
+
+    writeAt(2, 7, "Payroll total: " .. money(summary.payroll_total or 0), colors.cyan, colors.black)
+    writeAt(2, 8, "Grants total:  " .. money(summary.grants_total or 0), colors.cyan, colors.black)
+    writeAt(2, 9, "Minted/Burned: " .. money(summary.mint_total or 0) .. " / " .. money(summary.burn_total or 0), colors.orange, colors.black)
+
+    writeAt(2, 11, "Recent Treasury Transactions", colors.yellow, colors.black)
+
+    -- Three rows per transaction:
+    --   ref/type/amount
+    --   counterparty
+    --   memo
+    local rowsAvailable = h - 17
+    if rowsAvailable < 3 then rowsAvailable = 3 end
+    local perPage = math.floor(rowsAvailable / 3)
+    if perPage < 1 then perPage = 1 end
+
+    local totalPages = math.max(1, math.ceil(#txs / perPage))
+    if page > totalPages then page = totalPages end
+
+    local start = ((page - 1) * perPage) + 1
+    local y = 12
+
+    if #txs == 0 then
+      writeAt(2, y, "No treasury transactions found.", colors.lightGray, colors.black)
+    else
+      for i = start, math.min(#txs, start + perPage - 1) do
+        local tx = txs[i]
+        local sign, col = txSign(tx)
+        local amount = sign .. money(tx.amount or 0)
+        local main = tostring(tx.tx_id or "?") .. "  " .. tostring(tx.type or "?")
+
+        writeAt(2, y, main:sub(1, math.max(10, w - 18)), colors.white, colors.black)
+        writeAt(math.max(2, w - #amount - 1), y, amount, col, colors.black)
+
+        local cp = tostring(tx.direction == "IN" and "From: " or "To:   ")
+          .. tostring(tx.counterparty_name or tx.counterparty_id or "?")
+        writeAt(4, y + 1, cp:sub(1, w - 5), colors.lightGray, colors.black)
+
+        local memo = "Memo: " .. tostring(tx.memo or "")
+        writeAt(4, y + 2, memo:sub(1, w - 5), colors.gray, colors.black)
+
+        y = y + 3
+      end
+    end
+
+    writeAt(2, h - 3, "Page " .. page .. " / " .. totalPages .. "   TX shown: " .. tostring(#txs) .. " / " .. tostring(res.total_matching or #txs), colors.lightGray, colors.black)
+
+    local bw = math.floor((w - 8) / 3)
+    local bPrev = button(2, h - 1, bw, "Prev", colors.gray, colors.white)
+    local bNext = button(3 + bw, h - 1, bw, "Next", colors.gray, colors.white)
+    local bBack = button(4 + (bw * 2), h - 1, bw, "Back", colors.gray, colors.white)
+
+    local ev, p1, p2, p3 = os.pullEvent()
+    if ev == "mouse_click" then
+      if hit(bBack, p2, p3) then return end
+      if hit(bPrev, p2, p3) then page = math.max(1, page - 1) end
+      if hit(bNext, p2, p3) then page = math.min(totalPages, page + 1) end
+    elseif ev == "key" then
+      if p1 == keys.b or p1 == keys.escape or p1 == keys.backspace or p1 == keys.enter then
+        return
+      elseif p1 == keys.left or p1 == keys.p then
+        page = math.max(1, page - 1)
+      elseif p1 == keys.right or p1 == keys.n then
+        page = math.min(totalPages, page + 1)
+      end
+    end
+  end
+end
+
 -- =============================================================================
 -- MAIN UI
 -- =============================================================================
@@ -745,13 +863,20 @@ local function drawMain()
 
   local buttons = {}
   local bw = math.floor((w - 6) / 2)
-  local y = 14
+  local y = 13
+
   buttons.refresh  = button(2, y, bw, "Refresh", colors.gray, colors.white)
   buttons.print    = button(4 + bw, y, bw, "Print Money", colors.green, colors.black)
+
   buttons.grant    = button(2, y + 2, bw, "Grant Funds", colors.blue, colors.white)
   buttons.burn     = button(4 + bw, y + 2, bw, "Burn Money", colors.red, colors.white)
+
   buttons.accounts = button(2, y + 4, bw, "Accounts", colors.gray, colors.white)
-  buttons.reconnect= button(4 + bw, y + 4, bw, "Reconnect", colors.gray, colors.white)
+  buttons.history  = button(4 + bw, y + 4, bw, "Gov History", colors.orange, colors.black)
+
+  if h >= 22 then
+    buttons.reconnect = button(2, y + 6, w - 3, "Reconnect", colors.gray, colors.white)
+  end
 
   drawBottom()
   return buttons
@@ -777,7 +902,9 @@ local function mainLoop()
         actionBurnMoney()
       elseif hit(buttons.accounts, mx, my) then
         screenAccounts()
-      elseif hit(buttons.reconnect, mx, my) then
+      elseif hit(buttons.history, mx, my) then
+        screenFiscalHistory()
+      elseif buttons.reconnect and hit(buttons.reconnect, mx, my) then
         connectServer()
         refreshStatus()
       end
@@ -797,6 +924,8 @@ local function mainLoop()
         actionBurnMoney()
       elseif p1 == keys.a then
         screenAccounts()
+      elseif p1 == keys.h then
+        screenFiscalHistory()
       end
 
       buttons = drawMain()
