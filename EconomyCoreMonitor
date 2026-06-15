@@ -15,7 +15,7 @@
 -- Read-only. No banking controls. No trade panel. Contract GDP + tapered money-supply inflation.
 -- =============================================================================
 
-local VERSION         = "0.5.2-TAPERED-INFLATION"
+local VERSION         = "0.5.3-DAILY-INFLATION-RATE"
 local PROTOCOL        = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT      = 5
@@ -782,6 +782,21 @@ local function refreshSnapshot()
     snap = fallback
   end
 
+  -- Central inflation engine:
+  -- The bank server now owns inflation state. This monitor may still calculate
+  -- older fallback estimates above, but this block overrides the displayed
+  -- inflation with the central daily-rate price-index model.
+  local okInf, infRes = dbRequest({ type = "tick_inflation" }, 3)
+  if okInf and type(infRes) == "table" and type(infRes.state) == "table" then
+    local st = infRes.state
+    snap.inflation = (tonumber(st.inflation_rate) or 0) * 100
+    snap.inflation_status = "Daily price-change rate. Price index x" .. fmtNum(st.price_index, 3)
+    snap.monetary = snap.monetary or {}
+    snap.monetary.price_index = tonumber(st.price_index) or 1
+    snap.monetary.inflation_rate = tonumber(st.inflation_rate) or 0
+    snap.monetary.inflation_model = tostring(st.model or "daily_rate_price_index")
+  end
+
   last_snapshot = snap
   last_error = ""
 
@@ -924,6 +939,7 @@ local function drawMonetaryCard(x, y, w, h, snap)
   metric(x + 2, y + 3, "Private supply", fmtMoney(m.private_supply), m.private_supply and colors.white or C.warn)
   metric(x + 2, y + 4, "Treasury reserve", fmtMoney(m.treasury_reserve), m.treasury_reserve and colors.white or C.warn)
   metric(x + 2, y + 5, "Treasury Control", fmtPct(m.reserve_share, 2), m.reserve_share and colors.white or C.warn)
+  metric(x + 2, y + 6, "Price index", m.price_index and ("x" .. fmtNum(m.price_index, 3)) or "Awaiting data", m.price_index and colors.white or C.warn)
   writeAt(x + 2, y + h - 1, shortText(m.status or "Awaiting supply data", w - 4), m.status and C.good or C.warn, C.bg)
 end
 
