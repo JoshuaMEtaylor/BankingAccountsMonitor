@@ -22,7 +22,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.2.8"
+local VERSION  = "1.2.9"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -58,6 +58,7 @@ local FILE = {
   companies    = "data/companies.db",
   contracts    = "data/contracts.db",
   prices       = "data/prices.db",
+  inflation    = "data/inflation_state.db",
   config       = "data/config.db",
 }
 
@@ -69,6 +70,7 @@ local citizens  = {}  -- [username] = { display_name, password_hash, joined, sta
 local companies = {}
 local contracts = {}
 local prices    = {}
+local inflation_state = {}
 local config    = {}
 
 local tx_counter    = 0
@@ -282,6 +284,7 @@ local function saveCitizens()  writeFile(FILE.citizens,  citizens)  end
 local function saveCompanies() writeFile(FILE.companies, companies) end
 local function saveContracts() writeFile(FILE.contracts, contracts) end
 local function savePrices()    writeFile(FILE.prices,    prices)    end
+local function saveInflation() writeFile(FILE.inflation, inflation_state) end
 local function saveConfig()    writeFile(FILE.config,    config)    end
 
 -- =============================================================================
@@ -355,6 +358,134 @@ local function transfer(from_id, to_id, amount, tx_type, memo, actor)
     status = "settled"
   }
 end
+
+
+-- =============================================================================
+-- INFLATION ENGINE
+-- Inflation is now a daily price-change rate, not a direct permanent markup.
+--
+-- price_index:
+--   The accumulated price multiplier used by payroll/contracts.
+--
+-- inflation_rate:
+--   The daily Minecraft-day price movement rate.
+--   0.04 means prices rise 4% this Minecraft day.
+--  -0.01 means prices fall 1% this Minecraft day.
+-- =============================================================================
+local DEFAULT_INFLATION_POLICY = {
+  decay = 0.65,                 -- old inflation pressure retained each Minecraft day
+  print_sensitivity = 0.50,     -- supply growth -> daily inflation pressure
+  no_print_deflation = 0.005,   -- -0.5% daily drag when no new money is issued
+  max_daily_inflation = 0.10,   -- +10% cap per Minecraft day
+  max_daily_deflation = -0.03,  -- -3% cap per Minecraft day
+  min_price_index = 0.25,
+  max_price_index = 10.00,
+}
+
+local function clamp(n, lo, hi)
+  n = tonumber(n) or 0
+  if n < lo then return lo end
+  if n > hi then return hi end
+  return n
+end
+
+local function copyPolicy(src)
+  local out = {}
+  for k, v in pairs(DEFAULT_INFLATION_POLICY) do
+    out[k] = tonumber(src and src[k]) or v
+  end
+  return out
+end
+
+local function currentMinecraftDay()
+  if os.day then
+    return math.floor(tonumber(os.day()) or 0)
+  end
+  return math.floor(timestamp() / 1200000)
+end
+
+local function ensureInflationState()
+  local supply = deriveMonetarySupply()
+  local issued = tonumber(supply and supply.in_circulation) or 0
+  inflation_state = type(inflation_state) == "table" and inflation_state or {}
+
+  inflation_state.policy = copyPolicy(inflation_state.policy)
+  inflation_state.price_index = tonumber(inflation_state.price_index) or 1.00
+  inflation_state.inflation_rate = tonumber(inflation_state.inflation_rate) or 0.00
+
+  if not inflation_state.last_day then
+    inflation_state.last_day = currentMinecraftDay()
+  end
+
+  if not inflation_state.last_issued_supply then
+    inflation_state.last_issued_supply = issued
+  end
+
+  inflation_state.updated = inflation_state.updated or timestamp()
+  inflation_state.model = "daily_rate_price_index"
+  inflation_state.note = "Inflation is a daily price-change rate. Price index compounds upward or downward over Minecraft days."
+  return inflation_state
+end
+
+local function tickInflation(target_day)
+  ensureInflationState()
+
+  local supply = deriveMonetarySupply()
+  local currentIssued = tonumber(supply and supply.in_circulation) or 0
+  local day = math.floor(tonumber(target_day) or currentMinecraftDay())
+  local lastDay = math.floor(tonumber(inflation_state.last_day) or day)
+
+  if day <= lastDay then
+    inflation_state.current_issued_supply = currentIssued
+    inflation_state.updated = timestamp()
+    saveInflation()
+    return false, inflation_state, 0
+  end
+
+  local elapsed = math.max(1, math.min(30, day - lastDay))
+  local policy = copyPolicy(inflation_state.policy)
+  local rate = tonumber(inflation_state.inflation_rate) or 0
+  local index = tonumber(inflation_state.price_index) or 1
+  local lastIssued = tonumber(inflation_state.last_issued_supply) or currentIssued
+
+  for i = 1, elapsed do
+    local growth = 0
+    if lastIssued and lastIssued > 0 then
+      growth = (currentIssued - lastIssued) / lastIssued
+    elseif currentIssued > 0 then
+      growth = 1
+    end
+
+    local noPrintDrag = 0
+    if growth <= 0 then
+      noPrintDrag = policy.no_print_deflation
+    end
+
+    rate = (rate * policy.decay) + (growth * policy.print_sensitivity) - noPrintDrag
+    rate = clamp(rate, policy.max_daily_deflation, policy.max_daily_inflation)
+
+    index = index * (1 + rate)
+    index = clamp(index, policy.min_price_index, policy.max_price_index)
+
+    -- If several days elapsed, only the first missed day gets the supply jump.
+    lastIssued = currentIssued
+  end
+
+  inflation_state.price_index = index
+  inflation_state.inflation_rate = rate
+  inflation_state.last_issued_supply = currentIssued
+  inflation_state.current_issued_supply = currentIssued
+  inflation_state.last_day = day
+  inflation_state.updated = timestamp()
+  inflation_state.policy = policy
+  inflation_state.model = "daily_rate_price_index"
+  inflation_state.inflation_percent = rate * 100
+  inflation_state.price_index_percent = (index - 1) * 100
+  saveInflation()
+
+  return true, inflation_state, elapsed
+end
+
 
 -- =============================================================================
 -- REQUEST HANDLERS
@@ -594,6 +725,31 @@ handlers["supply"] = function(sender_id, req)
   return true, deriveMonetarySupply()
 end
 
+-- GET_INFLATION_STATE
+handlers["get_inflation_state"] = function(sender_id, req)
+  ensureInflationState()
+  return true, { state = inflation_state }
+end
+
+-- TICK_INFLATION
+-- Called by monitor/payroll once per Minecraft day. Safe to call repeatedly;
+-- it only advances when os.day() has moved forward.
+handlers["tick_inflation"] = function(sender_id, req)
+  local changed, state, elapsed = tickInflation(req and req.day)
+  audit("ACTION", "STATE", sender_id, "TICK_INFLATION", "changed=" .. tostring(changed) .. " elapsed=" .. tostring(elapsed))
+  return true, { changed = changed, elapsed_days = elapsed, state = state }
+end
+
+-- SET_INFLATION_POLICY
+handlers["set_inflation_policy"] = function(sender_id, req)
+  ensureInflationState()
+  inflation_state.policy = copyPolicy(req and req.policy or req)
+  inflation_state.updated = timestamp()
+  saveInflation()
+  audit("ACTION", "STATE", sender_id, "SET_INFLATION_POLICY", "ok")
+  return true, { state = inflation_state }
+end
+
 -- REGISTER_COMPANY
 handlers["register_company"] = function(sender_id, req)
   local name         = req.name
@@ -665,7 +821,8 @@ handlers["status"] = function(sender_id, req)
     company_count    = count(companies),
     tx_count         = tx_counter,
     audit_count      = audit_counter,
-    supply           = deriveMonetarySupply()
+    supply           = deriveMonetarySupply(),
+    inflation         = ensureInflationState()
   }
 end
 
@@ -778,6 +935,8 @@ local function initFiles()
   companies = readFile(FILE.companies) or {}
   contracts = readFile(FILE.contracts) or {}
   prices    = readFile(FILE.prices)    or {}
+  inflation_state = readFile(FILE.inflation) or {}
+  ensureInflationState()
   config    = readFile(FILE.config)    or {
     economy_status       = "active",
     mint_authority       = "locked"
