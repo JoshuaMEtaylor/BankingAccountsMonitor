@@ -1,0 +1,639 @@
+-- =============================================================================
+-- GOVERNMENT PAYROLL TERMINAL
+-- GovernmentPayroll
+--
+-- Pays state employees once per Minecraft day.
+-- Wages scale with the central Quid inflation price index.
+--
+-- Base daily wages at price_index = 1.00:
+--   Researchers: 3 Q / Minecraft day
+--   Soldiers:    2 Q / Minecraft day
+--   Couriers:    1 Q / Minecraft day
+-- =============================================================================
+
+local args = {...}
+if args[1] ~= "--updated" then
+  print("[ Government Payroll ]")
+  print("Deleting old version...")
+  fs.delete("startup.lua")
+  print("Downloading latest from GitHub...")
+  local cb = tostring(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
+  local url = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/GovernmentPayroll?cb=" .. cb
+  shell.run("wget " .. url .. " startup.lua")
+  if not fs.exists("startup.lua") then
+    print("")
+    print("Download failed.")
+    print("Expected GitHub file: GovernmentPayroll")
+    return
+  end
+  print("Relaunching...")
+  sleep(0.5)
+  shell.run("startup.lua", "--updated")
+  return
+end
+
+local VERSION = "1.0.0"
+local BANK_PROTOCOL = "quid_bank"
+local DB_TIMEOUT = 5
+local CHECK_INTERVAL = 10
+local HISTORY_FILE = "data/government_payroll_history.db"
+
+local db_id = nil
+local modem_name = nil
+local colony = nil
+local colony_name = "Colony"
+local auto_mode = true
+local last_message = "Booting..."
+local last_colour = colors.lightGray
+local price_index = 1.00
+local inflation_rate = 0.00
+local history = { days = {} }
+
+local stats = {
+  source = "none",
+  eligible = 0,
+  paid_today = 0,
+  total_today = 0,
+  skipped_today = 0,
+  last_run_day = nil,
+  last_run_total = 0,
+  last_run_count = 0,
+}
+
+local W, H = term.getSize()
+
+-- =============================================================================
+-- HELPERS
+-- =============================================================================
+local function now()
+  return os.epoch("utc")
+end
+
+local function mcDay()
+  if os.day then return math.floor(tonumber(os.day()) or 0) end
+  return math.floor(now() / 1200000)
+end
+
+local function lower(s)
+  return string.lower(tostring(s or ""))
+end
+
+local function trim(s)
+  return tostring(s or ""):match("^%s*(.-)%s*$")
+end
+
+local function setMsg(msg, col)
+  last_message = tostring(msg or "")
+  last_colour = col or colors.lightGray
+end
+
+local function ensureDir(path)
+  local dir = fs.getDir(path)
+  if dir and dir ~= "" and not fs.exists(dir) then fs.makeDir(dir) end
+end
+
+local function readFile(path)
+  if not fs.exists(path) then return nil end
+  local f = fs.open(path, "r")
+  if not f then return nil end
+  local text = f.readAll()
+  f.close()
+  if not text or text == "" then return nil end
+  local ok, data = pcall(textutils.unserialize, text)
+  if ok then return data end
+  return nil
+end
+
+local function writeFile(path, data)
+  ensureDir(path)
+  local f = fs.open(path, "w")
+  if not f then return false end
+  f.write(textutils.serialize(data))
+  f.close()
+  return true
+end
+
+local function money(n)
+  n = tonumber(n) or 0
+  local sign = ""
+  if n < 0 then sign = "-"; n = math.abs(n) end
+  return sign .. tostring(math.floor(n + 0.5)) .. " Q"
+end
+
+local function pct(n)
+  n = tonumber(n) or 0
+  return string.format("%.2f%%", n * 100)
+end
+
+local function normalType(s)
+  s = tostring(s or "")
+  s = s:gsub("com%.minecolonies%.building%.", "")
+  s = s:gsub("com%.minecolonies%.job%.", "")
+  s = s:gsub("[^%w_%- ]", "")
+  return lower(s)
+end
+
+local function citizenStableId(z)
+  if type(z) ~= "table" then return nil end
+  return z.id or z.citizen_id or z.citizenId or z.citizenID or z.uuid
+end
+
+local function citizenAccountId(z)
+  local id = citizenStableId(z)
+  if not id then return nil end
+  return "citizen:mc_" .. tostring(id)
+end
+
+local function citizenUsername(z)
+  local id = citizenStableId(z)
+  if not id then return nil end
+  return "mc_" .. tostring(id)
+end
+
+local function jobTextFromCitizen(z)
+  if type(z) ~= "table" then return "" end
+  local parts = {}
+  if z.job then parts[#parts+1] = tostring(z.job) end
+  if z.title then parts[#parts+1] = tostring(z.title) end
+  if type(z.work) == "table" then
+    if z.work.job then parts[#parts+1] = tostring(z.work.job) end
+    if z.work.type then parts[#parts+1] = tostring(z.work.type) end
+    if z.work.name then parts[#parts+1] = tostring(z.work.name) end
+  end
+  return table.concat(parts, " ")
+end
+
+local function wageRole(jobText)
+  local j = normalType(jobText)
+
+  if j:find("research", 1, true) or j:find("university", 1, true) or j:find("library", 1, true) then
+    return 3, "Researcher"
+  end
+
+  if j:find("soldier", 1, true) or j:find("guard", 1, true) or j:find("knight", 1, true) or
+     j:find("archer", 1, true) or j:find("ranger", 1, true) or j:find("combat", 1, true) or
+     j:find("barracks", 1, true) or j:find("tower", 1, true) then
+    return 2, "Soldier"
+  end
+
+  if j:find("courier", 1, true) or j:find("deliveryman", 1, true) or j:find("delivery", 1, true) then
+    return 1, "Courier"
+  end
+
+  return 0, nil
+end
+
+local function scaledWage(base)
+  base = tonumber(base) or 0
+  if base <= 0 then return 0 end
+  local amount = math.floor((base * (tonumber(price_index) or 1)) + 0.5)
+  if amount < 1 then amount = 1 end
+  return amount
+end
+
+-- =============================================================================
+-- NETWORK
+-- =============================================================================
+local function openModem()
+  for _, n in ipairs(peripheral.getNames()) do
+    if peripheral.getType(n) == "modem" then
+      local m = peripheral.wrap(n)
+      if m and m.isWireless and m.isWireless() then
+        rednet.open(n)
+        modem_name = n
+        return true
+      end
+    end
+  end
+  for _, n in ipairs(peripheral.getNames()) do
+    if peripheral.getType(n) == "modem" then
+      rednet.open(n)
+      modem_name = n
+      return true
+    end
+  end
+  return false
+end
+
+local function discoverBank()
+  for _ = 1, 5 do
+    rednet.broadcast({ type = "ping" }, BANK_PROTOCOL)
+    local sender, msg = rednet.receive(BANK_PROTOCOL, 3)
+    if sender and type(msg) == "table" then
+      if msg.type == "treasury_online" or msg.success == true then
+        db_id = sender
+        setMsg("Connected to Quid Bank.", colors.lime)
+        return true
+      end
+    end
+  end
+  setMsg("Bank server not found.", colors.red)
+  return false
+end
+
+local function bankReq(req, timeout)
+  timeout = timeout or DB_TIMEOUT
+  if not db_id then return false, "No bank server" end
+  rednet.send(db_id, req, BANK_PROTOCOL)
+  local deadline = os.clock() + timeout
+  while true do
+    local rem = deadline - os.clock()
+    if rem <= 0 then return false, "No response from bank" end
+    local sender, msg = rednet.receive(BANK_PROTOCOL, rem)
+    if sender == db_id and type(msg) == "table" and msg.success ~= nil then
+      return msg.success, msg.response
+    end
+  end
+end
+
+local function findColony()
+  colony = peripheral.find("colonyIntegrator") or peripheral.find("colony_integrator")
+  if colony and colony.getColonyName then
+    local ok, name = pcall(colony.getColonyName)
+    if ok and name then colony_name = tostring(name) end
+  end
+  return colony ~= nil
+end
+
+local function refreshInflation()
+  local ok, res = bankReq({ type = "tick_inflation", day = mcDay() }, 4)
+  if ok and type(res) == "table" then
+    local st = res.state or res
+    price_index = tonumber(st.price_index) or price_index
+    inflation_rate = tonumber(st.inflation_rate) or inflation_rate
+    return true
+  end
+
+  ok, res = bankReq({ type = "get_inflation_state" }, 4)
+  if ok and type(res) == "table" then
+    local st = res.state or res
+    price_index = tonumber(st.price_index) or price_index
+    inflation_rate = tonumber(st.inflation_rate) or inflation_rate
+    return true
+  end
+
+  setMsg("Inflation state unavailable. Using x" .. tostring(price_index), colors.orange)
+  return false
+end
+
+-- =============================================================================
+-- CITIZENS
+-- =============================================================================
+local function liveColonyCitizens()
+  if not colony or not colony.getCitizens then return nil end
+  local ok, citizens = pcall(colony.getCitizens)
+  if ok and type(citizens) == "table" then
+    stats.source = "colony"
+    return citizens
+  end
+  return nil
+end
+
+local function bankCitizenFallback()
+  local ok, res = bankReq({ type = "list_citizens" }, 4)
+  if ok and type(res) == "table" and type(res.citizens) == "table" then
+    local out = {}
+    for _, c in ipairs(res.citizens) do
+      out[#out+1] = {
+        id = tostring(c.citizen_id or ""):match("citizen:mc_(.+)"),
+        citizen_id = c.citizen_id,
+        name = c.display_name,
+        title = c.title,
+        job = c.title,
+        _bank_only = true,
+      }
+    end
+    stats.source = "bank"
+    return out
+  end
+  return {}
+end
+
+local function getCitizens()
+  local live = liveColonyCitizens()
+  if live then return live end
+  return bankCitizenFallback()
+end
+
+local function ensureCitizenAccount(z)
+  local account_id = z.citizen_id or citizenAccountId(z)
+  if not account_id then return false, "missing account id" end
+  if z._bank_only then return true, account_id end
+
+  local username = citizenUsername(z)
+  local display = tostring(z.name or z.display_name or account_id)
+  local jobText = jobTextFromCitizen(z)
+  local _, role = wageRole(jobText)
+  local title = role or trim(jobText)
+  if title == "" then title = "Citizen" end
+
+  local ok, res = bankReq({
+    type = "register_citizen",
+    display_name = display,
+    username = username,
+    password = "mc" .. tostring(citizenStableId(z)),
+    title = title,
+  }, 4)
+
+  if ok then return true, account_id end
+  local msg = tostring(res or "")
+  if msg:find("Username already exists", 1, true) or msg:find("Account already exists", 1, true) then
+    return true, account_id
+  end
+  return false, msg
+end
+
+local function eligibleCitizens()
+  local out = {}
+  for _, z in ipairs(getCitizens()) do
+    local account_id = z.citizen_id or citizenAccountId(z)
+    local name = tostring(z.name or z.display_name or account_id or "Citizen")
+    local jobText = jobTextFromCitizen(z)
+    local base, role = wageRole(jobText)
+
+    if account_id and base > 0 then
+      out[#out+1] = {
+        citizen = z,
+        account_id = account_id,
+        name = name,
+        job_text = jobText,
+        base = base,
+        role = role,
+        amount = scaledWage(base),
+      }
+    end
+  end
+
+  table.sort(out, function(a, b)
+    return tostring(a.name) < tostring(b.name)
+  end)
+
+  stats.eligible = #out
+  return out
+end
+
+-- =============================================================================
+-- PAYROLL
+-- =============================================================================
+local function loadHistory()
+  history = readFile(HISTORY_FILE) or { days = {} }
+  history.days = history.days or {}
+end
+
+local function saveHistory()
+  writeFile(HISTORY_FILE, history)
+end
+
+local function dayRecord(day)
+  local key = tostring(day)
+  history.days[key] = history.days[key] or { paid = {}, total = 0, count = 0, created = now() }
+  history.days[key].paid = history.days[key].paid or {}
+  return history.days[key]
+end
+
+local function refreshTodayStats()
+  local day = mcDay()
+  local rec = dayRecord(day)
+  local eligible = eligibleCitizens()
+  local paid = 0
+  local total = 0
+
+  for _, e in ipairs(eligible) do
+    local p = rec.paid[e.account_id]
+    if p then
+      paid = paid + 1
+      total = total + (tonumber(p.amount) or 0)
+    end
+  end
+
+  stats.paid_today = paid
+  stats.total_today = total
+end
+
+local function runPayroll()
+  if not db_id then discoverBank() end
+  if not db_id then return false end
+
+  refreshInflation()
+
+  local day = mcDay()
+  local rec = dayRecord(day)
+  local eligible = eligibleCitizens()
+
+  local runCount = 0
+  local runTotal = 0
+  local skipped = 0
+
+  for _, e in ipairs(eligible) do
+    if not rec.paid[e.account_id] then
+      local okAccount, accountErr = ensureCitizenAccount(e.citizen)
+      if okAccount then
+        local amount = scaledWage(e.base)
+        local ok, res = bankReq({
+          type = "grant",
+          to_id = e.account_id,
+          amount = amount,
+          memo = "Daily state payroll day " .. tostring(day) .. ": " .. tostring(e.role),
+        }, 5)
+
+        if ok and type(res) == "table" then
+          rec.paid[e.account_id] = {
+            amount = amount,
+            tx_id = res.tx_id,
+            name = e.name,
+            role = e.role,
+            base = e.base,
+            price_index = price_index,
+            inflation_rate = inflation_rate,
+            paid_at = now(),
+          }
+          runCount = runCount + 1
+          runTotal = runTotal + amount
+        else
+          skipped = skipped + 1
+          setMsg("Failed " .. e.account_id .. ": " .. tostring(res), colors.red)
+        end
+      else
+        skipped = skipped + 1
+        setMsg("Account missing " .. e.account_id .. ": " .. tostring(accountErr), colors.red)
+      end
+    end
+  end
+
+  rec.total = 0
+  rec.count = 0
+  for _, p in pairs(rec.paid) do
+    rec.total = rec.total + (tonumber(p.amount) or 0)
+    rec.count = rec.count + 1
+  end
+  rec.updated = now()
+  saveHistory()
+
+  stats.last_run_day = day
+  stats.last_run_total = runTotal
+  stats.last_run_count = runCount
+  stats.skipped_today = skipped
+  refreshTodayStats()
+
+  if runCount > 0 then
+    setMsg("Payroll paid " .. tostring(runCount) .. " citizens: " .. money(runTotal), colors.lime)
+  elseif skipped > 0 then
+    setMsg("Payroll had " .. tostring(skipped) .. " skipped payments.", colors.orange)
+  else
+    setMsg("Payroll already complete for day " .. tostring(day), colors.lightGray)
+  end
+
+  return true
+end
+
+local function todayComplete()
+  refreshInflation()
+  local eligible = eligibleCitizens()
+  local rec = dayRecord(mcDay())
+  if #eligible == 0 then return false end
+  for _, e in ipairs(eligible) do
+    if not rec.paid[e.account_id] then return false end
+  end
+  return true
+end
+
+-- =============================================================================
+-- DISPLAY
+-- =============================================================================
+local function cls()
+  W, H = term.getSize()
+  term.setCursorBlink(false)
+  term.setBackgroundColor(colors.black)
+  term.setTextColor(colors.white)
+  term.clear()
+  term.setCursorPos(1, 1)
+end
+
+local function at(x, y, text, fg, bg)
+  W, H = term.getSize()
+  if y < 1 or y > H or x > W then return end
+  if x < 1 then x = 1 end
+  term.setCursorPos(x, y)
+  term.setTextColor(fg or colors.white)
+  term.setBackgroundColor(bg or colors.black)
+  local maxw = W - x + 1
+  if maxw > 0 then term.write(tostring(text or ""):sub(1, maxw)) end
+end
+
+local function fill(x, y, w, h, bg)
+  W, H = term.getSize()
+  term.setBackgroundColor(bg or colors.black)
+  local row = string.rep(" ", math.max(0, w))
+  for yy = y, y + h - 1 do
+    if yy >= 1 and yy <= H then
+      term.setCursorPos(math.max(1, x), yy)
+      term.write(row:sub(1, math.max(0, W - x + 1)))
+    end
+  end
+end
+
+local function button(x, y, w, label, bg, fg)
+  fill(x, y, w, 1, bg or colors.gray)
+  local tx = x + math.floor((w - #label) / 2)
+  at(tx, y, label, fg or colors.white, bg or colors.gray)
+  return { x1=x, x2=x+w-1, y1=y, y2=y }
+end
+
+local function hit(b, mx, my)
+  return b and mx >= b.x1 and mx <= b.x2 and my >= b.y1 and my <= b.y2
+end
+
+local function draw()
+  cls()
+  fill(1, 1, W, 1, colors.purple)
+  at(2, 1, "GOVERNMENT PAYROLL", colors.white, colors.purple)
+  at(W - #VERSION, 1, VERSION, colors.lightGray, colors.purple)
+
+  refreshTodayStats()
+
+  at(2, 3, "Colony:   " .. tostring(colony_name), colors.white)
+  at(2, 4, "Bank:     " .. tostring(db_id or "not connected"), db_id and colors.lime or colors.red)
+  at(2, 5, "Source:   " .. tostring(stats.source), stats.source == "colony" and colors.lime or colors.orange)
+  at(2, 6, "Auto:     " .. (auto_mode and "ON" or "OFF"), auto_mode and colors.lime or colors.orange)
+
+  at(2, 8,  "Minecraft day:       " .. tostring(mcDay()), colors.white)
+  at(2, 9,  "Price index:         x" .. string.format("%.3f", price_index), colors.cyan)
+  at(2, 10, "Daily inflation:     " .. pct(inflation_rate), inflation_rate >= 0 and colors.orange or colors.lime)
+
+  at(2, 12, "Eligible employees:  " .. tostring(stats.eligible), colors.lightGray)
+  at(2, 13, "Paid today:          " .. tostring(stats.paid_today), colors.lightGray)
+  at(2, 14, "Total paid today:    " .. money(stats.total_today), colors.lightGray)
+  at(2, 15, "Last run:            " .. tostring(stats.last_run_count) .. " paid / " .. money(stats.last_run_total), colors.lightGray)
+
+  at(2, 17, "Rates: Researcher 3 Q, Soldier 2 Q, Courier 1 Q per Minecraft day", colors.gray)
+
+  local bw = math.floor((W - 8) / 3)
+  local bRun = button(2, H - 3, bw, "Run Payroll", colors.purple)
+  local bAuto = button(4 + bw, H - 3, bw, auto_mode and "Auto Off" or "Auto On", colors.gray)
+  local bRecon = button(6 + (bw * 2), H - 3, bw, "Reconnect", colors.gray)
+
+  at(2, H - 1, tostring(last_message):sub(1, W - 2), last_colour)
+  return bRun, bAuto, bRecon
+end
+
+-- =============================================================================
+-- MAIN
+-- =============================================================================
+local function main()
+  loadHistory()
+  cls()
+  fill(1, 1, W, 1, colors.purple)
+  at(2, 1, "GOVERNMENT PAYROLL", colors.white, colors.purple)
+  at(2, 3, "Starting...", colors.lightGray)
+
+  findColony()
+
+  if not openModem() then
+    at(2, 5, "No modem found.", colors.red)
+    at(2, 6, "Attach an Ender/Wireless modem.", colors.lightGray)
+    return
+  end
+
+  discoverBank()
+  refreshInflation()
+
+  local bRun, bAuto, bRecon = draw()
+  local timer = os.startTimer(2)
+
+  while true do
+    local ev, p1, p2, p3 = os.pullEvent()
+
+    if ev == "timer" and p1 == timer then
+      if not db_id then discoverBank() end
+      if db_id then refreshInflation() end
+
+      if auto_mode and db_id and not todayComplete() then
+        runPayroll()
+      end
+
+      bRun, bAuto, bRecon = draw()
+      timer = os.startTimer(CHECK_INTERVAL)
+
+    elseif ev == "mouse_click" then
+      local mx, my = p2, p3
+
+      if hit(bRun, mx, my) then
+        runPayroll()
+      elseif hit(bAuto, mx, my) then
+        auto_mode = not auto_mode
+        setMsg("Auto mode " .. (auto_mode and "enabled" or "disabled"), auto_mode and colors.lime or colors.orange)
+      elseif hit(bRecon, mx, my) then
+        discoverBank()
+        findColony()
+      end
+
+      bRun, bAuto, bRecon = draw()
+
+    elseif ev == "terminate" then
+      saveHistory()
+      break
+    end
+  end
+end
+
+main()
