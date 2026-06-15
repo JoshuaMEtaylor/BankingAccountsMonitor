@@ -52,7 +52,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION          = "1.0.6"
+local VERSION          = "1.0.7"
 local PROTOCOL         = "quid_bank"
 local TREASURY_ACCOUNT = "treasury:quid_bank"
 local DB_TIMEOUT       = 5
@@ -624,6 +624,22 @@ local function actionBurnMoney()
   end
 end
 
+local function accountTypeRank(acc)
+  local t = tostring(acc and acc.type or "")
+  if t == "treasury" then return 1 end
+  if t == "citizen" then return 2 end
+  if t == "company" then return 3 end
+  if t == "escrow" then return 4 end
+  return 9
+end
+
+local function accountDisplayName(acc)
+  if type(acc) ~= "table" then return "Unknown account" end
+  local name = trim(acc.display_name or "")
+  if name ~= "" then return name end
+  return tostring(acc.account_id or "Unknown account")
+end
+
 local function screenAccounts()
   local ok, accounts = requestAccounts()
   if not ok then accounts = last_accounts or {} end
@@ -632,10 +648,22 @@ local function screenAccounts()
 
   while true do
     local w, h = getSize()
-    local perPage = h - 7
-    if perPage < 4 then perPage = 4 end
+
+    -- Each account gets two rows now:
+    --   readable display name + balance
+    --   raw account id as small/reference text underneath
+    -- This keeps citizen:mc_5 accurate internally without presenting it as the name.
+    local rowsAvailable = h - 8
+    if rowsAvailable < 6 then rowsAvailable = 6 end
+    local perPage = math.floor(rowsAvailable / 2)
+    if perPage < 3 then perPage = 3 end
 
     table.sort(accounts, function(a, b)
+      local ar, br = accountTypeRank(a), accountTypeRank(b)
+      if ar ~= br then return ar < br end
+      local an = string.lower(accountDisplayName(a))
+      local bn = string.lower(accountDisplayName(b))
+      if an ~= bn then return an < bn end
       return tostring(a.account_id or "") < tostring(b.account_id or "")
     end)
 
@@ -645,16 +673,27 @@ local function screenAccounts()
     clear(colors.black)
     drawTop("STATE ACCOUNTS")
 
-    writeAt(2, 3, "Account", colors.cyan, colors.black)
-    writeAt(math.floor(w * 0.60), 3, "Balance", colors.cyan, colors.black)
+    local balanceX = math.floor(w * 0.66)
+    if balanceX < 28 then balanceX = math.max(20, w - 14) end
+
+    writeAt(2, 3, "Name / Account ID", colors.cyan, colors.black)
+    writeAt(balanceX, 3, "Balance", colors.cyan, colors.black)
 
     local start = ((page - 1) * perPage) + 1
     local y = 4
     for i = start, math.min(#accounts, start + perPage - 1) do
       local acc = accounts[i]
-      writeAt(2, y, tostring(acc.account_id or "?"), colors.white, colors.black)
-      writeAt(math.floor(w * 0.60), y, money(acc.balance or 0), colors.lime, colors.black)
-      y = y + 1
+      local display = accountDisplayName(acc)
+      local id = tostring(acc.account_id or "?")
+      local bal = money(acc.balance or 0)
+
+      local nameWidth = math.max(10, balanceX - 4)
+      local idWidth = math.max(10, w - 6)
+
+      writeAt(2, y, display:sub(1, nameWidth), colors.white, colors.black)
+      writeAt(balanceX, y, bal, colors.lime, colors.black)
+      writeAt(4, y + 1, id:sub(1, idWidth), colors.lightGray, colors.black)
+      y = y + 2
     end
 
     writeAt(2, h - 3, "Page " .. page .. " / " .. totalPages, colors.lightGray, colors.black)
