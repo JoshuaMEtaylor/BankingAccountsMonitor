@@ -1,40 +1,30 @@
 -- =============================================================================
--- QUID COMPANY PAYROLL TERMINAL
--- CompanyPayroll
+-- GOVERNMENT PAYROLL TERMINAL
+-- GovernmentPayroll
 --
--- Private-sector payroll only.
+-- Pays state employees once per Minecraft day.
+-- Wages scale with the central Quid inflation price index.
 --
--- Government/public workers are intentionally excluded:
---   soldiers, guards, archers, knights, barracks/tower workers,
---   researchers, university/library/education roles, etc.
---
--- Public wages remain managed by the FED/GovernmentPayroll console.
---
--- Private company wages:
---   Unskilled = 3 Q/day
---   Skilled   = 4 Q/day
---   Elite     = 5 Q/day
---
--- Wage growth:
---   GDP bonus is the main growth driver.
---   Inflation bonus is deliberately weak and only kicks in when price index > 1.
---
--- Companies may overdraft. The bank records negative balances for now.
+-- Base daily wages at price_index = 1.00 are loaded from the Quid bank.
+-- Defaults if the bank does not provide rates:
+--   Researchers: 3 Q / Minecraft day
+--   Soldiers:    2 Q / Minecraft day
+--   Couriers:    1 Q / Minecraft day
 -- =============================================================================
 
 local args = {...}
 if args[1] ~= "--updated" then
-  print("[ Company Payroll ]")
+  print("[ Government Payroll ]")
   print("Deleting old version...")
   fs.delete("startup.lua")
   print("Downloading latest from GitHub...")
   local cb = tostring(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
-  local url = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/CompanyPayroll?cb=" .. cb
+  local url = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/GovernmentPayroll?cb=" .. cb
   shell.run("wget " .. url .. " startup.lua")
   if not fs.exists("startup.lua") then
     print("")
     print("Download failed.")
-    print("Expected GitHub file: CompanyPayroll")
+    print("Expected GitHub file: GovernmentPayroll")
     return
   end
   print("Relaunching...")
@@ -43,14 +33,11 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION = "1.0.0-PRIVATE-SECTOR-WAGES"
+local VERSION = "1.0.2-SECTOR-WORKER-PAY"
 local BANK_PROTOCOL = "quid_bank"
 local DB_TIMEOUT = 5
 local CHECK_INTERVAL = 10
-
-local FILE_HISTORY = "data/company_payroll_history.db"
-local FILE_BUSINESSES = "data/building_companies.db"
-local FILE_INDUSTRIES = "data/industry_companies.db"
+local HISTORY_FILE = "data/government_payroll_history.db"
 
 local db_id = nil
 local modem_name = nil
@@ -59,43 +46,18 @@ local colony_name = "Colony"
 local auto_mode = true
 local last_message = "Booting..."
 local last_colour = colors.lightGray
-
 local price_index = 1.00
 local inflation_rate = 0.00
-local gdp_per_capita = 0
-local private_gdp = 0
-local gdp_days = 7
-
-local businesses = {}
-local industry_companies = {}
 local history = { days = {} }
+local worker_pay_rates = {
+  defence = { unskilled = 2, skilled = 3, elite = 4 },
+  research = { skilled = 3, elite = 5 },
+  logistics = { unskilled = 1, skilled = 2 },
 
-local W, H = term.getSize()
-
-local WAGE = {
-  unskilled = 3,
-  skilled = 4,
-  elite = 5,
-}
-
-local GDP_STEP = 100
-local GDP_BONUS_CAP = 5
-local INFLATION_PASS_THROUGH = 0.25
-
-local PRIVATE_INDUSTRIES = {
-  hospitality = true,
-  logistics = true,
-  mining = true,
-  timber = true,
-  agriculture = true,
-  manufacturing = true,
-  construction = true,
-  general = true,
-}
-
-local PUBLIC_INDUSTRIES = {
-  defence = true,
-  research = true,
+  -- Backwards compatibility with old flat keys.
+  researcher = 3,
+  soldier = 2,
+  courier = 1,
 }
 
 local stats = {
@@ -104,13 +66,12 @@ local stats = {
   paid_today = 0,
   total_today = 0,
   skipped_today = 0,
-  overdraft_payments = 0,
   last_run_day = nil,
   last_run_total = 0,
   last_run_count = 0,
-  unmapped = 0,
-  public_skipped = 0,
 }
+
+local W, H = term.getSize()
 
 -- =============================================================================
 -- HELPERS
@@ -167,13 +128,7 @@ local function money(n)
   n = tonumber(n) or 0
   local sign = ""
   if n < 0 then sign = "-"; n = math.abs(n) end
-  local s = tostring(math.floor(n + 0.5))
-  local out = ""
-  while #s > 3 do
-    out = "," .. s:sub(-3) .. out
-    s = s:sub(1, -4)
-  end
-  return sign .. s .. out .. " Q"
+  return sign .. tostring(math.floor(n + 0.5)) .. " Q"
 end
 
 local function pct(n)
@@ -187,19 +142,6 @@ local function normalType(s)
   s = s:gsub("com%.minecolonies%.job%.", "")
   s = s:gsub("[^%w_%- ]", "")
   return lower(s)
-end
-
-local function locString(loc)
-  if type(loc) ~= "table" then return "0,0,0" end
-  local x = loc.x or loc[1] or 0
-  local y = loc.y or loc[2] or 0
-  local z = loc.z or loc[3] or 0
-  return tostring(x) .. "," .. tostring(y) .. "," .. tostring(z)
-end
-
-local function workKey(w)
-  if type(w) ~= "table" then return nil end
-  return normalType(w.type or w.name) .. "@" .. locString(w.location)
 end
 
 local function citizenStableId(z)
@@ -232,86 +174,55 @@ local function jobTextFromCitizen(z)
   return table.concat(parts, " ")
 end
 
-local function classifyIndustryFromText(text)
-  local j = normalType(text)
-
-  if j:find("guard",1,true) or j:find("soldier",1,true) or j:find("knight",1,true)
-    or j:find("archer",1,true) or j:find("ranger",1,true) or j:find("combat",1,true)
-    or j:find("barracks",1,true) or j:find("tower",1,true) or j:find("defence",1,true)
-    or j:find("defense",1,true) then return "defence" end
-
-  if j:find("research",1,true) or j:find("university",1,true) or j:find("library",1,true)
-    or j:find("teacher",1,true) or j:find("pupil",1,true) or j:find("student",1,true)
-    or j:find("school",1,true) then return "research" end
-
-  if j:find("cook",1,true) or j:find("restaurant",1,true) or j:find("dining",1,true)
-    or j:find("waiter",1,true) or j:find("baker",1,true) or j:find("bakery",1,true) then return "hospitality" end
-
-  if j:find("delivery",1,true) or j:find("courier",1,true) or j:find("warehouse",1,true) then return "logistics" end
-  if j:find("miner",1,true) or j:find("mine",1,true) or j:find("quarry",1,true) then return "mining" end
-  if j:find("lumber",1,true) or j:find("forester",1,true) or j:find("sawmill",1,true) then return "timber" end
-  if j:find("farm",1,true) or j:find("fisher",1,true) or j:find("compost",1,true)
-    or j:find("shepherd",1,true) or j:find("cowhand",1,true) or j:find("swine",1,true)
-    or j:find("chicken",1,true) or j:find("rabbit",1,true) or j:find("beekeeper",1,true) then return "agriculture" end
-  if j:find("smith",1,true) or j:find("smelter",1,true) or j:find("smeltery",1,true)
-    or j:find("crusher",1,true) or j:find("mechanic",1,true) or j:find("carpenter",1,true)
-    or j:find("fletcher",1,true) or j:find("stonemason",1,true) or j:find("brick",1,true)
-    or j:find("glass",1,true) or j:find("concrete",1,true) then return "manufacturing" end
-  if j:find("builder",1,true) or j:find("construction",1,true) then return "construction" end
-
-  return "general"
+local function tierRate(sector, tier, fallback)
+  local n = nil
+  if type(worker_pay_rates[sector]) == "table" then
+    n = tonumber(worker_pay_rates[sector][tier])
+  end
+  if not n or n < 0 then n = fallback end
+  return math.floor(n + 0.5)
 end
 
-local function wageBand(jobText)
+local function roleBase(key, fallback)
+  local n = tonumber(worker_pay_rates and worker_pay_rates[key])
+  if not n or n < 0 then n = fallback end
+  return math.floor(n + 0.5)
+end
+
+local function wageRole(jobText)
   local j = normalType(jobText)
 
-  -- Government/public jobs are excluded from this private payroll system.
-  if classifyIndustryFromText(j) == "defence" or classifyIndustryFromText(j) == "research" then
-    return nil, "public"
+  if j:find("research", 1, true) or j:find("university", 1, true) then
+    return tierRate("research", "elite", roleBase("researcher", 3)), "Research Elite"
   end
 
-  if j:find("builder",1,true) or j:find("miner",1,true) or j:find("nether",1,true)
-    or j:find("quarry",1,true) or j:find("crusher",1,true) or j:find("blacksmith",1,true)
-    or j:find("smith",1,true) or j:find("carpenter",1,true) or j:find("fletcher",1,true)
-    or j:find("mechanic",1,true) or j:find("doctor",1,true) or j:find("alchemist",1,true)
-    or j:find("enchant",1,true) then
-    return "elite", WAGE.elite
+  if j:find("library", 1, true) or j:find("teacher", 1, true) or j:find("student", 1, true) or j:find("pupil", 1, true) then
+    return tierRate("research", "skilled", roleBase("researcher", 3)), "Research Skilled"
   end
 
-  if j:find("courier",1,true) or j:find("delivery",1,true) or j:find("forester",1,true)
-    or j:find("baker",1,true) or j:find("chef",1,true) or j:find("cook",1,true)
-    or j:find("beekeeper",1,true) or j:find("dyer",1,true) or j:find("sifter",1,true)
-    or j:find("smelter",1,true) or j:find("stonemason",1,true) or j:find("brick",1,true)
-    or j:find("glass",1,true) or j:find("concrete",1,true) or j:find("stable",1,true)
-    or j:find("undertaker",1,true) then
-    return "skilled", WAGE.skilled
+  if j:find("knight", 1, true) or j:find("archer", 1, true) or j:find("ranger", 1, true) or
+     j:find("combat", 1, true) then
+    return tierRate("defence", "elite", roleBase("soldier", 2)), "Defence Elite"
   end
 
-  if j:find("waiter",1,true) or j:find("farmer",1,true) or j:find("fisher",1,true)
-    or j:find("planter",1,true) or j:find("florist",1,true) or j:find("composter",1,true)
-    or j:find("chicken",1,true) or j:find("cowhand",1,true) or j:find("shepherd",1,true)
-    or j:find("swine",1,true) or j:find("rabbit",1,true) or j:find("farm",1,true) then
-    return "unskilled", WAGE.unskilled
+  if j:find("soldier", 1, true) or j:find("guard", 1, true) or
+     j:find("barracks", 1, true) or j:find("tower", 1, true) then
+    return tierRate("defence", "skilled", roleBase("soldier", 2)), "Defence Skilled"
   end
 
-  return nil, "unknown"
+  if j:find("courier", 1, true) or j:find("deliveryman", 1, true) or j:find("delivery", 1, true) then
+    return tierRate("logistics", "unskilled", roleBase("courier", 1)), "Logistics Unskilled"
+  end
+
+  return 0, nil
 end
 
-local function calculateWage(base)
-  base = math.floor(tonumber(base) or 0)
+local function scaledWage(base)
+  base = tonumber(base) or 0
   if base <= 0 then return 0 end
-
-  local gdp_bonus = math.floor((tonumber(gdp_per_capita) or 0) / GDP_STEP)
-  if gdp_bonus > GDP_BONUS_CAP then gdp_bonus = GDP_BONUS_CAP end
-  if gdp_bonus < 0 then gdp_bonus = 0 end
-
-  local inflation_excess = math.max(0, (tonumber(price_index) or 1) - 1)
-  local inflation_bonus = math.floor(inflation_excess * base * INFLATION_PASS_THROUGH)
-  if inflation_bonus < 0 then inflation_bonus = 0 end
-
-  local wage = base + gdp_bonus + inflation_bonus
-  if wage < 1 then wage = 1 end
-  return math.floor(wage), gdp_bonus, inflation_bonus
+  local amount = math.floor((base * (tonumber(price_index) or 1)) + 0.5)
+  if amount < 1 then amount = 1 end
+  return amount
 end
 
 -- =============================================================================
@@ -395,71 +306,88 @@ local function refreshInflation()
     return true
   end
 
+  setMsg("Inflation state unavailable. Using x" .. tostring(price_index), colors.orange)
   return false
 end
 
-local function refreshGDP()
-  local ok, res = bankReq({ type = "economic_gdp", days = gdp_days }, 4)
+local function refreshWorkerPayRates()
+  local ok, res = bankReq({ type = "get_worker_pay_rates" }, 4)
   if ok and type(res) == "table" then
-    private_gdp = tonumber(res.private_gdp or res.gdp) or 0
-    gdp_per_capita = tonumber(res.gdp_per_capita) or 0
+    local rates = res.rates or res
+
+    if type(rates.defence) == "table" then
+      worker_pay_rates.defence.unskilled = tonumber(rates.defence.unskilled) or worker_pay_rates.defence.unskilled
+      worker_pay_rates.defence.skilled   = tonumber(rates.defence.skilled)   or worker_pay_rates.defence.skilled
+      worker_pay_rates.defence.elite     = tonumber(rates.defence.elite)     or worker_pay_rates.defence.elite
+    end
+
+    if type(rates.research) == "table" then
+      worker_pay_rates.research.skilled = tonumber(rates.research.skilled) or worker_pay_rates.research.skilled
+      worker_pay_rates.research.elite   = tonumber(rates.research.elite)   or worker_pay_rates.research.elite
+    end
+
+    if type(rates.logistics) == "table" then
+      worker_pay_rates.logistics.unskilled = tonumber(rates.logistics.unskilled) or worker_pay_rates.logistics.unskilled
+      worker_pay_rates.logistics.skilled   = tonumber(rates.logistics.skilled)   or worker_pay_rates.logistics.skilled
+    end
+
+    worker_pay_rates.researcher = tonumber(rates.researcher) or worker_pay_rates.research.skilled or worker_pay_rates.researcher or 3
+    worker_pay_rates.soldier    = tonumber(rates.soldier)    or worker_pay_rates.defence.skilled  or worker_pay_rates.soldier    or 2
+    worker_pay_rates.courier    = tonumber(rates.courier)    or worker_pay_rates.logistics.unskilled or worker_pay_rates.courier or 1
     return true
   end
   return false
 end
 
 -- =============================================================================
--- COLONY / COMPANY MAPPING
+-- CITIZENS
 -- =============================================================================
-local function loadMappings()
-  businesses = readFile(FILE_BUSINESSES) or {}
-  industry_companies = readFile(FILE_INDUSTRIES) or {}
-end
-
-local function getCitizens()
-  if not colony or not colony.getCitizens then return {} end
+local function liveColonyCitizens()
+  if not colony or not colony.getCitizens then return nil end
   local ok, citizens = pcall(colony.getCitizens)
   if ok and type(citizens) == "table" then
     stats.source = "colony"
     return citizens
   end
-  stats.source = "none"
+  return nil
+end
+
+local function bankCitizenFallback()
+  local ok, res = bankReq({ type = "list_citizens" }, 4)
+  if ok and type(res) == "table" and type(res.citizens) == "table" then
+    local out = {}
+    for _, c in ipairs(res.citizens) do
+      out[#out+1] = {
+        id = tostring(c.citizen_id or ""):match("citizen:mc_(.+)"),
+        citizen_id = c.citizen_id,
+        name = c.display_name,
+        title = c.title,
+        job = c.title,
+        _bank_only = true,
+      }
+    end
+    stats.source = "bank"
+    return out
+  end
   return {}
 end
 
-local function resolveCompanyForCitizen(z)
-  if type(z) ~= "table" then return nil, "bad citizen" end
-
-  local jobText = jobTextFromCitizen(z)
-  local industry = classifyIndustryFromText(jobText)
-  if PUBLIC_INDUSTRIES[industry] then
-    return nil, "public"
-  end
-
-  if type(z.work) == "table" then
-    local key = workKey(z.work)
-    if key and businesses[key] and businesses[key].company_id then
-      local b = businesses[key]
-      if PUBLIC_INDUSTRIES[b.industry] then return nil, "public" end
-      return b, nil
-    end
-  end
-
-  if industry_companies[industry] and industry_companies[industry].company_id then
-    return industry_companies[industry], nil
-  end
-
-  return nil, "unmapped"
+local function getCitizens()
+  local live = liveColonyCitizens()
+  if live then return live end
+  return bankCitizenFallback()
 end
 
 local function ensureCitizenAccount(z)
-  local account_id = citizenAccountId(z)
+  local account_id = z.citizen_id or citizenAccountId(z)
   if not account_id then return false, "missing account id" end
+  if z._bank_only then return true, account_id end
 
   local username = citizenUsername(z)
   local display = tostring(z.name or z.display_name or account_id)
   local jobText = jobTextFromCitizen(z)
-  local title = trim(jobText)
+  local _, role = wageRole(jobText)
+  local title = role or trim(jobText)
   if title == "" then title = "Citizen" end
 
   local ok, res = bankReq({
@@ -478,62 +406,45 @@ local function ensureCitizenAccount(z)
   return false, msg
 end
 
-local function eligibleWorkers()
-  loadMappings()
-
+local function eligibleCitizens()
   local out = {}
-  stats.unmapped = 0
-  stats.public_skipped = 0
-
   for _, z in ipairs(getCitizens()) do
-    local account_id = citizenAccountId(z)
+    local account_id = z.citizen_id or citizenAccountId(z)
     local name = tostring(z.name or z.display_name or account_id or "Citizen")
     local jobText = jobTextFromCitizen(z)
-    local band, baseOrReason = wageBand(jobText)
+    local base, role = wageRole(jobText)
 
-    if band and account_id then
-      local company, reason = resolveCompanyForCitizen(z)
-      if company and company.company_id then
-        local wage, gdp_bonus, inflation_bonus = calculateWage(baseOrReason)
-        out[#out+1] = {
-          citizen = z,
-          account_id = account_id,
-          name = name,
-          job_text = jobText,
-          band = band,
-          base = baseOrReason,
-          wage = wage,
-          gdp_bonus = gdp_bonus,
-          inflation_bonus = inflation_bonus,
-          company_id = company.company_id,
-          company_name = company.name or company.company_id,
-          industry = company.industry or classifyIndustryFromText(jobText),
-        }
-      elseif reason == "public" then
-        stats.public_skipped = stats.public_skipped + 1
-      else
-        stats.unmapped = stats.unmapped + 1
-      end
-    elseif baseOrReason == "public" then
-      stats.public_skipped = stats.public_skipped + 1
+    if account_id and base > 0 then
+      out[#out+1] = {
+        citizen = z,
+        account_id = account_id,
+        name = name,
+        job_text = jobText,
+        base = base,
+        role = role,
+        amount = scaledWage(base),
+      }
     end
   end
 
-  table.sort(out, function(a, b) return tostring(a.name) < tostring(b.name) end)
+  table.sort(out, function(a, b)
+    return tostring(a.name) < tostring(b.name)
+  end)
+
   stats.eligible = #out
   return out
 end
 
 -- =============================================================================
--- PAYROLL HISTORY
+-- PAYROLL
 -- =============================================================================
 local function loadHistory()
-  history = readFile(FILE_HISTORY) or { days = {} }
+  history = readFile(HISTORY_FILE) or { days = {} }
   history.days = history.days or {}
 end
 
 local function saveHistory()
-  writeFile(FILE_HISTORY, history)
+  writeFile(HISTORY_FILE, history)
 end
 
 local function dayRecord(day)
@@ -544,12 +455,9 @@ local function dayRecord(day)
 end
 
 local function refreshTodayStats()
-  refreshInflation()
-  refreshGDP()
-
   local day = mcDay()
   local rec = dayRecord(day)
-  local eligible = eligibleWorkers()
+  local eligible = eligibleCitizens()
   local paid = 0
   local total = 0
 
@@ -570,63 +478,48 @@ local function runPayroll()
   if not db_id then return false end
 
   refreshInflation()
-  refreshGDP()
+  refreshWorkerPayRates()
 
   local day = mcDay()
   local rec = dayRecord(day)
-  local eligible = eligibleWorkers()
+  local eligible = eligibleCitizens()
 
   local runCount = 0
   local runTotal = 0
   local skipped = 0
-  local overdrafts = 0
 
   for _, e in ipairs(eligible) do
-    local pay_key = e.account_id .. "@" .. e.company_id
-
-    if not rec.paid[pay_key] then
+    if not rec.paid[e.account_id] then
       local okAccount, accountErr = ensureCitizenAccount(e.citizen)
       if okAccount then
+        local amount = scaledWage(e.base)
         local ok, res = bankReq({
-          type = "company_payroll",
-          company_id = e.company_id,
-          citizen_id = e.account_id,
-          amount = e.wage,
-          memo = "Private payroll day " .. tostring(day) .. ": " .. tostring(e.band) .. " / " .. tostring(e.name),
+          type = "grant",
+          to_id = e.account_id,
+          amount = amount,
+          memo = "Daily state payroll day " .. tostring(day) .. ": " .. tostring(e.role),
         }, 5)
 
         if ok and type(res) == "table" then
-          rec.paid[pay_key] = {
-            amount = e.wage,
+          rec.paid[e.account_id] = {
+            amount = amount,
             tx_id = res.tx_id,
             name = e.name,
-            citizen_id = e.account_id,
-            company_id = e.company_id,
-            company_name = e.company_name,
-            industry = e.industry,
-            band = e.band,
+            role = e.role,
             base = e.base,
-            gdp_bonus = e.gdp_bonus,
-            inflation_bonus = e.inflation_bonus,
-            gdp_per_capita = gdp_per_capita,
-            private_gdp = private_gdp,
             price_index = price_index,
+            inflation_rate = inflation_rate,
             paid_at = now(),
           }
-
-          if type(res.from_balance_after) == "number" and res.from_balance_after < 0 then
-            overdrafts = overdrafts + 1
-          end
-
           runCount = runCount + 1
-          runTotal = runTotal + e.wage
+          runTotal = runTotal + amount
         else
           skipped = skipped + 1
           setMsg("Failed " .. e.account_id .. ": " .. tostring(res), colors.red)
         end
       else
         skipped = skipped + 1
-        setMsg("Account missing " .. tostring(e.account_id) .. ": " .. tostring(accountErr), colors.red)
+        setMsg("Account missing " .. e.account_id .. ": " .. tostring(accountErr), colors.red)
       end
     end
   end
@@ -644,27 +537,26 @@ local function runPayroll()
   stats.last_run_total = runTotal
   stats.last_run_count = runCount
   stats.skipped_today = skipped
-  stats.overdraft_payments = overdrafts
   refreshTodayStats()
 
   if runCount > 0 then
-    setMsg("Company payroll paid " .. tostring(runCount) .. ": " .. money(runTotal), colors.lime)
+    setMsg("Payroll paid " .. tostring(runCount) .. " citizens: " .. money(runTotal), colors.lime)
   elseif skipped > 0 then
-    setMsg("Company payroll had " .. tostring(skipped) .. " skipped payments.", colors.orange)
+    setMsg("Payroll had " .. tostring(skipped) .. " skipped payments.", colors.orange)
   else
-    setMsg("Company payroll already complete for day " .. tostring(day), colors.lightGray)
+    setMsg("Payroll already complete for day " .. tostring(day), colors.lightGray)
   end
 
   return true
 end
 
 local function todayComplete()
-  local eligible = eligibleWorkers()
+  refreshInflation()
+  local eligible = eligibleCitizens()
   local rec = dayRecord(mcDay())
   if #eligible == 0 then return false end
   for _, e in ipairs(eligible) do
-    local pay_key = e.account_id .. "@" .. e.company_id
-    if not rec.paid[pay_key] then return false end
+    if not rec.paid[e.account_id] then return false end
   end
   return true
 end
@@ -718,31 +610,27 @@ end
 local function draw()
   cls()
   fill(1, 1, W, 1, colors.purple)
-  at(2, 1, "COMPANY PAYROLL", colors.white, colors.purple)
+  at(2, 1, "GOVERNMENT PAYROLL", colors.white, colors.purple)
   at(W - #VERSION, 1, VERSION, colors.lightGray, colors.purple)
 
   refreshTodayStats()
 
-  at(2, 3, "Colony:       " .. tostring(colony_name), colors.white)
-  at(2, 4, "Bank:         " .. tostring(db_id or "not connected"), db_id and colors.lime or colors.red)
-  at(2, 5, "Source:       " .. tostring(stats.source), stats.source == "colony" and colors.lime or colors.orange)
-  at(2, 6, "Auto:         " .. (auto_mode and "ON" or "OFF"), auto_mode and colors.lime or colors.orange)
+  at(2, 3, "Colony:   " .. tostring(colony_name), colors.white)
+  at(2, 4, "Bank:     " .. tostring(db_id or "not connected"), db_id and colors.lime or colors.red)
+  at(2, 5, "Source:   " .. tostring(stats.source), stats.source == "colony" and colors.lime or colors.orange)
+  at(2, 6, "Auto:     " .. (auto_mode and "ON" or "OFF"), auto_mode and colors.lime or colors.orange)
 
   at(2, 8,  "Minecraft day:       " .. tostring(mcDay()), colors.white)
-  at(2, 9,  "GDP/capita 7d:       " .. money(gdp_per_capita), colors.cyan)
-  at(2, 10, "Private GDP 7d:      " .. money(private_gdp), colors.cyan)
-  at(2, 11, "Price index:         x" .. string.format("%.3f", price_index), colors.lightGray)
-  at(2, 12, "Inflation pressure:  " .. pct(inflation_rate), inflation_rate >= 0 and colors.orange or colors.lime)
+  at(2, 9,  "Price index:         x" .. string.format("%.3f", price_index), colors.cyan)
+  at(2, 10, "Daily inflation:     " .. pct(inflation_rate), inflation_rate >= 0 and colors.orange or colors.lime)
 
-  at(2, 14, "Eligible private workers: " .. tostring(stats.eligible), colors.white)
-  at(2, 15, "Paid today:               " .. tostring(stats.paid_today), colors.lightGray)
-  at(2, 16, "Total paid today:         " .. money(stats.total_today), colors.lightGray)
-  at(2, 17, "Skipped public workers:   " .. tostring(stats.public_skipped), colors.gray)
-  at(2, 18, "Unmapped private workers: " .. tostring(stats.unmapped), stats.unmapped > 0 and colors.orange or colors.gray)
-  at(2, 19, "Last run:                 " .. tostring(stats.last_run_count) .. " paid / " .. money(stats.last_run_total), colors.lightGray)
+  at(2, 12, "Eligible employees:  " .. tostring(stats.eligible), colors.lightGray)
+  at(2, 13, "Paid today:          " .. tostring(stats.paid_today), colors.lightGray)
+  at(2, 14, "Total paid today:    " .. money(stats.total_today), colors.lightGray)
+  at(2, 15, "Last run:            " .. tostring(stats.last_run_count) .. " paid / " .. money(stats.last_run_total), colors.lightGray)
 
-  at(2, 21, "Wages: unskilled 3 Q, skilled 4 Q, elite 5 Q + GDP bonus + small inflation pressure.", colors.gray)
-  at(2, 22, "Public workers are excluded. Manage them through the FED/GovernmentPayroll console.", colors.gray)
+  at(2, 17, "Defence: U " .. tostring(tierRate("defence","unskilled",2)) .. " / S " .. tostring(tierRate("defence","skilled",3)) .. " / E " .. tostring(tierRate("defence","elite",4)) .. " Q", colors.gray)
+  at(2, 18, "Research: S " .. tostring(tierRate("research","skilled",3)) .. " / E " .. tostring(tierRate("research","elite",5)) .. " Q   Logistics: U " .. tostring(tierRate("logistics","unskilled",1)) .. " / S " .. tostring(tierRate("logistics","skilled",2)) .. " Q", colors.gray)
 
   local bw = math.floor((W - 8) / 3)
   local bRun = button(2, H - 3, bw, "Run Payroll", colors.purple)
@@ -758,10 +646,9 @@ end
 -- =============================================================================
 local function main()
   loadHistory()
-  loadMappings()
   cls()
   fill(1, 1, W, 1, colors.purple)
-  at(2, 1, "COMPANY PAYROLL", colors.white, colors.purple)
+  at(2, 1, "GOVERNMENT PAYROLL", colors.white, colors.purple)
   at(2, 3, "Starting...", colors.lightGray)
 
   findColony()
@@ -774,7 +661,7 @@ local function main()
 
   discoverBank()
   refreshInflation()
-  refreshGDP()
+  refreshWorkerPayRates()
 
   local bRun, bAuto, bRecon = draw()
   local timer = os.startTimer(2)
@@ -786,7 +673,7 @@ local function main()
       if not db_id then discoverBank() end
       if db_id then
         refreshInflation()
-        refreshGDP()
+        refreshWorkerPayRates()
       end
 
       if auto_mode and db_id and not todayComplete() then
@@ -807,9 +694,8 @@ local function main()
       elseif hit(bRecon, mx, my) then
         discoverBank()
         findColony()
-        loadMappings()
         refreshInflation()
-        refreshGDP()
+        refreshWorkerPayRates()
       end
 
       bRun, bAuto, bRecon = draw()
