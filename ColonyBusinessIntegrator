@@ -32,7 +32,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION = "1.0.8-QUANTITY-PRICING"
+local VERSION = "1.0.9-EXACT-RANGED-QUANTITY"
 local BANK_PROTOCOL = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT = 5
@@ -976,11 +976,10 @@ local function wealthMult(balance)
   return 1.0 + math.min(0.35, balance / 100000)
 end
 
-local function requestQuantity(req)
-  -- MineColonies often exposes the requested range in the display name, e.g.
-  -- "1-64 Raw Salmon", while each accepted item alternative has count = 1.
-  -- For contracts we care about the maximum quantity the colony is asking to
-  -- receive, otherwise a 64-stack gets priced like a single fish.
+local function requestQuantityRange(req)
+  -- MineColonies exposes ranged requests in titles such as "1-64 Raw Salmon".
+  -- A contract must choose one exact quantity inside that range, otherwise one
+  -- player can under-deliver and still claim the same reward.
   local texts = {
     tostring(req and req.name or ""),
     tostring(req and req.desc or ""),
@@ -990,34 +989,58 @@ local function requestQuantity(req)
   for _, txt in ipairs(texts) do
     local a, b = txt:match("(%d+)%s*%-%s*(%d+)")
     if a and b then
-      return math.max(tonumber(a) or 1, tonumber(b) or 1)
+      a = math.max(1, math.floor(tonumber(a) or 1))
+      b = math.max(1, math.floor(tonumber(b) or a))
+      if b < a then a, b = b, a end
+      return a, b
     end
   end
 
-  return tonumber(req and (req.count or req.maxCount or req.minCount) or 1) or 1
+  local exact = tonumber(req and (req.count or req.maxCount or req.minCount) or 1) or 1
+  exact = math.max(1, math.floor(exact))
+  return exact, exact
 end
 
-local function extractItems(req)
+local function stripRangePrefix(name)
+  name = trim(name or "")
+  local rest = name:match("^%d+%s*%-%s*%d+%s+(.+)$")
+  return trim(rest or name)
+end
+
+local function chooseContractQuantity(req, key)
+  local min_q, max_q = requestQuantityRange(req)
+  local existing = posted and posted[key]
+  local chosen = existing and tonumber(existing.fixed_quantity) or nil
+
+  if chosen and chosen >= min_q and chosen <= max_q then
+    return math.floor(chosen), min_q, max_q
+  end
+
+  if min_q == max_q then
+    chosen = min_q
+  else
+    chosen = math.random(min_q, max_q)
+  end
+
+  return math.floor(chosen), min_q, max_q
+end
+
+local function extractItems(req, fixed_quantity)
   local out = {}
   if type(req.items) ~= "table" then return out end
 
-  local requested_count = math.max(1, math.floor(requestQuantity(req)))
+  local requested_count = math.max(1, math.floor(tonumber(fixed_quantity) or select(2, requestQuantityRange(req)) or 1))
 
   for _, item in pairs(req.items) do
     if type(item) == "table" then
       local id = trim(item.name or item.item or item.id or "")
       local display = trim(item.displayName or item.display or item.label or id)
 
-      local item_count = tonumber(item.count or item.amount or 0) or 0
-      item_count = math.floor(item_count)
-
-      -- Use the larger value. This preserves exact item counts when provided,
-      -- but fixes the common MineColonies case where alternatives are listed as
-      -- 1x even though the request title says 1-64.
-      local count = math.max(1, item_count, requested_count)
+      -- All accepted alternatives satisfy the same exact quantity.
+      local count = requested_count
 
       if id ~= "" and count > 0 then
-        out[#out+1] = { item=id, display=display ~= "" and display or id, count=count }
+        out[#out+1] = { item=id, display=display ~= "" and display or id, count=count, exact_count=true }
       end
     end
   end
@@ -1174,9 +1197,12 @@ local function reqKey(req, items, business)
   return "mc_live:" .. tostring(company) .. "|" .. simpleHash(tostring(building) .. "|" .. requestFamily(req))
 end
 
-local function reqTitle(req)
-  local name = trim(req.name or req.desc or "Supply Request")
+local function reqTitle(req, fixed_quantity)
+  local name = stripRangePrefix(req.name or req.desc or "Supply Request")
   if name == "" then name = "Supply Request" end
+  if fixed_quantity then
+    return "Supply " .. tostring(fixed_quantity) .. "x " .. name
+  end
   return "Supply " .. name
 end
 
@@ -1186,15 +1212,18 @@ local function itemDesc(items)
   return table.concat(out, ", ")
 end
 
-local function postContract(req, business, items, reward)
-  local key = reqKey(req, items, business)
-  local desc = "MineColonies request from " .. tostring(req.target or "unknown") .. ". Accepted items: " .. itemDesc(items)
+local function postContract(req, business, items, reward, fixed_quantity, min_q, max_q, key)
+  key = key or reqKey(req, items, business)
+  local title = reqTitle(req, fixed_quantity)
+  local desc = "MineColonies request from " .. tostring(req.target or "unknown") ..
+    ". Exact quantity: " .. tostring(fixed_quantity) ..
+    " (source range " .. tostring(min_q) .. "-" .. tostring(max_q) .. "). Accepted items: " .. itemDesc(items)
 
   local ok, res = contractReq({
     type = "post_contract",
     upsert = true,
     source_key = key,
-    title = reqTitle(req),
+    title = title,
     description = desc,
     poster = business.company_id,
     reward = reward,
@@ -1204,6 +1233,10 @@ local function postContract(req, business, items, reward)
     minecolonies_request_id = tostring(req.id or ""),
     source_family = requestFamily(req),
     building_id = business.key,
+    fixed_quantity = fixed_quantity,
+    quantity_min = min_q,
+    quantity_max = max_q,
+    exact_fulfillment = true,
     items = items,
   })
 
@@ -1217,15 +1250,18 @@ local function postContract(req, business, items, reward)
       source_key = key,
       business = business.company_id,
       reward = reward,
+      fixed_quantity = fixed_quantity,
+      quantity_min = min_q,
+      quantity_max = max_q,
       posted_at = posted[key] and posted[key].posted_at or now(),
       refreshed_at = now(),
-      title = reqTitle(req),
+      title = title,
       item_signature = itemSignature(items)
     }
     writeFile(FILE_POSTED, posted)
 
     if res.posted then stats.contracts_posted = stats.contracts_posted + 1 end
-    setMsg(action .. " " .. reqTitle(req) .. " for " .. money(reward), colors.lime)
+    setMsg(action .. " " .. title .. " for " .. money(reward), colors.lime)
     return true, key
   end
 
@@ -1241,6 +1277,7 @@ local function syncStaleContracts(active_keys)
   local ok, res = contractReq({
     type = "sync_source_contracts",
     source_type = "minecolonies_request",
+    source_terminal = os.getComputerID(),
     active_source_keys = active_list,
     reason = "MineColonies request no longer exists or is no longer affordable"
   }, 8)
@@ -1267,21 +1304,23 @@ local function scanRequests(requests, citizens)
     if not business then
       stats.skipped_unmapped = stats.skipped_unmapped + 1
     else
-      local items = extractItems(req)
-      local key = reqKey(req, items, business)
+      local provisional_items = {}
+      local key = reqKey(req, provisional_items, business)
+      local fixed_quantity, min_q, max_q = chooseContractQuantity(req, key)
+      local items = extractItems(req, fixed_quantity)
 
       if #items > 0 then
         local reward, reason, bal = priceJob(business, items)
         if reward then
-          local posted_ok, active_key = postContract(req, business, items, reward)
+          local posted_ok, active_key = postContract(req, business, items, reward, fixed_quantity, min_q, max_q, key)
           if posted_ok and active_key then active_keys[active_key] = true end
         else
           stats.skipped_unfunded = stats.skipped_unfunded + 1
-          setMsg("Skipped " .. reqTitle(req) .. ": " .. tostring(reason) .. " (" .. money(bal) .. ")", colors.orange)
+          setMsg("Skipped " .. reqTitle(req, fixed_quantity) .. ": " .. tostring(reason) .. " (" .. money(bal) .. ")", colors.orange)
         end
       else
         stats.skipped_unmapped = stats.skipped_unmapped + 1
-        setMsg("Skipped " .. reqTitle(req) .. ": no valid item list", colors.orange)
+        setMsg("Skipped " .. reqTitle(req, fixed_quantity) .. ": no valid item list", colors.orange)
       end
     end
   end
