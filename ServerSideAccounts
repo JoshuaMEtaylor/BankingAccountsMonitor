@@ -22,7 +22,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.3.5-COMPANY-MGMT-MERGE"
+local VERSION  = "1.3.6-WORKER-PAY-RATES"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -368,6 +368,51 @@ local function saveContracts() return writeFile(FILE.contracts, contracts) end
 local function savePrices()    return writeFile(FILE.prices,    prices)    end
 local function saveInflation() return writeFile(FILE.inflation, inflation_state) end
 local function saveConfig()    return writeFile(FILE.config,    config)    end
+
+local DEFAULT_WORKER_PAY_RATES = {
+  researcher = 3,
+  soldier    = 2,
+  courier    = 1,
+}
+
+local function ensureWorkerPayRates()
+  config = type(config) == "table" and config or {}
+  config.worker_pay_rates = type(config.worker_pay_rates) == "table" and config.worker_pay_rates or {}
+
+  for key, default in pairs(DEFAULT_WORKER_PAY_RATES) do
+    local n = tonumber(config.worker_pay_rates[key])
+    if not n or n < 0 then n = default end
+    config.worker_pay_rates[key] = math.floor(n + 0.5)
+  end
+
+  return config.worker_pay_rates
+end
+
+local function setWorkerPayRates(rates)
+  if type(rates) ~= "table" then return false, "Missing pay rates" end
+  ensureWorkerPayRates()
+
+  local changed = {}
+  for _, key in ipairs({ "researcher", "soldier", "courier" }) do
+    local raw = rates[key]
+    if raw ~= nil and raw ~= "" then
+      local n = tonumber(raw)
+      if not n then return false, "Invalid " .. key .. " pay" end
+      n = math.floor(n)
+      if n < 0 then return false, key .. " pay cannot be negative" end
+      config.worker_pay_rates[key] = n
+      changed[key] = n
+    end
+  end
+
+  saveConfig()
+  return true, {
+    rates = ensureWorkerPayRates(),
+    changed = changed,
+    updated = timestamp()
+  }
+end
+
 
 -- =============================================================================
 -- AUTH  — username + password, works from any terminal
@@ -1039,6 +1084,27 @@ handlers["set_inflation_policy"] = function(sender_id, req)
   return true, { state = inflation_state }
 end
 
+-- GET_WORKER_PAY_RATES
+handlers["get_worker_pay_rates"] = function(sender_id, req)
+  return true, {
+    rates = ensureWorkerPayRates(),
+    updated = timestamp()
+  }
+end
+
+-- SET_WORKER_PAY_RATES
+handlers["set_worker_pay_rates"] = function(sender_id, req)
+  local ok, res = setWorkerPayRates(req and req.rates or req)
+  if ok then
+    audit("ACTION", "STATE", sender_id, "SET_WORKER_PAY_RATES",
+      "researcher=" .. tostring(res.rates.researcher)
+      .. " soldier=" .. tostring(res.rates.soldier)
+      .. " courier=" .. tostring(res.rates.courier))
+    return true, res
+  end
+  return false, res
+end
+
 -- REGISTER_COMPANY
 handlers["register_company"] = function(sender_id, req)
   local name         = req.name
@@ -1111,7 +1177,8 @@ handlers["status"] = function(sender_id, req)
     tx_count         = tx_counter,
     audit_count      = audit_counter,
     supply           = deriveMonetarySupply(),
-    inflation         = ensureInflationState()
+    inflation         = ensureInflationState(),
+    worker_pay_rates  = ensureWorkerPayRates()
   }
 end
 
@@ -1580,6 +1647,8 @@ local function initFiles()
     economy_status       = "active",
     mint_authority       = "locked"
   }
+  ensureWorkerPayRates()
+  saveConfig()
 
   migrateBalancesFromLedgerIfNeeded()
   recoverPendingTx()
