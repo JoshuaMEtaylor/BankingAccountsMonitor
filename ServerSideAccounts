@@ -22,7 +22,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.3.6-WORKER-PAY-RATES"
+local VERSION  = "1.3.4-COMPANY-PAYROLL-GDP"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -369,51 +369,6 @@ local function savePrices()    return writeFile(FILE.prices,    prices)    end
 local function saveInflation() return writeFile(FILE.inflation, inflation_state) end
 local function saveConfig()    return writeFile(FILE.config,    config)    end
 
-local DEFAULT_WORKER_PAY_RATES = {
-  researcher = 3,
-  soldier    = 2,
-  courier    = 1,
-}
-
-local function ensureWorkerPayRates()
-  config = type(config) == "table" and config or {}
-  config.worker_pay_rates = type(config.worker_pay_rates) == "table" and config.worker_pay_rates or {}
-
-  for key, default in pairs(DEFAULT_WORKER_PAY_RATES) do
-    local n = tonumber(config.worker_pay_rates[key])
-    if not n or n < 0 then n = default end
-    config.worker_pay_rates[key] = math.floor(n + 0.5)
-  end
-
-  return config.worker_pay_rates
-end
-
-local function setWorkerPayRates(rates)
-  if type(rates) ~= "table" then return false, "Missing pay rates" end
-  ensureWorkerPayRates()
-
-  local changed = {}
-  for _, key in ipairs({ "researcher", "soldier", "courier" }) do
-    local raw = rates[key]
-    if raw ~= nil and raw ~= "" then
-      local n = tonumber(raw)
-      if not n then return false, "Invalid " .. key .. " pay" end
-      n = math.floor(n)
-      if n < 0 then return false, key .. " pay cannot be negative" end
-      config.worker_pay_rates[key] = n
-      changed[key] = n
-    end
-  end
-
-  saveConfig()
-  return true, {
-    rates = ensureWorkerPayRates(),
-    changed = changed,
-    updated = timestamp()
-  }
-end
-
-
 -- =============================================================================
 -- AUTH  — username + password, works from any terminal
 -- =============================================================================
@@ -473,48 +428,6 @@ local function companyOwnerFields(company_id)
   return company and company.owner_id or nil, account and account.owner_id or nil
 end
 
-
-local function isTrustedManagement(sender_id)
-  -- Practical local-server trust model for state terminals. Older code already
-  -- allowed state-facing terminals to call management handlers without login;
-  -- this function prevents nil-function crashes on balance lookups.
-  return true
-end
-
-local function escapePattern(s)
-  return (tostring(s or ""):gsub("([^%w])", "%%%1"))
-end
-
-local function rewriteShareLedgerCompanyId(old_company_id, new_company_id)
-  if old_company_id == new_company_id then return true end
-  if not fs.exists(FILE.share_ledger) then return true end
-  local old_pat = escapePattern(old_company_id)
-  local lines = readLines(FILE.share_ledger)
-  local changed = false
-  for i, line in ipairs(lines) do
-    local new_line = line:gsub(old_pat, new_company_id)
-    if new_line ~= line then
-      lines[i] = new_line
-      changed = true
-    end
-  end
-  if changed then return writeLines(FILE.share_ledger, lines) end
-  return true
-end
-
-local function rewriteBankContractCompanyId(old_company_id, new_company_id)
-  if old_company_id == new_company_id or type(contracts) ~= "table" then return end
-  local changed = false
-  for _, c in pairs(contracts) do
-    if type(c) == "table" then
-      for _, field in ipairs({"poster", "source_account", "source_company", "claimed_by"}) do
-        if c[field] == old_company_id then c[field] = new_company_id; changed = true end
-      end
-    end
-  end
-  if changed then writeFile(FILE.contracts, contracts) end
-end
-
 local function ledgerHasTx(tx_id)
   for _, line in ipairs(readLines(FILE.ledger)) do
     if line:match("^" .. tostring(tx_id) .. "%s*|") then return true end
@@ -526,7 +439,7 @@ local function clearPendingTx()
   if fs.exists(FILE.pending_tx) then fs.delete(FILE.pending_tx) end
 end
 
-local function transfer(from_id, to_id, amount, tx_type, memo, actor)
+local function transfer(from_id, to_id, amount, tx_type, memo, actor, allow_overdraft)
   amount = tonumber(amount)
   tx_type = tx_type or "TRANSFER"
 
@@ -541,7 +454,7 @@ local function transfer(from_id, to_id, amount, tx_type, memo, actor)
   local from_before = from_id ~= "SYSTEM" and deriveBalance(from_id) or nil
   local to_before   = to_id   ~= "SYSTEM" and deriveBalance(to_id)   or nil
 
-  if from_id ~= "SYSTEM" and tx_type ~= "MINT" then
+  if from_id ~= "SYSTEM" and tx_type ~= "MINT" and not allow_overdraft then
     if from_before < amount then
       return false, "Insufficient funds. Balance: " .. from_before .. " Quid, Required: " .. amount .. " Quid"
     end
@@ -756,6 +669,93 @@ local function tickInflation(target_day)
   return true, inflation_state, elapsed
 end
 
+
+
+-- =============================================================================
+-- PRIVATE GDP / ACTIVITY ESTIMATION
+-- Company payroll uses this as a simple rolling prosperity signal.
+-- =============================================================================
+local function isGovernmentAccount(id)
+  id = tostring(id or "")
+  return id == "SYSTEM"
+    or id == "treasury:quid_bank"
+    or id == "market:escrow"
+    or id == "contract:escrow"
+    or id:find("^treasury:") ~= nil
+end
+
+local GDP_TX_TYPES = {
+  COMPANY_PAYROLL = true,
+  COMPANY_TRANSFER = true,
+  CONTRACT_PAYOUT = true,
+  CONTRACT_REWARD = true,
+  PRIVATE_SERVICE = true,
+  LIVING_COST = true,
+  TRANSFER = true,
+}
+
+local function isPrivateGDPTransaction(tx_type, from_id, to_id)
+  tx_type = trim(tx_type)
+  from_id = trim(from_id)
+  to_id = trim(to_id)
+
+  if tx_type == "MINT" or tx_type == "BURN" or tx_type == "GRANT" then return false end
+  if tx_type == "COMPANY_DEPOSIT" or tx_type == "COMPANY_WITHDRAW" then return false end
+  if isGovernmentAccount(from_id) or isGovernmentAccount(to_id) then return false end
+
+  return GDP_TX_TYPES[tx_type] == true
+end
+
+local function calculatePrivateGDP(window_ms)
+  window_ms = tonumber(window_ms) or (7 * 1200000)
+  local cutoff = timestamp() - window_ms
+  local total = 0
+  local count = 0
+  local by_type = {}
+
+  for _, line in ipairs(readLines(FILE.ledger)) do
+    local tx_id, ts, tx_type, from_id, to_id, amount, memo, status =
+      line:match("(TX%-%d+)%s*|%s*(%d+)%s*|%s*(%S+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*(%-?%d+)%s*|%s*([^|]+)%s*|%s*(.+)")
+    if tx_id then
+      ts = tonumber(ts) or 0
+      amount = tonumber(amount) or 0
+      status = trim(status)
+      tx_type = trim(tx_type)
+      from_id = trim(from_id)
+      to_id = trim(to_id)
+
+      if status == "settled" and ts >= cutoff and amount > 0 and isPrivateGDPTransaction(tx_type, from_id, to_id) then
+        total = total + amount
+        count = count + 1
+        by_type[tx_type] = (by_type[tx_type] or 0) + amount
+      end
+    end
+  end
+
+  local population = 0
+  for id, c in pairs(citizens or {}) do
+    if c.status == "active" then population = population + 1 end
+  end
+  if population <= 0 then
+    for id, acc in pairs(accounts or {}) do
+      if acc.type == "citizen" and acc.status == "active" then population = population + 1 end
+    end
+  end
+
+  local per_capita = 0
+  if population > 0 then per_capita = math.floor(total / population) end
+
+  return {
+    window_ms = window_ms,
+    private_gdp = math.floor(total),
+    gdp = math.floor(total),
+    gdp_per_capita = per_capita,
+    population = population,
+    transaction_count = count,
+    by_type = by_type,
+    note = "Private GDP estimate from recent non-government settled transaction flow."
+  }
+end
 
 -- =============================================================================
 -- REQUEST HANDLERS
@@ -1084,25 +1084,43 @@ handlers["set_inflation_policy"] = function(sender_id, req)
   return true, { state = inflation_state }
 end
 
--- GET_WORKER_PAY_RATES
-handlers["get_worker_pay_rates"] = function(sender_id, req)
-  return true, {
-    rates = ensureWorkerPayRates(),
-    updated = timestamp()
-  }
+
+-- ECONOMIC_GDP
+handlers["economic_gdp"] = function(sender_id, req)
+  local days = tonumber(req and req.days) or 7
+  if days < 1 then days = 1 end
+  if days > 30 then days = 30 end
+  local window_ms = days * 1200000
+  local snap = calculatePrivateGDP(window_ms)
+  snap.days = days
+  return true, snap
 end
 
--- SET_WORKER_PAY_RATES
-handlers["set_worker_pay_rates"] = function(sender_id, req)
-  local ok, res = setWorkerPayRates(req and req.rates or req)
-  if ok then
-    audit("ACTION", "STATE", sender_id, "SET_WORKER_PAY_RATES",
-      "researcher=" .. tostring(res.rates.researcher)
-      .. " soldier=" .. tostring(res.rates.soldier)
-      .. " courier=" .. tostring(res.rates.courier))
-    return true, res
-  end
-  return false, res
+-- COMPANY_PAYROLL
+-- Private-sector payroll only. Allows company overdraft by design.
+handlers["company_payroll"] = function(sender_id, req)
+  local company_id = req.company_id
+  local citizen_id = req.citizen_id
+  local amount = tonumber(req.amount)
+  local memo = req.memo or "Company payroll"
+
+  if not company_id or company_id == "" then return false, "Missing company_id" end
+  if not citizen_id or citizen_id == "" then return false, "Missing citizen_id" end
+  if not amount or amount <= 0 then return false, "Invalid amount" end
+  amount = math.floor(amount)
+  if amount <= 0 then return false, "Invalid integer amount" end
+
+  if not accountExists(company_id) then return false, "Company account not found: " .. tostring(company_id) end
+  if not accountExists(citizen_id) then return false, "Citizen account not found: " .. tostring(citizen_id) end
+  if not companies[company_id] then return false, "Company not registered: " .. tostring(company_id) end
+  if not citizens[citizen_id] then return false, "Citizen not registered: " .. tostring(citizen_id) end
+
+  local cacc = accounts[company_id]
+  local zacc = accounts[citizen_id]
+  if not cacc or cacc.type ~= "company" then return false, "Source is not a company account" end
+  if not zacc or zacc.type ~= "citizen" then return false, "Destination is not a citizen account" end
+
+  return transfer(company_id, citizen_id, amount, "COMPANY_PAYROLL", memo, "COMPANY_PAYROLL:" .. tostring(sender_id), true)
 end
 
 -- REGISTER_COMPANY
@@ -1177,8 +1195,7 @@ handlers["status"] = function(sender_id, req)
     tx_count         = tx_counter,
     audit_count      = audit_counter,
     supply           = deriveMonetarySupply(),
-    inflation         = ensureInflationState(),
-    worker_pay_rates  = ensureWorkerPayRates()
+    inflation         = ensureInflationState()
   }
 end
 
@@ -1240,118 +1257,6 @@ handlers["company_info"] = function(sender_id, req)
     cash_balance     = balance,
     shareholders     = holdings,
     founded          = company.founded
-  }
-end
-
-
--- UPDATE_COMPANY
--- Owner-authorised company profile edit. Ticker changes rename company:<ticker>
--- in companies/accounts/balances so players only need to see the ticker.
-handlers["update_company"] = function(sender_id, req)
-  local ok, citizen_id, citizen = authenticateUser(req.username, req.password)
-  if not ok then return false, citizen_id end
-
-  local old_company_id = req.company_id
-  if not old_company_id or old_company_id == "" then return false, "Missing company_id" end
-  if not companies[old_company_id] then return false, "Company not found: " .. tostring(old_company_id) end
-  if not accountExists(old_company_id) then return false, "Company account not found: " .. tostring(old_company_id) end
-  if not isCompanyOwner(old_company_id, citizen_id) then
-    return false, "Only the registered owner can edit this company"
-  end
-
-  local new_name = trim(req.name or companies[old_company_id].name or "")
-  local ticker = trim(req.ticker or companies[old_company_id].ticker or "")
-  ticker = string.upper(ticker):gsub("%s+", ""):gsub("[^A-Z0-9_%-]", "")
-  if new_name == "" then return false, "Missing company name" end
-  if ticker == "" then return false, "Invalid ticker" end
-
-  local new_company_id = "company:" .. string.lower(ticker)
-  if new_company_id ~= old_company_id and (companies[new_company_id] or accounts[new_company_id]) then
-    return false, "Ticker/account already exists: " .. new_company_id
-  end
-
-  local company = companies[old_company_id]
-  local account = accounts[old_company_id]
-  local bal = deriveBalance(old_company_id)
-
-  company.name = new_name
-  company.ticker = ticker
-  company.updated = timestamp()
-
-  account.display_name = new_name
-  account.owner_id = account.owner_id or company.owner_id or citizen_id
-
-  if new_company_id ~= old_company_id then
-    companies[new_company_id] = company
-    companies[old_company_id] = nil
-    accounts[new_company_id] = account
-    accounts[old_company_id] = nil
-    balances[new_company_id] = bal
-    balances[old_company_id] = nil
-    rewriteShareLedgerCompanyId(old_company_id, new_company_id)
-    rewriteBankContractCompanyId(old_company_id, new_company_id)
-  end
-
-  saveCompanies()
-  saveAccounts()
-  saveBalances()
-  audit("ACTION", citizen_id, sender_id, "UPDATE_COMPANY", tostring(old_company_id) .. "->" .. tostring(new_company_id))
-
-  return true, {
-    company_id = new_company_id,
-    old_company_id = old_company_id,
-    name = new_name,
-    ticker = ticker,
-    owner_id = company.owner_id,
-    account_owner_id = account.owner_id,
-    cash_balance = deriveBalance(new_company_id),
-    status = company.status,
-    message = "Company updated"
-  }
-end
-
--- DISSOLVE_COMPANY
--- Owner-authorised company deletion. Any remaining balance is paid back to the
--- registered owner before the company account and record are removed.
-handlers["dissolve_company"] = function(sender_id, req)
-  local ok, citizen_id, citizen = authenticateUser(req.username, req.password)
-  if not ok then return false, citizen_id end
-
-  local company_id = req.company_id
-  if not company_id or company_id == "" then return false, "Missing company_id" end
-  if not companies[company_id] then return false, "Company not found: " .. tostring(company_id) end
-  if not accountExists(company_id) then return false, "Company account not found: " .. tostring(company_id) end
-  if not isCompanyOwner(company_id, citizen_id) then
-    return false, "Only the registered owner can dissolve this company"
-  end
-
-  local bal = deriveBalance(company_id)
-  local memo = req.memo or "Company dissolved by owner"
-  local payout_tx = nil
-
-  if bal > 0 then
-    local paid, res = transfer(company_id, citizen_id, bal, "COMPANY_DISSOLVE", memo, citizen_id)
-    if not paid then return false, "Could not pay out company balance: " .. tostring(res) end
-    payout_tx = res
-  end
-
-  local old_company = companies[company_id]
-  companies[company_id] = nil
-  accounts[company_id] = nil
-  balances[company_id] = nil
-  saveCompanies()
-  saveAccounts()
-  saveBalances()
-
-  audit("ACTION", citizen_id, sender_id, "DISSOLVE_COMPANY", tostring(company_id) .. " paid=" .. tostring(bal))
-
-  return true, {
-    company_id = company_id,
-    name = old_company and old_company.name or company_id,
-    owner_id = citizen_id,
-    paid_out = bal,
-    payout_tx = payout_tx,
-    message = "Company dissolved"
   }
 end
 
@@ -1647,8 +1552,6 @@ local function initFiles()
     economy_status       = "active",
     mint_authority       = "locked"
   }
-  ensureWorkerPayRates()
-  saveConfig()
 
   migrateBalancesFromLedgerIfNeeded()
   recoverPendingTx()
