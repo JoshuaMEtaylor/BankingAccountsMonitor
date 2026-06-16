@@ -59,7 +59,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION           = "1.2.4"
+local VERSION           = "1.2.5-GUI-FIX"
 local BANK_PROTOCOL     = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT        = 5
@@ -266,6 +266,26 @@ local function hit(b, mx, my)
   return b and mx >= b.x1 and mx <= b.x2 and my >= b.y1 and my <= b.y2
 end
 
+local function buttonRow(y, specs)
+  -- specs = { {key="clear", label="Clear", bg=..., fg=...}, ... }
+  local buttons = {}
+  local n = #specs
+  if n <= 0 then return buttons end
+  local gap = 1
+  local x0 = 4
+  local total = W - 7
+  local bw = math.floor((total - ((n - 1) * gap)) / n)
+  if bw < 7 then bw = 7 end
+  for i, spec in ipairs(specs) do
+    local x = x0 + ((i - 1) * (bw + gap))
+    local ww = bw
+    if i == n then ww = math.max(7, W - x - 2) end
+    buttons[spec.key] = button(x, y, ww, spec.label, spec.bg, spec.fg)
+  end
+  return buttons
+end
+
+
 local function inputField(x, y, w, value, masked)
   value = tostring(value or "")
   local display = masked and string.rep("*", #value) or value
@@ -301,23 +321,29 @@ local function accountStrip()
 end
 
 local function tabStrip(y)
+  -- Fixed-width tabs with a blank column between each tab. This avoids the
+  -- old "CapitalContracts" visual merge on small ComputerCraft monitors.
   local tabs = {"Register", "Company", "Capital", "Contracts", "Ops"}
   local mode_to_tab = {register=1, company=2, capital=3, contracts=4, ops=5}
   local active = mode_to_tab[mode] or 1
-  local tw = math.floor((W - 2) / #tabs)
-  if tw < 8 then tw = 8 end
   local buttons = {}
+  local gap = 1
+  local available = W - 2 - ((#tabs - 1) * gap)
+  local tw = math.floor(available / #tabs)
+  if tw < 8 then tw = 8 end
   fill(1, y, W, 1, C.bg)
+  local x = 2
   for i, label in ipairs(tabs) do
-    local x = 2 + ((i - 1) * tw)
-    if x <= W then
-      local is_active = i == active
-      local bg = is_active and C.tab_act or C.tab_inact
-      local fg = is_active and C.tab_fg_a or C.tab_fg_i
-      fill(x, y, math.min(tw, W - x + 1), 1, bg)
-      at(x + math.max(0, math.floor((tw - #label) / 2)), y, label, fg, bg)
-      buttons[i] = {x1=x, x2=math.min(W, x+tw-1), y1=y, y2=y}
-    end
+    if x > W then break end
+    local ww = math.min(tw, W - x + 1)
+    local is_active = i == active
+    local bg = is_active and C.tab_act or C.tab_inact
+    local fg = is_active and C.tab_fg_a or C.tab_fg_i
+    fill(x, y, ww, 1, bg)
+    local text = shortText(label, ww)
+    at(x + math.max(0, math.floor((ww - #text) / 2)), y, text, fg, bg)
+    buttons[i] = {x1=x, x2=math.min(W, x+ww-1), y1=y, y2=y}
+    x = x + ww + gap
   end
   return buttons
 end
@@ -783,101 +809,100 @@ local function drawMain()
   local tabs = tabStrip(5)
 
   local card_y = 7
-  local card_h = H - 8
+  local card_h = H - card_y - 1
+  if card_h < 8 then card_h = 8 end
   card(2, card_y, W - 2, card_h)
 
   local fields = {}
   local buttons = {}
-  local btn_y = H - 2
-  local third = math.floor((W - 10) / 3); if third < 10 then third = 10 end
+  local btn_y = H - 3
+  local text_w = W - 8
 
   if mode == "register" then
     at(4, card_y + 1, "Register a player-made company.", C.label, C.card)
     at(4, card_y + 3, "Company Name", C.card_fg, C.card)
-    fields[1] = inputField(4, card_y + 4, W - 6, reg.name, false)
+    fields[1] = inputField(4, card_y + 4, W - 8, reg.name, false)
     at(4, card_y + 6, "Ticker", C.card_fg, C.card)
-    fields[2] = inputField(4, card_y + 7, W - 6, reg.ticker, false)
+    fields[2] = inputField(4, card_y + 7, W - 8, reg.ticker, false)
     local preview = companyIdFromTicker(reg.ticker); if preview == "" then preview = "company:<ticker>" end
-    at(4, card_y + 9, "Account: " .. preview, C.label, C.card)
-    at(4, card_y + 10, "Owner:   " .. tostring(session.citizen_id or "?"), C.label, C.card)
-    buttons.clear = button(4, btn_y, third, "Clear", C.btn_sec, C.card_fg)
-    buttons.primary = button(5 + third, btn_y, third + 4, "Register", C.btn_pri, C.btn_fg)
-    buttons.signout = button(10 + (third * 2), btn_y, third, "Sign Out", C.btn_dan, C.btn_fg)
+    at(4, card_y + 9, shortText("Account: " .. preview, text_w), C.label, C.card)
+    buttons = buttonRow(btn_y, {
+      {key="clear", label="Clear", bg=C.btn_sec, fg=C.card_fg},
+      {key="primary", label="Register", bg=C.btn_pri, fg=C.btn_fg},
+      {key="signout", label="Sign Out", bg=C.btn_dan, fg=C.btn_fg},
+    })
 
   elseif mode == "company" then
-    at(4, card_y + 1, "Load/select a company by ticker or company ID.", C.label, C.card)
+    at(4, card_y + 1, "Load/select company by ticker or ID.", C.label, C.card)
     at(4, card_y + 3, "Ticker or Company ID", C.card_fg, C.card)
-    fields[1] = inputField(4, card_y + 4, W - 6, company_lookup.company, false)
+    fields[1] = inputField(4, card_y + 4, W - 8, company_lookup.company, false)
     at(4, card_y + 6, "Owned companies found: " .. tostring(owned_company_count), owned_company_count > 0 and C.ok or C.warn, C.card)
     if active_company then
-      at(4, card_y + 8, "Name:    " .. tostring(active_company.name or "?"), C.card_fg, C.card)
-      at(4, card_y + 9, "Account: " .. tostring(active_company_id or "?"), C.card_fg, C.card)
-      at(4, card_y + 10, "Owner:   " .. tostring(active_company.owner_id or active_company.account_owner_id or "?"), isOwner() and C.ok or C.warn, C.card)
-      at(4, card_y + 11, "Status:  " .. tostring(active_company.status or "?"), C.label, C.card)
-      at(4, card_y + 12, "Balance: " .. money(active_company.cash_balance or 0), C.card_fg, C.card)
-      at(4, card_y + 13, "Shares:  " .. tostring(active_company.shares_total or 0), C.label, C.card)
-      local sh = active_company.shareholders or {}
-      local y = card_y + 15
-      at(4, y, "Shareholders:", C.card_fg, C.card); y = y + 1
-      local shown = 0
-      for holder, shares in pairs(sh) do
-        if y >= H - 3 then break end
-        at(4, y, shortText(holder, 24) .. " = " .. tostring(shares), C.label, C.card)
-        y = y + 1; shown = shown + 1
-      end
-      if shown == 0 then at(4, y, "No shareholder data.", C.label, C.card) end
+      at(4, card_y + 8, shortText("Name: " .. tostring(active_company.name or "?"), text_w), C.card_fg, C.card)
+      at(4, card_y + 9, shortText("Account: " .. tostring(active_company_id or "?"), text_w), C.card_fg, C.card)
+      local owner = tostring(active_company.owner_id or active_company.account_owner_id or "?")
+      at(4, card_y + 10, shortText("Owner: " .. owner, text_w), isOwner() and C.ok or C.warn, C.card)
+      local balance = "Balance: " .. money(active_company.cash_balance or 0)
+      local status = "Status: " .. tostring(active_company.status or "?")
+      at(4, card_y + 11, shortText(balance .. "  " .. status, text_w), C.label, C.card)
     end
-    buttons.clear = button(4, btn_y, third, "Clear", C.btn_sec, C.card_fg)
-    buttons.owned = button(5 + third, btn_y, third, "My Cos", C.btn_sec, C.card_fg)
-    buttons.primary = button(6 + (third * 2), btn_y, third, "Load", C.btn_pri, C.btn_fg)
-    buttons.signout = button(7 + (third * 3), btn_y, math.max(8, W - (7 + (third * 3)) - 1), "Sign Out", C.btn_dan, C.btn_fg)
+    buttons = buttonRow(btn_y, {
+      {key="clear", label="Clear", bg=C.btn_sec, fg=C.card_fg},
+      {key="owned", label="My Cos", bg=C.btn_sec, fg=C.card_fg},
+      {key="primary", label="Load", bg=C.btn_pri, fg=C.btn_fg},
+      {key="signout", label="Sign Out", bg=C.btn_dan, fg=C.btn_fg},
+    })
 
   elseif mode == "capital" then
-    at(4, card_y + 1, "Move funds between your personal account and the selected company.", C.label, C.card)
+    at(4, card_y + 1, "Move funds between personal and company.", C.label, C.card)
     at(4, card_y + 3, "Company", C.card_fg, C.card)
-    at(4, card_y + 4, tostring(active_company_id or "Load a company first"), active_company_id and C.ok or C.warn, C.card)
+    at(4, card_y + 4, shortText(tostring(active_company_id or "Load a company first"), text_w), active_company_id and C.ok or C.warn, C.card)
     at(4, card_y + 6, "Amount", C.card_fg, C.card)
-    fields[1] = inputField(4, card_y + 7, W - 6, capital.amount, false)
+    fields[1] = inputField(4, card_y + 7, W - 8, capital.amount, false)
     at(4, card_y + 9, "Memo", C.card_fg, C.card)
-    fields[2] = inputField(4, card_y + 10, W - 6, capital.memo, false)
-    at(4, card_y + 12, "Pay In: personal -> company.  Pay Out: company -> personal owner.", C.label, C.card)
-    buttons.clear = button(4, btn_y, third, "Clear", C.btn_sec, C.card_fg)
-    buttons.primary = button(5 + third, btn_y, third, "Pay In", C.btn_pri, C.btn_fg)
-    buttons.payout = button(6 + (third * 2), btn_y, third, "Pay Out", C.btn_sec, C.card_fg)
-    buttons.signout = button(7 + (third * 3), btn_y, math.max(8, W - (7 + (third * 3)) - 1), "Sign Out", C.btn_dan, C.btn_fg)
+    fields[2] = inputField(4, card_y + 10, W - 8, capital.memo, false)
+    at(4, card_y + 12, "Pay In: personal -> company", C.label, C.card)
+    at(4, card_y + 13, "Pay Out: company -> owner", C.label, C.card)
+    buttons = buttonRow(btn_y, {
+      {key="clear", label="Clear", bg=C.btn_sec, fg=C.card_fg},
+      {key="primary", label="Pay In", bg=C.btn_pri, fg=C.btn_fg},
+      {key="payout", label="Pay Out", bg=C.btn_sec, fg=C.card_fg},
+      {key="signout", label="Sign Out", bg=C.btn_dan, fg=C.btn_fg},
+    })
 
   elseif mode == "contracts" then
     at(4, card_y + 1, "Post a contract from the selected company.", C.label, C.card)
-    at(4, card_y + 2, "Contract server: " .. tostring(contract_id or "not connected"), contract_id and C.ok or C.warn, C.card)
+    at(4, card_y + 2, shortText("Contract server: " .. tostring(contract_id or "not connected"), text_w), contract_id and C.ok or C.warn, C.card)
     at(4, card_y + 4, "Title", C.card_fg, C.card)
-    fields[1] = inputField(4, card_y + 5, W - 6, post.title, false)
+    fields[1] = inputField(4, card_y + 5, W - 8, post.title, false)
     at(4, card_y + 7, "Reward Q", C.card_fg, C.card)
     fields[2] = inputField(4, card_y + 8, 14, post.reward, false)
     at(20, card_y + 7, "Item ID", C.card_fg, C.card)
-    fields[3] = inputField(20, card_y + 8, math.max(10, W - 22), post.item, false)
+    fields[3] = inputField(20, card_y + 8, math.max(10, W - 24), post.item, false)
     at(4, card_y + 10, "Count", C.card_fg, C.card)
     fields[4] = inputField(4, card_y + 11, 14, post.count, false)
-    at(20, card_y + 10, "Display Name", C.card_fg, C.card)
-    fields[5] = inputField(20, card_y + 11, math.max(10, W - 22), post.display, false)
-    at(4, card_y + 13, "Description", C.card_fg, C.card)
-    fields[6] = inputField(4, card_y + 14, W - 6, post.description, false)
-    buttons.clear = button(4, btn_y, third, "Clear", C.btn_sec, C.card_fg)
-    buttons.primary = button(5 + third, btn_y, third + 4, "Post", C.btn_pri, C.btn_fg)
-    buttons.signout = button(10 + (third * 2), btn_y, third, "Sign Out", C.btn_dan, C.btn_fg)
+    at(20, card_y + 10, "Display", C.card_fg, C.card)
+    fields[5] = inputField(20, card_y + 11, math.max(10, W - 24), post.display, false)
+    buttons = buttonRow(btn_y, {
+      {key="clear", label="Clear", bg=C.btn_sec, fg=C.card_fg},
+      {key="primary", label="Post", bg=C.btn_pri, fg=C.btn_fg},
+      {key="signout", label="Sign Out", bg=C.btn_dan, fg=C.btn_fg},
+    })
 
   elseif mode == "ops" then
     at(4, card_y + 1, "Company contract operations.", C.label, C.card)
-    at(4, card_y + 2, "Active company: " .. tostring(active_company_id or "none"), active_company_id and C.ok or C.warn, C.card)
+    at(4, card_y + 2, shortText("Active: " .. tostring(active_company_id or "none"), text_w), active_company_id and C.ok or C.warn, C.card)
     at(4, card_y + 4, "Contract ID", C.card_fg, C.card)
-    fields[1] = inputField(4, card_y + 5, W - 6, ops.contract_id, false)
+    fields[1] = inputField(4, card_y + 5, W - 8, ops.contract_id, false)
     at(4, card_y + 7, "Fulfilment Note", C.card_fg, C.card)
-    fields[2] = inputField(4, card_y + 8, W - 6, ops.note, false)
-    at(4, card_y + 10, "View shows contracts where company is poster, source, or claimant.", C.label, C.card)
-    local q = math.floor((W - 12) / 4); if q < 8 then q = 8 end
-    buttons.list = button(4, btn_y, q, "View", C.btn_sec, C.card_fg)
-    buttons.fulfil = button(5 + q, btn_y, q, "Fulfil", C.btn_pri, C.btn_fg)
-    buttons.cancel = button(6 + (q * 2), btn_y, q, "Cancel", C.btn_dan, C.btn_fg)
-    buttons.signout = button(7 + (q * 3), btn_y, q, "Sign Out", C.btn_sec, C.card_fg)
+    fields[2] = inputField(4, card_y + 8, W - 8, ops.note, false)
+    at(4, card_y + 10, "View: company as poster/source/claimant.", C.label, C.card)
+    buttons = buttonRow(btn_y, {
+      {key="list", label="View", bg=C.btn_sec, fg=C.card_fg},
+      {key="fulfil", label="Fulfil", bg=C.btn_pri, fg=C.btn_fg},
+      {key="cancel", label="Cancel", bg=C.btn_dan, fg=C.btn_fg},
+      {key="signout", label="Sign Out", bg=C.btn_sec, fg=C.card_fg},
+    })
   end
 
   statusBar(); placeCursor(fields)
