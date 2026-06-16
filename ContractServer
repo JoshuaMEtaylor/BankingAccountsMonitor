@@ -51,7 +51,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION            = "1.0.6"
+local VERSION            = "1.0.7-CLAIMED-PRICE-LOCK"
 local LABEL              = "Quid-Contracts"
 local PROTOCOL           = "quid_contracts"
 local PROTOCOL_BROADCAST = "quid_contracts_discovery"
@@ -336,17 +336,31 @@ local function postContract(sender_id, req)
     local existing_id, existing = findLiveContractBySourceKey(src_key)
     if existing then
       local old_sig = existing.item_signature or itemSignature(existing.items or {})
-      local changed = (
+      local new_description = trim(req.description or "")
+      local old_reward = tonumber(existing.reward or 0) or 0
+      local reward_changed = old_reward ~= reward
+      local request_changed = (
         old_sig ~= sig or
-        tonumber(existing.reward or 0) ~= reward or
         trim(existing.title or "") ~= title or
-        trim(existing.description or "") ~= trim(req.description or "")
+        trim(existing.description or "") ~= new_description or
+        tonumber(existing.fixed_quantity or 0) ~= tonumber(req.fixed_quantity or existing.fixed_quantity or 0)
       )
 
+      local changed = request_changed or reward_changed
+
       existing.title = title
-      existing.description = trim(req.description or "")
+      existing.description = new_description
       existing.poster = poster
-      existing.reward = reward
+
+      -- Open jobs float with live inflation. Claimed jobs keep the price that
+      -- the player accepted unless the underlying request itself changed.
+      if existing.status == "open" or request_changed then
+        existing.reward = reward
+      else
+        existing.reward_locked = true
+        existing.locked_reward = old_reward
+      end
+
       existing.currency = "Q"
       existing.items = items
       existing.updated = timestamp()
@@ -361,19 +375,23 @@ local function postContract(sender_id, req)
       existing.quantity_min = req.quantity_min or existing.quantity_min
       existing.quantity_max = req.quantity_max or existing.quantity_max
       existing.exact_fulfillment = req.exact_fulfillment or existing.exact_fulfillment
+      existing.min_fulfillment = req.min_fulfillment or existing.min_fulfillment
+      existing.overdelivery_allowed = req.overdelivery_allowed or existing.overdelivery_allowed
       existing.building_id = req.building_id
       existing.location = req.location
       existing.escrow_status = req.escrow_status or existing.escrow_status or "not_locked"
       existing.source_key = src_key
       existing.item_signature = sig
 
-      if changed and existing.status == "claimed" then
+      if request_changed and existing.status == "claimed" then
         existing.status = "open"
         existing.claimed_by = nil
         existing.claimed_type = nil
         existing.claimed_at = nil
         existing.reopened_at = timestamp()
         existing.reopen_reason = "Live source request changed; old claim cleared"
+        existing.reward_locked = nil
+        existing.locked_reward = nil
       end
 
       writeFile(FILE.contracts, contracts)
@@ -382,7 +400,9 @@ local function postContract(sender_id, req)
       return true, {
         contract = publicContract(existing),
         message = changed and "Contract reconciled from live request" or "Contract already current",
-        updated = changed
+        updated = changed,
+        reward_updated = (existing.status == "open" and reward_changed) or request_changed,
+        reward_locked = existing.reward_locked or false
       }
     end
   end
