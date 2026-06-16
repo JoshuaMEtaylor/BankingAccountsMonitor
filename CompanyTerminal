@@ -59,7 +59,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION           = "1.2.5-GUI-FIX"
+local VERSION           = "1.2.5"
 local BANK_PROTOCOL     = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT        = 5
