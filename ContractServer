@@ -51,7 +51,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION            = "1.0.5-STRICT-LIVE-REQUESTS"
+local VERSION            = "1.0.6"
 local LABEL              = "Quid-Contracts"
 local PROTOCOL           = "quid_contracts"
 local PROTOCOL_BROADCAST = "quid_contracts_discovery"
@@ -181,9 +181,24 @@ local function itemSignature(items)
 end
 
 local function sameFulfilmentItem(required, supplied)
-  if not required or not supplied then return false end
-  return trim(required.item or required.id or required.name or "") == trim(supplied.item or supplied.id or supplied.name or "")
-    and math.floor(tonumber(required.count or 0) or 0) == math.floor(tonumber(supplied.count or supplied.amount or supplied.qty or 0) or 0)
+  if not required or not supplied then return false, "Missing fulfilment item" end
+
+  local required_item = trim(required.item or required.id or required.name or "")
+  local supplied_item = trim(supplied.item or supplied.id or supplied.name or "")
+  local required_count = math.floor(tonumber(required.count or 0) or 0)
+  local supplied_count = math.floor(tonumber(supplied.count or supplied.amount or supplied.qty or 0) or 0)
+
+  if required_item ~= supplied_item then
+    return false, "Wrong item type"
+  end
+  if supplied_count < required_count then
+    return false, "Insufficient quantity. Required at least " .. tostring(required_count) .. ", supplied " .. tostring(supplied_count)
+  end
+
+  -- Over-delivery is allowed because MineColonies fulfilment is a bit finicky.
+  -- The contract pays the fixed contract reward only; excess items do not earn
+  -- extra Quid.
+  return true
 end
 
 local function fulfilmentMatchesContract(c, supplied_items)
@@ -193,13 +208,16 @@ local function fulfilmentMatchesContract(c, supplied_items)
   if #required <= 0 then return false, "Contract has no required items" end
   if #supplied ~= 1 then return false, "Provide exactly one accepted item type for fulfilment" end
 
+  local last_error = "Fulfilment must use one accepted item and meet or exceed the required quantity"
   for _, req_item in ipairs(required) do
-    if sameFulfilmentItem(req_item, supplied[1]) then
+    local ok, err = sameFulfilmentItem(req_item, supplied[1])
+    if ok then
       return true
     end
+    last_error = err or last_error
   end
 
-  return false, "Fulfilment must exactly match one accepted option and the exact quantity"
+  return false, last_error
 end
 
 local function sourceKey(req)
