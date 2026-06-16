@@ -52,7 +52,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION          = "1.0.12"
+local VERSION          = "1.0.11-SECTOR-WORKER-PAY"
 local PROTOCOL         = "quid_bank"
 local TREASURY_ACCOUNT = "treasury:quid_bank"
 local DB_TIMEOUT       = 5
@@ -179,6 +179,8 @@ local function drawBottom()
   if last_message ~= "" then
     writeAt(2, h, last_message, last_message_colour, colors.black)
   end
+  local q = "[Q] Quit"
+  writeAt(w - #q, h, q, colors.lightGray, colors.black)
 end
 
 -- =============================================================================
@@ -370,7 +372,7 @@ local function formScreen(title, help, fields, submitLabel)
     if err ~= "" then
       writeAt(2, h - 3, err, colors.red, colors.black)
     else
-      writeAt(2, h - 3, "TAB changes field. Click Back to cancel.", colors.lightGray, colors.black)
+      writeAt(2, h - 3, "TAB changes field. ESC/B/back button cancels.", colors.lightGray, colors.black)
     end
 
     local bw = math.floor((w - 6) / 2)
@@ -438,7 +440,7 @@ local function formScreen(title, help, fields, submitLabel)
           fieldHits, bSubmit, bBack = draw()
         end
 
-      elseif p1 == keys.escape then
+      elseif p1 == keys.escape or p1 == keys.b then
         return nil
       end
 
@@ -489,7 +491,7 @@ local function confirmScreen(title, lines, confirmLabel, dangerous)
       if hit(bConfirm, p2, p3) then return true end
     elseif ev == "key" then
       if p1 == keys.enter then return true end
-      if p1 == keys.escape or p1 == keys.backspace then return false end
+      if p1 == keys.escape or p1 == keys.b or p1 == keys.backspace then return false end
     end
   end
 end
@@ -760,7 +762,7 @@ local function workerPaySectorMenu(rates)
         end
       end
     elseif ev == "key" then
-      if p1 == keys.escape or p1 == keys.backspace then return nil end
+      if p1 == keys.escape or p1 == keys.b or p1 == keys.backspace then return nil end
     end
   end
 end
@@ -927,11 +929,11 @@ local function screenAccounts()
       if hit(bPrev, p2, p3) then page = math.max(1, page - 1) end
       if hit(bNext, p2, p3) then page = math.min(totalPages, page + 1) end
     elseif ev == "key" then
-      if p1 == keys.escape or p1 == keys.backspace or p1 == keys.enter then
+      if p1 == keys.b or p1 == keys.escape or p1 == keys.backspace or p1 == keys.enter then
         return
-      elseif p1 == keys.left then
+      elseif p1 == keys.left or p1 == keys.p then
         page = math.max(1, page - 1)
-      elseif p1 == keys.right then
+      elseif p1 == keys.right or p1 == keys.n then
         page = math.min(totalPages, page + 1)
       end
     end
@@ -1029,11 +1031,11 @@ local function screenFiscalHistory()
       if hit(bPrev, p2, p3) then page = math.max(1, page - 1) end
       if hit(bNext, p2, p3) then page = math.min(totalPages, page + 1) end
     elseif ev == "key" then
-      if p1 == keys.escape or p1 == keys.backspace or p1 == keys.enter then
+      if p1 == keys.b or p1 == keys.escape or p1 == keys.backspace or p1 == keys.enter then
         return
-      elseif p1 == keys.left then
+      elseif p1 == keys.left or p1 == keys.p then
         page = math.max(1, page - 1)
-      elseif p1 == keys.right then
+      elseif p1 == keys.right or p1 == keys.n then
         page = math.min(totalPages, page + 1)
       end
     end
@@ -1108,9 +1110,6 @@ local function drawMain()
     end
   end
 
-  -- Explicit button only. No letter hotkeys on this terminal.
-  buttons.quit = button(2, h - 1, w - 3, "Quit", colors.gray, colors.white)
-
   drawBottom()
   return buttons
 end
@@ -1142,15 +1141,30 @@ local function mainLoop()
       elseif buttons.reconnect and hit(buttons.reconnect, mx, my) then
         connectServer()
         refreshStatus()
-      elseif hit(buttons.quit, mx, my) then
-        return
       end
 
       buttons = drawMain()
 
     elseif ev == "key" then
-      -- No single-letter hotkeys. This terminal uses mouse buttons so typing
-      -- into forms cannot accidentally trigger menu actions.
+      if p1 == keys.q then
+        return
+      elseif p1 == keys.r then
+        refreshStatus()
+      elseif p1 == keys.p then
+        actionPrintMoney()
+      elseif p1 == keys.g then
+        actionGrantFunds()
+      elseif p1 == keys.b then
+        actionBurnMoney()
+      elseif p1 == keys.a then
+        screenAccounts()
+      elseif p1 == keys.h then
+        screenFiscalHistory()
+      elseif p1 == keys.w then
+        actionWorkerPay()
+      end
+
+      buttons = drawMain()
     end
   end
 end
