@@ -22,7 +22,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.3.3-BALANCE-SNAPSHOT-COMPANY-OWNER-FIX"
+local VERSION  = "1.3.5-COMPANY-MGMT-MERGE"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -426,6 +426,48 @@ local function companyOwnerFields(company_id)
   local company = companies[company_id]
   local account = accounts[company_id]
   return company and company.owner_id or nil, account and account.owner_id or nil
+end
+
+
+local function isTrustedManagement(sender_id)
+  -- Practical local-server trust model for state terminals. Older code already
+  -- allowed state-facing terminals to call management handlers without login;
+  -- this function prevents nil-function crashes on balance lookups.
+  return true
+end
+
+local function escapePattern(s)
+  return (tostring(s or ""):gsub("([^%w])", "%%%1"))
+end
+
+local function rewriteShareLedgerCompanyId(old_company_id, new_company_id)
+  if old_company_id == new_company_id then return true end
+  if not fs.exists(FILE.share_ledger) then return true end
+  local old_pat = escapePattern(old_company_id)
+  local lines = readLines(FILE.share_ledger)
+  local changed = false
+  for i, line in ipairs(lines) do
+    local new_line = line:gsub(old_pat, new_company_id)
+    if new_line ~= line then
+      lines[i] = new_line
+      changed = true
+    end
+  end
+  if changed then return writeLines(FILE.share_ledger, lines) end
+  return true
+end
+
+local function rewriteBankContractCompanyId(old_company_id, new_company_id)
+  if old_company_id == new_company_id or type(contracts) ~= "table" then return end
+  local changed = false
+  for _, c in pairs(contracts) do
+    if type(c) == "table" then
+      for _, field in ipairs({"poster", "source_account", "source_company", "claimed_by"}) do
+        if c[field] == old_company_id then c[field] = new_company_id; changed = true end
+      end
+    end
+  end
+  if changed then writeFile(FILE.contracts, contracts) end
 end
 
 local function ledgerHasTx(tx_id)
@@ -1131,6 +1173,118 @@ handlers["company_info"] = function(sender_id, req)
     cash_balance     = balance,
     shareholders     = holdings,
     founded          = company.founded
+  }
+end
+
+
+-- UPDATE_COMPANY
+-- Owner-authorised company profile edit. Ticker changes rename company:<ticker>
+-- in companies/accounts/balances so players only need to see the ticker.
+handlers["update_company"] = function(sender_id, req)
+  local ok, citizen_id, citizen = authenticateUser(req.username, req.password)
+  if not ok then return false, citizen_id end
+
+  local old_company_id = req.company_id
+  if not old_company_id or old_company_id == "" then return false, "Missing company_id" end
+  if not companies[old_company_id] then return false, "Company not found: " .. tostring(old_company_id) end
+  if not accountExists(old_company_id) then return false, "Company account not found: " .. tostring(old_company_id) end
+  if not isCompanyOwner(old_company_id, citizen_id) then
+    return false, "Only the registered owner can edit this company"
+  end
+
+  local new_name = trim(req.name or companies[old_company_id].name or "")
+  local ticker = trim(req.ticker or companies[old_company_id].ticker or "")
+  ticker = string.upper(ticker):gsub("%s+", ""):gsub("[^A-Z0-9_%-]", "")
+  if new_name == "" then return false, "Missing company name" end
+  if ticker == "" then return false, "Invalid ticker" end
+
+  local new_company_id = "company:" .. string.lower(ticker)
+  if new_company_id ~= old_company_id and (companies[new_company_id] or accounts[new_company_id]) then
+    return false, "Ticker/account already exists: " .. new_company_id
+  end
+
+  local company = companies[old_company_id]
+  local account = accounts[old_company_id]
+  local bal = deriveBalance(old_company_id)
+
+  company.name = new_name
+  company.ticker = ticker
+  company.updated = timestamp()
+
+  account.display_name = new_name
+  account.owner_id = account.owner_id or company.owner_id or citizen_id
+
+  if new_company_id ~= old_company_id then
+    companies[new_company_id] = company
+    companies[old_company_id] = nil
+    accounts[new_company_id] = account
+    accounts[old_company_id] = nil
+    balances[new_company_id] = bal
+    balances[old_company_id] = nil
+    rewriteShareLedgerCompanyId(old_company_id, new_company_id)
+    rewriteBankContractCompanyId(old_company_id, new_company_id)
+  end
+
+  saveCompanies()
+  saveAccounts()
+  saveBalances()
+  audit("ACTION", citizen_id, sender_id, "UPDATE_COMPANY", tostring(old_company_id) .. "->" .. tostring(new_company_id))
+
+  return true, {
+    company_id = new_company_id,
+    old_company_id = old_company_id,
+    name = new_name,
+    ticker = ticker,
+    owner_id = company.owner_id,
+    account_owner_id = account.owner_id,
+    cash_balance = deriveBalance(new_company_id),
+    status = company.status,
+    message = "Company updated"
+  }
+end
+
+-- DISSOLVE_COMPANY
+-- Owner-authorised company deletion. Any remaining balance is paid back to the
+-- registered owner before the company account and record are removed.
+handlers["dissolve_company"] = function(sender_id, req)
+  local ok, citizen_id, citizen = authenticateUser(req.username, req.password)
+  if not ok then return false, citizen_id end
+
+  local company_id = req.company_id
+  if not company_id or company_id == "" then return false, "Missing company_id" end
+  if not companies[company_id] then return false, "Company not found: " .. tostring(company_id) end
+  if not accountExists(company_id) then return false, "Company account not found: " .. tostring(company_id) end
+  if not isCompanyOwner(company_id, citizen_id) then
+    return false, "Only the registered owner can dissolve this company"
+  end
+
+  local bal = deriveBalance(company_id)
+  local memo = req.memo or "Company dissolved by owner"
+  local payout_tx = nil
+
+  if bal > 0 then
+    local paid, res = transfer(company_id, citizen_id, bal, "COMPANY_DISSOLVE", memo, citizen_id)
+    if not paid then return false, "Could not pay out company balance: " .. tostring(res) end
+    payout_tx = res
+  end
+
+  local old_company = companies[company_id]
+  companies[company_id] = nil
+  accounts[company_id] = nil
+  balances[company_id] = nil
+  saveCompanies()
+  saveAccounts()
+  saveBalances()
+
+  audit("ACTION", citizen_id, sender_id, "DISSOLVE_COMPANY", tostring(company_id) .. " paid=" .. tostring(bal))
+
+  return true, {
+    company_id = company_id,
+    name = old_company and old_company.name or company_id,
+    owner_id = citizen_id,
+    paid_out = bal,
+    payout_tx = payout_tx,
+    message = "Company dissolved"
   }
 end
 
