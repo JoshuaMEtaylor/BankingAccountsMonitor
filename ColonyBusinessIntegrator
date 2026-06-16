@@ -32,7 +32,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION = "1.0.9-EXACT-RANGED-QUANTITY"
+local VERSION = "1.0.10-MINIMUM-RANGED-QUANTITY"
 local BANK_PROTOCOL = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT = 5
@@ -1216,8 +1216,8 @@ local function postContract(req, business, items, reward, fixed_quantity, min_q,
   key = key or reqKey(req, items, business)
   local title = reqTitle(req, fixed_quantity)
   local desc = "MineColonies request from " .. tostring(req.target or "unknown") ..
-    ". Exact quantity: " .. tostring(fixed_quantity) ..
-    " (source range " .. tostring(min_q) .. "-" .. tostring(max_q) .. "). Accepted items: " .. itemDesc(items)
+    ". Minimum quantity for payment: " .. tostring(fixed_quantity) ..
+    " (source range " .. tostring(min_q) .. "-" .. tostring(max_q) .. "; over-delivery allowed, no extra pay). Accepted items: " .. itemDesc(items)
 
   local ok, res = contractReq({
     type = "post_contract",
@@ -1237,6 +1237,8 @@ local function postContract(req, business, items, reward, fixed_quantity, min_q,
     quantity_min = min_q,
     quantity_max = max_q,
     exact_fulfillment = true,
+    min_fulfillment = true,
+    overdelivery_allowed = true,
     items = items,
   })
 
