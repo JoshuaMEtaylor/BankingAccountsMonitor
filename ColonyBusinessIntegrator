@@ -32,14 +32,14 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION = "1.0.3"
+local VERSION = "1.0.6-LIVE-REQUEST-RECONCILE"
 local BANK_PROTOCOL = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT = 5
 local SCAN_INTERVAL = 30
 
-local STARTING_CAPITAL = 5000
-local AUTO_GRANT_CAPITAL = true
+local STARTING_CAPITAL = 0
+local AUTO_GRANT_CAPITAL = false
 local DEFAULT_OWNER_ID = "treasury:quid_bank"
 
 local PRICE_INDEX = 1.00          -- central inflation price index from bank
@@ -52,13 +52,15 @@ local FILE_BUSINESSES = "data/building_companies.db"
 local FILE_POSTED = "data/posted_requests.db"
 local FILE_CONFIG = "data/colony_business_config.db"
 local FILE_CITIZENS = "data/colony_citizens.db"
+local FILE_INDUSTRIES = "data/industry_companies.db"
 
 local colony = nil
 local colony_name = "Colony"
 local modem_name = nil
 local bank_id = nil
 local contract_id = nil
-local businesses = {}
+local businesses = {}      -- building location -> industry company mapping
+local industry_companies = {} -- industry -> company record
 local posted = {}
 local citizens_map = {}
 local config = {}
@@ -71,6 +73,8 @@ local W, H = term.getSize()
 local stats = {
   buildings_seen = 0,
   businesses_registered = 0,
+  industry_count = 0,
+  business_locations = 0,
   citizens_seen = 0,
   citizen_accounts = 0,
   citizens_registered = 0,
@@ -223,15 +227,16 @@ local function draw()
   at(2, 5, "Contracts: " .. tostring(contract_id or "not connected"), contract_id and colors.lime or colors.red)
   at(2, 6, "Auto:      " .. (auto_mode and "ON" or "OFF"), auto_mode and colors.lime or colors.orange)
 
-  at(2, 8,  "Buildings: " .. tostring(stats.buildings_seen) .. "   Businesses: " .. tostring(countTable(businesses)) .. " (new " .. tostring(stats.businesses_registered) .. ")", colors.lightGray)
-  at(2, 9,  "Citizens:  " .. tostring(stats.citizens_seen) .. "   Accounts: " .. tostring(countTable(citizens_map)) .. " (new " .. tostring(stats.citizens_registered) .. ")", colors.lightGray)
-  at(2, 10, "Requests:  " .. tostring(stats.requests_seen) .. "   Contracts: " .. tostring(stats.contracts_posted), colors.lime)
-  at(2, 11, "Skipped:   unmapped " .. tostring(stats.skipped_unmapped) .. " / unfunded " .. tostring(stats.skipped_unfunded), colors.orange)
-  at(2, 12, "Pricing:   base " .. tostring(BASE_CONTRACT_FEE) .. " Q, index x" .. string.format("%.3f", PRICE_INDEX) .. ", rate " .. string.format("%.2f%%", INFLATION_RATE * 100), colors.lightGray)
+  at(2, 8,  "Buildings: " .. tostring(stats.buildings_seen) .. "   Industries: " .. tostring(countTable(industry_companies)) .. " (new " .. tostring(stats.businesses_registered) .. ")", colors.lightGray)
+  at(2, 9,  "Locations: " .. tostring(countTable(businesses)) .. "   Model: industry company + locations", colors.lightGray)
+  at(2, 10, "Citizens:  " .. tostring(stats.citizens_seen) .. "   Accounts: " .. tostring(countTable(citizens_map)) .. " (new " .. tostring(stats.citizens_registered) .. ")", colors.lightGray)
+  at(2, 11, "Requests:  " .. tostring(stats.requests_seen) .. "   Contracts: " .. tostring(stats.contracts_posted), colors.lime)
+  at(2, 12, "Skipped:   unmapped " .. tostring(stats.skipped_unmapped) .. " / unfunded " .. tostring(stats.skipped_unfunded), colors.orange)
+  at(2, 13, "Pricing:   base " .. tostring(BASE_CONTRACT_FEE) .. " Q, index x" .. string.format("%.3f", PRICE_INDEX) .. ", rate " .. string.format("%.2f%%", INFLATION_RATE * 100), colors.lightGray)
 
   local last = "never"
   if stats.last_scan > 0 then last = tostring(math.floor((now() - stats.last_scan) / 1000)) .. "s ago" end
-  at(2, 14, "Last scan: " .. last, colors.lightGray)
+  at(2, 15, "Last scan: " .. last, colors.lightGray)
 
   local bw = math.floor((W - 8) / 3)
   local bScan = button(2, H - 3, bw, "Scan Now", colors.purple)
@@ -316,24 +321,98 @@ end
 -- =============================================================================
 -- BUSINESS REGISTRATION
 -- =============================================================================
-local IGNORE_TYPES = { townhall=true, residence=true, home=true, citizen=true, decoration=true, decorations=true, graveyard=true }
+-- v1.0.4 changes the economic model from:
+--   1 building = 1 company
+-- to:
+--   1 industry = 1 company, many buildings = company locations
+--
+-- businesses[building_key] remains the location map used for request resolution.
+-- industry_companies[industry] is the primary company account for that industry.
+
+local IGNORE_TYPES = {
+  townhall=true, residence=true, home=true, citizen=true,
+  decoration=true, decorations=true, graveyard=true
+}
+
 local ECONOMIC_TYPES = {
   builder=true, cook=true, restaurant=true, deliveryman=true, courier=true, warehouse=true,
   miner=true, mine=true, lumberjack=true, forester=true, farmer=true, farm=true, sawmill=true,
   blacksmith=true, smeltery=true, crusher=true, composter=true, baker=true, bakery=true,
-  fisher=true, university=true, guardtower=true,
+  fisher=true, university=true, guardtower=true, barracks=true, combatacademy=true,
+  mechanic=true, stonesmeltery=true, shepherd=true, cowhand=true, swineherder=true,
+  chickenherder=true, rabbitfarmer=true, plantation=true, concretemixer=true,
 }
-local SUFFIX = {
-  builder={"Builders","Construction","Works"}, cook={"Kitchens","Catering","Hearthworks"}, restaurant={"Kitchens","Catering","Hearthworks"},
-  deliveryman={"Logistics","Carriers","Dispatch"}, courier={"Logistics","Carriers","Dispatch"}, warehouse={"Storage","Logistics","Warehousing"},
-  miner={"Mining","Quarry","Excavation"}, mine={"Mining","Quarry","Excavation"}, lumberjack={"Timberworks","Forestry","Timber"}, forester={"Timberworks","Forestry","Timber"},
-  farmer={"Produce","Agriculture","Farms"}, farm={"Produce","Agriculture","Farms"}, sawmill={"Milling","Timber","Sawmills"},
-  blacksmith={"Smithing","Foundry","Forge"}, smeltery={"Foundry","Smelting","Metals"}, crusher={"Crushing","Materials","Stoneworks"},
-  composter={"Composting","Soils","Organics"}, baker={"Bakery","Baking","Ovens"}, bakery={"Bakery","Baking","Ovens"}, fisher={"Fisheries","Fishery","Harbour"},
-  university={"Research","Institute","Studies"}, guardtower={"Security","Watch","Defence"},
+
+local INDUSTRY_BY_TYPE = {
+  -- Public works / construction
+  builder="construction",
+
+  -- Hospitality / citizen service
+  cook="hospitality", restaurant="hospitality", dininghall="hospitality",
+  tavern="hospitality", baker="hospitality", bakery="hospitality",
+
+  -- Logistics infrastructure
+  deliveryman="logistics", courier="logistics", warehouse="logistics",
+
+  -- Extraction
+  miner="mining", mine="mining", quarry="mining",
+
+  -- Timber chain
+  lumberjack="timber", forester="timber", sawmill="timber",
+
+  -- Agriculture / food production
+  farmer="agriculture", farm="agriculture", fisher="agriculture", fisherman="agriculture",
+  composter="agriculture", plantation="agriculture", shepherd="agriculture",
+  cowhand="agriculture", swineherder="agriculture", chickenherder="agriculture", rabbitfarmer="agriculture",
+
+  -- Manufacturing / industry
+  blacksmith="manufacturing", smeltery="manufacturing", crusher="manufacturing",
+  mechanic="manufacturing", stonesmeltery="manufacturing", concretemixer="manufacturing",
+
+  -- State intellectual institutions
+  university="research", researcher="research", library="research", school="research",
+
+  -- State military/security institutions
+  guardtower="defence", barracks="defence", combatacademy="defence", archer="defence", knight="defence",
 }
-local PREFIX = {"Plenty","Muppet","Northgate","Eastmere","Oakmere","Hearthline","Greyford","Redbridge","Highwall","Deepwell","Ashford","Stoneford","Greenridge","Ironmere","Westbrook","Rookwell","Clearwater","Longfield","Southmere","Blackfen","Whitehill","Kingswell","Brindle","Holloway"}
-local RESERVED = { QUID=true, BANK=true, TRSY=true, GOVT=true, STAT=true, MRKT=true, CNTR=true, CNCL=true, CASH=true, MINT=true }
+
+local INDUSTRY_LABEL = {
+  construction="Construction",
+  hospitality="Hospitality",
+  logistics="Logistics",
+  mining="Mining",
+  timber="Timber",
+  agriculture="Agriculture",
+  manufacturing="Manufacturing",
+  research="Research",
+  defence="Defence",
+  general="Services",
+}
+
+local INDUSTRY_SUFFIX = {
+  construction={"Construction", "Builders", "Public Works"},
+  hospitality={"Hospitality", "Catering", "Dining"},
+  logistics={"Logistics", "Carriers", "Dispatch"},
+  mining={"Mining", "Quarry", "Excavation"},
+  timber={"Timber", "Forestry", "Milling"},
+  agriculture={"Agriculture", "Produce", "Farms"},
+  manufacturing={"Manufacturing", "Foundry", "Works"},
+  research={"Research", "Institute", "Studies"},
+  defence={"Defence", "Security", "Watch"},
+  general={"Services", "Works", "Trading"},
+}
+
+local PREFIX = {
+  "Plenty", "Muppet", "Northgate", "Eastmere", "Oakmere", "Hearthline",
+  "Greyford", "Redbridge", "Highwall", "Deepwell", "Ashford", "Stoneford",
+  "Greenridge", "Ironmere", "Westbrook", "Rookwell", "Clearwater", "Longfield",
+  "Southmere", "Blackfen", "Whitehill", "Kingswell", "Brindle", "Holloway"
+}
+
+local RESERVED = {
+  QUID=true, BANK=true, TRSY=true, GOVT=true, STAT=true,
+  MRKT=true, CNTR=true, CNCL=true, CASH=true, MINT=true
+}
 
 local function normalType(t)
   t = tostring(t or "")
@@ -359,6 +438,30 @@ local function workKey(w)
   return normalType(w.type or w.name) .. "@" .. locString(w.location)
 end
 
+local function classifyIndustryFromType(typ, name)
+  typ = normalType(typ or name)
+  local n = lower(name or "")
+
+  if INDUSTRY_BY_TYPE[typ] then return INDUSTRY_BY_TYPE[typ] end
+
+  if n:find("cook", 1, true) or n:find("restaurant", 1, true) or n:find("dining", 1, true) then return "hospitality" end
+  if n:find("builder", 1, true) then return "construction" end
+  if n:find("warehouse", 1, true) or n:find("courier", 1, true) or n:find("delivery", 1, true) then return "logistics" end
+  if n:find("miner", 1, true) or n:find("mine", 1, true) or n:find("quarry", 1, true) then return "mining" end
+  if n:find("lumber", 1, true) or n:find("forester", 1, true) or n:find("sawmill", 1, true) then return "timber" end
+  if n:find("farm", 1, true) or n:find("fisher", 1, true) or n:find("compost", 1, true) then return "agriculture" end
+  if n:find("smith", 1, true) or n:find("smeltery", 1, true) or n:find("crusher", 1, true) then return "manufacturing" end
+  if n:find("university", 1, true) or n:find("research", 1, true) then return "research" end
+  if n:find("guard", 1, true) or n:find("barracks", 1, true) or n:find("combat", 1, true) then return "defence" end
+
+  return "general"
+end
+
+local function buildingIndustry(b)
+  if not b then return "general" end
+  return classifyIndustryFromType(b.type or b.name, b.name)
+end
+
 local function isEconomic(b)
   if not b then return false end
   local t = normalType(b.type or b.name)
@@ -366,18 +469,21 @@ local function isEconomic(b)
   if IGNORE_TYPES[t] then return false end
   if n:find("townhall",1,true) or n:find("residence",1,true) or n:find("graveyard",1,true) then return false end
   if ECONOMIC_TYPES[t] then return true end
+  if INDUSTRY_BY_TYPE[t] then return true end
   if type(b.citizens) == "table" and #b.citizens > 0 then return true end
   return false
 end
 
 local function usedName(name)
-  for _, r in pairs(businesses) do if r.name == name then return true end end
+  for _, r in pairs(industry_companies or {}) do if r.name == name then return true end end
+  for _, r in pairs(businesses or {}) do if r.name == name then return true end end
   return false
 end
 
 local function usedTicker(t)
   if RESERVED[t] then return true end
-  for _, r in pairs(businesses) do if r.ticker == t then return true end end
+  for _, r in pairs(industry_companies or {}) do if r.ticker == t then return true end end
+  for _, r in pairs(businesses or {}) do if r.ticker == t then return true end end
   return false
 end
 
@@ -388,65 +494,227 @@ local function padTicker(s)
   return s
 end
 
-local function tickerFromName(name, typ)
+local function tickerFromName(name, industry)
   local words = {}
   for w in tostring(name):gmatch("%w+") do words[#words+1] = w:upper() end
   local s = ""
   if #words >= 2 then s = words[1]:sub(1,2) .. words[2]:sub(1,2)
   elseif #words == 1 then s = words[1]:sub(1,4) end
-  if #s < 4 then s = s .. tostring(typ or "BIZ"):upper():sub(1, 4 - #s) end
+  if #s < 4 then s = s .. tostring(industry or "BIZ"):upper():sub(1, 4 - #s) end
   return padTicker(s)
 end
 
-local function generateIdentity(typ)
-  typ = normalType(typ)
-  local suffixes = SUFFIX[typ] or {"Works","Services","Trading"}
+local function generateIndustryIdentity(industry)
+  industry = industry or "general"
+  local suffixes = INDUSTRY_SUFFIX[industry] or INDUSTRY_SUFFIX.general
   for _ = 1, 50 do
     local name = PREFIX[math.random(1,#PREFIX)] .. " " .. suffixes[math.random(1,#suffixes)]
-    local ticker = tickerFromName(name, typ)
+    local ticker = tickerFromName(name, industry)
     if not usedName(name) and not usedTicker(ticker) then return name, ticker end
   end
   local ticker
-  repeat ticker = padTicker(string.char(math.random(65,90)) .. string.char(math.random(65,90)) .. string.char(math.random(65,90)) .. string.char(math.random(65,90))) until not usedTicker(ticker)
-  return "Colony " .. ticker .. " Works", ticker
+  repeat
+    ticker = padTicker(string.char(math.random(65,90)) .. string.char(math.random(65,90)) .. string.char(math.random(65,90)) .. string.char(math.random(65,90)))
+  until not usedTicker(ticker)
+  return "Colony " .. ticker .. " " .. (INDUSTRY_LABEL[industry] or "Services"), ticker
 end
 
-local function registerBuilding(b)
-  local key = buildingKey(b)
-  if businesses[key] then return false end
-  local typ = normalType(b.type or b.name)
+local function getIndustryCompany(industry)
+  industry = industry or "general"
+  return industry_companies[industry]
+end
+
+local function registerIndustryCompany(industry)
+  industry = industry or "general"
+  if industry_companies[industry] then return industry_companies[industry], false end
+
   for _ = 1, 20 do
-    local name, ticker = generateIdentity(typ)
-    local ok, res = bankReq({ type="register_company", name=name, ticker=ticker, biz_type=typ, owner_id=DEFAULT_OWNER_ID, shares_total=1000, shares_public=0 })
+    local name, ticker = generateIndustryIdentity(industry)
+    local ok, res = bankReq({
+      type="register_company",
+      name=name,
+      ticker=ticker,
+      biz_type=industry,
+      owner_id=DEFAULT_OWNER_ID,
+      shares_total=1000,
+      shares_public=0,
+    })
+
     if ok and type(res) == "table" then
-      businesses[key] = { key=key, company_id=res.company_id or ("company:"..lower(ticker)), name=name, ticker=ticker, building_type=typ, building_name=b.name or typ, location=b.location, level=b.level or 0, built=true, enabled=true, registered_at=now() }
-      writeFile(FILE_BUSINESSES, businesses)
+      local rec = {
+        industry = industry,
+        industry_label = INDUSTRY_LABEL[industry] or industry,
+        company_id = res.company_id or ("company:" .. lower(ticker)),
+        name = name,
+        ticker = ticker,
+        locations = {},
+        location_count = 0,
+        created_at = now(),
+        enabled = true,
+      }
+      industry_companies[industry] = rec
+      writeFile(FILE_INDUSTRIES, industry_companies)
+
       if AUTO_GRANT_CAPITAL and STARTING_CAPITAL > 0 then
-        bankReq({ type="grant", to_id=businesses[key].company_id, amount=STARTING_CAPITAL, memo="Starting capital for " .. name }, DB_TIMEOUT)
+        local gok, gres = bankReq({ type="grant", to_id=rec.company_id, amount=STARTING_CAPITAL, memo="Industry startup capital for " .. name }, DB_TIMEOUT)
+        rec.startup_granted = gok and true or false
+        rec.startup_error = gok and nil or tostring(gres)
+        rec.startup_capital = STARTING_CAPITAL
+        rec.startup_granted_at = gok and now() or nil
+        writeFile(FILE_INDUSTRIES, industry_companies)
       end
+
       stats.businesses_registered = stats.businesses_registered + 1
       setMsg("Registered " .. name .. " (" .. ticker .. ")", colors.lime)
-      return true
+      return rec, true
     end
-    if not tostring(res or ""):find("Company already exists", 1, true) then return false end
+
+    if not tostring(res or ""):find("Company already exists", 1, true) then
+      setMsg("Industry registration failed: " .. tostring(res), colors.red)
+      return nil, false
+    end
   end
-  return false
+
+  setMsg("Could not generate unique industry company", colors.red)
+  return nil, false
+end
+
+local function attachBuildingToCompany(b, company, industry)
+  local key = buildingKey(b)
+  if not company then return false end
+
+  local existing = businesses[key]
+  local previous_company = existing and existing.company_id or nil
+
+  businesses[key] = businesses[key] or {}
+  local rec = businesses[key]
+
+  rec.key = key
+  rec.industry = industry
+  rec.company_id = company.company_id
+  rec.name = company.name
+  rec.ticker = company.ticker
+  rec.building_type = normalType(b.type or b.name)
+  rec.building_name = b.name or rec.building_type
+  rec.location = b.location
+  rec.level = b.level or rec.level or 0
+  rec.built = b.built and true or false
+  rec.enabled = true
+  rec.updated_at = now()
+
+  if not rec.attached_at then rec.attached_at = now() end
+  if previous_company and previous_company ~= company.company_id then
+    rec.previous_company_id = previous_company
+  end
+
+  company.locations = company.locations or {}
+  company.locations[key] = {
+    key = key,
+    building_type = rec.building_type,
+    building_name = rec.building_name,
+    location = rec.location,
+    level = rec.level,
+    attached_at = rec.attached_at,
+    updated_at = rec.updated_at,
+  }
+
+  local n = 0
+  for _ in pairs(company.locations) do n = n + 1 end
+  company.location_count = n
+  company.updated_at = now()
+
+  return true
+end
+
+local function migrateIndustryMappings()
+  industry_companies = industry_companies or {}
+  businesses = businesses or {}
+
+  -- First boot after v1.0.4: use existing building-company records as the
+  -- seed companies for each industry, then remap duplicate locations in the
+  -- same industry to that first primary company. Old duplicate company bank
+  -- accounts are not deleted; they just stop being used for future location
+  -- request posting.
+  for key, rec in pairs(businesses) do
+    if type(rec) == "table" then
+      local industry = rec.industry or classifyIndustryFromType(rec.building_type or rec.type, rec.building_name or rec.name)
+      rec.industry = industry
+      if not industry_companies[industry] and rec.company_id then
+        industry_companies[industry] = {
+          industry = industry,
+          industry_label = INDUSTRY_LABEL[industry] or industry,
+          company_id = rec.company_id,
+          name = rec.name or rec.display_name or rec.company_id,
+          ticker = rec.ticker or tostring(rec.company_id):gsub("company:", ""):upper():sub(1,4),
+          locations = {},
+          created_at = rec.registered_at or rec.attached_at or now(),
+          migrated_from_location = key,
+          enabled = true,
+        }
+      end
+    end
+  end
+
+  for key, rec in pairs(businesses) do
+    if type(rec) == "table" then
+      local industry = rec.industry or classifyIndustryFromType(rec.building_type or rec.type, rec.building_name or rec.name)
+      local company = industry_companies[industry]
+      if company then
+        if rec.company_id and rec.company_id ~= company.company_id then
+          rec.previous_company_id = rec.company_id
+        end
+        rec.industry = industry
+        rec.company_id = company.company_id
+        rec.name = company.name
+        rec.ticker = company.ticker
+        company.locations = company.locations or {}
+        company.locations[key] = {
+          key = key,
+          building_type = rec.building_type,
+          building_name = rec.building_name,
+          location = rec.location,
+          level = rec.level,
+          attached_at = rec.attached_at or rec.registered_at or now(),
+          updated_at = rec.updated_at or now(),
+        }
+      end
+    end
+  end
+
+  for _, company in pairs(industry_companies) do
+    local n = 0
+    for _ in pairs(company.locations or {}) do n = n + 1 end
+    company.location_count = n
+  end
+
+  writeFile(FILE_BUSINESSES, businesses)
+  writeFile(FILE_INDUSTRIES, industry_companies)
 end
 
 local function scanBusinesses(buildings)
   for _, b in ipairs(buildings or {}) do
     if b.built and isEconomic(b) then
       local key = buildingKey(b)
-      if not businesses[key] then registerBuilding(b)
-      else
-        businesses[key].level = b.level or businesses[key].level
-        businesses[key].updated_at = now()
+      local industry = buildingIndustry(b)
+      local company = getIndustryCompany(industry)
+      if not company then
+        company = registerIndustryCompany(industry)
+      end
+      if company then
+        local was_new_location = businesses[key] == nil
+        attachBuildingToCompany(b, company, industry)
+        if was_new_location then
+          setMsg("Added " .. tostring(b.name or key) .. " to " .. company.name, colors.lime)
+        end
       end
     end
   end
-  writeFile(FILE_BUSINESSES, businesses)
-end
 
+  stats.industry_count = countTable(industry_companies)
+  stats.business_locations = countTable(businesses)
+  writeFile(FILE_BUSINESSES, businesses)
+  writeFile(FILE_INDUSTRIES, industry_companies)
+end
 
 -- =============================================================================
 -- CITIZEN ACCOUNT SYNC
@@ -746,19 +1014,72 @@ local function citizenMatches(z, target)
   return t:find(name,1,true) ~= nil or name:find(t,1,true) ~= nil
 end
 
+local function resolveBusinessFromText(target)
+  local t = lower(target or "")
+  if t == "" then return nil end
+
+  -- Direct building/business text match. MineColonies often reports targets as
+  -- "Dining Hall: Name" rather than a clean citizen work table, so do not rely
+  -- only on matching a citizen name.
+  local best = nil
+  for _, b in pairs(businesses or {}) do
+    local bname = lower(b.building_name or "")
+    local btype = lower(b.building_type or "")
+    local industry = lower(b.industry or "")
+
+    if bname ~= "" and t:find(bname, 1, true) then return b end
+    if btype ~= "" and t:find(btype, 1, true) then best = best or b end
+    if industry ~= "" and t:find(industry, 1, true) then best = best or b end
+  end
+
+  -- Common MineColonies wording fallbacks.
+  local wanted_industry = nil
+  if t:find("dining",1,true) or t:find("restaurant",1,true) or t:find("cook",1,true) or t:find("waiter",1,true) then
+    wanted_industry = "hospitality"
+  elseif t:find("fish",1,true) or t:find("fisher",1,true) or t:find("farm",1,true) then
+    wanted_industry = "agriculture"
+  elseif t:find("courier",1,true) or t:find("delivery",1,true) or t:find("warehouse",1,true) then
+    wanted_industry = "logistics"
+  elseif t:find("builder",1,true) or t:find("build",1,true) then
+    wanted_industry = "construction"
+  elseif t:find("miner",1,true) or t:find("mine",1,true) then
+    wanted_industry = "mining"
+  end
+
+  if wanted_industry then
+    for _, b in pairs(businesses or {}) do
+      if b.industry == wanted_industry then return b end
+    end
+  end
+
+  return best
+end
+
 local function resolveBusiness(req, citizens)
   local target = req and req.target
+
   if type(target) == "string" then
+    -- 1) Prefer a citizen worker location if the target contains a citizen name.
     for _, z in ipairs(citizens or {}) do
       if citizenMatches(z, target) and type(z.work) == "table" then
         local key = workKey(z.work)
         if businesses[key] then return businesses[key] end
       end
     end
+
+    -- 2) Then resolve against building/business text. This fixes targets like
+    -- "Dining Hall: Alessia U." where the citizen match fails or changes.
+    local by_text = resolveBusinessFromText(target)
+    if by_text then return by_text end
+
   elseif type(target) == "table" then
     local key = normalType(target.type or target.name) .. "@" .. locString(target.location or target)
     if businesses[key] then return businesses[key] end
+
+    local by_text = resolveBusinessFromText(tostring(target.name or target.type or ""))
+    if by_text then return by_text end
   end
+
   return nil
 end
 
@@ -769,9 +1090,26 @@ local function simpleHash(raw)
   return tostring(h)
 end
 
-local function reqKey(req)
+local function itemSignature(items)
+  local out = {}
+  for _, it in ipairs(items or {}) do
+    out[#out+1] = tostring(it.item or "") .. ":" .. tostring(it.count or 0)
+  end
+  table.sort(out)
+  return table.concat(out, ";")
+end
+
+local function reqKey(req, items)
+  -- Use MineColonies request id when it exists so a changed live request updates
+  -- the existing contract instead of creating duplicates. ContractServer upsert
+  -- compares the item signature and rewrites/reopens the contract if required.
   if req.id then return "request:" .. tostring(req.id) end
-  return "request_hash:" .. simpleHash(tostring(req.name or "") .. "|" .. tostring(req.desc or "") .. "|" .. tostring(req.target or "") .. "|" .. tostring(req.count or ""))
+
+  -- Fallback for request objects without a stable id. In that case the item
+  -- signature must be part of the key so two different food/fuel requests from
+  -- the same building do not collapse into one posted entry.
+  local sig = itemSignature(items or extractItems(req))
+  return "request_hash:" .. simpleHash(tostring(req.name or "") .. "|" .. tostring(req.desc or "") .. "|" .. tostring(req.target or "") .. "|" .. tostring(req.count or "") .. "|" .. sig)
 end
 
 local function reqTitle(req)
@@ -787,10 +1125,13 @@ local function itemDesc(items)
 end
 
 local function postContract(req, business, items, reward)
-  local key = reqKey(req)
+  local key = reqKey(req, items)
   local desc = "MineColonies request from " .. tostring(req.target or "unknown") .. ". Accepted items: " .. itemDesc(items)
+
   local ok, res = contractReq({
     type = "post_contract",
+    upsert = true,
+    source_key = key,
     title = reqTitle(req),
     description = desc,
     poster = business.company_id,
@@ -801,39 +1142,87 @@ local function postContract(req, business, items, reward)
     building_id = business.key,
     items = items,
   })
+
   if ok and type(res) == "table" then
-    local cid = res.contract and res.contract.contract_id or "unknown"
-    posted[key] = { contract_id=cid, request_id=req.id, business=business.company_id, reward=reward, posted_at=now(), title=reqTitle(req) }
+    local cid = res.contract and res.contract.contract_id or (posted[key] and posted[key].contract_id) or "unknown"
+    local action = res.posted and "Posted" or (res.updated and "Updated" or "Refreshed")
+
+    posted[key] = {
+      contract_id = cid,
+      request_id = req.id,
+      source_key = key,
+      business = business.company_id,
+      reward = reward,
+      posted_at = posted[key] and posted[key].posted_at or now(),
+      refreshed_at = now(),
+      title = reqTitle(req),
+      item_signature = itemSignature(items)
+    }
     writeFile(FILE_POSTED, posted)
-    stats.contracts_posted = stats.contracts_posted + 1
-    setMsg("Posted " .. reqTitle(req) .. " for " .. money(reward), colors.lime)
-    return true
+
+    if res.posted then stats.contracts_posted = stats.contracts_posted + 1 end
+    setMsg(action .. " " .. reqTitle(req) .. " for " .. money(reward), colors.lime)
+    return true, key
   end
-  setMsg("Post failed: " .. tostring(res), colors.red)
-  return false
+
+  setMsg("Post/update failed: " .. tostring(res), colors.red)
+  return false, nil
+end
+
+
+local function syncStaleContracts(active_keys)
+  local active_list = {}
+  for key, _ in pairs(active_keys or {}) do active_list[#active_list+1] = key end
+
+  local ok, res = contractReq({
+    type = "sync_source_contracts",
+    source_type = "minecolonies_request",
+    active_source_keys = active_list,
+    reason = "MineColonies request no longer exists or is no longer affordable"
+  }, 8)
+
+  if ok and type(res) == "table" then
+    -- Clean local posted cache for keys that are no longer active.
+    for key, _ in pairs(posted or {}) do
+      if not active_keys[key] then posted[key] = nil end
+    end
+    writeFile(FILE_POSTED, posted)
+    if tonumber(res.cancelled or 0) > 0 then
+      setMsg("Cancelled " .. tostring(res.cancelled) .. " stale contracts.", colors.orange)
+    end
+  end
 end
 
 local function scanRequests(requests, citizens)
+  local active_keys = {}
+
   for _, req in ipairs(requests or {}) do
     stats.requests_seen = stats.requests_seen + 1
-    local key = reqKey(req)
-    if not posted[key] then
-      local business = resolveBusiness(req, citizens)
-      if not business then
-        stats.skipped_unmapped = stats.skipped_unmapped + 1
-      else
-        local items = extractItems(req)
-        if #items > 0 then
-          local reward, reason, bal = priceJob(business, items)
-          if reward then postContract(req, business, items, reward)
-          else
-            stats.skipped_unfunded = stats.skipped_unfunded + 1
-            setMsg("Skipped " .. reqTitle(req) .. ": " .. tostring(reason) .. " (" .. money(bal) .. ")", colors.orange)
-          end
+
+    local business = resolveBusiness(req, citizens)
+    if not business then
+      stats.skipped_unmapped = stats.skipped_unmapped + 1
+    else
+      local items = extractItems(req)
+      local key = reqKey(req, items)
+
+      if #items > 0 then
+        local reward, reason, bal = priceJob(business, items)
+        if reward then
+          local posted_ok, active_key = postContract(req, business, items, reward)
+          if posted_ok and active_key then active_keys[active_key] = true end
+        else
+          stats.skipped_unfunded = stats.skipped_unfunded + 1
+          setMsg("Skipped " .. reqTitle(req) .. ": " .. tostring(reason) .. " (" .. money(bal) .. ")", colors.orange)
         end
+      else
+        stats.skipped_unmapped = stats.skipped_unmapped + 1
+        setMsg("Skipped " .. reqTitle(req) .. ": no valid item list", colors.orange)
       end
     end
   end
+
+  syncStaleContracts(active_keys)
 end
 
 -- =============================================================================
@@ -870,6 +1259,8 @@ end
 
 local function loadState()
   businesses = readFile(FILE_BUSINESSES) or {}
+  industry_companies = readFile(FILE_INDUSTRIES) or {}
+  migrateIndustryMappings()
   posted = readFile(FILE_POSTED) or {}
   citizens_map = readFile(FILE_CITIZENS) or {}
   config = readFile(FILE_CONFIG) or {}
