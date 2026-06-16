@@ -32,7 +32,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION = "1.0.10"
+local VERSION = "1.0.11-LIVE-INFLATION-PRICING"
 local BANK_PROTOCOL = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT = 5
@@ -1212,9 +1212,34 @@ local function itemDesc(items)
   return table.concat(out, ", ")
 end
 
+local function shouldUpsertContract(key, reward, item_sig, title)
+  local p = posted and posted[key] or nil
+  if not p then return true end
+
+  -- Always refresh occasionally so stale source metadata stays alive, but do not
+  -- rewrite a contract every scan for tiny changes.
+  local age = now() - (tonumber(p.refreshed_at) or 0)
+  if age > 60000 then return true end
+
+  if tostring(p.item_signature or "") ~= tostring(item_sig or "") then return true end
+  if tostring(p.title or "") ~= tostring(title or "") then return true end
+
+  local old_reward = tonumber(p.reward) or 0
+  local new_reward = tonumber(reward) or 0
+
+  -- Whole-Quid threshold. This keeps inflation live without noisy churn.
+  return math.abs(new_reward - old_reward) >= 1
+end
+
 local function postContract(req, business, items, reward, fixed_quantity, min_q, max_q, key)
   key = key or reqKey(req, items, business)
   local title = reqTitle(req, fixed_quantity)
+  local item_sig = itemSignature(items)
+
+  if not shouldUpsertContract(key, reward, item_sig, title) then
+    return true, key
+  end
+
   local desc = "MineColonies request from " .. tostring(req.target or "unknown") ..
     ". Minimum quantity for payment: " .. tostring(fixed_quantity) ..
     " (source range " .. tostring(min_q) .. "-" .. tostring(max_q) .. "; over-delivery allowed, no extra pay). Accepted items: " .. itemDesc(items)
@@ -1258,7 +1283,7 @@ local function postContract(req, business, items, reward, fixed_quantity, min_q,
       posted_at = posted[key] and posted[key].posted_at or now(),
       refreshed_at = now(),
       title = title,
-      item_signature = itemSignature(items)
+      item_signature = item_sig
     }
     writeFile(FILE_POSTED, posted)
 
