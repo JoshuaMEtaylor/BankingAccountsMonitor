@@ -10,7 +10,7 @@
 --   * Capitalise company from the logged-in citizen bank account
 --   * Pay company funds back out to the registered owner citizen account
 --   * Connect to ContractServer
---   * Post company contracts
+--   * Post simple company contracts
 --   * View contracts involving the active company
 --   * Mark claimed contract fulfilled
 --   * Cancel company-posted contract
@@ -59,7 +59,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION           = "1.2.8-SINGLE-CO"
+local VERSION           = "1.2.9-CONTRACT-LITE"
 local BANK_PROTOCOL     = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT        = 5
@@ -814,19 +814,17 @@ local function doPostContract()
 
   local title = trim(post.title)
   local reward = positiveInt(post.reward)
-  local item = trim(post.item)
-  local count = positiveInt(post.count)
+  local item = "company:work_order"
+  local count = 1
   if title == "" then setMessage("Missing contract title.", C.err); return end
   if not reward then setMessage("Invalid reward.", C.err); return end
-  if item == "" then setMessage("Missing item id.", C.err); return end
-  if not count then setMessage("Invalid item count.", C.err); return end
 
   if not confirmScreen("Post company contract", {
     "Company: " .. active_company_id,
     "Title:   " .. title,
     "Reward:  " .. money(reward),
-    "Item:    " .. tostring(count) .. "x " .. item,
     "",
+    "Item/count details are hidden for now.",
     "No escrow is locked yet. ContractServer payment hooks are next.",
   }, "Post") then setMessage("Post cancelled.", C.dim); return end
 
@@ -839,7 +837,7 @@ local function doPostContract()
     source_company = active_company_id,
     source_type = "company_terminal",
     reward = reward,
-    items = {{item=item, display=item, count=count}},
+    items = {{item=item, display="Company work order", count=count}},
     escrow_status = "not_locked",
   })
 
@@ -997,17 +995,8 @@ local function drawMain()
     at(4, card_y + 3, "Title", C.card_fg, C.card)
     fields[1] = inputField(4, card_y + 4, full_w, post.title, false)
 
-    local left_w = 16
-    local right_x = 24
-    local right_w = math.max(10, W - right_x - 3)
-
-    at(4, card_y + 5, "Reward Q", C.card_fg, C.card)
-    at(right_x, card_y + 5, "Item ID", C.card_fg, C.card)
-    fields[2] = inputField(4, card_y + 6, left_w, post.reward, false)
-    fields[3] = inputField(right_x, card_y + 6, right_w, post.item, false)
-
-    at(4, card_y + 7, "Count", C.card_fg, C.card)
-    fields[4] = inputField(4, card_y + 8, left_w, post.count, false)
+    at(4, card_y + 6, "Reward Q", C.card_fg, C.card)
+    fields[2] = inputField(4, card_y + 7, full_w, post.reward, false)
 
     buttons = buttonRow(btn_y, {
       {key="primary", label="Post", bg=C.btn_pri, fg=C.btn_fg},
@@ -1066,9 +1055,6 @@ local function appendChar(ch)
   elseif mode == "contracts" then
     if focused == 1 and #post.title < 40 then post.title = post.title .. ch end
     if focused == 2 and #post.reward < 10 then post.reward = post.reward .. ch end
-    if focused == 3 and #post.item < 48 then post.item = post.item .. ch end
-    if focused == 4 and #post.count < 10 then post.count = post.count .. ch end
-    if focused == 5 and #post.description < 64 then post.description = post.description .. ch end
   elseif mode == "ops" then
     if focused == 1 and #ops.contract_id < 20 then ops.contract_id = ops.contract_id .. ch end
     if focused == 2 and #ops.note < 64 then ops.note = ops.note .. ch end
@@ -1088,9 +1074,6 @@ local function backspaceField()
   elseif mode == "contracts" then
     if focused == 1 then post.title = post.title:sub(1, -2) end
     if focused == 2 then post.reward = post.reward:sub(1, -2) end
-    if focused == 3 then post.item = post.item:sub(1, -2) end
-    if focused == 4 then post.count = post.count:sub(1, -2) end
-    if focused == 5 then post.description = post.description:sub(1, -2) end
   elseif mode == "ops" then
     if focused == 1 then ops.contract_id = ops.contract_id:sub(1, -2) end
     if focused == 2 then ops.note = ops.note:sub(1, -2) end
