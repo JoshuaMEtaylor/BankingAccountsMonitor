@@ -52,7 +52,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION          = "1.0.10-WORKER-PAY-UI"
+local VERSION          = "1.0.11-SECTOR-WORKER-PAY"
 local PROTOCOL         = "quid_bank"
 local TREASURY_ACCOUNT = "treasury:quid_bank"
 local DB_TIMEOUT       = 5
@@ -663,20 +663,135 @@ local function actionBurnMoney()
   end
 end
 
+local function tierLabel(tier)
+  if tier == "unskilled" then return "Unskilled" end
+  if tier == "skilled" then return "Skilled" end
+  if tier == "elite" then return "Elite" end
+  return tostring(tier or "")
+end
+
+local WORKER_PAY_SECTORS = {
+  {
+    key = "defence",
+    label = "Defence",
+    help = "Public defence payroll. Used for guards, soldiers, knights, archers, barracks/towers.",
+    tiers = { "unskilled", "skilled", "elite" },
+    defaults = { unskilled = 2, skilled = 3, elite = 4 },
+  },
+  {
+    key = "research",
+    label = "Research",
+    help = "Public research/education payroll. Used for researchers, universities/libraries, teachers/students if enabled.",
+    tiers = { "skilled", "elite" },
+    defaults = { skilled = 3, elite = 5 },
+  },
+  {
+    key = "logistics",
+    label = "Logistics",
+    help = "Public logistics payroll. Used for state couriers/delivery workers if treated as public.",
+    tiers = { "unskilled", "skilled" },
+    defaults = { unskilled = 1, skilled = 2 },
+  },
+}
+
+local function defaultSectorRates()
+  local out = {}
+  for _, s in ipairs(WORKER_PAY_SECTORS) do
+    out[s.key] = {}
+    for _, tier in ipairs(s.tiers) do
+      out[s.key][tier] = s.defaults[tier]
+    end
+  end
+  return out
+end
+
+local function normaliseRatesForUI(rates)
+  rates = type(rates) == "table" and rates or {}
+  local out = defaultSectorRates()
+
+  -- Backwards compatibility with old flat worker rates.
+  if rates.researcher then out.research.skilled = tonumber(rates.researcher) or out.research.skilled end
+  if rates.soldier then out.defence.skilled = tonumber(rates.soldier) or out.defence.skilled end
+  if rates.courier then out.logistics.unskilled = tonumber(rates.courier) or out.logistics.unskilled end
+
+  for _, s in ipairs(WORKER_PAY_SECTORS) do
+    if type(rates[s.key]) == "table" then
+      for _, tier in ipairs(s.tiers) do
+        local n = tonumber(rates[s.key][tier])
+        if n and n > 0 then out[s.key][tier] = math.floor(n) end
+      end
+    end
+  end
+
+  return out
+end
+
+local function workerPaySectorMenu(rates)
+  local selected = nil
+
+  while true do
+    local w, h = getSize()
+    clear(colors.black)
+    drawTop("WORKER PAY")
+
+    writeAt(2, 3, "Select a public payroll sector to edit.", colors.lightGray, colors.black)
+    writeAt(2, 4, "Private company wages are not controlled here.", colors.gray, colors.black)
+
+    local buttons = {}
+    local y = 6
+    local bw = w - 3
+
+    for _, s in ipairs(WORKER_PAY_SECTORS) do
+      local line = s.label .. "  "
+      for _, tier in ipairs(s.tiers) do
+        line = line .. tierLabel(tier) .. " " .. tostring(rates[s.key][tier] or 0) .. "Q  "
+      end
+      buttons[s.key] = button(2, y, bw, line:sub(1, bw), colors.purple, colors.white)
+      y = y + 2
+    end
+
+    writeAt(2, h - 3, "Choose a sector, or Back to return.", colors.lightGray, colors.black)
+    local bBack = button(2, h - 1, w - 3, "Back", colors.gray, colors.white)
+
+    local ev, p1, p2, p3 = os.pullEvent()
+    if ev == "mouse_click" then
+      if hit(bBack, p2, p3) then return nil end
+      for _, s in ipairs(WORKER_PAY_SECTORS) do
+        if hit(buttons[s.key], p2, p3) then
+          return s
+        end
+      end
+    elseif ev == "key" then
+      if p1 == keys.escape or p1 == keys.b or p1 == keys.backspace then return nil end
+    end
+  end
+end
+
 local function actionWorkerPay()
   local okRates, rates = requestWorkerPayRates()
-  if not okRates or type(rates) ~= "table" then
-    rates = { researcher = 3, soldier = 2, courier = 1 }
+  rates = normaliseRatesForUI(okRates and rates or nil)
+
+  local sector = workerPaySectorMenu(rates)
+  if not sector then
+    setMessage("Worker pay cancelled.", colors.lightGray)
+    return
+  end
+
+  local fields = {}
+  for _, tier in ipairs(sector.tiers) do
+    fields[#fields+1] = {
+      label = sector.label .. " " .. tierLabel(tier) .. " base pay",
+      key = tier,
+      required = true,
+      max = 8,
+      value = tostring(rates[sector.key][tier] or sector.defaults[tier] or 1)
+    }
   end
 
   local data = formScreen(
-    "WORKER PAY",
-    "Sets base daily government worker pay. Inflation still scales final pay.",
-    {
-      { label = "Researcher base pay", key = "researcher", required = true, max = 8, value = tostring(rates.researcher or 3) },
-      { label = "Soldier base pay", key = "soldier", required = true, max = 8, value = tostring(rates.soldier or 2) },
-      { label = "Courier base pay", key = "courier", required = true, max = 8, value = tostring(rates.courier or 1) },
-    },
+    "WORKER PAY - " .. string.upper(sector.label),
+    sector.help,
+    fields,
     "Review"
   )
 
@@ -685,47 +800,47 @@ local function actionWorkerPay()
     return
   end
 
-  local researcher = positiveInt(data.researcher)
-  local soldier = positiveInt(data.soldier)
-  local courier = positiveInt(data.courier)
-
-  if not researcher then
-    setMessage("Invalid researcher pay.", colors.red)
-    return
-  end
-  if not soldier then
-    setMessage("Invalid soldier pay.", colors.red)
-    return
-  end
-  if not courier then
-    setMessage("Invalid courier pay.", colors.red)
-    return
+  local changed = {}
+  for _, tier in ipairs(sector.tiers) do
+    local n = positiveInt(data[tier])
+    if not n then
+      setMessage("Invalid " .. sector.label .. " " .. tierLabel(tier) .. " pay.", colors.red)
+      return
+    end
+    changed[tier] = n
   end
 
-  local okConfirm = confirmScreen("CONFIRM WORKER PAY", {
-    "This changes future government payroll.",
+  local lines = {
+    "This changes future public payroll.",
     "",
-    "Researcher: " .. money(researcher) .. " base per Minecraft day",
-    "Soldier:    " .. money(soldier) .. " base per Minecraft day",
-    "Courier:    " .. money(courier) .. " base per Minecraft day",
+    "Sector: " .. sector.label,
     "",
-    "Final wages still scale with the live inflation price index.",
-    "Already-paid workers for today will not be paid again.",
-  }, "Set Pay", false)
+  }
+
+  for _, tier in ipairs(sector.tiers) do
+    lines[#lines+1] = tierLabel(tier) .. ": " .. money(changed[tier]) .. " base per Minecraft day"
+  end
+
+  lines[#lines+1] = ""
+  lines[#lines+1] = "Private company payroll is not affected."
+  lines[#lines+1] = "Already-paid workers for today will not be paid again."
+
+  local okConfirm = confirmScreen("CONFIRM WORKER PAY", lines, "Set Pay", false)
 
   if not okConfirm then
     setMessage("Worker pay cancelled.", colors.lightGray)
     return
   end
 
-  local ok, res = setWorkerPayRates({
-    researcher = researcher,
-    soldier = soldier,
-    courier = courier,
-  })
+  rates[sector.key] = rates[sector.key] or {}
+  for tier, amount in pairs(changed) do
+    rates[sector.key][tier] = amount
+  end
+
+  local ok, res = setWorkerPayRates(rates)
 
   if ok then
-    setMessage("Worker pay updated: R " .. tostring(res.researcher) .. " / S " .. tostring(res.soldier) .. " / C " .. tostring(res.courier) .. " Q.", colors.lime)
+    setMessage(sector.label .. " worker pay updated.", colors.lime)
     refreshStatus()
   end
 end
