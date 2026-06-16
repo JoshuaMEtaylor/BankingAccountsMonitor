@@ -59,7 +59,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION           = "1.2.6-GUI-TIDY"
+local VERSION           = "1.2.7-COMPANY-MGMT"
 local BANK_PROTOCOL     = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT        = 5
@@ -117,6 +117,7 @@ local focused = 1
 
 local reg = { name = "", ticker = "" }
 local company_lookup = { company = "" }
+local edit_company = { name = "", ticker = "" }
 
 local active_company_id = nil
 local active_company = nil
@@ -129,7 +130,6 @@ local post = {
   title = "",
   reward = "",
   item = "",
-  display = "",
   count = "",
   description = "",
 }
@@ -164,6 +164,16 @@ local function normaliseCompanyId(s)
   if s == "" then return "" end
   if s:find(":") then return s end
   return companyIdFromTicker(s)
+end
+
+local function displayTicker(company)
+  if type(company) == "table" and company.ticker and tostring(company.ticker) ~= "" then
+    return tostring(company.ticker)
+  end
+  if active_company_id then
+    return tostring(active_company_id):gsub("^company:", ""):upper()
+  end
+  return ""
 end
 
 local function positiveInt(s)
@@ -316,7 +326,7 @@ local function accountStrip()
   local id = session.citizen_id or ""
   if id ~= "" then at(W - #id - 1, 2, id, C.label, C.card) end
 
-  local company = active_company_id or "No active company"
+  local company = active_company_id and ("Company: " .. displayTicker(active_company)) or "No active company"
   at(3, 4, "Active: " .. shortText(company, W - 12), active_company_id and C.ok or C.warn, C.bg)
 end
 
@@ -409,7 +419,9 @@ local function refreshOwnedCompanies(silent)
       local c = owned_companies[1]
       active_company_id = tostring(c.company_id or "")
       active_company = c
-      company_lookup.company = active_company_id
+      company_lookup.company = displayTicker(c)
+      edit_company.name = tostring(c.name or "")
+      edit_company.ticker = displayTicker(c)
       if active_company_id ~= "" then
         if not silent then setMessage("Selected owned company " .. active_company_id, C.ok) end
         return true
@@ -584,7 +596,9 @@ local function loadCompany(company_id)
   if ok and type(res) == "table" then
     active_company_id = tostring(res.company_id or company_id)
     active_company = res
-    company_lookup.company = active_company_id
+    company_lookup.company = displayTicker(res)
+    edit_company.name = tostring(res.name or "")
+    edit_company.ticker = displayTicker(res)
     if isOwner() then setMessage("Loaded owned company " .. active_company_id, C.ok)
     else setMessage("Loaded company, but you are not owner.", C.warn) end
     return true
@@ -594,6 +608,7 @@ local function loadCompany(company_id)
 end
 
 local function doRegister()
+  if active_company_id then setMessage("Dissolve current company before registering another.", C.err); return end
   local name = trim(reg.name)
   local ticker = cleanTicker(reg.ticker)
   local owner_id = session.citizen_id
@@ -636,6 +651,84 @@ local function doRegister()
     mode = "company"
   else
     resultScreen("REGISTRATION FAILED", {tostring(res or "Unknown error"), "", "Check whether that ticker already exists."}, C.err)
+  end
+end
+
+local function doUpdateCompany()
+  if not active_company_id then setMessage("Load/select a company first.", C.err); return end
+  if not isOwner() then setMessage("Only the owner can edit this company.", C.err); return end
+  local new_name = trim(edit_company.name)
+  local new_ticker = cleanTicker(edit_company.ticker)
+  if new_name == "" then setMessage("Enter a company name.", C.err); return end
+  if new_ticker == "" then setMessage("Enter a valid ticker.", C.err); return end
+
+  if not confirmScreen("Update company", {
+    "Current: " .. tostring(active_company_id),
+    "Name:    " .. new_name,
+    "Ticker:  " .. new_ticker,
+    "",
+    "Ticker changes rename the company account ID.",
+  }, "Save") then setMessage("Company update cancelled.", C.dim); return end
+
+  local ok, res = bankRequest({
+    type = "update_company",
+    username = session.username,
+    password = session.password,
+    company_id = active_company_id,
+    name = new_name,
+    ticker = new_ticker,
+  })
+
+  if ok and type(res) == "table" then
+    active_company_id = tostring(res.company_id or active_company_id)
+    setMessage("Company updated: " .. active_company_id, C.ok)
+    loadCompany(active_company_id)
+    refreshOwnedCompanies(true)
+  else
+    setMessage("Update failed: " .. tostring(res), C.err)
+  end
+end
+
+local function doDissolveCompany()
+  if not active_company_id then setMessage("No active company to dissolve.", C.err); return end
+  if not isOwner() then setMessage("Only the owner can dissolve this company.", C.err); return end
+  local payout = active_company and tonumber(active_company.cash_balance) or 0
+
+  if not confirmScreen("Dissolve company", {
+    "Company: " .. tostring(active_company_id),
+    "Owner:   " .. tostring(session.citizen_id),
+    "Payout:  " .. money(payout),
+    "",
+    "This deletes the company account after payout.",
+  }, "Dissolve") then setMessage("Dissolve cancelled.", C.dim); return end
+
+  local ok, res = bankRequest({
+    type = "dissolve_company",
+    username = session.username,
+    password = session.password,
+    company_id = active_company_id,
+    memo = "Company dissolved by owner",
+  })
+
+  if ok and type(res) == "table" then
+    local paid = tonumber(res.paid_out) or 0
+    setMessage("Company dissolved. Paid out " .. money(paid), C.ok)
+    resultScreen("COMPANY DISSOLVED", {
+      "Company: " .. tostring(res.company_id or active_company_id),
+      "Owner:   " .. tostring(session.citizen_id),
+      "Paid:    " .. money(paid),
+      "",
+      "You can now register a new company.",
+    }, C.ok)
+    active_company_id = nil
+    active_company = nil
+    company_lookup.company = ""
+    edit_company.name = ""
+    edit_company.ticker = ""
+    refreshOwnedCompanies(true)
+    mode = "register"
+  else
+    setMessage("Dissolve failed: " .. tostring(res), C.err)
   end
 end
 
@@ -720,7 +813,6 @@ local function doPostContract()
   local reward = positiveInt(post.reward)
   local item = trim(post.item)
   local count = positiveInt(post.count)
-  local display = trim(post.display)
   if title == "" then setMessage("Missing contract title.", C.err); return end
   if not reward then setMessage("Invalid reward.", C.err); return end
   if item == "" then setMessage("Missing item id.", C.err); return end
@@ -730,7 +822,7 @@ local function doPostContract()
     "Company: " .. active_company_id,
     "Title:   " .. title,
     "Reward:  " .. money(reward),
-    "Item:    " .. tostring(count) .. "x " .. (display ~= "" and display or item),
+    "Item:    " .. tostring(count) .. "x " .. item,
     "",
     "No escrow is locked yet. ContractServer payment hooks are next.",
   }, "Post") then setMessage("Post cancelled.", C.dim); return end
@@ -744,7 +836,7 @@ local function doPostContract()
     source_company = active_company_id,
     source_type = "company_terminal",
     reward = reward,
-    items = {{item=item, display=display ~= "" and display or item, count=count}},
+    items = {{item=item, display=item, count=count}},
     escrow_status = "not_locked",
   })
 
@@ -757,7 +849,7 @@ local function doPostContract()
       "Reward:  " .. money(reward),
       "Status:  " .. tostring(c.status or "open"),
     }, C.ok)
-    post.title, post.reward, post.item, post.display, post.count, post.description = "", "", "", "", "", ""
+    post.title, post.reward, post.item, post.count, post.description = "", "", "", "", ""
   else
     setMessage("Post failed: " .. tostring(res), C.err)
   end
@@ -825,60 +917,83 @@ local function drawMain()
     if y <= max_text_y then at(4, y, shortText(text, text_w), fg or C.label, C.card) end
   end
 
+  local function shortCompanyLabel()
+    if not active_company_id then return "none" end
+    return displayTicker(active_company) ~= "" and displayTicker(active_company) or tostring(active_company_id)
+  end
+
   if mode == "register" then
-    safeLine(card_y + 1, "Register a player-made company.", C.label)
+    if active_company_id then
+      safeLine(card_y + 1, "You already control a company.", C.label)
+      safeLine(card_y + 3, "Company: " .. shortCompanyLabel(), C.ok)
+      if active_company then
+        safeLine(card_y + 4, "Name: " .. tostring(active_company.name or "?"), C.card_fg)
+        safeLine(card_y + 5, "Balance to return: " .. money(active_company.cash_balance or 0), C.card_fg)
+      end
+      safeLine(card_y + 7, "Dissolve returns company cash to owner.", C.warn)
+      safeLine(card_y + 8, "This removes the company record/account.", C.warn)
+      buttons = buttonRow(btn_y, {
+        {key="dissolve", label="Dissolve", bg=C.btn_dan, fg=C.btn_fg},
+        {key="companytab", label="Company", bg=C.btn_sec, fg=C.card_fg},
+        {key="signout", label="Sign Out", bg=C.btn_sec, fg=C.card_fg},
+      })
+    else
+      safeLine(card_y + 1, "Register a player-made company.", C.label)
 
-    at(4, card_y + 3, "Company Name", C.card_fg, C.card)
-    fields[1] = inputField(4, card_y + 4, full_w, reg.name, false)
+      at(4, card_y + 3, "Company Name", C.card_fg, C.card)
+      fields[1] = inputField(4, card_y + 4, full_w, reg.name, false)
 
-    at(4, card_y + 6, "Ticker", C.card_fg, C.card)
-    fields[2] = inputField(4, card_y + 7, full_w, reg.ticker, false)
+      at(4, card_y + 6, "Ticker", C.card_fg, C.card)
+      fields[2] = inputField(4, card_y + 7, full_w, reg.ticker, false)
 
-    local preview = companyIdFromTicker(reg.ticker); if preview == "" then preview = "company:<ticker>" end
-    safeLine(card_y + 8, "Account: " .. preview, C.label)
+      local preview = cleanTicker(reg.ticker); if preview == "" then preview = "<ticker>" end
+      safeLine(card_y + 8, "Account ticker: " .. preview, C.label)
 
-    buttons = buttonRow(btn_y, {
-      {key="clear", label="Clear", bg=C.btn_sec, fg=C.card_fg},
-      {key="primary", label="Register", bg=C.btn_pri, fg=C.btn_fg},
-      {key="signout", label="Sign Out", bg=C.btn_dan, fg=C.btn_fg},
-    })
+      buttons = buttonRow(btn_y, {
+        {key="clear", label="Clear", bg=C.btn_sec, fg=C.card_fg},
+        {key="primary", label="Register", bg=C.btn_pri, fg=C.btn_fg},
+        {key="signout", label="Sign Out", bg=C.btn_dan, fg=C.btn_fg},
+      })
+    end
 
   elseif mode == "company" then
-    safeLine(card_y + 1, "Load/select company by ticker or ID.", C.label)
+    safeLine(card_y + 1, "Load or edit your selected company.", C.label)
 
-    at(4, card_y + 3, "Ticker or Company ID", C.card_fg, C.card)
+    at(4, card_y + 3, "Select Ticker", C.card_fg, C.card)
     fields[1] = inputField(4, card_y + 4, full_w, company_lookup.company, false)
 
-    safeLine(card_y + 6, "Owned companies found: " .. tostring(owned_company_count), owned_company_count > 0 and C.ok or C.warn)
+    local left_w = math.floor((full_w - 2) / 2)
+    local right_x = 4 + left_w + 2
+    local right_w = full_w - left_w - 2
 
+    at(4, card_y + 6, "New Name", C.card_fg, C.card)
+    at(right_x, card_y + 6, "New Ticker", C.card_fg, C.card)
+    fields[2] = inputField(4, card_y + 7, left_w, edit_company.name, false)
+    fields[3] = inputField(right_x, card_y + 7, right_w, edit_company.ticker, false)
+
+    safeLine(card_y + 9, "Owned: " .. tostring(owned_company_count) .. " | Active: " .. shortCompanyLabel(), active_company_id and C.ok or C.warn)
     if active_company then
-      safeLine(card_y + 8, "Name: " .. tostring(active_company.name or "?"), C.card_fg)
-      safeLine(card_y + 9, "Account: " .. tostring(active_company_id or "?"), C.card_fg)
-      local bal_status = "Balance: " .. money(active_company.cash_balance or 0) .. " | Status: " .. tostring(active_company.status or "?")
-      safeLine(card_y + 10, bal_status, C.label)
+      safeLine(card_y + 10, "Bal: " .. money(active_company.cash_balance or 0) .. " | Status: " .. tostring(active_company.status or "?"), C.label)
     end
 
     buttons = buttonRow(btn_y, {
-      {key="clear", label="Clear", bg=C.btn_sec, fg=C.card_fg},
       {key="owned", label="My Cos", bg=C.btn_sec, fg=C.card_fg},
       {key="primary", label="Load", bg=C.btn_pri, fg=C.btn_fg},
+      {key="save", label="Save", bg=C.btn_pri, fg=C.btn_fg},
       {key="signout", label="Sign Out", bg=C.btn_dan, fg=C.btn_fg},
     })
 
   elseif mode == "capital" then
-    safeLine(card_y + 1, "Move funds: personal <-> company.", C.label)
-    safeLine(card_y + 3, "Company: " .. tostring(active_company_id or "load one first"), active_company_id and C.ok or C.warn)
+    safeLine(card_y + 1, "Move funds between personal and company.", C.label)
+    safeLine(card_y + 2, "Company: " .. shortCompanyLabel(), active_company_id and C.ok or C.warn)
 
-    at(4, card_y + 5, "Amount", C.card_fg, C.card)
-    fields[1] = inputField(4, card_y + 6, full_w, capital.amount, false)
+    at(4, card_y + 4, "Amount", C.card_fg, C.card)
+    fields[1] = inputField(4, card_y + 5, full_w, capital.amount, false)
 
-    at(4, card_y + 8, "Memo", C.card_fg, C.card)
-    fields[2] = inputField(4, card_y + 9, full_w, capital.memo, false)
-
-    safeLine(card_y + 11, "Pay In = personal to company; Pay Out = company to owner.", C.label)
+    at(4, card_y + 7, "Memo", C.card_fg, C.card)
+    fields[2] = inputField(4, card_y + 8, full_w, capital.memo, false)
 
     buttons = buttonRow(btn_y, {
-      {key="clear", label="Clear", bg=C.btn_sec, fg=C.card_fg},
       {key="primary", label="Pay In", bg=C.btn_pri, fg=C.btn_fg},
       {key="payout", label="Pay Out", bg=C.btn_sec, fg=C.card_fg},
       {key="signout", label="Sign Out", bg=C.btn_dan, fg=C.btn_fg},
@@ -901,19 +1016,16 @@ local function drawMain()
     fields[3] = inputField(right_x, card_y + 7, right_w, post.item, false)
 
     at(4, card_y + 8, "Count", C.card_fg, C.card)
-    at(right_x, card_y + 8, "Display name", C.card_fg, C.card)
     fields[4] = inputField(4, card_y + 9, left_w, post.count, false)
-    fields[5] = inputField(right_x, card_y + 9, right_w, post.display, false)
 
     buttons = buttonRow(btn_y, {
-      {key="clear", label="Clear", bg=C.btn_sec, fg=C.card_fg},
       {key="primary", label="Post", bg=C.btn_pri, fg=C.btn_fg},
       {key="signout", label="Sign Out", bg=C.btn_dan, fg=C.btn_fg},
     })
 
   elseif mode == "ops" then
     safeLine(card_y + 1, "Company contract operations.", C.label)
-    safeLine(card_y + 2, "Active: " .. tostring(active_company_id or "none"), active_company_id and C.ok or C.warn)
+    safeLine(card_y + 2, "Active: " .. shortCompanyLabel(), active_company_id and C.ok or C.warn)
 
     at(4, card_y + 4, "Contract ID", C.card_fg, C.card)
     fields[1] = inputField(4, card_y + 5, full_w, ops.contract_id, false)
@@ -937,9 +1049,9 @@ end
 
 local function clearCurrentForm()
   if mode == "register" then reg.name, reg.ticker = "", ""
-  elseif mode == "company" then company_lookup.company = ""; active_company_id = nil; active_company = nil
+  elseif mode == "company" then company_lookup.company = ""; edit_company.name = ""; edit_company.ticker = ""
   elseif mode == "capital" then capital.amount = ""; capital.memo = "Owner capital injection"
-  elseif mode == "contracts" then post.title, post.reward, post.item, post.display, post.count, post.description = "", "", "", "", "", ""
+  elseif mode == "contracts" then post.title, post.reward, post.item, post.count, post.description = "", "", "", "", ""
   elseif mode == "ops" then ops.contract_id = ""; ops.note = "" end
   focused = 1
 end
@@ -949,7 +1061,9 @@ local function appendChar(ch)
     if focused == 1 and #reg.name < 32 then reg.name = reg.name .. ch end
     if focused == 2 and #reg.ticker < 8 then reg.ticker = reg.ticker .. ch end
   elseif mode == "company" then
-    if focused == 1 and #company_lookup.company < 40 then company_lookup.company = company_lookup.company .. ch end
+    if focused == 1 and #company_lookup.company < 16 then company_lookup.company = company_lookup.company .. ch end
+    if focused == 2 and #edit_company.name < 32 then edit_company.name = edit_company.name .. ch end
+    if focused == 3 and #edit_company.ticker < 8 then edit_company.ticker = edit_company.ticker .. ch end
   elseif mode == "capital" then
     if focused == 1 and #capital.amount < 10 then capital.amount = capital.amount .. ch end
     if focused == 2 and #capital.memo < 48 then capital.memo = capital.memo .. ch end
@@ -958,8 +1072,7 @@ local function appendChar(ch)
     if focused == 2 and #post.reward < 10 then post.reward = post.reward .. ch end
     if focused == 3 and #post.item < 48 then post.item = post.item .. ch end
     if focused == 4 and #post.count < 10 then post.count = post.count .. ch end
-    if focused == 5 and #post.display < 48 then post.display = post.display .. ch end
-    if focused == 6 and #post.description < 64 then post.description = post.description .. ch end
+    if focused == 5 and #post.description < 64 then post.description = post.description .. ch end
   elseif mode == "ops" then
     if focused == 1 and #ops.contract_id < 20 then ops.contract_id = ops.contract_id .. ch end
     if focused == 2 and #ops.note < 64 then ops.note = ops.note .. ch end
@@ -971,7 +1084,9 @@ local function backspaceField()
     if focused == 1 then reg.name = reg.name:sub(1, -2) end
     if focused == 2 then reg.ticker = reg.ticker:sub(1, -2) end
   elseif mode == "company" then
-    company_lookup.company = company_lookup.company:sub(1, -2)
+    if focused == 1 then company_lookup.company = company_lookup.company:sub(1, -2) end
+    if focused == 2 then edit_company.name = edit_company.name:sub(1, -2) end
+    if focused == 3 then edit_company.ticker = edit_company.ticker:sub(1, -2) end
   elseif mode == "capital" then
     if focused == 1 then capital.amount = capital.amount:sub(1, -2) end
     if focused == 2 then capital.memo = capital.memo:sub(1, -2) end
@@ -980,8 +1095,7 @@ local function backspaceField()
     if focused == 2 then post.reward = post.reward:sub(1, -2) end
     if focused == 3 then post.item = post.item:sub(1, -2) end
     if focused == 4 then post.count = post.count:sub(1, -2) end
-    if focused == 5 then post.display = post.display:sub(1, -2) end
-    if focused == 6 then post.description = post.description:sub(1, -2) end
+    if focused == 5 then post.description = post.description:sub(1, -2) end
   elseif mode == "ops" then
     if focused == 1 then ops.contract_id = ops.contract_id:sub(1, -2) end
     if focused == 2 then ops.note = ops.note:sub(1, -2) end
@@ -997,6 +1111,8 @@ local function signOut()
   login.password = ""
   active_company_id = nil
   active_company = nil
+  edit_company.name = ""
+  edit_company.ticker = ""
   mode = "register"
   focused = 1
   setMessage("Signed out.", C.dim)
@@ -1024,6 +1140,10 @@ local function screenMain()
       elseif hit(tabs[5], mx, my) then mode = "ops"; focused = 1; if not contract_id then connectContracts(true) end
       elseif buttons.primary and hit(buttons.primary, mx, my) then doPrimary()
       elseif buttons.payout and hit(buttons.payout, mx, my) then doPayout()
+      elseif buttons.save and hit(buttons.save, mx, my) then doUpdateCompany()
+      elseif buttons.owned and hit(buttons.owned, mx, my) then refreshOwnedCompanies(false)
+      elseif buttons.dissolve and hit(buttons.dissolve, mx, my) then doDissolveCompany()
+      elseif buttons.companytab and hit(buttons.companytab, mx, my) then mode = "company"; focused = 1
       elseif buttons.clear and hit(buttons.clear, mx, my) then clearCurrentForm(); setMessage("Form cleared.", C.dim)
       elseif buttons.list and hit(buttons.list, mx, my) then showMyContracts()
       elseif buttons.fulfil and hit(buttons.fulfil, mx, my) then doFulfil()
