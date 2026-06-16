@@ -32,7 +32,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION = "1.0.6-LIVE-REQUEST-RECONCILE"
+local VERSION = "1.0.8-QUANTITY-PRICING"
 local BANK_PROTOCOL = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT = 5
@@ -45,7 +45,7 @@ local DEFAULT_OWNER_ID = "treasury:quid_bank"
 local PRICE_INDEX = 1.00          -- central inflation price index from bank
 local INFLATION_RATE = 0.00       -- daily inflation/deflation rate from bank
 local BASE_CONTRACT_FEE = 1       -- deliberately low for early economy growth
-local SPEND_LIMIT = 0.10          -- max % of business balance per job
+local SPEND_LIMIT = 0.50          -- max % of business balance per job; bulk supply jobs need room to pay by quantity
 local MIN_FAIR_RATIO = 0.50       -- don't post if affordable price is under this share of fair value
 
 local FILE_BUSINESSES = "data/building_companies.db"
@@ -926,7 +926,8 @@ end
 local function fallbackPrice(id)
   id = lower(id)
 
-  -- Early-economy fallback rates are intentionally tiny.
+  -- Fallback prices are PER ITEM. The job value later multiplies this by the
+  -- requested quantity and then by the central price index.
   -- Official state price table still overrides these values through get_prices/set_price.
   if id:find("netherite",1,true) then return 20 end
   if id:find("diamond",1,true) then return 8 end
@@ -945,7 +946,16 @@ local function fallbackPrice(id)
   if id:find("log",1,true) then return 0.08 end
   if id:find("plank",1,true) or id:find("stair",1,true) or id:find("slab",1,true) then return 0.05 end
   if id:find("cobble",1,true) or id:find("stone",1,true) or id:find("dirt",1,true) or id:find("sand",1,true) or id:find("gravel",1,true) then return 0.03 end
-  if id:find("bread",1,true) or id:find("wheat",1,true) or id:find("potato",1,true) or id:find("carrot",1,true) or id:find("food",1,true) then return 0.2 end
+
+  -- Food is now a real economic good: default 1 Q per item before inflation.
+  if id:find("salmon",1,true) or id:find("cod",1,true) or id:find("fish",1,true)
+    or id:find("bread",1,true) or id:find("wheat",1,true)
+    or id:find("potato",1,true) or id:find("carrot",1,true)
+    or id:find("beef",1,true) or id:find("pork",1,true)
+    or id:find("chicken",1,true) or id:find("mutton",1,true)
+    or id:find("rabbit",1,true) or id:find("food",1,true) then
+    return 1
+  end
 
   return 0.1
 end
@@ -966,16 +976,49 @@ local function wealthMult(balance)
   return 1.0 + math.min(0.35, balance / 100000)
 end
 
+local function requestQuantity(req)
+  -- MineColonies often exposes the requested range in the display name, e.g.
+  -- "1-64 Raw Salmon", while each accepted item alternative has count = 1.
+  -- For contracts we care about the maximum quantity the colony is asking to
+  -- receive, otherwise a 64-stack gets priced like a single fish.
+  local texts = {
+    tostring(req and req.name or ""),
+    tostring(req and req.desc or ""),
+    tostring(req and req.displayName or ""),
+  }
+
+  for _, txt in ipairs(texts) do
+    local a, b = txt:match("(%d+)%s*%-%s*(%d+)")
+    if a and b then
+      return math.max(tonumber(a) or 1, tonumber(b) or 1)
+    end
+  end
+
+  return tonumber(req and (req.count or req.maxCount or req.minCount) or 1) or 1
+end
+
 local function extractItems(req)
   local out = {}
   if type(req.items) ~= "table" then return out end
+
+  local requested_count = math.max(1, math.floor(requestQuantity(req)))
+
   for _, item in pairs(req.items) do
     if type(item) == "table" then
       local id = trim(item.name or item.item or item.id or "")
       local display = trim(item.displayName or item.display or item.label or id)
-      local count = tonumber(item.count or item.amount or req.count or req.minCount or 1) or 1
-      count = math.floor(count)
-      if id ~= "" and count > 0 then out[#out+1] = { item=id, display=display ~= "" and display or id, count=count } end
+
+      local item_count = tonumber(item.count or item.amount or 0) or 0
+      item_count = math.floor(item_count)
+
+      -- Use the larger value. This preserves exact item counts when provided,
+      -- but fixes the common MineColonies case where alternatives are listed as
+      -- 1x even though the request title says 1-64.
+      local count = math.max(1, item_count, requested_count)
+
+      if id ~= "" and count > 0 then
+        out[#out+1] = { item=id, display=display ~= "" and display or id, count=count }
+      end
     end
   end
   return out
@@ -995,7 +1038,16 @@ end
 local function priceJob(business, items)
   local bal = companyBalance(business.company_id)
   if bal <= 0 then return nil, "no funds", bal, 0 end
-  local fair = (BASE_CONTRACT_FEE + requestItemValue(items)) * PRICE_INDEX * wealthMult(bal)
+
+  -- Quantity pricing:
+  --   fair = (job fee + cheapest accepted item unit price * requested quantity)
+  --          * central price index * wealth multiplier
+  --
+  -- Example at price index x1:
+  --   64 cooked salmon = (1 + 1*64) = 65 Q before wealth multiplier.
+  local raw_item_value = requestItemValue(items)
+  local fair = (BASE_CONTRACT_FEE + raw_item_value) * PRICE_INDEX * wealthMult(bal)
+
   local max_pay = math.floor(bal * SPEND_LIMIT)
   if max_pay <= 0 then return nil, "unfunded", bal, fair end
   if max_pay < fair * MIN_FAIR_RATIO then return nil, "cannot afford fair price", bal, fair end
@@ -1099,17 +1151,27 @@ local function itemSignature(items)
   return table.concat(out, ";")
 end
 
-local function reqKey(req, items)
-  -- Use MineColonies request id when it exists so a changed live request updates
-  -- the existing contract instead of creating duplicates. ContractServer upsert
-  -- compares the item signature and rewrites/reopens the contract if required.
-  if req.id then return "request:" .. tostring(req.id) end
+local function requestFamily(req)
+  -- MineColonies request ids can behave like object-instance ids and change
+  -- between scans. For contract reconciliation we need a stable "live request
+  -- family" key that survives item-alternative changes.
+  --
+  -- IMPORTANT: Do not include itemSignature here. If the accepted alternatives
+  -- change, the existing contract should update, not spawn a new contract.
+  local name = trim(req and (req.name or "") or "")
+  local desc = trim(req and (req.desc or "") or "")
+  local target = trim(req and (req.target or "") or "")
 
-  -- Fallback for request objects without a stable id. In that case the item
-  -- signature must be part of the key so two different food/fuel requests from
-  -- the same building do not collapse into one posted entry.
-  local sig = itemSignature(items or extractItems(req))
-  return "request_hash:" .. simpleHash(tostring(req.name or "") .. "|" .. tostring(req.desc or "") .. "|" .. tostring(req.target or "") .. "|" .. tostring(req.count or "") .. "|" .. sig)
+  -- Prefer name+target. Raw Salmon and Cooked Salmon naturally split because
+  -- their request names differ, while changing accepted alternatives for Fuel
+  -- keeps the same family.
+  return lower(name) .. "|" .. lower(desc) .. "|" .. lower(target)
+end
+
+local function reqKey(req, items, business)
+  local company = business and business.company_id or "unknown_company"
+  local building = business and (business.key or business.building_name or business.company_id) or "unknown_building"
+  return "mc_live:" .. tostring(company) .. "|" .. simpleHash(tostring(building) .. "|" .. requestFamily(req))
 end
 
 local function reqTitle(req)
@@ -1125,7 +1187,7 @@ local function itemDesc(items)
 end
 
 local function postContract(req, business, items, reward)
-  local key = reqKey(req, items)
+  local key = reqKey(req, items, business)
   local desc = "MineColonies request from " .. tostring(req.target or "unknown") .. ". Accepted items: " .. itemDesc(items)
 
   local ok, res = contractReq({
@@ -1138,7 +1200,9 @@ local function postContract(req, business, items, reward)
     reward = reward,
     source_type = "minecolonies_request",
     source_company = business.company_id,
-    request_id = tostring(req.id or key),
+    request_id = key,
+    minecolonies_request_id = tostring(req.id or ""),
+    source_family = requestFamily(req),
     building_id = business.key,
     items = items,
   })
@@ -1204,7 +1268,7 @@ local function scanRequests(requests, citizens)
       stats.skipped_unmapped = stats.skipped_unmapped + 1
     else
       local items = extractItems(req)
-      local key = reqKey(req, items)
+      local key = reqKey(req, items, business)
 
       if #items > 0 then
         local reward, reason, bal = priceJob(business, items)
