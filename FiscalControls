@@ -52,7 +52,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION          = "1.0.9-WORKER-PAY-RATES"
+local VERSION          = "1.0.10-WORKER-PAY-UI"
 local PROTOCOL         = "quid_bank"
 local TREASURY_ACCOUNT = "treasury:quid_bank"
 local DB_TIMEOUT       = 5
@@ -938,22 +938,43 @@ local function drawMain()
   local s = last_status or {}
   local supply = s.supply or {}
 
-  writeAt(2, 3, "Server:   " .. tostring(db_id or "?"), colors.lightGray, colors.black)
-  writeAt(2, 4, "Modem:    " .. tostring(modem_name or "?"), colors.lightGray, colors.black)
-  writeAt(2, 5, "Economy:  " .. tostring(s.economy_status or "unknown"), colors.white, colors.black)
-
-  writeAt(2, 7, "Treasury:       " .. money(supply.treasury_balance or 0), colors.lime, colors.black)
-  writeAt(2, 8, "In circulation: " .. money(supply.in_circulation or 0), colors.white, colors.black)
-  writeAt(2, 9, "Total minted:   " .. money(supply.total_minted or 0), colors.white, colors.black)
-  writeAt(2,10, "Total burned:   " .. money(supply.total_burned or 0), colors.white, colors.black)
-
-  writeAt(2,12, "Accounts: " .. tostring(s.account_count or "?")
-    .. "   Citizens: " .. tostring(s.citizen_count or "?")
-    .. "   Companies: " .. tostring(s.company_count or "?"), colors.lightGray, colors.black)
-
   local buttons = {}
   local bw = math.floor((w - 6) / 2)
   local y = 13
+
+  -- Compact layout for normal pocket/monitor sizes.
+  -- The previous worker-pay button was being drawn on the bottom status row on
+  -- 19-line terminals, so drawBottom() erased it. This layout keeps the salary
+  -- control visible above the bottom bar.
+  if h < 22 then
+    writeAt(2, 3, "Server: " .. tostring(db_id or "?") .. "   Modem: " .. tostring(modem_name or "?"), colors.lightGray, colors.black)
+    writeAt(2, 4, "Economy: " .. tostring(s.economy_status or "unknown"), colors.white, colors.black)
+
+    writeAt(2, 6, "Treasury:       " .. money(supply.treasury_balance or 0), colors.lime, colors.black)
+    writeAt(2, 7, "In circulation: " .. money(supply.in_circulation or 0), colors.white, colors.black)
+    writeAt(2, 8, "Minted/Burned:  " .. money(supply.total_minted or 0) .. " / " .. money(supply.total_burned or 0), colors.white, colors.black)
+
+    writeAt(2, 9, "Accounts: " .. tostring(s.account_count or "?")
+      .. "   Citizens: " .. tostring(s.citizen_count or "?")
+      .. "   Companies: " .. tostring(s.company_count or "?"), colors.lightGray, colors.black)
+
+    y = 10
+  else
+    writeAt(2, 3, "Server:   " .. tostring(db_id or "?"), colors.lightGray, colors.black)
+    writeAt(2, 4, "Modem:    " .. tostring(modem_name or "?"), colors.lightGray, colors.black)
+    writeAt(2, 5, "Economy:  " .. tostring(s.economy_status or "unknown"), colors.white, colors.black)
+
+    writeAt(2, 7, "Treasury:       " .. money(supply.treasury_balance or 0), colors.lime, colors.black)
+    writeAt(2, 8, "In circulation: " .. money(supply.in_circulation or 0), colors.white, colors.black)
+    writeAt(2, 9, "Total minted:   " .. money(supply.total_minted or 0), colors.white, colors.black)
+    writeAt(2,10, "Total burned:   " .. money(supply.total_burned or 0), colors.white, colors.black)
+
+    writeAt(2,12, "Accounts: " .. tostring(s.account_count or "?")
+      .. "   Citizens: " .. tostring(s.citizen_count or "?")
+      .. "   Companies: " .. tostring(s.company_count or "?"), colors.lightGray, colors.black)
+
+    y = 13
+  end
 
   buttons.refresh  = button(2, y, bw, "Refresh", colors.gray, colors.white)
   buttons.print    = button(4 + bw, y, bw, "Print Money", colors.green, colors.black)
@@ -964,10 +985,14 @@ local function drawMain()
   buttons.accounts = button(2, y + 4, bw, "Accounts", colors.gray, colors.white)
   buttons.history  = button(4 + bw, y + 4, bw, "Gov History", colors.orange, colors.black)
 
-  buttons.workerpay = button(2, y + 6, w - 3, "Worker Pay", colors.purple, colors.white)
-
-  if h >= 24 then
-    buttons.reconnect = button(2, y + 8, w - 3, "Reconnect", colors.gray, colors.white)
+  if h < 22 then
+    buttons.workerpay = button(2, y + 6, bw, "Worker Pay", colors.purple, colors.white)
+    buttons.reconnect = button(4 + bw, y + 6, bw, "Reconnect", colors.gray, colors.white)
+  else
+    buttons.workerpay = button(2, y + 6, w - 3, "Worker Pay", colors.purple, colors.white)
+    if h >= 24 then
+      buttons.reconnect = button(2, y + 8, w - 3, "Reconnect", colors.gray, colors.white)
+    end
   end
 
   drawBottom()
