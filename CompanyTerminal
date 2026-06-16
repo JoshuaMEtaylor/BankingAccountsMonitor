@@ -59,7 +59,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION           = "1.2.5"
+local VERSION           = "1.2.6-GUI-TIDY"
 local BANK_PROTOCOL     = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT        = 5
@@ -134,7 +134,7 @@ local post = {
   description = "",
 }
 
-local ops = { contract_id = "", note = "Delivered / fulfilled" }
+local ops = { contract_id = "", note = "" }
 
 -- =============================================================================
 -- HELPERS
@@ -816,16 +816,27 @@ local function drawMain()
   local fields = {}
   local buttons = {}
   local btn_y = H - 3
+  if btn_y < card_y + 8 then btn_y = card_y + 8 end
+  local max_text_y = btn_y - 1
   local text_w = W - 8
+  local full_w = W - 8
+
+  local function safeLine(y, text, fg)
+    if y <= max_text_y then at(4, y, shortText(text, text_w), fg or C.label, C.card) end
+  end
 
   if mode == "register" then
-    at(4, card_y + 1, "Register a player-made company.", C.label, C.card)
+    safeLine(card_y + 1, "Register a player-made company.", C.label)
+
     at(4, card_y + 3, "Company Name", C.card_fg, C.card)
-    fields[1] = inputField(4, card_y + 4, W - 8, reg.name, false)
+    fields[1] = inputField(4, card_y + 4, full_w, reg.name, false)
+
     at(4, card_y + 6, "Ticker", C.card_fg, C.card)
-    fields[2] = inputField(4, card_y + 7, W - 8, reg.ticker, false)
+    fields[2] = inputField(4, card_y + 7, full_w, reg.ticker, false)
+
     local preview = companyIdFromTicker(reg.ticker); if preview == "" then preview = "company:<ticker>" end
-    at(4, card_y + 9, shortText("Account: " .. preview, text_w), C.label, C.card)
+    safeLine(card_y + 8, "Account: " .. preview, C.label)
+
     buttons = buttonRow(btn_y, {
       {key="clear", label="Clear", bg=C.btn_sec, fg=C.card_fg},
       {key="primary", label="Register", bg=C.btn_pri, fg=C.btn_fg},
@@ -833,19 +844,20 @@ local function drawMain()
     })
 
   elseif mode == "company" then
-    at(4, card_y + 1, "Load/select company by ticker or ID.", C.label, C.card)
+    safeLine(card_y + 1, "Load/select company by ticker or ID.", C.label)
+
     at(4, card_y + 3, "Ticker or Company ID", C.card_fg, C.card)
-    fields[1] = inputField(4, card_y + 4, W - 8, company_lookup.company, false)
-    at(4, card_y + 6, "Owned companies found: " .. tostring(owned_company_count), owned_company_count > 0 and C.ok or C.warn, C.card)
+    fields[1] = inputField(4, card_y + 4, full_w, company_lookup.company, false)
+
+    safeLine(card_y + 6, "Owned companies found: " .. tostring(owned_company_count), owned_company_count > 0 and C.ok or C.warn)
+
     if active_company then
-      at(4, card_y + 8, shortText("Name: " .. tostring(active_company.name or "?"), text_w), C.card_fg, C.card)
-      at(4, card_y + 9, shortText("Account: " .. tostring(active_company_id or "?"), text_w), C.card_fg, C.card)
-      local owner = tostring(active_company.owner_id or active_company.account_owner_id or "?")
-      at(4, card_y + 10, shortText("Owner: " .. owner, text_w), isOwner() and C.ok or C.warn, C.card)
-      local balance = "Balance: " .. money(active_company.cash_balance or 0)
-      local status = "Status: " .. tostring(active_company.status or "?")
-      at(4, card_y + 11, shortText(balance .. "  " .. status, text_w), C.label, C.card)
+      safeLine(card_y + 8, "Name: " .. tostring(active_company.name or "?"), C.card_fg)
+      safeLine(card_y + 9, "Account: " .. tostring(active_company_id or "?"), C.card_fg)
+      local bal_status = "Balance: " .. money(active_company.cash_balance or 0) .. " | Status: " .. tostring(active_company.status or "?")
+      safeLine(card_y + 10, bal_status, C.label)
     end
+
     buttons = buttonRow(btn_y, {
       {key="clear", label="Clear", bg=C.btn_sec, fg=C.card_fg},
       {key="owned", label="My Cos", bg=C.btn_sec, fg=C.card_fg},
@@ -854,15 +866,17 @@ local function drawMain()
     })
 
   elseif mode == "capital" then
-    at(4, card_y + 1, "Move funds between personal and company.", C.label, C.card)
-    at(4, card_y + 3, "Company", C.card_fg, C.card)
-    at(4, card_y + 4, shortText(tostring(active_company_id or "Load a company first"), text_w), active_company_id and C.ok or C.warn, C.card)
-    at(4, card_y + 6, "Amount", C.card_fg, C.card)
-    fields[1] = inputField(4, card_y + 7, W - 8, capital.amount, false)
-    at(4, card_y + 9, "Memo", C.card_fg, C.card)
-    fields[2] = inputField(4, card_y + 10, W - 8, capital.memo, false)
-    at(4, card_y + 12, "Pay In: personal -> company", C.label, C.card)
-    at(4, card_y + 13, "Pay Out: company -> owner", C.label, C.card)
+    safeLine(card_y + 1, "Move funds: personal <-> company.", C.label)
+    safeLine(card_y + 3, "Company: " .. tostring(active_company_id or "load one first"), active_company_id and C.ok or C.warn)
+
+    at(4, card_y + 5, "Amount", C.card_fg, C.card)
+    fields[1] = inputField(4, card_y + 6, full_w, capital.amount, false)
+
+    at(4, card_y + 8, "Memo", C.card_fg, C.card)
+    fields[2] = inputField(4, card_y + 9, full_w, capital.memo, false)
+
+    safeLine(card_y + 11, "Pay In = personal to company; Pay Out = company to owner.", C.label)
+
     buttons = buttonRow(btn_y, {
       {key="clear", label="Clear", bg=C.btn_sec, fg=C.card_fg},
       {key="primary", label="Pay In", bg=C.btn_pri, fg=C.btn_fg},
@@ -871,18 +885,26 @@ local function drawMain()
     })
 
   elseif mode == "contracts" then
-    at(4, card_y + 1, "Post a contract from the selected company.", C.label, C.card)
-    at(4, card_y + 2, shortText("Contract server: " .. tostring(contract_id or "not connected"), text_w), contract_id and C.ok or C.warn, C.card)
+    safeLine(card_y + 1, "Post contract from selected company.", C.label)
+    safeLine(card_y + 2, "Contract server: " .. tostring(contract_id or "not connected"), contract_id and C.ok or C.warn)
+
     at(4, card_y + 4, "Title", C.card_fg, C.card)
-    fields[1] = inputField(4, card_y + 5, W - 8, post.title, false)
-    at(4, card_y + 7, "Reward Q", C.card_fg, C.card)
-    fields[2] = inputField(4, card_y + 8, 14, post.reward, false)
-    at(20, card_y + 7, "Item ID", C.card_fg, C.card)
-    fields[3] = inputField(20, card_y + 8, math.max(10, W - 24), post.item, false)
-    at(4, card_y + 10, "Count", C.card_fg, C.card)
-    fields[4] = inputField(4, card_y + 11, 14, post.count, false)
-    at(20, card_y + 10, "Display", C.card_fg, C.card)
-    fields[5] = inputField(20, card_y + 11, math.max(10, W - 24), post.display, false)
+    fields[1] = inputField(4, card_y + 5, full_w, post.title, false)
+
+    local left_w = 14
+    local right_x = 22
+    local right_w = math.max(10, W - right_x - 3)
+
+    at(4, card_y + 6, "Reward Q", C.card_fg, C.card)
+    at(right_x, card_y + 6, "Item ID", C.card_fg, C.card)
+    fields[2] = inputField(4, card_y + 7, left_w, post.reward, false)
+    fields[3] = inputField(right_x, card_y + 7, right_w, post.item, false)
+
+    at(4, card_y + 8, "Count", C.card_fg, C.card)
+    at(right_x, card_y + 8, "Display name", C.card_fg, C.card)
+    fields[4] = inputField(4, card_y + 9, left_w, post.count, false)
+    fields[5] = inputField(right_x, card_y + 9, right_w, post.display, false)
+
     buttons = buttonRow(btn_y, {
       {key="clear", label="Clear", bg=C.btn_sec, fg=C.card_fg},
       {key="primary", label="Post", bg=C.btn_pri, fg=C.btn_fg},
@@ -890,13 +912,17 @@ local function drawMain()
     })
 
   elseif mode == "ops" then
-    at(4, card_y + 1, "Company contract operations.", C.label, C.card)
-    at(4, card_y + 2, shortText("Active: " .. tostring(active_company_id or "none"), text_w), active_company_id and C.ok or C.warn, C.card)
+    safeLine(card_y + 1, "Company contract operations.", C.label)
+    safeLine(card_y + 2, "Active: " .. tostring(active_company_id or "none"), active_company_id and C.ok or C.warn)
+
     at(4, card_y + 4, "Contract ID", C.card_fg, C.card)
-    fields[1] = inputField(4, card_y + 5, W - 8, ops.contract_id, false)
+    fields[1] = inputField(4, card_y + 5, full_w, ops.contract_id, false)
+
     at(4, card_y + 7, "Fulfilment Note", C.card_fg, C.card)
-    fields[2] = inputField(4, card_y + 8, W - 8, ops.note, false)
-    at(4, card_y + 10, "View: company as poster/source/claimant.", C.label, C.card)
+    fields[2] = inputField(4, card_y + 8, full_w, ops.note, false)
+
+    safeLine(card_y + 10, "View shows company as poster/source/claimant.", C.label)
+
     buttons = buttonRow(btn_y, {
       {key="list", label="View", bg=C.btn_sec, fg=C.card_fg},
       {key="fulfil", label="Fulfil", bg=C.btn_pri, fg=C.btn_fg},
@@ -914,7 +940,7 @@ local function clearCurrentForm()
   elseif mode == "company" then company_lookup.company = ""; active_company_id = nil; active_company = nil
   elseif mode == "capital" then capital.amount = ""; capital.memo = "Owner capital injection"
   elseif mode == "contracts" then post.title, post.reward, post.item, post.display, post.count, post.description = "", "", "", "", "", ""
-  elseif mode == "ops" then ops.contract_id = ""; ops.note = "Delivered / fulfilled" end
+  elseif mode == "ops" then ops.contract_id = ""; ops.note = "" end
   focused = 1
 end
 
