@@ -5,7 +5,8 @@
 -- Pays state employees once per Minecraft day.
 -- Wages scale with the central Quid inflation price index.
 --
--- Base daily wages at price_index = 1.00:
+-- Base daily wages at price_index = 1.00 are loaded from the Quid bank.
+-- Defaults if the bank does not provide rates:
 --   Researchers: 3 Q / Minecraft day
 --   Soldiers:    2 Q / Minecraft day
 --   Couriers:    1 Q / Minecraft day
@@ -32,7 +33,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION = "1.0.0"
+local VERSION = "1.0.1-WORKER-PAY-RATES"
 local BANK_PROTOCOL = "quid_bank"
 local DB_TIMEOUT = 5
 local CHECK_INTERVAL = 10
@@ -48,6 +49,11 @@ local last_colour = colors.lightGray
 local price_index = 1.00
 local inflation_rate = 0.00
 local history = { days = {} }
+local worker_pay_rates = {
+  researcher = 3,
+  soldier    = 2,
+  courier    = 1,
+}
 
 local stats = {
   source = "none",
@@ -163,21 +169,27 @@ local function jobTextFromCitizen(z)
   return table.concat(parts, " ")
 end
 
+local function roleBase(key, fallback)
+  local n = tonumber(worker_pay_rates and worker_pay_rates[key])
+  if not n or n < 0 then n = fallback end
+  return math.floor(n + 0.5)
+end
+
 local function wageRole(jobText)
   local j = normalType(jobText)
 
   if j:find("research", 1, true) or j:find("university", 1, true) or j:find("library", 1, true) then
-    return 3, "Researcher"
+    return roleBase("researcher", 3), "Researcher"
   end
 
   if j:find("soldier", 1, true) or j:find("guard", 1, true) or j:find("knight", 1, true) or
      j:find("archer", 1, true) or j:find("ranger", 1, true) or j:find("combat", 1, true) or
      j:find("barracks", 1, true) or j:find("tower", 1, true) then
-    return 2, "Soldier"
+    return roleBase("soldier", 2), "Soldier"
   end
 
   if j:find("courier", 1, true) or j:find("deliveryman", 1, true) or j:find("delivery", 1, true) then
-    return 1, "Courier"
+    return roleBase("courier", 1), "Courier"
   end
 
   return 0, nil
@@ -273,6 +285,18 @@ local function refreshInflation()
   end
 
   setMsg("Inflation state unavailable. Using x" .. tostring(price_index), colors.orange)
+  return false
+end
+
+local function refreshWorkerPayRates()
+  local ok, res = bankReq({ type = "get_worker_pay_rates" }, 4)
+  if ok and type(res) == "table" then
+    local rates = res.rates or res
+    worker_pay_rates.researcher = tonumber(rates.researcher) or worker_pay_rates.researcher or 3
+    worker_pay_rates.soldier    = tonumber(rates.soldier)    or worker_pay_rates.soldier    or 2
+    worker_pay_rates.courier    = tonumber(rates.courier)    or worker_pay_rates.courier    or 1
+    return true
+  end
   return false
 end
 
@@ -415,6 +439,7 @@ local function runPayroll()
   if not db_id then return false end
 
   refreshInflation()
+  refreshWorkerPayRates()
 
   local day = mcDay()
   local rec = dayRecord(day)
@@ -565,7 +590,8 @@ local function draw()
   at(2, 14, "Total paid today:    " .. money(stats.total_today), colors.lightGray)
   at(2, 15, "Last run:            " .. tostring(stats.last_run_count) .. " paid / " .. money(stats.last_run_total), colors.lightGray)
 
-  at(2, 17, "Rates: Researcher 3 Q, Soldier 2 Q, Courier 1 Q per Minecraft day", colors.gray)
+  at(2, 17, "Base pay: Researcher " .. tostring(roleBase("researcher", 3)) .. " Q, Soldier " .. tostring(roleBase("soldier", 2)) .. " Q, Courier " .. tostring(roleBase("courier", 1)) .. " Q", colors.gray)
+  at(2, 18, "Final pay = base pay x price index, rounded.", colors.gray)
 
   local bw = math.floor((W - 8) / 3)
   local bRun = button(2, H - 3, bw, "Run Payroll", colors.purple)
@@ -596,6 +622,7 @@ local function main()
 
   discoverBank()
   refreshInflation()
+  refreshWorkerPayRates()
 
   local bRun, bAuto, bRecon = draw()
   local timer = os.startTimer(2)
@@ -605,7 +632,10 @@ local function main()
 
     if ev == "timer" and p1 == timer then
       if not db_id then discoverBank() end
-      if db_id then refreshInflation() end
+      if db_id then
+        refreshInflation()
+        refreshWorkerPayRates()
+      end
 
       if auto_mode and db_id and not todayComplete() then
         runPayroll()
@@ -625,6 +655,8 @@ local function main()
       elseif hit(bRecon, mx, my) then
         discoverBank()
         findColony()
+        refreshInflation()
+        refreshWorkerPayRates()
       end
 
       bRun, bAuto, bRecon = draw()
