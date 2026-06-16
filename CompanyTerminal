@@ -59,7 +59,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION           = "1.2.7-COMPANY-MGMT"
+local VERSION           = "1.2.8-SINGLE-CO"
 local BANK_PROTOCOL     = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT        = 5
@@ -333,7 +333,10 @@ end
 local function tabStrip(y)
   -- Fixed-width tabs with a blank column between each tab. This avoids the
   -- old "CapitalContracts" visual merge on small ComputerCraft monitors.
-  local tabs = {"Register", "Company", "Capital", "Contracts", "Ops"}
+  -- If the logged-in owner already controls a company, the registration slot
+  -- becomes the dissolve screen instead of implying another company can be made.
+  local reg_label = active_company_id and "Dissolve" or "Register"
+  local tabs = {reg_label, "Company", "Capital", "Contracts", "Ops"}
   local mode_to_tab = {register=1, company=2, capital=3, contracts=4, ops=5}
   local active = mode_to_tab[mode] or 1
   local buttons = {}
@@ -668,7 +671,7 @@ local function doUpdateCompany()
     "Ticker:  " .. new_ticker,
     "",
     "Ticker changes rename the company account ID.",
-  }, "Save") then setMessage("Company update cancelled.", C.dim); return end
+  }, "Confirm") then setMessage("Company update cancelled.", C.dim); return end
 
   local ok, res = bankRequest({
     type = "update_company",
@@ -957,41 +960,29 @@ local function drawMain()
     end
 
   elseif mode == "company" then
-    safeLine(card_y + 1, "Load or edit your selected company.", C.label)
+    safeLine(card_y + 1, "Edit your company details.", C.label)
+    safeLine(card_y + 2, "Active: " .. shortCompanyLabel(), active_company_id and C.ok or C.warn)
 
-    at(4, card_y + 3, "Select Ticker", C.card_fg, C.card)
-    fields[1] = inputField(4, card_y + 4, full_w, company_lookup.company, false)
+    at(4, card_y + 4, "Company Name", C.card_fg, C.card)
+    fields[1] = inputField(4, card_y + 5, full_w, edit_company.name, false)
 
-    local left_w = math.floor((full_w - 2) / 2)
-    local right_x = 4 + left_w + 2
-    local right_w = full_w - left_w - 2
-
-    at(4, card_y + 6, "New Name", C.card_fg, C.card)
-    at(right_x, card_y + 6, "New Ticker", C.card_fg, C.card)
-    fields[2] = inputField(4, card_y + 7, left_w, edit_company.name, false)
-    fields[3] = inputField(right_x, card_y + 7, right_w, edit_company.ticker, false)
-
-    safeLine(card_y + 9, "Owned: " .. tostring(owned_company_count) .. " | Active: " .. shortCompanyLabel(), active_company_id and C.ok or C.warn)
-    if active_company then
-      safeLine(card_y + 10, "Bal: " .. money(active_company.cash_balance or 0) .. " | Status: " .. tostring(active_company.status or "?"), C.label)
-    end
+    at(4, card_y + 7, "Ticker Symbol", C.card_fg, C.card)
+    fields[2] = inputField(4, card_y + 8, full_w, edit_company.ticker, false)
 
     buttons = buttonRow(btn_y, {
-      {key="owned", label="My Cos", bg=C.btn_sec, fg=C.card_fg},
-      {key="primary", label="Load", bg=C.btn_pri, fg=C.btn_fg},
-      {key="save", label="Save", bg=C.btn_pri, fg=C.btn_fg},
+      {key="save", label="Confirm Change", bg=C.btn_pri, fg=C.btn_fg},
       {key="signout", label="Sign Out", bg=C.btn_dan, fg=C.btn_fg},
     })
 
   elseif mode == "capital" then
-    safeLine(card_y + 1, "Move funds between personal and company.", C.label)
+    safeLine(card_y + 1, "Move funds: personal <-> company.", C.label)
     safeLine(card_y + 2, "Company: " .. shortCompanyLabel(), active_company_id and C.ok or C.warn)
 
-    at(4, card_y + 4, "Amount", C.card_fg, C.card)
-    fields[1] = inputField(4, card_y + 5, full_w, capital.amount, false)
+    at(4, card_y + 3, "Amount", C.card_fg, C.card)
+    fields[1] = inputField(4, card_y + 4, full_w, capital.amount, false)
 
-    at(4, card_y + 7, "Memo", C.card_fg, C.card)
-    fields[2] = inputField(4, card_y + 8, full_w, capital.memo, false)
+    at(4, card_y + 5, "Memo", C.card_fg, C.card)
+    fields[2] = inputField(4, card_y + 6, full_w, capital.memo, false)
 
     buttons = buttonRow(btn_y, {
       {key="primary", label="Pay In", bg=C.btn_pri, fg=C.btn_fg},
@@ -1003,20 +994,20 @@ local function drawMain()
     safeLine(card_y + 1, "Post contract from selected company.", C.label)
     safeLine(card_y + 2, "Contract server: " .. tostring(contract_id or "not connected"), contract_id and C.ok or C.warn)
 
-    at(4, card_y + 4, "Title", C.card_fg, C.card)
-    fields[1] = inputField(4, card_y + 5, full_w, post.title, false)
+    at(4, card_y + 3, "Title", C.card_fg, C.card)
+    fields[1] = inputField(4, card_y + 4, full_w, post.title, false)
 
-    local left_w = 14
-    local right_x = 22
+    local left_w = 16
+    local right_x = 24
     local right_w = math.max(10, W - right_x - 3)
 
-    at(4, card_y + 6, "Reward Q", C.card_fg, C.card)
-    at(right_x, card_y + 6, "Item ID", C.card_fg, C.card)
-    fields[2] = inputField(4, card_y + 7, left_w, post.reward, false)
-    fields[3] = inputField(right_x, card_y + 7, right_w, post.item, false)
+    at(4, card_y + 5, "Reward Q", C.card_fg, C.card)
+    at(right_x, card_y + 5, "Item ID", C.card_fg, C.card)
+    fields[2] = inputField(4, card_y + 6, left_w, post.reward, false)
+    fields[3] = inputField(right_x, card_y + 6, right_w, post.item, false)
 
-    at(4, card_y + 8, "Count", C.card_fg, C.card)
-    fields[4] = inputField(4, card_y + 9, left_w, post.count, false)
+    at(4, card_y + 7, "Count", C.card_fg, C.card)
+    fields[4] = inputField(4, card_y + 8, left_w, post.count, false)
 
     buttons = buttonRow(btn_y, {
       {key="primary", label="Post", bg=C.btn_pri, fg=C.btn_fg},
@@ -1049,7 +1040,13 @@ end
 
 local function clearCurrentForm()
   if mode == "register" then reg.name, reg.ticker = "", ""
-  elseif mode == "company" then company_lookup.company = ""; edit_company.name = ""; edit_company.ticker = ""
+  elseif mode == "company" then
+    if active_company then
+      edit_company.name = tostring(active_company.name or "")
+      edit_company.ticker = displayTicker(active_company)
+    else
+      edit_company.name = ""; edit_company.ticker = ""
+    end
   elseif mode == "capital" then capital.amount = ""; capital.memo = "Owner capital injection"
   elseif mode == "contracts" then post.title, post.reward, post.item, post.count, post.description = "", "", "", "", ""
   elseif mode == "ops" then ops.contract_id = ""; ops.note = "" end
@@ -1061,9 +1058,8 @@ local function appendChar(ch)
     if focused == 1 and #reg.name < 32 then reg.name = reg.name .. ch end
     if focused == 2 and #reg.ticker < 8 then reg.ticker = reg.ticker .. ch end
   elseif mode == "company" then
-    if focused == 1 and #company_lookup.company < 16 then company_lookup.company = company_lookup.company .. ch end
-    if focused == 2 and #edit_company.name < 32 then edit_company.name = edit_company.name .. ch end
-    if focused == 3 and #edit_company.ticker < 8 then edit_company.ticker = edit_company.ticker .. ch end
+    if focused == 1 and #edit_company.name < 32 then edit_company.name = edit_company.name .. ch end
+    if focused == 2 and #edit_company.ticker < 8 then edit_company.ticker = edit_company.ticker .. ch end
   elseif mode == "capital" then
     if focused == 1 and #capital.amount < 10 then capital.amount = capital.amount .. ch end
     if focused == 2 and #capital.memo < 48 then capital.memo = capital.memo .. ch end
@@ -1084,9 +1080,8 @@ local function backspaceField()
     if focused == 1 then reg.name = reg.name:sub(1, -2) end
     if focused == 2 then reg.ticker = reg.ticker:sub(1, -2) end
   elseif mode == "company" then
-    if focused == 1 then company_lookup.company = company_lookup.company:sub(1, -2) end
-    if focused == 2 then edit_company.name = edit_company.name:sub(1, -2) end
-    if focused == 3 then edit_company.ticker = edit_company.ticker:sub(1, -2) end
+    if focused == 1 then edit_company.name = edit_company.name:sub(1, -2) end
+    if focused == 2 then edit_company.ticker = edit_company.ticker:sub(1, -2) end
   elseif mode == "capital" then
     if focused == 1 then capital.amount = capital.amount:sub(1, -2) end
     if focused == 2 then capital.memo = capital.memo:sub(1, -2) end
