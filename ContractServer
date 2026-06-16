@@ -51,7 +51,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION            = "1.0.4-LIVE-REQUEST-DEDUPER"
+local VERSION            = "1.0.5-STRICT-LIVE-REQUESTS"
 local LABEL              = "Quid-Contracts"
 local PROTOCOL           = "quid_contracts"
 local PROTOCOL_BROADCAST = "quid_contracts_discovery"
@@ -178,6 +178,28 @@ local function itemSignature(items)
   end
   table.sort(parts)
   return table.concat(parts, ";")
+end
+
+local function sameFulfilmentItem(required, supplied)
+  if not required or not supplied then return false end
+  return trim(required.item or required.id or required.name or "") == trim(supplied.item or supplied.id or supplied.name or "")
+    and math.floor(tonumber(required.count or 0) or 0) == math.floor(tonumber(supplied.count or supplied.amount or supplied.qty or 0) or 0)
+end
+
+local function fulfilmentMatchesContract(c, supplied_items)
+  local required = normaliseItems(c and c.items or {})
+  local supplied = normaliseItems(supplied_items or {})
+
+  if #required <= 0 then return false, "Contract has no required items" end
+  if #supplied ~= 1 then return false, "Provide exactly one accepted item type for fulfilment" end
+
+  for _, req_item in ipairs(required) do
+    if sameFulfilmentItem(req_item, supplied[1]) then
+      return true
+    end
+  end
+
+  return false, "Fulfilment must exactly match one accepted option and the exact quantity"
 end
 
 local function sourceKey(req)
@@ -317,6 +339,10 @@ local function postContract(sender_id, req)
       existing.request_id = req.request_id or existing.request_id
       existing.minecolonies_request_id = req.minecolonies_request_id or existing.minecolonies_request_id
       existing.source_family = req.source_family or existing.source_family
+      existing.fixed_quantity = req.fixed_quantity or existing.fixed_quantity
+      existing.quantity_min = req.quantity_min or existing.quantity_min
+      existing.quantity_max = req.quantity_max or existing.quantity_max
+      existing.exact_fulfillment = req.exact_fulfillment or existing.exact_fulfillment
       existing.building_id = req.building_id
       existing.location = req.location
       existing.escrow_status = req.escrow_status or existing.escrow_status or "not_locked"
@@ -369,6 +395,10 @@ local function postContract(sender_id, req)
     request_id      = req.request_id,
     minecolonies_request_id = req.minecolonies_request_id,
     source_family   = req.source_family,
+    fixed_quantity  = req.fixed_quantity,
+    quantity_min    = req.quantity_min,
+    quantity_max    = req.quantity_max,
+    exact_fulfillment = req.exact_fulfillment,
     work_order_id   = req.work_order_id,
     building_id     = req.building_id,
     location        = req.location,
@@ -465,6 +495,15 @@ local function markFulfilled(sender_id, req)
 
   local c = contracts[id]
   if not c then return false, "Contract not found: " .. tostring(id) end
+  if c.status ~= "claimed" and c.status ~= "open" then
+    return false, "Contract is not active"
+  end
+
+  if c.exact_fulfillment or c.source_type == "minecolonies_request" then
+    local ok, err = fulfilmentMatchesContract(c, req.fulfilled_items or req.items or {})
+    if not ok then return false, err end
+    c.fulfilled_items = normaliseItems(req.fulfilled_items or req.items or {})
+  end
 
   c.status = "fulfilled"
   c.fulfilled_at = timestamp()
@@ -499,6 +538,7 @@ end
 local function syncSourceContracts(sender_id, req)
   local source_type = req.source_type
   local source_company = req.source_company
+  local source_terminal = req.source_terminal or sender_id
   local active = {}
 
   if type(req.active_source_keys) == "table" then
@@ -516,11 +556,20 @@ local function syncSourceContracts(sender_id, req)
   for id, c in pairs(contracts) do
     local matches_type = c.source_type == source_type
     local matches_company = (not source_company or c.source_company == source_company)
+
+    -- Scope stale cleanup to the current integrator where possible, but also
+    -- clean older MineColonies contracts that were created before source_terminal
+    -- was stored. This removes fake board entries automatically after requests
+    -- are cancelled in MineColonies.
+    local matches_terminal = (not source_terminal)
+      or (not c.source_terminal)
+      or tostring(c.source_terminal) == tostring(source_terminal)
+
     local live_status = (c.status == "open" or c.status == "claimed")
     local key = c.source_key
 
-    if matches_type and matches_company and live_status and key then
-      if not active[key] then
+    if matches_type and matches_company and matches_terminal and live_status then
+      if not key or not active[key] then
         c.status = "cancelled"
         c.cancelled_at = timestamp()
         c.updated = timestamp()
