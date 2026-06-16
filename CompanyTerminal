@@ -59,7 +59,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION           = "1.2.1-PAYOUT"
+local VERSION           = "1.2.4-OWNED-AUTO-FIX"
 local BANK_PROTOCOL     = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT        = 5
@@ -120,6 +120,8 @@ local company_lookup = { company = "" }
 
 local active_company_id = nil
 local active_company = nil
+local owned_companies = {}
+local owned_company_count = 0
 
 local capital = { amount = "", memo = "Owner capital injection" }
 
@@ -198,7 +200,7 @@ local function setMessage(msg, colour)
 end
 
 local function isOwner()
-  return active_company and active_company.owner_id == session.citizen_id
+  return active_company and (active_company.owner_id == session.citizen_id or active_company.account_owner_id == session.citizen_id)
 end
 
 -- =============================================================================
@@ -353,6 +355,51 @@ local function bankRequest(request, timeout)
   end
 end
 
+local function refreshOwnedCompanies(silent)
+  owned_companies = {}
+  owned_company_count = 0
+
+  if not session.logged_in or not session.username or not session.password then
+    if not silent then setMessage("Log in first.", C.err) end
+    return false
+  end
+
+  local ok, res = bankRequest({
+    type = "list_my_companies",
+    username = session.username,
+    password = session.password,
+  })
+
+  if not ok then
+    if not silent then setMessage("Owned company scan failed: " .. tostring(res), C.warn) end
+    return false
+  end
+
+  if type(res) == "table" and type(res.companies) == "table" then
+    owned_companies = res.companies
+    owned_company_count = tonumber(res.count) or #owned_companies
+
+    if not active_company_id and #owned_companies > 0 then
+      local c = owned_companies[1]
+      active_company_id = tostring(c.company_id or "")
+      active_company = c
+      company_lookup.company = active_company_id
+      if active_company_id ~= "" then
+        if not silent then setMessage("Selected owned company " .. active_company_id, C.ok) end
+        return true
+      end
+    end
+
+    if not silent then
+      setMessage("Owned companies: " .. tostring(owned_company_count), owned_company_count > 0 and C.ok or C.warn)
+    end
+    return true
+  end
+
+  if not silent then setMessage("Owned company scan returned no company list.", C.warn) end
+  return false
+end
+
 local function contractRequest(request, timeout)
   timeout = timeout or DB_TIMEOUT
   if not contract_id then return false, "No contract server connected" end
@@ -466,6 +513,10 @@ local function doLogin()
     session.title = res.title or "Account Holder"
     login.password = ""
     setMessage("Logged in as " .. tostring(session.citizen_id), C.ok)
+    refreshOwnedCompanies(true)
+    if active_company_id then
+      setMessage("Logged in. Active company: " .. tostring(active_company_id), C.ok)
+    end
     connectContracts(true)
     return true
   end
@@ -757,15 +808,16 @@ local function drawMain()
     at(4, card_y + 1, "Load/select a company by ticker or company ID.", C.label, C.card)
     at(4, card_y + 3, "Ticker or Company ID", C.card_fg, C.card)
     fields[1] = inputField(4, card_y + 4, W - 6, company_lookup.company, false)
+    at(4, card_y + 6, "Owned companies found: " .. tostring(owned_company_count), owned_company_count > 0 and C.ok or C.warn, C.card)
     if active_company then
-      at(4, card_y + 6, "Name:    " .. tostring(active_company.name or "?"), C.card_fg, C.card)
-      at(4, card_y + 7, "Account: " .. tostring(active_company_id or "?"), C.card_fg, C.card)
-      at(4, card_y + 8, "Owner:   " .. tostring(active_company.owner_id or "?"), isOwner() and C.ok or C.warn, C.card)
-      at(4, card_y + 9, "Status:  " .. tostring(active_company.status or "?"), C.label, C.card)
-      at(4, card_y + 10, "Balance: " .. money(active_company.cash_balance or 0), C.card_fg, C.card)
-      at(4, card_y + 11, "Shares:  " .. tostring(active_company.shares_total or 0), C.label, C.card)
+      at(4, card_y + 8, "Name:    " .. tostring(active_company.name or "?"), C.card_fg, C.card)
+      at(4, card_y + 9, "Account: " .. tostring(active_company_id or "?"), C.card_fg, C.card)
+      at(4, card_y + 10, "Owner:   " .. tostring(active_company.owner_id or active_company.account_owner_id or "?"), isOwner() and C.ok or C.warn, C.card)
+      at(4, card_y + 11, "Status:  " .. tostring(active_company.status or "?"), C.label, C.card)
+      at(4, card_y + 12, "Balance: " .. money(active_company.cash_balance or 0), C.card_fg, C.card)
+      at(4, card_y + 13, "Shares:  " .. tostring(active_company.shares_total or 0), C.label, C.card)
       local sh = active_company.shareholders or {}
-      local y = card_y + 13
+      local y = card_y + 15
       at(4, y, "Shareholders:", C.card_fg, C.card); y = y + 1
       local shown = 0
       for holder, shares in pairs(sh) do
@@ -776,8 +828,9 @@ local function drawMain()
       if shown == 0 then at(4, y, "No shareholder data.", C.label, C.card) end
     end
     buttons.clear = button(4, btn_y, third, "Clear", C.btn_sec, C.card_fg)
-    buttons.primary = button(5 + third, btn_y, third + 4, "Load", C.btn_pri, C.btn_fg)
-    buttons.signout = button(10 + (third * 2), btn_y, third, "Sign Out", C.btn_dan, C.btn_fg)
+    buttons.owned = button(5 + third, btn_y, third, "My Cos", C.btn_sec, C.card_fg)
+    buttons.primary = button(6 + (third * 2), btn_y, third, "Load", C.btn_pri, C.btn_fg)
+    buttons.signout = button(7 + (third * 3), btn_y, math.max(8, W - (7 + (third * 3)) - 1), "Sign Out", C.btn_dan, C.btn_fg)
 
   elseif mode == "capital" then
     at(4, card_y + 1, "Move funds between your personal account and the selected company.", C.label, C.card)
