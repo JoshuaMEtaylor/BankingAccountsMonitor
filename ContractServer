@@ -51,7 +51,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION            = "1.0.3-LIVE-REQUEST-RECONCILE"
+local VERSION            = "1.0.4-LIVE-REQUEST-DEDUPER"
 local LABEL              = "Quid-Contracts"
 local PROTOCOL           = "quid_contracts"
 local PROTOCOL_BROADCAST = "quid_contracts_discovery"
@@ -206,6 +206,62 @@ local function findLiveContractBySourceKey(key)
   return nil, nil
 end
 
+local function duplicateKey(c)
+  if not c then return nil end
+  local live_status = c.status == "open" or c.status == "claimed"
+  if not live_status then return nil end
+
+  -- Prefer explicit stable source keys from v1.0.7+ integrator.
+  if c.source_key and tostring(c.source_key) ~= "" then
+    return "source|" .. tostring(c.source_key)
+  end
+
+  -- Fallback for old contracts created before source_key existed. This cleans
+  -- old duplicate rows already present in data/contracts.db.
+  local poster = tostring(c.poster or c.source_company or "")
+  local title = tostring(c.title or "")
+  local sig = c.item_signature or itemSignature(c.items or {})
+  if poster ~= "" and title ~= "" and sig ~= "" then
+    return "legacy|" .. poster .. "|" .. title .. "|" .. sig
+  end
+  return nil
+end
+
+local function dedupeLiveContracts(reason)
+  local seen = {}
+  local cancelled = 0
+
+  local ids = {}
+  for id, _ in pairs(contracts or {}) do ids[#ids+1] = id end
+  table.sort(ids, function(a,b)
+    local ca, cb = contracts[a], contracts[b]
+    return tonumber(ca and ca.created or 0) > tonumber(cb and cb.created or 0)
+  end)
+
+  for _, id in ipairs(ids) do
+    local c = contracts[id]
+    local key = duplicateKey(c)
+    if key then
+      if not seen[key] then
+        seen[key] = id
+      else
+        c.status = "cancelled"
+        c.cancelled_at = timestamp()
+        c.updated = timestamp()
+        c.cancel_reason = reason or ("Duplicate live contract superseded by " .. tostring(seen[key]))
+        c.claimed_by = nil
+        c.claimed_type = nil
+        c.claimed_at = nil
+        cancelled = cancelled + 1
+        audit("DEDUP_CANCEL", c.poster or "unknown", "server", id)
+      end
+    end
+  end
+
+  if cancelled > 0 then writeFile(FILE.contracts, contracts) end
+  return cancelled
+end
+
 local function publicContract(c)
   local copy = {}
   for k, v in pairs(c) do
@@ -259,6 +315,8 @@ local function postContract(sender_id, req)
       existing.source_company = req.source_company or poster
       existing.work_order_id = req.work_order_id
       existing.request_id = req.request_id or existing.request_id
+      existing.minecolonies_request_id = req.minecolonies_request_id or existing.minecolonies_request_id
+      existing.source_family = req.source_family or existing.source_family
       existing.building_id = req.building_id
       existing.location = req.location
       existing.escrow_status = req.escrow_status or existing.escrow_status or "not_locked"
@@ -275,6 +333,7 @@ local function postContract(sender_id, req)
       end
 
       writeFile(FILE.contracts, contracts)
+      dedupeLiveContracts("Duplicate after live request refresh")
       audit(changed and "UPDATE" or "REFRESH", poster, sender_id, existing_id)
       return true, {
         contract = publicContract(existing),
@@ -308,6 +367,8 @@ local function postContract(sender_id, req)
     source_company  = req.source_company or poster,
     source_key      = src_key ~= "" and src_key or nil,
     request_id      = req.request_id,
+    minecolonies_request_id = req.minecolonies_request_id,
+    source_family   = req.source_family,
     work_order_id   = req.work_order_id,
     building_id     = req.building_id,
     location        = req.location,
@@ -316,6 +377,7 @@ local function postContract(sender_id, req)
 
   contracts[contract_id] = c
   writeFile(FILE.contracts, contracts)
+  dedupeLiveContracts("Duplicate after live request post")
   audit("POST", poster, sender_id, contract_id)
 
   return true, { contract = publicContract(c), message = "Contract posted", posted = true }
@@ -475,7 +537,8 @@ local function syncSourceContracts(sender_id, req)
   end
 
   writeFile(FILE.contracts, contracts)
-  return true, { cancelled = cancelled, kept = kept }
+  local deduped = dedupeLiveContracts("Duplicate live request contract")
+  return true, { cancelled = cancelled, kept = kept, deduped = deduped }
 end
 
 -- =============================================================================
@@ -538,6 +601,8 @@ local function initFiles()
     n = tonumber(n)
     if n and n > contract_counter then contract_counter = n end
   end
+
+  dedupeLiveContracts("Duplicate contract cleanup on boot")
 
   if fs.exists(FILE.audit) then
     local f = fs.open(FILE.audit, "r")
