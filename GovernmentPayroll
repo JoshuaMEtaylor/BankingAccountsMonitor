@@ -43,7 +43,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION = "1.0.2-CENTRAL-EMPLOYMENT-MAP"
+local VERSION = "1.0.3-SAFE-MAIN-CALL"
 local BANK_PROTOCOL = "quid_bank"
 local DB_TIMEOUT = 5
 local CHECK_INTERVAL = 10
@@ -912,4 +912,10 @@ local function main()
   end
 end
 
-main()
+
+-- Explicit startup call. Do not remove the brackets; ComputerCraft needs an actual function call here.
+local ok_COMPANY_PAYROLL_SAFE_MAIN, err_COMPANY_PAYROLL_SAFE_MAIN = pcall(main)
+if not ok_COMPANY_PAYROLL_SAFE_MAIN then
+  term.setCursorBlink(false)
+  print("Runtime error: " .. tostring(err_COMPANY_PAYROLL_SAFE_MAIN))
+end
