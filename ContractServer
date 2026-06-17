@@ -51,7 +51,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION            = "1.0.15-AUTO-COMPLETE-CLAIMS"
+local VERSION            = "1.0.17-CLAIMANT-PAYOUT-RESOLVE"
 local LABEL              = "Quid-Contracts"
 local PROTOCOL           = "quid_contracts"
 local PROTOCOL_BROADCAST = "quid_contracts_discovery"
@@ -370,19 +370,43 @@ local function isCompanyAccount(acc)
   return false
 end
 
-local function bankCompanyExists(company_id)
-  company_id = trim(company_id or "")
-  if company_id == "" then return false end
+local function resolveCompanyAccount(company_ref)
+  company_ref = trim(company_ref or "")
+  if company_ref == "" then return false, "Missing company reference" end
+
   local accounts, err = bankAccounts()
   if not accounts then return false, err or "Could not read bank accounts" end
 
+  local wanted = string.lower(company_ref)
+  local wanted_ticker = wanted:gsub("^company:", "")
+
   for _, acc in ipairs(accounts) do
-    local id = tostring(acc.account_id or acc.id or "")
-    if id == company_id and isCompanyAccount(acc) then
-      return true, acc
+    if isCompanyAccount(acc) then
+      local id = tostring(acc.account_id or acc.id or "")
+      local id_l = string.lower(id)
+      local ticker = id_l:gsub("^company:", "")
+      local acc_ticker = string.lower(tostring(acc.ticker or ticker or ""))
+
+      if id_l == wanted
+        or ticker == wanted_ticker
+        or acc_ticker == wanted_ticker
+        or ("company:" .. acc_ticker) == wanted then
+        local copy = {}
+        for k, v in pairs(acc) do copy[k] = v end
+        copy.account_id = id
+        copy.company_id = id
+        copy.ticker = string.upper(ticker ~= "" and ticker or acc_ticker)
+        copy.display_name = copy.display_name or copy.name or id
+        return true, copy
+      end
     end
   end
-  return false, "Company account not found: " .. tostring(company_id)
+
+  return false, "Company account not found: " .. tostring(company_ref)
+end
+
+local function bankCompanyExists(company_id)
+  return resolveCompanyAccount(company_id)
 end
 
 local function listClaimantCompanies(sender_id, req)
@@ -611,6 +635,10 @@ local function claimContract(sender_id, req)
     end
     local exists, acc_or_err = bankCompanyExists(claimant)
     if not exists then return false, acc_or_err end
+    claimant = acc_or_err.account_id or acc_or_err.company_id or claimant
+    c.claimed_company_id = claimant
+    c.claimed_ticker = acc_or_err.ticker
+    c.claimed_name = acc_or_err.display_name
   end
 
   c.status = "claimed"
@@ -639,6 +667,9 @@ local function unclaimContract(sender_id, req)
   c.claimed_by = nil
   c.claimed_type = nil
   c.claimed_at = nil
+  c.claimed_company_id = nil
+  c.claimed_ticker = nil
+  c.claimed_name = nil
   c.updated = timestamp()
 
   writeFile(FILE.contracts, contracts)
@@ -653,13 +684,26 @@ local function payContract(c)
   if c.payout_status == "paid" then return true, { already_paid = true, tx_id = c.payout_tx_id } end
 
   local from_id = trim(c.poster or c.source_company or "")
-  local to_id = trim(c.claimed_by or "")
+  local to_id = trim(c.claimed_company_id or c.claimed_by or "")
   local amount = tonumber(c.reward) or 0
   amount = math.floor(amount)
 
   if from_id == "" then return false, "Missing poster account for payout" end
   if to_id == "" then return false, "Missing claimant account for payout" end
   if amount <= 0 then return false, "Invalid payout amount" end
+
+  if (c.claimed_type or "company") == "company" then
+    local exists, acc_or_err = resolveCompanyAccount(to_id)
+    if not exists then
+      return false, "Claimant company could not be resolved for payout: " .. tostring(acc_or_err)
+    end
+
+    to_id = acc_or_err.account_id or acc_or_err.company_id or to_id
+    c.claimed_company_id = to_id
+    c.claimed_by = to_id
+    c.claimed_ticker = acc_or_err.ticker
+    c.claimed_name = acc_or_err.display_name
+  end
 
   local ok, res = bankReq({
     type = "contract_payout",
@@ -834,6 +878,31 @@ local function syncSourceContracts(sender_id, req)
 
           kept = kept + 1
 
+        elseif c.status == "pending_payout" then
+          -- Fulfilment has already been detected. Keep retrying payout, but do
+          -- not cancel or reopen the contract.
+          local paid_ok, paid_res = payContract(c)
+
+          if paid_ok then
+            c.status = "fulfilled"
+            c.fulfilled_at = timestamp()
+            c.updated = timestamp()
+            c.fulfillment_note = "Auto-completed after pending payout retry."
+            c.completion_confirmed_by = "retry:" .. tostring(sender_id)
+            auto_completed = auto_completed + 1
+            audit("AUTO_PAYOUT_RETRY_SUCCESS", c.claimed_by or "unknown", sender_id, id)
+          else
+            c.status = "pending_payout"
+            c.updated = timestamp()
+            c.payout_status = "failed"
+            c.payout_error = tostring(paid_res)
+            c.payout_failed_at = timestamp()
+            payout_failed = payout_failed + 1
+            audit("AUTO_PAYOUT_RETRY_FAILED", c.claimed_by or "unknown", sender_id, id .. " " .. tostring(paid_res))
+          end
+
+          kept = kept + 1
+
         else
           -- Unclaimed/open request disappeared: it was never assigned to a claimant,
           -- so it is stale and should be cancelled.
@@ -844,6 +913,9 @@ local function syncSourceContracts(sender_id, req)
           c.claimed_by = nil
           c.claimed_type = nil
           c.claimed_at = nil
+          c.claimed_company_id = nil
+          c.claimed_ticker = nil
+          c.claimed_name = nil
           cancelled = cancelled + 1
           audit("STALE_CANCEL", c.poster or "unknown", sender_id, id)
         end
@@ -915,6 +987,36 @@ handlers["mark_fulfilled"] = markFulfilled
 handlers["cancel_contract"] = cancelContract
 handlers["sync_source_contracts"] = syncSourceContracts
 handlers["list_claimant_companies"] = listClaimantCompanies
+handlers["retry_contract_payout"] = function(sender_id, req)
+  local id = req.contract_id
+  if not id then return false, "Missing contract_id" end
+
+  local c = contracts[id]
+  if not c then return false, "Contract not found: " .. tostring(id) end
+  if c.status ~= "pending_payout" then return false, "Contract is not pending payout" end
+
+  local paid_ok, paid_res = payContract(c)
+  if paid_ok then
+    c.status = "fulfilled"
+    c.fulfilled_at = timestamp()
+    c.updated = timestamp()
+    c.fulfillment_note = "Fulfilled after manual payout retry."
+    c.completion_confirmed_by = "retry:" .. tostring(sender_id)
+    writeFile(FILE.contracts, contracts)
+    audit("MANUAL_PAYOUT_RETRY_SUCCESS", c.claimed_by or "unknown", sender_id, id)
+    return true, { contract = publicContract(c), payout = paid_res, message = "Payout retried and paid" }
+  end
+
+  c.status = "pending_payout"
+  c.updated = timestamp()
+  c.payout_status = "failed"
+  c.payout_error = tostring(paid_res)
+  c.payout_failed_at = timestamp()
+  writeFile(FILE.contracts, contracts)
+  audit("MANUAL_PAYOUT_RETRY_FAILED", c.claimed_by or "unknown", sender_id, id .. " " .. tostring(paid_res))
+  return false, "Payout still failed: " .. tostring(paid_res)
+end
+
 
 
 local function bootReopenActiveContracts()
@@ -929,11 +1031,14 @@ local function bootReopenActiveContracts()
         or tostring(c.source_family or "") ~= ""
 
       if is_minecolonies then
-        if c.status == "claimed" or c.status == "pending_completion" or c.status == "pending_payout" then
+        if c.status == "claimed" or c.status == "pending_completion" then
           c.status = "open"
           c.claimed_by = nil
           c.claimed_type = nil
           c.claimed_at = nil
+          c.claimed_company_id = nil
+          c.claimed_ticker = nil
+          c.claimed_name = nil
           c.pending_completion_at = nil
           c.pending_reason = nil
           c.payout_status = nil
@@ -944,6 +1049,25 @@ local function bootReopenActiveContracts()
           c.reopen_reason = "Boot reset: active claimed live request reopened"
           reopened = reopened + 1
           audit("BOOT_REOPEN", c.poster or "unknown", "server", id)
+        elseif c.status == "pending_payout" then
+          -- Fulfilment has already been detected. Preserve claimant and retry
+          -- the payout instead of reopening the job.
+          local paid_ok, paid_res = payContract(c)
+          if paid_ok then
+            c.status = "fulfilled"
+            c.fulfilled_at = ts
+            c.updated = ts
+            c.fulfillment_note = "Fulfilled after boot payout retry."
+            c.completion_confirmed_by = "boot-retry"
+            audit("BOOT_PAYOUT_RETRY_SUCCESS", c.claimed_by or "unknown", "server", id)
+          else
+            c.status = "pending_payout"
+            c.updated = ts
+            c.payout_status = "failed"
+            c.payout_error = tostring(paid_res)
+            c.payout_failed_at = ts
+            audit("BOOT_PAYOUT_RETRY_FAILED", c.claimed_by or "unknown", "server", id .. " " .. tostring(paid_res))
+          end
         elseif c.status == "cancelled" and (c.reset_by or tostring(c.cancel_reason or ""):find("Manual reset", 1, true)) then
           -- Repair the damage from the removed Reset Live button: those were
           -- live request contracts cancelled by tooling, not fulfilled/cancelled
@@ -952,6 +1076,9 @@ local function bootReopenActiveContracts()
           c.claimed_by = nil
           c.claimed_type = nil
           c.claimed_at = nil
+          c.claimed_company_id = nil
+          c.claimed_ticker = nil
+          c.claimed_name = nil
           c.cancelled_at = nil
           c.cancel_reason = nil
           c.reset_by = nil
