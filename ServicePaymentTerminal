@@ -2,7 +2,7 @@
 -- SERVICE PAYMENT TERMINAL
 -- ServicePaymentTerminal
 --
--- v1.2.3-PRICE-SHOCK-FALLBACK
+-- v1.2.5-HALLOWAY-DINING-TARGET
 --
 -- Dining Hall / Restaurant point-of-sale for MineColonies citizens.
 --
@@ -18,7 +18,7 @@
 --   3. current positive inflation_rate as an immediate price-pressure floor
 --
 -- Payment route:
---   citizen account -> company:grki via bank hospitality_meal_payment endpoint
+--   citizen account -> detected Dining Hall company account via bank hospitality_meal_payment endpoint
 -- =============================================================================
 
 local args = {...}
@@ -44,9 +44,9 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION = "1.2.4-ZERO-BASE-PRICE-FALLBACK"
+local VERSION = "1.2.5-HALLOWAY-DINING-TARGET"
 local BANK_PROTOCOL = "quid_bank"
-local TARGET_COMPANY = "company:grki"
+local TARGET_COMPANY = "company:halloway_dining" -- fallback / manual override; auto-detects from Dining Hall name when possible
 
 local SCAN_SECONDS = 2
 local DINING_RADIUS = 28
@@ -80,6 +80,8 @@ local CONFIG_FILE = "data/service_payment_config.db"
 -- =============================================================================
 local db_id = nil
 local colony = nil
+local active_company_id = TARGET_COMPANY
+local active_dining_name = "fallback target"
 local auto_charge = true
 local last_message = "Booting..."
 local last_colour = colors.lightGray
@@ -272,6 +274,43 @@ local function citizenAccountId(z)
   return "citizen:" .. u
 end
 
+local function companySlug(text)
+  text = lower(text or "")
+  text = text:gsub("^company:", "")
+  text = text:gsub("[^%w]+", "_")
+  text = text:gsub("^_+", "")
+  text = text:gsub("_+$", "")
+  if text == "" then return nil end
+  return text
+end
+
+local function companyIdFromName(name)
+  local slug = companySlug(name)
+  if not slug then return nil end
+  return "company:" .. slug
+end
+
+local function diningCompanyIdForBuilding(b)
+  if type(b) ~= "table" then return TARGET_COMPANY end
+
+  -- Prefer explicit company-like fields if a future integrator exposes them.
+  local explicit = b.company_id or b.companyId or b.account_id or b.accountId or b.business_id or b.businessId
+  if explicit and tostring(explicit) ~= "" then
+    explicit = tostring(explicit)
+    if explicit:find("^company:") then return explicit end
+    return companyIdFromName(explicit) or TARGET_COMPANY
+  end
+
+  -- Current MineColonies building data normally gives us name/type/location,
+  -- not a bank account. Use the building name as the company account slug.
+  -- Example: "Halloway dining" -> "company:halloway_dining".
+  local name = b.name or b.display_name or b.displayName
+  local id = companyIdFromName(name)
+  if id then return id end
+
+  return TARGET_COMPANY
+end
+
 local function citizenName(z, fallback)
   return tostring(z and (z.name or z.display_name or z.displayName) or fallback or "citizen")
 end
@@ -451,8 +490,10 @@ local function diningBuildings(buildings)
     if isDiningBuilding(b) then
       local p = getPos(b)
       if p then
+        local dname = tostring(b.name or b.type or "Dining Hall")
         out[#out + 1] = {
-          name = tostring(b.name or b.type or "Dining Hall"),
+          name = dname,
+          company_id = diningCompanyIdForBuilding(b),
           pos = p,
           raw = b,
         }
@@ -545,11 +586,12 @@ local function totalReceivables()
   return total
 end
 
-local function chargeCitizenMeal(citizen_id, name, amount, label, gain)
+local function chargeCitizenMeal(citizen_id, name, amount, label, gain, company_id)
+  company_id = company_id or active_company_id or TARGET_COMPANY
   local ok, res = bankReq({
     type = "hospitality_meal_payment",
     citizen_id = citizen_id,
-    company_id = TARGET_COMPANY,
+    company_id = company_id,
     amount = amount,
     item = label,
     memo = "Dining Hall " .. label .. " (sat +" .. string.format("%.1f", gain) .. ", CPI x" .. string.format("%.3f", pricing.effective_index) .. ")",
@@ -572,6 +614,7 @@ local function chargeCitizenMeal(citizen_id, name, amount, label, gain)
     addEvent({
       type = "meal_charge",
       citizen_id = citizen_id,
+      company_id = company_id,
       name = name,
       label = label,
       gain = gain,
@@ -585,7 +628,7 @@ local function chargeCitizenMeal(citizen_id, name, amount, label, gain)
     })
 
     if paid > 0 then
-      setMsg("Charged " .. tostring(name) .. " " .. money(paid) .. " for " .. label, colors.lime)
+      setMsg("Charged " .. tostring(name) .. " " .. money(paid) .. " to " .. tostring(company_id), colors.lime)
     else
       setMsg(tostring(name) .. " could not pay " .. money(amount) .. " for " .. label, colors.orange)
     end
@@ -625,6 +668,7 @@ local function processCitizen(z, dining)
   if near then
     rec.near_at = t
     rec.near_building = nearBuilding and nearBuilding.name or "proximity disabled"
+    rec.near_company_id = nearBuilding and nearBuilding.company_id or active_company_id or TARGET_COMPANY
     rec.near_distance = nearDistance
     stats.near_dining = stats.near_dining + 1
   end
@@ -672,7 +716,7 @@ local function processCitizen(z, dining)
       elseif amount <= 0 then
         stats.skipped_small_gain = stats.skipped_small_gain + 1
       else
-        if chargeCitizenMeal(cid, name, amount, label, gain) then
+        if chargeCitizenMeal(cid, name, amount, label, gain, rec.near_company_id or active_company_id or TARGET_COMPANY) then
           rec.last_charge_at = t
           rec.last_charge_amount = amount
           rec.last_charge_label = label
@@ -709,6 +753,14 @@ local function poll()
   local citizens = getLiveCitizens()
   local buildings = getLiveBuildings()
   local dining = diningBuildings(buildings)
+
+  if #dining > 0 then
+    active_company_id = dining[1].company_id or TARGET_COMPANY
+    active_dining_name = dining[1].name or "Dining Hall"
+  else
+    active_company_id = TARGET_COMPANY
+    active_dining_name = "fallback target"
+  end
 
   stats.citizens_seen = #citizens
   stats.dining_buildings = #dining
@@ -782,19 +834,20 @@ local function draw()
   at(2, 3, "Source:       saturation POS, no inventory scan", colors.white)
   at(2, 4, "Bank:         " .. tostring(db_id or "not connected"), db_id and colors.lime or colors.red)
   at(2, 5, "Colony:       " .. tostring(colony and "connected" or "missing"), colony and colors.lime or colors.red)
-  at(2, 6, "Company:      " .. TARGET_COMPANY, colors.lime)
-  at(2, 7, "Auto:         " .. (auto_charge and "ON" or "OFF"), auto_charge and colors.lime or colors.orange)
+  at(2, 6, "Company:      " .. tostring(active_company_id or TARGET_COMPANY), colors.lime)
+  at(2, 7, "Dining area:  " .. tostring(active_dining_name or "unknown"), colors.lightGray)
+  at(2, 8, "Auto:         " .. (auto_charge and "ON" or "OFF"), auto_charge and colors.lime or colors.orange)
 
-  at(2, 9,  "Citizens:     " .. tostring(stats.citizens_seen) .. "   Near dining: " .. tostring(stats.near_dining), colors.lightGray)
-  at(2, 10, "Dining halls: " .. tostring(stats.dining_buildings) .. "   Radius: " .. tostring(DINING_RADIUS), stats.dining_buildings > 0 and colors.lime or colors.orange)
-  at(2, 11, "Price CPI:    food x" .. string.format("%.3f", pricing.food_index) .. "  general x" .. string.format("%.3f", pricing.general_index), colors.cyan)
-  at(2, 12, "Meal price:   normal " .. money(pricing.normal_meal) .. " | pressure " .. string.format("%.1f%%", (pricing.monetary_pressure or 0) * 100), colors.cyan)
-  at(2, 13, "Oracle:       " .. tostring(pricing.source or "fallback"), colors.lightGray)
+  at(2, 10,  "Citizens:     " .. tostring(stats.citizens_seen) .. "   Near dining: " .. tostring(stats.near_dining), colors.lightGray)
+  at(2, 11, "Dining halls: " .. tostring(stats.dining_buildings) .. "   Radius: " .. tostring(DINING_RADIUS), stats.dining_buildings > 0 and colors.lime or colors.orange)
+  at(2, 12, "Price CPI:    food x" .. string.format("%.3f", pricing.food_index) .. "  general x" .. string.format("%.3f", pricing.general_index), colors.cyan)
+  at(2, 13, "Meal price:   normal " .. money(pricing.normal_meal) .. " | pressure " .. string.format("%.1f%%", (pricing.monetary_pressure or 0) * 100), colors.cyan)
+  at(2, 14, "Oracle:       " .. tostring(pricing.source or "fallback"), colors.lightGray)
 
-  at(2, 15, "Sat rises:    " .. tostring(stats.saturation_rises) .. "   Last gain: +" .. string.format("%.1f", stats.last_gain), colors.lightGray)
-  at(2, 16, "Meals:        " .. tostring(stats.meals_charged) .. "   Charged: " .. money(stats.charged) .. "   Unpaid: " .. money(stats.unpaid), colors.lime)
-  at(2, 17, "Skipped:      staff " .. tostring(stats.skipped_staff) .. " / cooldown " .. tostring(stats.skipped_cooldown) .. " / not near " .. tostring(stats.skipped_not_near) .. " / tiny " .. tostring(stats.skipped_small_gain), colors.orange)
-  at(2, 18, "Receivables:  " .. money(totalReceivables()), totalReceivables() > 0 and colors.orange or colors.gray)
+  at(2, 16, "Sat rises:    " .. tostring(stats.saturation_rises) .. "   Last gain: +" .. string.format("%.1f", stats.last_gain), colors.lightGray)
+  at(2, 17, "Meals:        " .. tostring(stats.meals_charged) .. "   Charged: " .. money(stats.charged) .. "   Unpaid: " .. money(stats.unpaid), colors.lime)
+  at(2, 18, "Skipped:      staff " .. tostring(stats.skipped_staff) .. " / cooldown " .. tostring(stats.skipped_cooldown) .. " / not near " .. tostring(stats.skipped_not_near) .. " / tiny " .. tostring(stats.skipped_small_gain), colors.orange)
+  at(2, 19, "Receivables:  " .. money(totalReceivables()), totalReceivables() > 0 and colors.orange or colors.gray)
 
   local third = math.floor((W - 8) / 3)
   local bScan = button(2, H - 3, third, "Poll Now", colors.purple)
@@ -817,6 +870,15 @@ local function loadConfig()
   if tonumber(cfg.near_grace_seconds) then NEAR_GRACE_SECONDS = math.max(1, tonumber(cfg.near_grace_seconds)) end
   if tonumber(cfg.meal_cooldown_seconds) then MEAL_COOLDOWN_SECONDS = math.max(1, tonumber(cfg.meal_cooldown_seconds)) end
   if tonumber(cfg.base_normal_meal_price) then BASE_NORMAL_MEAL_PRICE = math.max(0.1, tonumber(cfg.base_normal_meal_price)) end
+  if cfg.target_company or cfg.company_id then
+    local t = tostring(cfg.target_company or cfg.company_id)
+    if t ~= "" then
+      if not t:find("^company:") then t = companyIdFromName(t) or t end
+      TARGET_COMPANY = t
+      active_company_id = TARGET_COMPANY
+      active_dining_name = "config override"
+    end
+  end
 end
 
 local function main()
