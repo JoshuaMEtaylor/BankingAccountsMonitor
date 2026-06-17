@@ -1,0 +1,182 @@
+-- =============================================================================
+-- DINING HALL DIAGNOSTIC
+-- DiningHallDiagnostic
+--
+-- Dumps exactly what ComputerCraft / Advanced Peripherals can see for:
+--   * Dining Hall / Restaurant / Cook buildings
+--   * storageBlocks fields
+--   * Waiter / Cook / Chef citizens
+--   * attached inventory peripherals with list()
+--
+-- Run on the same terminal as the ServicePaymentTerminal.
+-- =============================================================================
+
+local OUT = "data/dining_hall_diagnostic.txt"
+
+local function ensureDir(path)
+  local dir = fs.getDir(path)
+  if dir and dir ~= "" and not fs.exists(dir) then fs.makeDir(dir) end
+end
+
+local function writeLines(lines)
+  ensureDir(OUT)
+  local f = fs.open(OUT, "w")
+  for _, line in ipairs(lines) do f.writeLine(line) end
+  f.close()
+end
+
+local function safeSerialize(v)
+  local ok, res = pcall(textutils.serialize, v)
+  if ok then return res end
+  return "<unserializable>"
+end
+
+local function lower(s)
+  return string.lower(tostring(s or ""))
+end
+
+local function normalType(s)
+  s = tostring(s or "")
+  s = s:gsub("com%.minecolonies%.building%.", "")
+  s = s:gsub("com%.minecolonies%.job%.", "")
+  return lower(s)
+end
+
+local function isDiningBuilding(b)
+  local t = normalType(b and (b.type or b.name) or "")
+  local n = normalType(b and b.name or "")
+  return t:find("dining",1,true)
+    or t:find("restaurant",1,true)
+    or t:find("cook",1,true)
+    or t:find("tavern",1,true)
+    or n:find("dining",1,true)
+    or n:find("restaurant",1,true)
+    or n:find("cook",1,true)
+    or n:find("tavern",1,true)
+end
+
+local function citizenJobText(z)
+  local parts = {}
+  if z.job then parts[#parts+1] = tostring(z.job) end
+  if z.title then parts[#parts+1] = tostring(z.title) end
+  if type(z.work) == "table" then
+    if z.work.job then parts[#parts+1] = tostring(z.work.job) end
+    if z.work.type then parts[#parts+1] = tostring(z.work.type) end
+    if z.work.name then parts[#parts+1] = tostring(z.work.name) end
+  end
+  return lower(table.concat(parts, " "))
+end
+
+local function isDiningCitizen(z)
+  local txt = citizenJobText(z) .. " " .. lower(z.name)
+  return txt:find("waiter",1,true)
+    or txt:find("cook",1,true)
+    or txt:find("chef",1,true)
+    or txt:find("restaurant",1,true)
+    or txt:find("dining",1,true)
+end
+
+term.clear()
+term.setCursorPos(1, 1)
+term.setTextColor(colors.yellow)
+print("Dining Hall Diagnostic")
+term.setTextColor(colors.white)
+print("Scanning...")
+
+local lines = {}
+local function log(s)
+  lines[#lines+1] = tostring(s or "")
+end
+
+log("DINING HALL DIAGNOSTIC")
+log("Time: " .. tostring(os.epoch and os.epoch("utc") or os.clock()))
+log("Computer: " .. tostring(os.getComputerLabel() or os.getComputerID()))
+log("")
+
+local colony = peripheral.find("colonyIntegrator") or peripheral.find("colony_integrator")
+log("COLONY INTEGRATOR")
+log("Found: " .. tostring(colony ~= nil))
+
+if colony then
+  if colony.getColonyName then
+    local ok, name = pcall(colony.getColonyName)
+    log("Colony name: " .. tostring(ok and name or "<error>"))
+  end
+
+  log("")
+  log("BUILDINGS")
+  if colony.getBuildings then
+    local ok, buildings = pcall(colony.getBuildings)
+    log("getBuildings ok: " .. tostring(ok))
+    if ok and type(buildings) == "table" then
+      log("Building count: " .. tostring(#buildings))
+      for i, b in ipairs(buildings) do
+        if isDiningBuilding(b) then
+          log("")
+          log("---- DINING BUILDING #" .. tostring(i) .. " ----")
+          log(safeSerialize(b))
+        end
+      end
+    else
+      log("getBuildings returned: " .. tostring(buildings))
+    end
+  else
+    log("getBuildings unavailable")
+  end
+
+  log("")
+  log("DINING CITIZENS / WORKERS")
+  if colony.getCitizens then
+    local ok, citizens = pcall(colony.getCitizens)
+    log("getCitizens ok: " .. tostring(ok))
+    if ok and type(citizens) == "table" then
+      log("Citizen count: " .. tostring(#citizens))
+      for i, z in ipairs(citizens) do
+        if isDiningCitizen(z) then
+          log("")
+          log("---- DINING CITIZEN #" .. tostring(i) .. " ----")
+          log(safeSerialize(z))
+        end
+      end
+    else
+      log("getCitizens returned: " .. tostring(citizens))
+    end
+  else
+    log("getCitizens unavailable")
+  end
+end
+
+log("")
+log("ATTACHED INVENTORY PERIPHERALS")
+for _, name in ipairs(peripheral.getNames()) do
+  local typ = peripheral.getType(name)
+  local obj = peripheral.wrap(name)
+  local hasList = obj and type(obj.list) == "function"
+  log("")
+  log("Peripheral: " .. tostring(name) .. " type=" .. tostring(typ) .. " has list()=" .. tostring(hasList))
+  if hasList then
+    local ok, items = pcall(obj.list)
+    log("list() ok: " .. tostring(ok))
+    if ok then
+      log(safeSerialize(items))
+    else
+      log("list() error: " .. tostring(items))
+    end
+  end
+end
+
+writeLines(lines)
+
+term.clear()
+term.setCursorPos(1, 1)
+term.setTextColor(colors.lime)
+print("Dining diagnostic complete.")
+term.setTextColor(colors.white)
+print("")
+print("Saved:")
+print(OUT)
+print("")
+print("Open with:")
+print("edit " .. OUT)
+print("")
+print("Send me the output if you want me to wire the service terminal to the actual exposed fields.")
