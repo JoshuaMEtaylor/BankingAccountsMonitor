@@ -5,7 +5,7 @@
 -- Current service module: Hospitality / Dining Hall meals.
 --
 -- Flow:
---   1. Watch Dining Hall / Restaurant / Cook food stock.
+--   1. Watch Waiter/Cook inventory first, then Dining Hall / Restaurant / Cook stock.
 --   2. Ignore coal/charcoal only; everything else in dining stock is treated as chargeable stock.
 --   3. When food stock decreases, wait the configured eating delay.
 --   4. Find the citizen who last increased saturation after that stock decrease.
@@ -48,7 +48,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION = "1.0.2-DINING-STOCK-NON-FUEL"
+local VERSION = "1.0.3-WAITER-INVENTORY-STOCK"
 local BANK_PROTOCOL = "quid_bank"
 local DB_TIMEOUT = 5
 
@@ -80,6 +80,7 @@ local last_colour = colors.lightGray
 
 local stats = {
   stock_sources = 0,
+  worker_stock_sources = 0,
   food_kinds = 0,
   food_units = 0,
   last_food_loss = 0,
@@ -366,12 +367,30 @@ local function getBuildings()
   return {}
 end
 
-local function hospitalityBuildings()
-  local out = {}
-  for _, b in ipairs(getBuildings()) do
-    if isHospitalityBuilding(b) then out[#out+1] = b end
+local function citizenJobText(z)
+  local parts = {}
+
+  if type(z) ~= "table" then return "" end
+  if z.job then parts[#parts+1] = tostring(z.job) end
+  if z.title then parts[#parts+1] = tostring(z.title) end
+  if z.profession then parts[#parts+1] = tostring(z.profession) end
+
+  if type(z.work) == "table" then
+    if z.work.job then parts[#parts+1] = tostring(z.work.job) end
+    if z.work.type then parts[#parts+1] = tostring(z.work.type) end
+    if z.work.name then parts[#parts+1] = tostring(z.work.name) end
   end
-  return out
+
+  return lower(table.concat(parts, " "))
+end
+
+local function isDiningWorker(z)
+  local txt = citizenJobText(z) .. " " .. lower(z and z.name or "")
+  return txt:find("waiter",1,true)
+    or txt:find("cook",1,true)
+    or txt:find("chef",1,true)
+    or txt:find("restaurant",1,true)
+    or txt:find("dining",1,true)
 end
 
 -- =============================================================================
@@ -439,10 +458,80 @@ local function countFromStorageTable(tbl, counts)
   return after_units > before_units
 end
 
+local function countFromCitizenInventoryValue(v, counts, depth)
+  if type(v) ~= "table" then return false end
+  depth = depth or 0
+  if depth > 5 then return false end
+
+  local before_units = 0
+  for _, q in pairs(counts) do before_units = before_units + q end
+
+  -- Direct stack-like table.
+  local item_name = v.name or v.item or v.id or v.item_id or v.itemName or v.displayName
+  local qty = v.count or v.qty or v.amount or v.size or v.quantity
+
+  if item_name and qty then
+    addFood(counts, item_name, qty)
+  end
+
+  -- Common inventory containers exposed by AP/mod integrations.
+  local keys = {
+    "inventory", "items", "stacks", "contents", "mainInventory",
+    "main_inventory", "heldItems", "held_items", "food", "foods",
+    "slots", "backpack", "equipment"
+  }
+
+  for _, k in ipairs(keys) do
+    if type(v[k]) == "table" then
+      countFromCitizenInventoryValue(v[k], counts, depth + 1)
+    end
+  end
+
+  -- Array-style inventory list.
+  local is_arrayish = false
+  for k, _ in pairs(v) do
+    if type(k) == "number" then is_arrayish = true break end
+  end
+
+  if is_arrayish then
+    for _, child in pairs(v) do
+      if type(child) == "table" then
+        countFromCitizenInventoryValue(child, counts, depth + 1)
+      end
+    end
+  end
+
+  local after_units = 0
+  for _, q in pairs(counts) do after_units = after_units + q end
+  return after_units > before_units
+end
+
+local function countDiningWorkerInventories(counts)
+  local sources = 0
+
+  if not colony or not colony.getCitizens then return 0 end
+
+  local ok, citizens = pcall(colony.getCitizens)
+  if not ok or type(citizens) ~= "table" then return 0 end
+
+  for _, z in ipairs(citizens) do
+    if isDiningWorker(z) then
+      if countFromCitizenInventoryValue(z, counts, 0) then
+        sources = sources + 1
+      end
+    end
+  end
+
+  return sources
+end
+
 local function readFoodStock()
   local counts = {}
   local sources = 0
   local seen_peripherals = {}
+
+  local worker_sources = countDiningWorkerInventories(counts)
+  if worker_sources > 0 then sources = sources + worker_sources end
 
   local function tryPeripheral(pname)
     if type(pname) ~= "string" or pname == "" then return end
@@ -518,6 +607,7 @@ local function readFoodStock()
   end
 
   stats.stock_sources = sources
+  stats.worker_stock_sources = worker_sources or 0
   stats.food_kinds = kinds
   stats.food_units = units
 
@@ -914,15 +1004,16 @@ local function draw()
   at(2, 7, "Auto charge:  " .. (auto_charge and "ON" or "OFF"), auto_charge and colors.lime or colors.orange)
 
   at(2, 9,  "Dining stock sources: " .. tostring(stats.stock_sources), stats.stock_sources > 0 and colors.lime or colors.orange)
-  at(2, 10, "Tracked kinds/units:  " .. tostring(stats.food_kinds) .. " / " .. tostring(stats.food_units), colors.white)
-  at(2, 11, "Last food decrease:   " .. tostring(stats.last_food_loss), stats.last_food_loss > 0 and colors.yellow or colors.gray)
-  at(2, 12, "Pending food events:  " .. tostring(#pending_food_events), #pending_food_events > 0 and colors.yellow or colors.gray)
-  at(2, 13, "Saturation events:    " .. tostring(#saturation_events), colors.cyan)
+  at(2, 10, "Waiter/Cook sources:  " .. tostring(stats.worker_stock_sources or 0), (stats.worker_stock_sources or 0) > 0 and colors.lime or colors.orange)
+  at(2, 11, "Tracked kinds/units:  " .. tostring(stats.food_kinds) .. " / " .. tostring(stats.food_units), colors.white)
+  at(2, 12, "Last food decrease:   " .. tostring(stats.last_food_loss), stats.last_food_loss > 0 and colors.yellow or colors.gray)
+  at(2, 13, "Pending food events:  " .. tostring(#pending_food_events), #pending_food_events > 0 and colors.yellow or colors.gray)
+  at(2, 14, "Saturation events:    " .. tostring(#saturation_events), colors.cyan)
 
-  at(2, 15, "Matched meals today:  " .. tostring(rec.matched or 0), colors.white)
-  at(2, 16, "Charged today:        " .. money(rec.charged or 0), colors.lime)
-  at(2, 17, "Unpaid receivable:    " .. money(rec.unpaid or 0), (rec.unpaid or 0) > 0 and colors.orange or colors.gray)
-  at(2, 18, "Unattributed food:    " .. tostring(rec.unattributed or 0) .. " units", (rec.unattributed or 0) > 0 and colors.orange or colors.gray)
+  at(2, 16, "Matched meals today:  " .. tostring(rec.matched or 0), colors.white)
+  at(2, 17, "Charged today:        " .. money(rec.charged or 0), colors.lime)
+  at(2, 18, "Unpaid receivable:    " .. money(rec.unpaid or 0), (rec.unpaid or 0) > 0 and colors.orange or colors.gray)
+  at(2, 19, "Unattributed food:    " .. tostring(rec.unattributed or 0) .. " units", (rec.unattributed or 0) > 0 and colors.orange or colors.gray)
 
   at(2, 20, "Eating delay: " .. tostring(config.eat_delay_ticks or DEFAULT_EAT_DELAY_TICKS) .. " ticks. Tracks all dining stock except coal/charcoal.", colors.gray)
   at(2, 21, "Inventory discovery: " .. (config.scan_all_attached_inventories ~= false and "all attached dining inventories" or "configured only"), colors.gray)
