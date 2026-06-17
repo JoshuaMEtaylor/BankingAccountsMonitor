@@ -15,7 +15,7 @@
 -- Read-only. No banking controls. No trade panel. Contract GDP over 365 Minecraft days + in-view MCT clock + tapered money-supply inflation.
 -- =============================================================================
 
-local VERSION         = "0.5.8-ROBUST-CPI"
+local VERSION         = "0.5.9-PRICE-SHOCK"
 local PROTOCOL        = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT      = 5
@@ -579,7 +579,7 @@ end
 
 -- =============================================================================
 -- PRICE / INFLATION ORACLE
--- ServerSideAccounts v1.4.3+ exposes a wide sector price oracle. The monitor
+-- ServerSideAccounts v1.4.4+ exposes a wide sector price oracle with an immediate price-pressure floor. The monitor
 -- treats that as the live inflation source when available. The older adaptive
 -- money-supply inflation remains as a fallback only.
 -- =============================================================================
@@ -1292,7 +1292,7 @@ local function drawPriceOracleCard(x, y, w, h, snap)
     local m = snap and snap.monetary or {}
     metric(x + 2, y + 4, "Issued supply", fmtMoney(m.issued_supply), m.issued_supply and C.good or C.warn)
     metric(x + 2, y + 5, "Fallback inflation", fmtPct(snap and snap.inflation, 2), snap and snap.inflation and colors.white or C.warn)
-    writeAt(x + 2, y + h - 1, "ServerSideAccounts v1.4.3+ needed for sector CPI", C.warn, C.bg)
+    writeAt(x + 2, y + h - 1, "ServerSideAccounts v1.4.4+ needed for sector CPI shock", C.warn, C.bg)
     return
   end
 
@@ -1304,16 +1304,20 @@ local function drawPriceOracleCard(x, y, w, h, snap)
   local hospitality = sectorFromOracle(po, "hospitality") or {}
   local general = sectorFromOracle(po, "general") or {}
 
+  local floor = tonumber(food.price_pressure_floor or general.price_pressure_floor)
+  local pressure = tonumber(food.monetary_pressure or general.monetary_pressure)
+
   metric(x + 2, y + 2, "Bank rate", fmtPct(po.inflation_percent, 2), po.inflation_percent and colors.white or C.warn, 16)
-  metric(x + 2, y + 3, "Old CPI", fmtIndex(po.old_price_index, 3) .. " ignored < x1", colors.gray, 16)
-  metric(x + 2, y + 4, "General CPI", fmtIndex(general.index, 3), general.index and colors.white or C.warn, 16)
-  metric(x + 2, y + 5, "Food CPI", fmtIndex(food.index, 3), food.index and colors.white or C.warn, 16)
-  metric(x + 2, y + 6, "Construction", fmtIndex(construction.index, 3), construction.index and colors.white or C.warn, 16)
-  metric(x + 2, y + 7, "Fuel/Logistics", fmtIndex(fuel.index, 2) .. " / " .. fmtIndex(logistics.index, 2), fuel.index and colors.white or C.warn, 16)
-  metric(x + 2, y + 8, "Tools/Hospital", fmtIndex(tools.index, 2) .. " / " .. fmtIndex(hospitality.index, 2), tools.index and colors.white or C.warn, 16)
+  metric(x + 2, y + 3, "Price pressure", fmtPct(pressure and (pressure * 100) or nil, 1), pressure and colors.white or C.warn, 16)
+  metric(x + 2, y + 4, "Shock floor", fmtPct(floor and (floor * 100) or nil, 1), floor and C.warn or C.dim, 16)
+  metric(x + 2, y + 5, "General CPI", fmtIndex(general.index, 3), general.index and colors.white or C.warn, 16)
+  metric(x + 2, y + 6, "Food CPI", fmtIndex(food.index, 3), food.index and colors.white or C.warn, 16)
+  metric(x + 2, y + 7, "Construction", fmtIndex(construction.index, 3), construction.index and colors.white or C.warn, 16)
+  metric(x + 2, y + 8, "Fuel/Logistics", fmtIndex(fuel.index, 2) .. " / " .. fmtIndex(logistics.index, 2), fuel.index and colors.white or C.warn, 16)
+  metric(x + 2, y + 9, "Tools/Hospital", fmtIndex(tools.index, 2) .. " / " .. fmtIndex(hospitality.index, 2), tools.index and colors.white or C.warn, 16)
 
   local q = po.quotes or {}
-  local lineY = y + 10
+  local lineY = y + 11
   if lineY <= y + h - 3 then
     writeAt(x + 2, lineY, "Live quotes", colors.white, C.bg)
   end
