@@ -22,7 +22,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.4.2-MEAL-POS-CLEANUP"
+local VERSION  = "1.4.3-WIDE-SECTOR-PRICE-ORACLE"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -62,6 +62,7 @@ local FILE = {
   companies    = "data/companies.db",
   contracts    = "data/contracts.db",
   prices       = "data/prices.db",
+  price_oracle = "data/price_oracle.db",
   inflation    = "data/inflation_state.db",
   config       = "data/config.db",
   employment   = "data/employment_mappings.db",
@@ -87,6 +88,7 @@ local companies = {}
 local contracts = {}
 local employment_mappings = {} -- [citizen_id] = central citizen -> employer/company map pushed by ColonyBusinessIntegrator
 local prices    = {}
+local price_oracle = {}
 local inflation_state = {}
 local config    = {}
 
@@ -368,6 +370,7 @@ local function saveCitizens()  return writeFile(FILE.citizens,  citizens)  end
 local function saveCompanies() return writeFile(FILE.companies, companies) end
 local function saveContracts() return writeFile(FILE.contracts, contracts) end
 local function savePrices()    return writeFile(FILE.prices,    prices)    end
+local function savePriceOracle() return writeFile(FILE.price_oracle, price_oracle) end
 local function saveInflation() return writeFile(FILE.inflation, inflation_state) end
 local function saveConfig()    return writeFile(FILE.config,    config)    end
 
@@ -675,6 +678,317 @@ local function tickInflation(target_day)
 
   return true, inflation_state, elapsed
 end
+
+
+-- =============================================================================
+-- WIDE SECTOR PRICE ORACLE
+--
+-- This is deliberately broad rather than deep. MineColonies citizens are not
+-- real economic agents, so this system does not try to make them change
+-- behaviour. It simply gives the Quid economy width: food, construction,
+-- logistics, fuel, tools/arms, research, defence, and general services all get
+-- their own visible price pressure.
+--
+-- Important design choice:
+--   inflation_state.price_index can be below 1 because of the older bank CPI
+--   model. The price oracle does NOT let that deflate live prices. For immediate
+--   impact it uses the current positive inflation_rate as a price-pressure
+--   floor. If the monitor says current inflation is 25%, sector prices should
+--   visibly rise by roughly that order of magnitude.
+-- =============================================================================
+local DEFAULT_PRICE_ORACLE = {
+  model = "wide_sector_price_oracle_v1",
+  min_index = 1.00,
+  max_index = 8.00,
+  immediate_pass_through = 1.00,
+  default_markup = 1.00,
+  sectors = {
+    general =      { label="General CPI",       sensitivity=1.00, bias=0.00 },
+    food =         { label="Food CPI",          sensitivity=1.40, bias=0.05 },
+    construction = { label="Construction CPI",  sensitivity=1.30, bias=0.03 },
+    fuel =         { label="Fuel CPI",          sensitivity=1.25, bias=0.03 },
+    logistics =    { label="Logistics CPI",     sensitivity=1.15, bias=0.02 },
+    tools =        { label="Tools/Arms CPI",    sensitivity=1.25, bias=0.03 },
+    defence =      { label="Defence CPI",       sensitivity=1.20, bias=0.03 },
+    research =     { label="Research CPI",      sensitivity=1.10, bias=0.02 },
+    hospitality =  { label="Hospitality CPI",   sensitivity=1.35, bias=0.04 },
+  },
+  service_prices = {
+    dining_meal = { label="Dining Hall meal", sector="food", base=2.00, min_price=2 },
+    courier_job = { label="Courier service", sector="logistics", base=4.00, min_price=4 },
+    guard_service = { label="Guard service", sector="defence", base=5.00, min_price=5 },
+  },
+  item_base_prices = {
+    bread=1, baked_potato=1, potato=1, carrot=1, wheat=1,
+    cooked_beef=3, steak=3, cooked_porkchop=3, cooked_chicken=2,
+    cooked_mutton=2, cooked_cod=2, cooked_salmon=2, fish=2,
+    oak_log=1, spruce_log=1, birch_log=1, jungle_log=1, acacia_log=1, dark_oak_log=1,
+    oak_planks=1, spruce_planks=1, birch_planks=1, cobblestone=1, stone=1,
+    glass=2, torch=1, brick=2, iron_ingot=5, gold_ingot=8, diamond=20,
+    coal=2, charcoal=2, coal_block=18,
+  },
+  observations = {},
+}
+
+local function cloneTable(src)
+  local out = {}
+  if type(src) ~= "table" then return out end
+  for k, v in pairs(src) do
+    if type(v) == "table" then out[k] = cloneTable(v) else out[k] = v end
+  end
+  return out
+end
+
+local function simpleItemName(name)
+  name = lower(name or "")
+  name = name:gsub("^minecraft:", "")
+  name = name:gsub("^minecolonies:", "")
+  name = name:gsub("^%w+:", "")
+  return name
+end
+
+local function ensurePriceOracle()
+  price_oracle = type(price_oracle) == "table" and price_oracle or {}
+  if not price_oracle.model then price_oracle.model = DEFAULT_PRICE_ORACLE.model end
+  price_oracle.min_index = tonumber(price_oracle.min_index) or DEFAULT_PRICE_ORACLE.min_index
+  price_oracle.max_index = tonumber(price_oracle.max_index) or DEFAULT_PRICE_ORACLE.max_index
+  price_oracle.immediate_pass_through = tonumber(price_oracle.immediate_pass_through) or DEFAULT_PRICE_ORACLE.immediate_pass_through
+  price_oracle.default_markup = tonumber(price_oracle.default_markup) or DEFAULT_PRICE_ORACLE.default_markup
+
+  price_oracle.sectors = type(price_oracle.sectors) == "table" and price_oracle.sectors or {}
+  for key, def in pairs(DEFAULT_PRICE_ORACLE.sectors) do
+    price_oracle.sectors[key] = type(price_oracle.sectors[key]) == "table" and price_oracle.sectors[key] or {}
+    local rec = price_oracle.sectors[key]
+    rec.label = rec.label or def.label
+    rec.sensitivity = tonumber(rec.sensitivity) or def.sensitivity
+    rec.bias = tonumber(rec.bias) or def.bias
+  end
+
+  price_oracle.service_prices = type(price_oracle.service_prices) == "table" and price_oracle.service_prices or {}
+  for key, def in pairs(DEFAULT_PRICE_ORACLE.service_prices) do
+    price_oracle.service_prices[key] = type(price_oracle.service_prices[key]) == "table" and price_oracle.service_prices[key] or cloneTable(def)
+    local rec = price_oracle.service_prices[key]
+    rec.label = rec.label or def.label
+    rec.sector = rec.sector or def.sector
+    rec.base = tonumber(rec.base) or def.base
+    rec.min_price = tonumber(rec.min_price) or def.min_price
+  end
+
+  price_oracle.item_base_prices = type(price_oracle.item_base_prices) == "table" and price_oracle.item_base_prices or {}
+  for key, val in pairs(DEFAULT_PRICE_ORACLE.item_base_prices) do
+    if tonumber(price_oracle.item_base_prices[key]) == nil then price_oracle.item_base_prices[key] = val end
+  end
+  price_oracle.observations = type(price_oracle.observations) == "table" and price_oracle.observations or {}
+  price_oracle.updated = timestamp()
+  return price_oracle
+end
+
+local function inflationPressure()
+  ensureInflationState()
+  local rate = tonumber(inflation_state.inflation_rate) or 0
+  local idx = tonumber(inflation_state.price_index) or 1
+  local by_index = idx - 1
+  if by_index < 0 then by_index = 0 end
+  if rate < 0 then rate = 0 end
+  local pressure = math.max(rate, by_index)
+  pressure = pressure * (tonumber(ensurePriceOracle().immediate_pass_through) or 1)
+  if pressure < 0 then pressure = 0 end
+  if pressure > 3 then pressure = 3 end
+  return pressure, rate, idx
+end
+
+local function sectorIndex(sector)
+  sector = lower(sector or "general")
+  ensurePriceOracle()
+  if not price_oracle.sectors[sector] then sector = "general" end
+  local rec = price_oracle.sectors[sector] or price_oracle.sectors.general or {}
+  local pressure, rate, bank_index = inflationPressure()
+  local idx = 1 + (pressure * (tonumber(rec.sensitivity) or 1)) + (pressure > 0 and (tonumber(rec.bias) or 0) or 0)
+  idx = clamp(idx, tonumber(price_oracle.min_index) or 1, tonumber(price_oracle.max_index) or 8)
+  return idx, {
+    sector = sector,
+    label = rec.label or sector,
+    monetary_pressure = pressure,
+    bank_inflation_rate = rate,
+    old_bank_price_index = bank_index,
+    sensitivity = tonumber(rec.sensitivity) or 1,
+    bias = tonumber(rec.bias) or 0,
+  }
+end
+
+local function classifyItemSector(id)
+  id = simpleItemName(id)
+  if id == "" then return "general" end
+
+  if id:find("bread",1,true) or id:find("potato",1,true) or id:find("carrot",1,true)
+    or id:find("wheat",1,true) or id:find("beef",1,true) or id:find("pork",1,true)
+    or id:find("chicken",1,true) or id:find("mutton",1,true) or id:find("rabbit",1,true)
+    or id:find("cod",1,true) or id:find("salmon",1,true) or id:find("fish",1,true)
+    or id:find("stew",1,true) or id:find("soup",1,true) or id:find("food",1,true) then
+    return "food"
+  end
+
+  if id:find("coal",1,true) or id:find("charcoal",1,true) or id:find("lava",1,true)
+    or id:find("blaze",1,true) or id:find("fuel",1,true) then
+    return "fuel"
+  end
+
+  if id:find("sword",1,true) or id:find("bow",1,true) or id:find("crossbow",1,true)
+    or id:find("armor",1,true) or id:find("helmet",1,true) or id:find("chestplate",1,true)
+    or id:find("leggings",1,true) or id:find("boots",1,true) or id:find("shield",1,true) then
+    return "defence"
+  end
+
+  if id:find("pickaxe",1,true) or id:find("shovel",1,true) or id:find("axe",1,true)
+    or id:find("hoe",1,true) or id:find("tool",1,true) then
+    return "tools"
+  end
+
+  if id:find("book",1,true) or id:find("paper",1,true) or id:find("redstone",1,true)
+    or id:find("lapis",1,true) or id:find("experience",1,true) then
+    return "research"
+  end
+
+  if id:find("log",1,true) or id:find("plank",1,true) or id:find("slab",1,true)
+    or id:find("stair",1,true) or id:find("stone",1,true) or id:find("cobble",1,true)
+    or id:find("glass",1,true) or id:find("brick",1,true) or id:find("sand",1,true)
+    or id:find("gravel",1,true) or id:find("dirt",1,true) or id:find("door",1,true)
+    or id:find("fence",1,true) or id:find("torch",1,true) or id:find("block",1,true) then
+    return "construction"
+  end
+
+  return "general"
+end
+
+local function manualBasePrice(id)
+  local key = simpleItemName(id)
+  ensurePriceOracle()
+
+  local p = prices[key] or prices["minecraft:" .. key]
+  if type(p) == "table" then p = p.unit_price or p.price or p.value end
+  p = tonumber(p)
+  if p and p > 0 then return p, "manual_price" end
+
+  p = tonumber(price_oracle.item_base_prices[key])
+  if p and p > 0 then return p, "oracle_base" end
+
+  -- Fallbacks are broad and chunky on purpose. NPCs will not bargain; the goal
+  -- is visible price width across sectors.
+  if key:find("netherite",1,true) then return 40, "fallback" end
+  if key:find("diamond",1,true) then return 20, "fallback" end
+  if key:find("emerald",1,true) then return 12, "fallback" end
+  if key:find("gold",1,true) then return 8, "fallback" end
+  if key:find("iron",1,true) then return 5, "fallback" end
+  if classifyItemSector(key) == "food" then return 1, "fallback" end
+  if classifyItemSector(key) == "fuel" then return 2, "fallback" end
+  if classifyItemSector(key) == "tools" then return 6, "fallback" end
+  if classifyItemSector(key) == "defence" then return 8, "fallback" end
+  if classifyItemSector(key) == "construction" then return 1, "fallback" end
+  return 1, "fallback"
+end
+
+local function roundPrice(n)
+  n = tonumber(n) or 0
+  if n <= 0 then return 0 end
+  return math.max(1, math.floor(n + 0.5))
+end
+
+local function quoteItemPrice(item, count, sector_override)
+  ensurePriceOracle()
+  item = simpleItemName(item)
+  count = math.max(1, math.floor(tonumber(count) or 1))
+  local base, base_source = manualBasePrice(item)
+  local sector = sector_override and lower(sector_override) or classifyItemSector(item)
+  local idx, meta = sectorIndex(sector)
+  local unit_raw = (tonumber(base) or 1) * idx * (tonumber(price_oracle.default_markup) or 1)
+  local total = roundPrice(unit_raw * count)
+  local unit_display = total / count
+  return {
+    item = item,
+    count = count,
+    sector = sector,
+    sector_label = meta.label,
+    base_unit_price = base,
+    base_source = base_source,
+    sector_index = idx,
+    monetary_pressure = meta.monetary_pressure,
+    bank_inflation_rate = meta.bank_inflation_rate,
+    old_bank_price_index = meta.old_bank_price_index,
+    unit_price = unit_display,
+    total = total,
+    source = "wide_sector_price_oracle",
+  }
+end
+
+local function serviceTierMultiplier(service, tier, gain)
+  service = lower(service or "")
+  tier = lower(tier or "")
+  gain = tonumber(gain) or nil
+
+  if service == "dining_meal" then
+    if gain then
+      if gain >= 13 then return 2.00, "full refill" end
+      if gain >= 9 then return 1.50, "large meal" end
+      if gain >= 5 then return 1.00, "normal meal" end
+      if gain >= 2 then return 0.50, "snack" end
+      return 0, "none"
+    end
+    if tier:find("full",1,true) then return 2.00, "full refill" end
+    if tier:find("large",1,true) then return 1.50, "large meal" end
+    if tier:find("snack",1,true) or tier:find("small",1,true) then return 0.50, "snack" end
+    return 1.00, "normal meal"
+  end
+
+  return tonumber(tier) or 1.00, tier ~= "" and tier or "standard"
+end
+
+local function quoteServicePrice(service, tier, gain, sector_override)
+  ensurePriceOracle()
+  service = lower(service or "")
+  local def = price_oracle.service_prices[service] or { label=service, sector="general", base=1, min_price=1 }
+  local mult, tier_label = serviceTierMultiplier(service, tier, gain)
+  local sector = sector_override or def.sector or "general"
+  local idx, meta = sectorIndex(sector)
+  local raw = (tonumber(def.base) or 1) * idx * (tonumber(mult) or 1)
+  local min_price = tonumber(def.min_price) or 1
+  local total = raw > 0 and math.max(min_price, roundPrice(raw)) or 0
+
+  return {
+    service = service,
+    label = def.label or service,
+    tier = tier_label,
+    tier_multiplier = mult,
+    sector = sector,
+    sector_label = meta.label,
+    base_price = tonumber(def.base) or 1,
+    sector_index = idx,
+    monetary_pressure = meta.monetary_pressure,
+    bank_inflation_rate = meta.bank_inflation_rate,
+    old_bank_price_index = meta.old_bank_price_index,
+    raw = raw,
+    total = total,
+    source = "wide_sector_price_oracle",
+  }
+end
+
+local function sectorIndexSnapshot()
+  ensurePriceOracle()
+  local out = {}
+  for sector, _ in pairs(price_oracle.sectors or {}) do
+    local idx, meta = sectorIndex(sector)
+    out[sector] = {
+      index = idx,
+      label = meta.label,
+      monetary_pressure = meta.monetary_pressure,
+      bank_inflation_rate = meta.bank_inflation_rate,
+      old_bank_price_index = meta.old_bank_price_index,
+      sensitivity = meta.sensitivity,
+      bias = meta.bias,
+    }
+  end
+  return out
+end
+
 
 
 
@@ -1580,6 +1894,88 @@ handlers["get_prices"] = function(sender_id, req)
   return true, { prices = prices, time = timestamp() }
 end
 
+-- GET_PRICE_INDICES
+handlers["get_price_indices"] = function(sender_id, req)
+  ensureInflationState()
+  ensurePriceOracle()
+  return true, {
+    model = price_oracle.model,
+    sectors = sectorIndexSnapshot(),
+    inflation = inflation_state,
+    time = timestamp(),
+    note = "Sector indices use current positive inflation_rate as immediate pressure; old price_index cannot deflate live prices below x1.00."
+  }
+end
+
+-- QUOTE_ITEM_PRICE
+handlers["quote_item_price"] = function(sender_id, req)
+  local item = req and (req.item or req.name or req.id)
+  local count = req and (req.count or req.qty or req.quantity) or 1
+  local sector = req and req.sector or nil
+  if not item or tostring(item) == "" then return false, "Missing item" end
+  return true, quoteItemPrice(item, count, sector)
+end
+
+-- QUOTE_SERVICE_PRICE
+handlers["quote_service_price"] = function(sender_id, req)
+  local service = req and (req.service or req.name)
+  if not service or tostring(service) == "" then return false, "Missing service" end
+  return true, quoteServicePrice(service, req and req.tier, req and req.saturation_gain, req and req.sector)
+end
+
+-- RECORD_PRICE_OBSERVATION
+-- Optional simple hook for later: contract/server terminals can report what was
+-- actually paid. For now this is stored as evidence, not a deep behavioural sim.
+handlers["record_price_observation"] = function(sender_id, req)
+  ensurePriceOracle()
+  local item = req and (req.item or req.service or req.name)
+  local sector = req and req.sector or (item and classifyItemSector(item) or "general")
+  local total = tonumber(req and (req.total or req.amount or req.price))
+  local count = math.max(1, math.floor(tonumber(req and (req.count or req.qty or req.quantity)) or 1))
+  if not item or item == "" or not total or total <= 0 then return false, "Missing item/service or total" end
+  local obs = {
+    time = timestamp(),
+    source = "terminal:" .. tostring(sender_id),
+    item = simpleItemName(item),
+    sector = sector,
+    total = total,
+    count = count,
+    unit = total / count,
+    memo = req and req.memo or nil,
+  }
+  price_oracle.observations[#price_oracle.observations + 1] = obs
+  while #price_oracle.observations > 300 do table.remove(price_oracle.observations, 1) end
+  savePriceOracle()
+  return true, { recorded = obs, observations = #price_oracle.observations }
+end
+
+-- SET_PRICE_ORACLE_SECTOR
+handlers["set_price_oracle_sector"] = function(sender_id, req)
+  req = req or {}
+  ensurePriceOracle()
+  local sector = lower(req.sector or "")
+  if sector == "" then return false, "Missing sector" end
+  price_oracle.sectors[sector] = price_oracle.sectors[sector] or { label=sector }
+  if req.label then price_oracle.sectors[sector].label = tostring(req.label) end
+  if tonumber(req.sensitivity) then price_oracle.sectors[sector].sensitivity = tonumber(req.sensitivity) end
+  if tonumber(req.bias) then price_oracle.sectors[sector].bias = tonumber(req.bias) end
+  savePriceOracle()
+  return true, { sector = sector, config = price_oracle.sectors[sector], indices = sectorIndexSnapshot() }
+end
+
+-- REBASE_PRICE_INDICES
+-- Keeps money/accounts, but resets oracle settings to sane x1 floors. Because
+-- the index is computed live from inflation_rate, prices still rise immediately
+-- when current inflation is high.
+handlers["rebase_price_indices"] = function(sender_id, req)
+  price_oracle = cloneTable(DEFAULT_PRICE_ORACLE)
+  price_oracle.rebased_at = timestamp()
+  price_oracle.rebased_by = tostring(sender_id)
+  savePriceOracle()
+  audit("ACTION", "STATE", sender_id, "REBASE_PRICE_INDICES", "wide sector oracle reset")
+  return true, { oracle = price_oracle, indices = sectorIndexSnapshot() }
+end
+
 -- STATUS
 handlers["status"] = function(sender_id, req)
   local function count(t) local n=0; for _ in pairs(t) do n=n+1 end; return n end
@@ -1596,7 +1992,8 @@ handlers["status"] = function(sender_id, req)
     tx_count         = tx_counter,
     audit_count      = audit_counter,
     supply           = deriveMonetarySupply(),
-    inflation         = ensureInflationState()
+    inflation         = ensureInflationState(),
+    price_indices     = sectorIndexSnapshot()
   }
 end
 
@@ -1947,9 +2344,11 @@ local function initFiles()
   companies = readFile(FILE.companies) or {}
   contracts = readFile(FILE.contracts) or {}
   prices    = readFile(FILE.prices)    or {}
+  price_oracle = readFile(FILE.price_oracle) or {}
   employment_mappings = readFile(FILE.employment) or {}
   inflation_state = readFile(FILE.inflation) or {}
   ensureInflationState()
+  ensurePriceOracle()
   config    = readFile(FILE.config)    or {
     economy_status       = "active",
     mint_authority       = "locked"
@@ -1966,6 +2365,7 @@ local function initFiles()
   print("  Citizens:  " .. count(citizens))
   print("  Companies: " .. count(companies))
   print("  Employment mappings: " .. count(employment_mappings))
+  print("  Price oracle sectors: " .. count(price_oracle.sectors or {}))
 end
 
 local function initCounters()
@@ -2079,6 +2479,7 @@ local function drawStatus()
   print("  Citizens:  " .. count(citizens))
   print("  Companies: " .. count(companies))
   print("  Employment mappings: " .. count(employment_mappings))
+  print("  Price oracle sectors: " .. count(price_oracle.sectors or {}))
   term.setTextColor(colors.lime)
   print("  Treasury:  " .. deriveBalance("treasury:quid_bank") .. " Quid")
   term.setTextColor(colors.lightGray)
