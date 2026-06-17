@@ -22,7 +22,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.4.3-WIDE-SECTOR-PRICE-ORACLE"
+local VERSION  = "1.4.4-SECTOR-PRICE-SHOCK"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -701,6 +701,12 @@ local DEFAULT_PRICE_ORACLE = {
   min_index = 1.00,
   max_index = 8.00,
   immediate_pass_through = 1.00,
+  -- Bootstrap visible inflation into prices immediately.
+  -- The old monitor may already show high money-supply inflation, but if this
+  -- oracle is installed after the money was printed the bank daily-rate model
+  -- can start at 0. This floor gives prices the shock the economy should feel
+  -- now. Set to 0 later if you want prices to fully rebase.
+  price_pressure_floor = 0.26,
   default_markup = 1.00,
   sectors = {
     general =      { label="General CPI",       sensitivity=1.00, bias=0.00 },
@@ -753,6 +759,8 @@ local function ensurePriceOracle()
   price_oracle.min_index = tonumber(price_oracle.min_index) or DEFAULT_PRICE_ORACLE.min_index
   price_oracle.max_index = tonumber(price_oracle.max_index) or DEFAULT_PRICE_ORACLE.max_index
   price_oracle.immediate_pass_through = tonumber(price_oracle.immediate_pass_through) or DEFAULT_PRICE_ORACLE.immediate_pass_through
+  price_oracle.price_pressure_floor = tonumber(price_oracle.price_pressure_floor)
+  if price_oracle.price_pressure_floor == nil then price_oracle.price_pressure_floor = DEFAULT_PRICE_ORACLE.price_pressure_floor end
   price_oracle.default_markup = tonumber(price_oracle.default_markup) or DEFAULT_PRICE_ORACLE.default_markup
 
   price_oracle.sectors = type(price_oracle.sectors) == "table" and price_oracle.sectors or {}
@@ -785,16 +793,23 @@ end
 
 local function inflationPressure()
   ensureInflationState()
+  ensurePriceOracle()
   local rate = tonumber(inflation_state.inflation_rate) or 0
   local idx = tonumber(inflation_state.price_index) or 1
   local by_index = idx - 1
   if by_index < 0 then by_index = 0 end
   if rate < 0 then rate = 0 end
-  local pressure = math.max(rate, by_index)
-  pressure = pressure * (tonumber(ensurePriceOracle().immediate_pass_through) or 1)
+
+  -- Immediate visible inflation pressure. This is intentionally broad: NPCs are
+  -- not real consumers, so we reflect inflation through sector-wide prices.
+  local floor = tonumber(price_oracle.price_pressure_floor) or 0
+  if floor < 0 then floor = 0 end
+
+  local pressure = math.max(rate, by_index, floor)
+  pressure = pressure * (tonumber(price_oracle.immediate_pass_through) or 1)
   if pressure < 0 then pressure = 0 end
   if pressure > 3 then pressure = 3 end
-  return pressure, rate, idx
+  return pressure, rate, idx, floor
 end
 
 local function sectorIndex(sector)
@@ -802,7 +817,7 @@ local function sectorIndex(sector)
   ensurePriceOracle()
   if not price_oracle.sectors[sector] then sector = "general" end
   local rec = price_oracle.sectors[sector] or price_oracle.sectors.general or {}
-  local pressure, rate, bank_index = inflationPressure()
+  local pressure, rate, bank_index, floor = inflationPressure()
   local idx = 1 + (pressure * (tonumber(rec.sensitivity) or 1)) + (pressure > 0 and (tonumber(rec.bias) or 0) or 0)
   idx = clamp(idx, tonumber(price_oracle.min_index) or 1, tonumber(price_oracle.max_index) or 8)
   return idx, {
@@ -811,6 +826,7 @@ local function sectorIndex(sector)
     monetary_pressure = pressure,
     bank_inflation_rate = rate,
     old_bank_price_index = bank_index,
+    price_pressure_floor = floor,
     sensitivity = tonumber(rec.sensitivity) or 1,
     bias = tonumber(rec.bias) or 0,
   }
@@ -982,6 +998,7 @@ local function sectorIndexSnapshot()
       monetary_pressure = meta.monetary_pressure,
       bank_inflation_rate = meta.bank_inflation_rate,
       old_bank_price_index = meta.old_bank_price_index,
+      price_pressure_floor = meta.price_pressure_floor,
       sensitivity = meta.sensitivity,
       bias = meta.bias,
     }
@@ -1903,7 +1920,7 @@ handlers["get_price_indices"] = function(sender_id, req)
     sectors = sectorIndexSnapshot(),
     inflation = inflation_state,
     time = timestamp(),
-    note = "Sector indices use current positive inflation_rate as immediate pressure; old price_index cannot deflate live prices below x1.00."
+    note = "Sector indices use current inflation plus a visible price-pressure floor; old price_index cannot deflate live prices below x1.00."
   }
 end
 
@@ -1976,24 +1993,58 @@ handlers["rebase_price_indices"] = function(sender_id, req)
   return true, { oracle = price_oracle, indices = sectorIndexSnapshot() }
 end
 
+-- SET_PRICE_PRESSURE_FLOOR
+-- Example: { type="set_price_pressure_floor", floor=0.26 } means +26%
+-- broad price pressure before sector sensitivities.
+handlers["set_price_pressure_floor"] = function(sender_id, req)
+  ensurePriceOracle()
+  local floor = tonumber(req and (req.floor or req.pressure or req.value))
+  if floor == nil then return false, "Missing floor/pressure value" end
+  if floor < 0 then floor = 0 end
+  if floor > 3 then floor = 3 end
+  price_oracle.price_pressure_floor = floor
+  price_oracle.updated = timestamp()
+  savePriceOracle()
+  audit("ACTION", "STATE", sender_id, "SET_PRICE_PRESSURE_FLOOR", tostring(floor))
+  return true, { floor = floor, indices = sectorIndexSnapshot() }
+end
+
 -- STATUS
 handlers["status"] = function(sender_id, req)
-  local function count(t) local n=0; for _ in pairs(t) do n=n+1 end; return n end
+  local function count(t)
+    local n = 0
+    if type(t) ~= "table" then return 0 end
+    for _ in pairs(t) do n = n + 1 end
+    return n
+  end
+
+  local supply = nil
+  local okSupply, supplyRes = pcall(deriveMonetarySupply)
+  if okSupply then supply = supplyRes else supply = { error = tostring(supplyRes) } end
+
+  local inf = nil
+  local okInf, infRes = pcall(ensureInflationState)
+  if okInf then inf = infRes else inf = { error = tostring(infRes) } end
+
+  local indices = nil
+  local okIdx, idxRes = pcall(sectorIndexSnapshot)
+  if okIdx then indices = idxRes else indices = { error = tostring(idxRes) } end
+
   return true, {
     version          = VERSION,
     computer_id      = os.getComputerID(),
     label            = os.getComputerLabel(),
     time             = timestamp(),
     uptime           = os.clock(),
-    economy_status   = config.economy_status or "active",
+    economy_status   = (type(config) == "table" and config.economy_status) or "active",
     account_count    = count(accounts),
     citizen_count    = count(citizens),
     company_count    = count(companies),
     tx_count         = tx_counter,
     audit_count      = audit_counter,
-    supply           = deriveMonetarySupply(),
-    inflation         = ensureInflationState(),
-    price_indices     = sectorIndexSnapshot()
+    supply           = supply,
+    inflation         = inf,
+    price_indices     = indices
   }
 end
 
