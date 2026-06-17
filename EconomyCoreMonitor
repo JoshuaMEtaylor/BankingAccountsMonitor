@@ -15,7 +15,7 @@
 -- Read-only. No banking controls. No trade panel. Contract GDP over 365 Minecraft days + in-view MCT clock + tapered money-supply inflation.
 -- =============================================================================
 
-local VERSION         = "0.5.15-MARKET-VIEW-FULL"
+local VERSION         = "0.5.17-CORE-FINANCE-REVERT"
 local PROTOCOL        = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT      = 5
@@ -29,6 +29,9 @@ local HISTORY_FILE    = "data/economy_core_monitor_history.db"
 local INFLATION_BASE_FILE = "data/economy_monetary_inflation_base.db"
 local INFLATION_HALF_LIFE_MS = 24 * 60 * 60 * 1000 -- no new printing: inflation pressure halves every 24h
 local MAX_HISTORY     = 120
+
+local args = {...}
+local FORCED_BANK_ID = tonumber(args[1])
 
 -- Low-impact polling controls.
 -- The monitor still keeps the full original dashboard/features, but expensive
@@ -373,6 +376,13 @@ local function copyList(values)
   return out
 end
 
+local function shallowCopyTable(src)
+  local out = {}
+  if type(src) ~= "table" then return out end
+  for k, v in pairs(src) do out[k] = v end
+  return out
+end
+
 local function calculateMedian(values)
   if type(values) ~= "table" or #values == 0 then return nil end
   table.sort(values)
@@ -545,12 +555,25 @@ local function cachedDbRequest(req, timeout, ttlSeconds)
   local now = os.clock()
   local entry = request_cache[key]
   if entry and (now - (tonumber(entry.time) or 0)) < ttlSeconds then
-    return entry.ok, entry.response, true
+    return entry.ok, entry.response, true, false
   end
 
   local ok, response = dbRequest(req, timeout)
-  request_cache[key] = { time = now, ok = ok, response = response }
-  return ok, response, false
+
+  -- Important: do not cache failures. A single timeout should not blank GDP/c,
+  -- inequality, companies, CPI, or quotes for the full cache window. If we have
+  -- an older successful value, return it as stale instead of replacing it with
+  -- an error/zero state.
+  if ok then
+    request_cache[key] = { time = now, ok = ok, response = response }
+    return ok, response, false, false
+  end
+
+  if entry and entry.ok then
+    return entry.ok, entry.response, true, true
+  end
+
+  return ok, response, false, false
 end
 
 local function clearRequestCache()
@@ -564,18 +587,48 @@ local function connectServer()
   centerIn(1, math.floor(h / 2) - 2, w, "ECONOMY CORE MONITOR", colors.yellow, colors.black)
   centerIn(1, math.floor(h / 2), w, "Connecting to Quid Bank server...", colors.lightGray, colors.black)
   centerIn(1, math.floor(h / 2) + 1, w, "Modem: " .. tostring(modem_name or "none"), colors.gray, colors.black)
+
+  if FORCED_BANK_ID then
+    db_id = FORCED_BANK_ID
+    clearRequestCache()
+    centerIn(1, math.floor(h / 2) + 3, w, "Using forced bank ID " .. tostring(db_id), colors.lime, colors.black)
+    sleep(0.4)
+    return true
+  end
+
+  -- Do not accept the first random treasury_online broadcast blindly. Collect
+  -- responses briefly and prefer a direct ping reply from ServerSideAccounts.
   for attempt = 1, 8 do
     centerIn(1, math.floor(h / 2) + 3, w, "Bank attempt " .. attempt .. " of 8", colors.gray, colors.black)
     rednet.broadcast({ type = "ping" }, PROTOCOL)
-    local sender, msg = rednet.receive(PROTOCOL, 4)
-    if sender and type(msg) == "table" then
-      if msg.type == "treasury_online" or msg.success == true then
-        db_id = sender
-        clearRequestCache()
-        centerIn(1, math.floor(h / 2) + 5, w, "Connected to bank " .. tostring(db_id), colors.lime, colors.black)
-        sleep(0.4)
-        return true
+
+    local bestDirect = nil
+    local bestBroadcast = nil
+    local deadline = os.clock() + 4
+    while true do
+      local remaining = deadline - os.clock()
+      if remaining <= 0 then break end
+      local sender, msg = rednet.receive(PROTOCOL, remaining)
+      if sender and type(msg) == "table" then
+        if msg.success == true and type(msg.response) == "table" then
+          local r = msg.response
+          local message = tostring(r.message or "")
+          if message:find("Quid Bank", 1, true) or r.version or r.label then
+            bestDirect = sender
+            break
+          end
+        elseif msg.type == "treasury_online" and (msg.version or msg.id) then
+          bestBroadcast = sender
+        end
       end
+    end
+
+    if bestDirect or bestBroadcast then
+      db_id = bestDirect or bestBroadcast
+      clearRequestCache()
+      centerIn(1, math.floor(h / 2) + 5, w, "Connected to bank " .. tostring(db_id), colors.lime, colors.black)
+      sleep(0.4)
+      return true
     end
   end
   last_error = "Unable to discover bank server"
@@ -632,12 +685,20 @@ local function cachedContractRequest(req, timeout, ttlSeconds)
   local now = os.clock()
   local entry = request_cache[key]
   if entry and (now - (tonumber(entry.time) or 0)) < ttlSeconds then
-    return entry.ok, entry.response, true
+    return entry.ok, entry.response, true, false
   end
 
   local ok, response = contractRequest(req, timeout)
-  request_cache[key] = { time = now, ok = ok, response = response }
-  return ok, response, false
+  if ok then
+    request_cache[key] = { time = now, ok = ok, response = response }
+    return ok, response, false, false
+  end
+
+  if entry and entry.ok then
+    return entry.ok, entry.response, true, true
+  end
+
+  return ok, response, false, false
 end
 
 
@@ -666,8 +727,18 @@ local function quoteLabel(q)
 end
 
 local function fetchPriceOracle()
-  local ok, res = cachedDbRequest({ type = "get_price_indices" }, 2, PRICE_ORACLE_POLL_SECONDS)
+  local ok, res, fromCache, stale = cachedDbRequest({ type = "get_price_indices" }, 5, PRICE_ORACLE_POLL_SECONDS)
   if not ok or type(res) ~= "table" then
+    -- Do not let one slow oracle response blank the whole panel if we previously
+    -- had live CPI. Keep the last good oracle visible and mark it stale.
+    local previous = last_snapshot and last_snapshot.price_oracle
+    if type(previous) == "table" and previous.connected then
+      local out = shallowCopyTable(previous)
+      out.status = "Price oracle stale; last good CPI retained"
+      out.stale = true
+      return out
+    end
+
     return {
       connected = false,
       status = "Price oracle unavailable: " .. tostring(res),
@@ -685,9 +756,10 @@ local function fetchPriceOracle()
   local out = {
     connected = true,
     model = tostring(res.model or "sector_price_oracle"),
-    status = "Live sector CPI from bank price oracle",
+    status = stale and "Live sector CPI from cached bank price oracle" or "Live sector CPI from bank price oracle",
     note = res.note,
     time = tonumber(res.time),
+    stale = stale == true,
     inflation = inflation,
     inflation_rate = rate,
     inflation_percent = percent,
@@ -697,22 +769,29 @@ local function fetchPriceOracle()
     quotes = {},
   }
 
+  local previousQuotes = {}
+  if last_snapshot and type(last_snapshot.price_oracle) == "table" and type(last_snapshot.price_oracle.quotes) == "table" then
+    previousQuotes = last_snapshot.price_oracle.quotes
+  end
+
+  local function cachedQuote(key, req)
+    local qOk, qRes = cachedDbRequest(req, 4, QUOTE_POLL_SECONDS)
+    if qOk and type(qRes) == "table" then
+      out.quotes[key] = qRes
+    elseif type(previousQuotes[key]) == "table" then
+      out.quotes[key] = previousQuotes[key]
+      out.quotes[key].stale = true
+    end
+  end
+
   -- A few visible quote examples give the monitor immediate practical meaning.
-  -- These are intentionally broad, not deep behavioural modelling.
-  local okMeal, meal = cachedDbRequest({ type = "quote_service_price", service = "dining_meal", tier = "normal" }, 2, QUOTE_POLL_SECONDS)
-  if okMeal and type(meal) == "table" then out.quotes.dining_meal = meal end
-
-  local okMealLarge, mealLarge = cachedDbRequest({ type = "quote_service_price", service = "dining_meal", tier = "large" }, 2, QUOTE_POLL_SECONDS)
-  if okMealLarge and type(mealLarge) == "table" then out.quotes.large_meal = mealLarge end
-
-  local okBuild, build = cachedDbRequest({ type = "quote_item_price", item = "oak_planks", count = 64, sector = "construction" }, 2, QUOTE_POLL_SECONDS)
-  if okBuild and type(build) == "table" then out.quotes.oak_planks_64 = build end
-
-  local okIron, iron = cachedDbRequest({ type = "quote_item_price", item = "iron_ingot", count = 8, sector = "tools" }, 2, QUOTE_POLL_SECONDS)
-  if okIron and type(iron) == "table" then out.quotes.iron_ingot_8 = iron end
-
-  local okCoal, coal = cachedDbRequest({ type = "quote_item_price", item = "coal", count = 16, sector = "fuel" }, 2, QUOTE_POLL_SECONDS)
-  if okCoal and type(coal) == "table" then out.quotes.coal_16 = coal end
+  -- These are intentionally broad, not deep behavioural modelling. Failures keep
+  -- the previous quote rather than deleting the panel values.
+  cachedQuote("dining_meal", { type = "quote_service_price", service = "dining_meal", tier = "normal" })
+  cachedQuote("large_meal", { type = "quote_service_price", service = "dining_meal", tier = "large" })
+  cachedQuote("oak_planks_64", { type = "quote_item_price", item = "oak_planks", count = 64, sector = "construction" })
+  cachedQuote("iron_ingot_8", { type = "quote_item_price", item = "iron_ingot", count = 8, sector = "tools" })
+  cachedQuote("coal_16", { type = "quote_item_price", item = "coal", count = 16, sector = "fuel" })
 
   return out
 end
@@ -895,7 +974,7 @@ local function fetchContractEconomy()
     return { connected = false, status = err, open = 0, claimed = 0, fulfilled = 0, cancelled = 0, total = 0 }
   end
 
-  local okList, listRes = cachedContractRequest({ type = "list_contracts", status = "all" }, 3, CONTRACT_LIST_POLL_SECONDS)
+  local okList, listRes = cachedContractRequest({ type = "list_contracts", status = "all" }, 5, CONTRACT_LIST_POLL_SECONDS)
   local contracts = {}
   if okList and type(listRes) == "table" then
     contracts = listRes.contracts or {}
@@ -979,13 +1058,13 @@ local function fallbackSnapshot()
   -- So this snapshot is assembled from separate narrow endpoints.
   local endpointErrors = {}
 
-  local okStatus, status = cachedDbRequest({ type = "status" }, 2, LIGHT_POLL_SECONDS)
+  local okStatus, status = cachedDbRequest({ type = "status" }, 3, LIGHT_POLL_SECONDS)
   if not okStatus or type(status) ~= "table" then
     endpointErrors[#endpointErrors + 1] = "status=" .. shortText(tostring(status), 36)
     status = {}
   end
 
-  local okSupply, supplyRes = cachedDbRequest({ type = "supply" }, 2, LIGHT_POLL_SECONDS)
+  local okSupply, supplyRes = cachedDbRequest({ type = "supply" }, 3, LIGHT_POLL_SECONDS)
   local supply = {}
   if okSupply and type(supplyRes) == "table" then
     supply = supplyRes
@@ -994,12 +1073,19 @@ local function fallbackSnapshot()
     if type(status.supply) == "table" then supply = status.supply end
   end
 
-  local okAccounts, accRes = cachedDbRequest({ type = "list_accounts" }, 3, ACCOUNT_LIST_POLL_SECONDS)
+  local okAccounts, accRes = cachedDbRequest({ type = "list_accounts" }, 5, ACCOUNT_LIST_POLL_SECONDS)
   local accounts = nil
+  local accountsFromPrevious = false
   if okAccounts and type(accRes) == "table" then
     accounts = accRes.accounts or {}
   else
     endpointErrors[#endpointErrors + 1] = "accounts=" .. shortText(tostring(accRes), 36)
+    -- Preserve important display values instead of replacing them with zero or
+    -- Awaiting Data when the account endpoint is slow for one refresh.
+    if last_snapshot and last_snapshot._raw_accounts then
+      accounts = last_snapshot._raw_accounts
+      accountsFromPrevious = true
+    end
   end
 
   local issued = num(supply.in_circulation or supply.total_supply)
@@ -1048,7 +1134,7 @@ local function fallbackSnapshot()
   -- Prefer the bank's actual inflation state. The older adaptive monetary
   -- calculation remains only as a fallback if that endpoint is unavailable.
   local inflation, inflationStatus = nil, nil
-  local okInf, infRes = cachedDbRequest({ type = "get_inflation_state" }, 2, LIGHT_POLL_SECONDS)
+  local okInf, infRes = cachedDbRequest({ type = "get_inflation_state" }, 3, LIGHT_POLL_SECONDS)
   if okInf and type(infRes) == "table" then
     local st = infRes.state or infRes
     local rate = num(st.inflation_rate)
@@ -1067,7 +1153,7 @@ local function fallbackSnapshot()
     gdp = tonumber(contractEco.gdp_365d or contractEco.gdp_24h) or 0
     outputStatus = contractEco.status or "GDP from fulfilled contracts"
   else
-    local okGdp, gdpRes = cachedDbRequest({ type = "economic_gdp", days = 30 }, 2, ECONOMIC_GDP_POLL_SECONDS)
+    local okGdp, gdpRes = cachedDbRequest({ type = "economic_gdp", days = 30 }, 4, ECONOMIC_GDP_POLL_SECONDS)
     if okGdp and type(gdpRes) == "table" then
       gdp = num(gdpRes.total or gdpRes.gdp or gdpRes.private_gdp)
       outputStatus = "Private GDP fallback from bank ledger"
@@ -1096,6 +1182,8 @@ local function fallbackSnapshot()
     gdp = gdp,
     gdp_per_capita = gdpCap,
     inflation = inflation,
+    status_price_indices = type(status.price_indices) == "table" and status.price_indices or nil,
+    status_inflation = type(status.inflation) == "table" and status.inflation or nil,
     output_status = outputStatus,
     inflation_status = inflationStatus or "Awaiting inflation state",
     inequality = inequalityFromAccounts(accounts),
@@ -1116,6 +1204,8 @@ local function fallbackSnapshot()
       source = sourceText,
     },
     contracts = contractEco,
+    _raw_accounts = accounts,
+    accounts_from_previous = accountsFromPrevious,
   }
 end
 
@@ -1129,17 +1219,10 @@ local function refreshSnapshot()
   local snap, err = fallbackSnapshot()
   if not snap then return false, err or "Could not build snapshot" end
 
-  local priceOracle = fetchPriceOracle()
-  snap.price_oracle = priceOracle
-  if priceOracle and priceOracle.connected then
-    if priceOracle.inflation_percent ~= nil then
-      snap.inflation = priceOracle.inflation_percent
-      snap.inflation_status = "Live bank inflation rate driving sector CPI"
-    end
-    if snap.quality == "PARTIAL" then
-      snap.quality = "PARTIAL + CPI"
-    end
-  end
+  -- Keep this monitor public-facing and read-only.
+  -- Do not poll the price oracle or quote endpoints from the display board.
+  -- Inflation is shown as a bank/economic metric only; sector CPI internals are hidden.
+  snap.price_oracle = nil
 
   snap.mc_clock = minecraftClock()
   snap.gdp_period_mc_days = GDP_PERIOD_MC_DAYS
@@ -1156,11 +1239,6 @@ local function refreshSnapshot()
   pushHistory("gdp_per_capita", snap.gdp_per_capita)
   pushHistory("inflation", snap.inflation)
   pushHistory("issued_supply", snap.monetary and snap.monetary.issued_supply)
-  if snap.price_oracle and snap.price_oracle.connected then
-    pushHistory("general_index", sectorIndexFromOracle(snap.price_oracle, "general"))
-    pushHistory("food_index", sectorIndexFromOracle(snap.price_oracle, "food"))
-    pushHistory("construction_index", sectorIndexFromOracle(snap.price_oracle, "construction"))
-  end
   saveHistory()
 
   return true, snap
@@ -1347,14 +1425,14 @@ end
 
 local function drawPriceOracleCard(x, y, w, h, snap)
   local po = snap and snap.price_oracle or {}
-  card(x, y, w, h, "SECTOR PRICES", C.money)
+  card(x, y, w, h, "PRICE / INFLATION ENGINE", C.money)
 
   if not po.connected then
-    metric(x + 2, y + 2, "Status", "Pricing feed unavailable", C.warn)
+    metric(x + 2, y + 2, "Status", shortText(po.status or "Awaiting price oracle", w - 15), C.warn)
     local m = snap and snap.monetary or {}
     metric(x + 2, y + 4, "Issued supply", fmtMoney(m.issued_supply), m.issued_supply and C.good or C.warn)
-    metric(x + 2, y + 5, "Inflation", fmtPct(snap and snap.inflation, 2), snap and snap.inflation and colors.white or C.warn)
-    writeAt(x + 2, y + h - 1, "Using headline economy data until sector pricing returns", C.warn, C.bg)
+    metric(x + 2, y + 5, "Fallback inflation", fmtPct(snap and snap.inflation, 2), snap and snap.inflation and colors.white or C.warn)
+    writeAt(x + 2, y + h - 1, "Bank oracle endpoint failed; reboot/patched ServerSideAccounts required", C.warn, C.bg)
     return
   end
 
@@ -1366,19 +1444,25 @@ local function drawPriceOracleCard(x, y, w, h, snap)
   local hospitality = sectorFromOracle(po, "hospitality") or {}
   local general = sectorFromOracle(po, "general") or {}
 
-  metric(x + 2, y + 2, "Inflation", fmtPct(po.inflation_percent, 2), po.inflation_percent and colors.white or C.warn, 16)
-  metric(x + 2, y + 3, "General CPI", fmtIndex(general.index, 2), general.index and colors.white or C.warn, 16)
-  metric(x + 2, y + 4, "Food CPI", fmtIndex(food.index, 2), food.index and colors.white or C.warn, 16)
-  metric(x + 2, y + 5, "Building CPI", fmtIndex(construction.index, 2), construction.index and colors.white or C.warn, 16)
-  metric(x + 2, y + 6, "Fuel CPI", fmtIndex(fuel.index, 2), fuel.index and colors.white or C.warn, 16)
-  metric(x + 2, y + 7, "Logistics CPI", fmtIndex(logistics.index, 2), logistics.index and colors.white or C.warn, 16)
-  metric(x + 2, y + 8, "Tools CPI", fmtIndex(tools.index, 2), tools.index and colors.white or C.warn, 16)
-  metric(x + 2, y + 9, "Hospitality CPI", fmtIndex(hospitality.index, 2), hospitality.index and colors.white or C.warn, 16)
+  local floor = tonumber(food.price_pressure_floor or general.price_pressure_floor)
+  local pressure = tonumber(food.monetary_pressure or general.monetary_pressure)
+  local shock = tonumber(food.shock_pressure or general.shock_pressure)
+  local sticky = tonumber(food.sticky_floor_from_ath or general.sticky_floor_from_ath)
+  local defCap = tonumber(food.max_daily_deflation or general.max_daily_deflation)
+
+  metric(x + 2, y + 2, "Bank rate", fmtPct(po.inflation_percent, 2), po.inflation_percent and colors.white or C.warn, 16)
+  metric(x + 2, y + 3, "Price pressure", fmtPct(pressure and (pressure * 100) or nil, 1), pressure and colors.white or C.warn, 16)
+  metric(x + 2, y + 4, "Admin floor", fmtPct(floor and (floor * 100) or nil, 1), floor and floor > 0 and C.warn or C.dim, 16)
+  metric(x + 2, y + 5, "Print shock", fmtPct(shock and (shock * 100) or nil, 1), shock and shock > 0 and C.warn or C.dim, 16)
+  metric(x + 2, y + 6, "Deflation cap", fmtPct(defCap and (defCap * 100) or nil, 1), defCap and colors.white or C.warn, 16)
+  metric(x + 2, y + 7, "ATH floor", sticky and (fmtPct(sticky * 100, 0) .. " of ATH") or "Awaiting data", sticky and colors.white or C.warn, 16)
+  metric(x + 2, y + 8, "General/Food", fmtIndex(general.index, 2) .. " / " .. fmtIndex(food.index, 2), food.index and colors.white or C.warn, 16)
+  metric(x + 2, y + 9, "Construct/Fuel", fmtIndex(construction.index, 2) .. " / " .. fmtIndex(fuel.index, 2), construction.index and colors.white or C.warn, 16)
 
   local q = po.quotes or {}
   local lineY = y + 11
   if lineY <= y + h - 3 then
-    writeAt(x + 2, lineY, "Current prices", colors.white, C.bg)
+    writeAt(x + 2, lineY, "Live quotes", colors.white, C.bg)
   end
   if lineY + 1 <= y + h - 2 then
     local meal = quoteLabel(q.dining_meal) or "n/a"
@@ -1395,7 +1479,7 @@ local function drawPriceOracleCard(x, y, w, h, snap)
     writeAt(x + 2, lineY + 3, shortText("16 coal: " .. coal, w - 4), C.text, C.bg)
   end
 
-  writeAt(x + 2, y + h - 1, shortText("Live sector prices", w - 4), C.good, C.bg)
+  writeAt(x + 2, y + h - 1, shortText(po.status or "Live sector CPI", w - 4), C.good, C.bg)
 end
 
 local function drawScaleCard(x, y, w, h, snap)
@@ -1444,14 +1528,7 @@ local function drawHeader(snap)
 
   writeAt(2, 3, "Tick: " .. tostring(clock.tick_text), C.good, C.bg)
   writeAt(18, 3, "GDP window: " .. tostring(GDP_PERIOD_MC_DAYS) .. " MC days", C.warn, C.bg)
-  local po = snap and snap.price_oracle or nil
-  if po and po.connected then
-    local food = sectorIndexFromOracle(po, "food")
-    local build = sectorIndexFromOracle(po, "construction")
-    writeAt(52, 3, "Food " .. fmtIndex(food, 2) .. "  Build " .. fmtIndex(build, 2), C.good, C.bg)
-  else
-    writeAt(52, 3, "Sector CPI: awaiting oracle", C.warn, C.bg)
-  end
+  writeAt(52, 3, "Last update: " .. tostring(last_update_text or "never"), C.dim, C.bg)
   if db_id then writeAt(86, 3, "Bank: " .. tostring(db_id), C.dim, C.bg) end
   if contract_id then writeAt(102, 3, "Contracts: " .. tostring(contract_id), C.dim, C.bg) end
 end
@@ -1460,7 +1537,7 @@ local function drawFooter()
   local w, h = getSize()
   fill(1, h - 1, w, 2, C.bg)
   writeAt(1, h - 1, string.rep("-", w), C.dim, C.bg)
-  local text = "Refresh: " .. REFRESH_SECONDS .. "s   SAFE-POLL SECTOR CPI / CONTRACT GDP   Monitor: " .. (monitor and "attached" or "terminal") .. "   [Q] Quit"
+  local text = "Refresh: " .. REFRESH_SECONDS .. "s   CORE FINANCE / CONTRACT GDP   Monitor: " .. (monitor and "attached" or "terminal") .. "   [Q] Quit"
   writeAt(2, h, text, C.dim, C.bg)
   if last_error ~= "" then writeAt(math.max(2, w - #last_error - 2), h, last_error, C.bad, C.bg) end
 end
@@ -1497,7 +1574,7 @@ local function drawScreen()
   graphCard(col3, topY, colW, topH, "INFLATION", "Bank inflation rate", fmtPct(snap and snap.inflation, 2), snap and snap.inflation and colors.white or C.warn, history.inflation, C.inflation, snap and snap.inflation_status or "inflation data")
 
   drawInequalityCard(col1, bottomY, colW, bottomH, snap)
-  drawPriceOracleCard(col2, bottomY, colW, bottomH, snap)
+  drawMonetaryCard(col2, bottomY, colW, bottomH, snap)
   drawScaleCard(col3, bottomY, colW, bottomH, snap)
 
   drawFooter()
