@@ -15,14 +15,38 @@ if args[1] ~= "--updated" then
   local cache_bust = tostring(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
   local update_url = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/ServerSideAccounts?cb=" .. cache_bust
 
-  shell.run("wget " .. update_url .. " startup.lua")
+  local tmp_file = "startup.lua.new"
+  if fs.exists(tmp_file) then fs.delete(tmp_file) end
+  shell.run("wget " .. update_url .. " " .. tmp_file)
+
+  if not fs.exists(tmp_file) then
+    print("Download failed. No file written.")
+    return
+  end
+
+  local f = fs.open(tmp_file, "r")
+  local head = f and f.read(80) or ""
+  if f then f.close() end
+  head = tostring(head or "")
+
+  -- If GitHub/web access returns an HTML error page, CraftOS later reports:
+  -- /startup: unexpected symbol near '<'. Do not install that as startup.lua.
+  if head:find("<", 1, true) and (head:lower():find("html", 1, true) or head:find("<!DOCTYPE", 1, true)) then
+    print("Download returned HTML, not Lua. Keeping old startup.lua.")
+    fs.delete(tmp_file)
+    return
+  end
+
+  fs.delete("startup.lua")
+  fs.move(tmp_file, "startup.lua")
+
   print("Relaunching...")
   sleep(0.5)
   shell.run("startup.lua", "--updated")
   return
 end
 
-local VERSION  = "1.4.7-ORACLE-DEFLATION-FIX"
+local VERSION  = "1.4.8-SYNTAX-CHECKED-ORACLE"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
