@@ -12,16 +12,16 @@
 --   COMPANIES
 --   TRANSACTIONS PER DAY
 --
--- Read-only. No banking controls. No trade panel. Contract GDP over 365 Minecraft days + in-view Minecraft clock + tapered money-supply inflation.
+-- Read-only. No banking controls. No trade panel. Contract GDP over 365 Minecraft days + in-view MCT clock + tapered money-supply inflation.
 -- =============================================================================
 
-local VERSION         = "0.5.5-MC-CALENDAR"
+local VERSION         = "0.5.6-MCT"
 local PROTOCOL        = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT      = 5
 local CONTRACT_TIMEOUT = 3
 local GDP_PERIOD_MC_DAYS = 365
-local MINECRAFT_DAY_MS = 20 * 60 * 1000 -- standard Minecraft day: 20 real minutes
+local MINECRAFT_DAY_MS = 20 * 60 * 1000 -- standard Minecraft day length for fallback timing
 local GDP_PERIOD_MS   = GDP_PERIOD_MC_DAYS * MINECRAFT_DAY_MS
 local REFRESH_SECONDS = 5
 local TEXT_SCALE      = 0.5
@@ -141,7 +141,8 @@ local function minecraftClock()
   local second = total_seconds % 60
 
   local date_text = string.format("%02d/%02d/%04d", cal.day_of_month, cal.month, cal.year)
-  local time_text = string.format("%02d:%02d:%02d", hour, minute, second)
+  local time_text = string.format("%02d:%02dMCT", hour, minute)
+  local time_seconds_text = string.format("%02d:%02d:%02dMCT", hour, minute, second)
 
   return {
     day = absolute_day,
@@ -158,6 +159,7 @@ local function minecraftClock()
     second = second,
     date_text = date_text,
     time_text = time_text,
+    time_seconds_text = time_seconds_text,
     tick_text = tostring(tick),
     full_text = date_text .. " " .. time_text,
   }
@@ -1148,25 +1150,24 @@ local function drawHeader(snap)
   writeAt(w - #v, 1, v, C.title, C.header)
 
   fill(1, 2, w, 2, C.bg)
+  local clock = (snap and snap.mc_clock) or minecraftClock()
   writeAt(2, 2, "Mode: " .. tostring(snap and snap.mode or "CONNECTING"), C.dim, C.bg)
   writeAt(34, 2, "Data: " .. tostring(snap and snap.quality or "NO DATA"), (snap and snap.quality == "OFFICIAL") and C.good or C.warn, C.bg)
-  writeAt(54, 2, "Updated: " .. tostring(last_update_text), C.dim, C.bg)
-  if db_id then writeAt(82, 2, "Bank: " .. tostring(db_id), C.dim, C.bg) end
-  if contract_id then writeAt(96, 2, "Contracts: " .. tostring(contract_id), C.dim, C.bg) end
+  writeAt(54, 2, "Date: " .. tostring(clock.date_text), C.good, C.bg)
+  writeAt(76, 2, "Time: " .. tostring(clock.time_text), C.good, C.bg)
 
-  local clock = (snap and snap.mc_clock) or minecraftClock()
-  writeAt(2, 3, "MC Date: " .. tostring(clock.date_text), C.good, C.bg)
-  writeAt(29, 3, "MC Time: " .. tostring(clock.time_text), C.good, C.bg)
-  writeAt(56, 3, "Tick: " .. tostring(clock.tick_text), C.good, C.bg)
-  writeAt(72, 3, "GDP window: " .. tostring(GDP_PERIOD_MC_DAYS) .. " MC days", C.warn, C.bg)
-  writeAt(106, 3, "Calendar: 0/0/0000", C.dim, C.bg)
+  writeAt(2, 3, "Tick: " .. tostring(clock.tick_text), C.good, C.bg)
+  writeAt(18, 3, "GDP window: " .. tostring(GDP_PERIOD_MC_DAYS) .. " MC days", C.warn, C.bg)
+  writeAt(52, 3, "Calendar: 0/0/0000", C.dim, C.bg)
+  if db_id then writeAt(76, 3, "Bank: " .. tostring(db_id), C.dim, C.bg) end
+  if contract_id then writeAt(92, 3, "Contracts: " .. tostring(contract_id), C.dim, C.bg) end
 end
 
 local function drawFooter()
   local w, h = getSize()
   fill(1, h - 1, w, 2, C.bg)
   writeAt(1, h - 1, string.rep("-", w), C.dim, C.bg)
-  local text = "Refresh: " .. REFRESH_SECONDS .. "s   MC CALENDAR CONTRACT GDP BUILD   Monitor: " .. (monitor and "attached" or "terminal") .. "   [Q] Quit"
+  local text = "Refresh: " .. REFRESH_SECONDS .. "s   MCT CALENDAR CONTRACT GDP BUILD   Monitor: " .. (monitor and "attached" or "terminal") .. "   [Q] Quit"
   writeAt(2, h, text, C.dim, C.bg)
   if last_error ~= "" then writeAt(math.max(2, w - #last_error - 2), h, last_error, C.bad, C.bg) end
 end
