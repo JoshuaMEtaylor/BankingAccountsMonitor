@@ -51,10 +51,12 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION            = "1.0.7-CLAIMED-PRICE-LOCK"
+local VERSION            = "1.0.8-COMPLETION-PAYOUT"
 local LABEL              = "Quid-Contracts"
 local PROTOCOL           = "quid_contracts"
 local PROTOCOL_BROADCAST = "quid_contracts_discovery"
+local BANK_PROTOCOL      = "quid_bank"
+local bank_id = nil
 
 local FILE = {
   contracts = "data/contracts.db",
@@ -239,7 +241,7 @@ end
 local function findLiveContractBySourceKey(key)
   if not key or key == "" then return nil, nil end
   for id, c in pairs(contracts) do
-    if c.source_key == key and (c.status == "open" or c.status == "claimed") then
+    if c.source_key == key and (c.status == "open" or c.status == "claimed" or c.status == "pending_completion") then
       return id, c
     end
   end
@@ -527,31 +529,84 @@ local function unclaimContract(sender_id, req)
   return true, { contract = publicContract(c), message = "Contract reopened" }
 end
 
+
+local function payContract(c)
+  if not c then return false, "missing contract" end
+  if c.payout_status == "paid" then return true, { already_paid = true, tx_id = c.payout_tx_id } end
+
+  local from_id = trim(c.poster or c.source_company or "")
+  local to_id = trim(c.claimed_by or "")
+  local amount = tonumber(c.reward) or 0
+  amount = math.floor(amount)
+
+  if from_id == "" then return false, "Missing poster account for payout" end
+  if to_id == "" then return false, "Missing claimant account for payout" end
+  if amount <= 0 then return false, "Invalid payout amount" end
+
+  local ok, res = bankReq({
+    type = "contract_payout",
+    from_id = from_id,
+    to_id = to_id,
+    amount = amount,
+    contract_id = c.contract_id,
+    memo = "Contract payout " .. tostring(c.contract_id) .. ": " .. tostring(c.title or ""),
+  }, 6)
+
+  if ok and type(res) == "table" then
+    c.payout_status = "paid"
+    c.payout_tx_id = res.tx_id
+    c.paid_at = timestamp()
+    return true, res
+  end
+
+  c.payout_status = "failed"
+  c.payout_error = tostring(res)
+  c.payout_failed_at = timestamp()
+  return false, res
+end
+
 local function markFulfilled(sender_id, req)
   local id = req.contract_id
   if not id then return false, "Missing contract_id" end
 
   local c = contracts[id]
   if not c then return false, "Contract not found: " .. tostring(id) end
-  if c.status ~= "claimed" and c.status ~= "open" then
+  if c.status ~= "claimed" and c.status ~= "open" and c.status ~= "pending_completion" and c.status ~= "pending_payout" then
     return false, "Contract is not active"
   end
 
-  if c.exact_fulfillment or c.source_type == "minecolonies_request" then
+  -- If the MineColonies source request disappeared after the contract was
+  -- claimed, the item delivery has already been accepted by MineColonies.
+  -- In that state, completion is confirmed by the board rather than by asking
+  -- for the items again.
+  local source_disappeared = c.status == "pending_completion"
+
+  if (c.exact_fulfillment or c.source_type == "minecolonies_request") and not source_disappeared then
     local ok, err = fulfilmentMatchesContract(c, req.fulfilled_items or req.items or {})
     if not ok then return false, err end
     c.fulfilled_items = normaliseItems(req.fulfilled_items or req.items or {})
   end
 
+  local paid_ok, paid_res = payContract(c)
+  if not paid_ok then
+    c.status = "pending_payout"
+    c.updated = timestamp()
+    c.fulfillment_note = req.note or "Fulfilled but payout failed"
+    writeFile(FILE.contracts, contracts)
+    audit("PAYOUT_FAILED", c.claimed_by or "unknown", sender_id, id .. " " .. tostring(paid_res))
+    return false, "Contract completion detected, but payout failed: " .. tostring(paid_res)
+  end
+
   c.status = "fulfilled"
   c.fulfilled_at = timestamp()
   c.updated = timestamp()
-  c.fulfillment_note = req.note or ""
+  c.fulfillment_note = req.note or (source_disappeared and "MineColonies request disappeared after claim; manually confirmed." or "")
+  c.completion_confirmed_by = sender_id
 
   writeFile(FILE.contracts, contracts)
   audit("FULFILLED", c.claimed_by or "unknown", sender_id, id)
 
-  return true, { contract = publicContract(c), message = "Contract marked fulfilled" }
+  return true, { contract = publicContract(c), payout = paid_res, message = "Contract marked fulfilled and paid" }
 end
 
 local function cancelContract(sender_id, req)
@@ -603,20 +658,32 @@ local function syncSourceContracts(sender_id, req)
       or (not c.source_terminal)
       or tostring(c.source_terminal) == tostring(source_terminal)
 
-    local live_status = (c.status == "open" or c.status == "claimed")
+    local live_status = (c.status == "open" or c.status == "claimed" or c.status == "pending_completion")
     local key = c.source_key
 
     if matches_type and matches_company and matches_terminal and live_status then
       if not key or not active[key] then
-        c.status = "cancelled"
-        c.cancelled_at = timestamp()
-        c.updated = timestamp()
-        c.cancel_reason = req.reason or "Source request no longer exists"
-        c.claimed_by = nil
-        c.claimed_type = nil
-        c.claimed_at = nil
-        cancelled = cancelled + 1
-        audit("STALE_CANCEL", c.poster or "unknown", sender_id, id)
+        if c.status == "claimed" then
+          -- Claimed MineColonies request disappeared. That usually means the
+          -- request was actually satisfied in-game. Do not cancel it; move it
+          -- to a manual completion queue so the claimant can be paid.
+          c.status = "pending_completion"
+          c.pending_completion_at = timestamp()
+          c.updated = timestamp()
+          c.pending_reason = req.reason or "Source request disappeared after claim"
+          kept = kept + 1
+          audit("PENDING_COMPLETION", c.claimed_by or "unknown", sender_id, id)
+        else
+          c.status = "cancelled"
+          c.cancelled_at = timestamp()
+          c.updated = timestamp()
+          c.cancel_reason = req.reason or "Source request no longer exists"
+          c.claimed_by = nil
+          c.claimed_type = nil
+          c.claimed_at = nil
+          cancelled = cancelled + 1
+          audit("STALE_CANCEL", c.poster or "unknown", sender_id, id)
+        end
       else
         kept = kept + 1
       end
@@ -644,12 +711,13 @@ handlers["ping"] = function(sender_id, req)
 end
 
 handlers["status"] = function(sender_id, req)
-  local open, claimed, fulfilled, cancelled = 0, 0, 0, 0
+  local open, claimed, fulfilled, cancelled, pending = 0, 0, 0, 0, 0
   for _, c in pairs(contracts) do
     if c.status == "open" then open = open + 1
     elseif c.status == "claimed" then claimed = claimed + 1
     elseif c.status == "fulfilled" then fulfilled = fulfilled + 1
-    elseif c.status == "cancelled" then cancelled = cancelled + 1 end
+    elseif c.status == "cancelled" then cancelled = cancelled + 1
+    elseif c.status == "pending_completion" or c.status == "pending_payout" then pending = pending + 1 end
   end
 
   return true, {
@@ -663,6 +731,7 @@ handlers["status"] = function(sender_id, req)
     claimed = claimed,
     fulfilled = fulfilled,
     cancelled = cancelled,
+    pending = pending,
     audit_count = audit_counter,
   }
 end
@@ -730,6 +799,41 @@ local function openModem()
   return false
 end
 
+
+local function discoverBank()
+  for _ = 1, 5 do
+    rednet.broadcast({ type = "ping" }, BANK_PROTOCOL)
+    local sender, msg = rednet.receive(BANK_PROTOCOL, 2)
+    if sender and type(msg) == "table" then
+      if msg.type == "treasury_online" or msg.success == true then
+        bank_id = sender
+        print("  Bank: " .. tostring(bank_id))
+        return true
+      end
+    end
+  end
+  print("  WARN: Quid bank not found. Payouts will fail until bank is online.")
+  return false
+end
+
+local function bankReq(req, timeout)
+  timeout = timeout or 5
+  if not bank_id then discoverBank() end
+  if not bank_id then return false, "No bank server connected" end
+
+  rednet.send(bank_id, req, BANK_PROTOCOL)
+  local deadline = os.clock() + timeout
+
+  while true do
+    local remaining = deadline - os.clock()
+    if remaining <= 0 then return false, "No response from bank" end
+    local sender, msg = rednet.receive(BANK_PROTOCOL, remaining)
+    if sender == bank_id and type(msg) == "table" and msg.success ~= nil then
+      return msg.success, msg.response
+    end
+  end
+end
+
 local function drawStatus()
   term.clear()
   term.setCursorPos(1, 1)
@@ -760,6 +864,8 @@ local function drawStatus()
   print("  Fulfilled: " .. tostring(s and s.fulfilled or "?"))
   term.setTextColor(colors.red)
   print("  Cancelled: " .. tostring(s and s.cancelled or "?"))
+  term.setTextColor(colors.yellow)
+  print("  Pending:   " .. tostring(s and s.pending or "?"))
   term.setTextColor(colors.white)
   print("  Total:     " .. tostring(s and s.total or countTable(contracts)))
 
@@ -846,6 +952,8 @@ local function main()
     print("FATAL: No modem. Halting.")
     return
   end
+
+  discoverBank()
 
   audit("BOOT", "SYSTEM", os.getComputerID(), "v" .. VERSION)
 
