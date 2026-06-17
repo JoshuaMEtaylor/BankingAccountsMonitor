@@ -42,12 +42,14 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION          = "1.0.0-PAYROLL-PIE"
+local VERSION          = "1.0.1-ANNUALIZED-365"
 local BANK_PROTOCOL    = "quid_bank"
 local TREASURY_ACCOUNT = "treasury:quid_bank"
 local DB_TIMEOUT       = 5
 local REFRESH_SECONDS  = 10
 local HISTORY_LIMIT    = 900
+local MC_ANNUAL_DAYS   = 365
+local MC_DAY_MS        = 20 * 60 * 1000
 
 local bank_id = nil
 local modem_name = nil
@@ -202,10 +204,15 @@ local function yearDays(year)
   return isLeapYear(year) and 366 or 365
 end
 
-local function mcDate()
+local function mcAbsoluteDay()
   local d = 0
   if os.day then d = math.floor(tonumber(os.day()) or 0) end
   if d < 0 then d = 0 end
+  return d
+end
+
+local function mcDate()
+  local d = mcAbsoluteDay()
 
   local year = 0
   while d >= yearDays(year) do
@@ -445,52 +452,128 @@ local function classifySector(tx)
   return "other"
 end
 
+
+local function txTimestamp(tx)
+  local n = tonumber(txField(tx, "time", "timestamp", "created", "created_at", "updated", "paid_at") or 0) or 0
+  if n <= 0 then return nil end
+  -- All current Quid ledger timestamps are os.epoch("utc") milliseconds.
+  -- If an older script ever wrote seconds, normalize to milliseconds.
+  if n < 100000000000 then n = n * 1000 end
+  return n
+end
+
+local function txMCDay(tx, current_day, current_ms)
+  local direct = tonumber(txField(tx, "mc_day", "minecraft_day", "day") or nil)
+  if direct then
+    direct = math.floor(direct)
+    if direct < 0 then direct = 0 end
+    return direct
+  end
+
+  local ts = txTimestamp(tx)
+  if ts and current_ms and current_ms > 0 then
+    local age_days = math.floor(math.max(0, current_ms - ts) / MC_DAY_MS)
+    local d = math.floor((tonumber(current_day) or 0) - age_days)
+    if d < 0 then d = 0 end
+    return d
+  end
+
+  return nil
+end
+
 local function analyse(res)
   local txs = {}
   if type(res) == "table" then
     txs = res.transactions or res.history or {}
   end
 
+  local current_day = mcAbsoluteDay()
+  local current_ms = nowMs()
+  local window_days_elapsed = math.min(MC_ANNUAL_DAYS, current_day + 1)
+  if window_days_elapsed < 1 then window_days_elapsed = 1 end
+  local window_start_day = math.max(0, current_day - MC_ANNUAL_DAYS + 1)
+  local annual_factor = MC_ANNUAL_DAYS / window_days_elapsed
+
   local by = {}
   for _, s in ipairs(SECTORS) do
-    by[s.key] = { key = s.key, label = s.label, color = s.color, amount = 0, count = 0 }
+    by[s.key] = {
+      key = s.key,
+      label = s.label,
+      color = s.color,
+      amount = 0,             -- annualized amount, used by the table and pie chart
+      observed_amount = 0,    -- actual payroll found in the 365 MC-day window
+      count = 0,
+    }
   end
 
-  local total = 0
+  local observed_total = 0
   local count = 0
   local last = nil
+  local earliest_day = nil
+  local latest_day = nil
+  local rows_in_window = 0
+  local skipped_outside_window = 0
 
   for _, tx in ipairs(txs) do
     if isPayrollTx(tx) then
-      local amount = math.floor(tonumber(txField(tx, "amount", "value") or 0) or 0)
-      if amount > 0 then
-        local key = classifySector(tx)
-        by[key] = by[key] or { key = key, label = key, color = colors.lightGray, amount = 0, count = 0 }
-        by[key].amount = by[key].amount + amount
-        by[key].count = by[key].count + 1
-        total = total + amount
-        count = count + 1
-        last = tx
+      local tx_day = txMCDay(tx, current_day, current_ms)
+      local in_window = true
+      if tx_day then
+        in_window = (tx_day >= window_start_day and tx_day <= current_day)
+      end
+
+      if in_window then
+        rows_in_window = rows_in_window + 1
+        if tx_day then
+          if not earliest_day or tx_day < earliest_day then earliest_day = tx_day end
+          if not latest_day or tx_day > latest_day then latest_day = tx_day end
+        end
+
+        local amount = math.floor(tonumber(txField(tx, "amount", "value") or 0) or 0)
+        if amount > 0 then
+          local key = classifySector(tx)
+          by[key] = by[key] or {
+            key = key,
+            label = key,
+            color = colors.lightGray,
+            amount = 0,
+            observed_amount = 0,
+            count = 0,
+          }
+          by[key].observed_amount = by[key].observed_amount + amount
+          by[key].count = by[key].count + 1
+          observed_total = observed_total + amount
+          count = count + 1
+          last = tx
+        end
+      else
+        skipped_outside_window = skipped_outside_window + 1
       end
     end
   end
 
   -- If the newer fiscal endpoint provides a payroll total but individual rows
   -- could not be read/classified, still show the total as unclassified payroll.
-  if total <= 0 and type(res) == "table" and type(res.summary) == "table" then
+  if observed_total <= 0 and type(res) == "table" and type(res.summary) == "table" then
     local summary_total = tonumber(res.summary.payroll_total or res.summary.expenditure_total or 0) or 0
     if summary_total > 0 then
-      by.other.amount = math.floor(summary_total)
+      by.other.observed_amount = math.floor(summary_total)
       by.other.count = tonumber(res.summary.payroll_count or 0) or 0
-      total = by.other.amount
+      observed_total = by.other.observed_amount
       count = by.other.count
+      rows_in_window = rows_in_window + by.other.count
     end
+  end
+
+  local annual_total = math.floor((observed_total * annual_factor) + 0.5)
+  for _, row in pairs(by) do
+    row.amount = math.floor(((row.observed_amount or 0) * annual_factor) + 0.5)
   end
 
   local list = {}
   for _, s in ipairs(SECTORS) do
     local row = by[s.key]
-    if row and row.amount > 0 then list[#list + 1] = row end
+    if row and ((row.observed_amount or 0) > 0 or (row.amount or 0) > 0) then list[#list + 1] = row end
   end
   table.sort(list, function(a, b)
     if a.amount ~= b.amount then return a.amount > b.amount end
@@ -498,13 +581,23 @@ local function analyse(res)
   end)
 
   return {
-    total = total,
+    total = annual_total,
+    observed_total = observed_total,
     count = count,
     sectors = list,
     by = by,
     last = last,
     raw_count = #txs,
     source = last_data_source,
+    current_day = current_day,
+    window_start_day = window_start_day,
+    window_days = MC_ANNUAL_DAYS,
+    days_elapsed = window_days_elapsed,
+    annual_factor = annual_factor,
+    earliest_day = earliest_day,
+    latest_day = latest_day,
+    rows_in_window = rows_in_window,
+    skipped_outside_window = skipped_outside_window,
   }
 end
 
@@ -590,25 +683,26 @@ local function drawScreen(data, err)
     return
   end
 
-  data = data or { total = 0, count = 0, sectors = {}, raw_count = 0 }
+  data = data or { total = 0, observed_total = 0, count = 0, sectors = {}, raw_count = 0, days_elapsed = 1, window_days = MC_ANNUAL_DAYS }
 
   local leftW = math.max(32, math.floor(W * 0.46))
   if leftW > W - 22 then leftW = W - 22 end
   local rightX = leftW + 3
 
-  drawBox(2, 4, leftW - 2, H - 5, "PAYROLL EXPENDITURE")
+  drawBox(2, 4, leftW - 2, H - 5, "ANNUAL GOV PAYROLL")
 
   at(4, 6, "Current expense model:", C.label, C.bg)
   at(4, 7, "Government payroll only", C.text, C.bg)
-  at(4, 9, "Total payroll: " .. money(data.total), C.good, C.bg)
-  at(4,10, "Payroll entries: " .. tostring(data.count), C.text, C.bg)
-  at(4,11, "Ledger rows read: " .. tostring(data.raw_count or 0), C.dim, C.bg)
+  at(4, 9, "Annualized payroll: " .. money(data.total), C.good, C.bg)
+  at(4,10, "Observed payroll:   " .. money(data.observed_total or 0), C.text, C.bg)
+  at(4,11, "Period: " .. tostring(data.days_elapsed or 1) .. "/" .. tostring(data.window_days or MC_ANNUAL_DAYS) .. " MC days", C.dim, C.bg)
+  at(4,12, "Ledger rows read: " .. tostring(data.raw_count or 0), C.dim, C.bg)
 
-  at(4,13, "Sector", C.label, C.bg)
-  at(math.max(18, leftW - 20), 13, "Amount", C.label, C.bg)
-  at(math.max(27, leftW - 8), 13, "Share", C.label, C.bg)
+  at(4,14, "Sector", C.label, C.bg)
+  at(math.max(18, leftW - 20), 14, "Annual", C.label, C.bg)
+  at(math.max(27, leftW - 8), 14, "Share", C.label, C.bg)
 
-  local y = 14
+  local y = 15
   if #data.sectors == 0 then
     at(4, y, "No payroll expenditure found.", C.dim, C.bg)
     y = y + 1
@@ -630,7 +724,7 @@ local function drawScreen(data, err)
     end
   end
 
-  drawBox(rightX, 4, W - rightX - 1, H - 5, "SPEND MIX")
+  drawBox(rightX, 4, W - rightX - 1, H - 5, "ANNUAL SPEND MIX")
 
   local pieW = W - rightX - 4
   local rx = math.floor(math.min(14, math.max(4, pieW / 3)))
@@ -639,9 +733,10 @@ local function drawScreen(data, err)
   local cy = 7 + ry
 
   drawPie(cx, cy, rx, ry, data.sectors, data.total)
-  at(rightX + 2, cy + ry + 2, "Total: " .. money(data.total), C.good, C.bg)
+  at(rightX + 2, cy + ry + 2, "Annualized: " .. money(data.total), C.good, C.bg)
+  at(rightX + 2, cy + ry + 3, "Observed: " .. money(data.observed_total or 0), C.dim, C.bg)
 
-  local legendY = cy + ry + 4
+  local legendY = cy + ry + 5
   if legendY < H - 7 then
     drawLegend(rightX + 2, legendY, data.sectors, data.total)
   else
@@ -650,7 +745,7 @@ local function drawScreen(data, err)
 
   local age = "never"
   if last_refresh > 0 then age = tostring(math.floor((nowMs() - last_refresh) / 1000)) .. "s ago" end
-  last_message = "Refresh " .. age .. " | Q quits | R refreshes"
+  last_message = "Annualized over 365 MC days | Refresh " .. age .. " | Q quits | R refreshes"
   last_colour = C.dim
   statusBar()
 end
