@@ -32,7 +32,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION = "1.0.19-DINING-PAYROLL-EMPLOYEE-STOCK"
+local VERSION = "1.0.20-DINING-LEDGER-PAYROLL-SOURCE"
 local BANK_PROTOCOL = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT = 5
@@ -1517,125 +1517,47 @@ local function serviceDiningText(s)
   return wanted and not wrong
 end
 
+local function servicePayrollSourceForCitizen(citizen_id)
+  if not citizen_id or citizen_id == "" or not bank_id then return nil end
+
+  local ok, res = bankReq({
+    type = "payroll_source_for_citizen",
+    citizen_id = citizen_id,
+    limit = 2000,
+  }, 5)
+
+  if ok and type(res) == "table" and res.company_id then
+    return res.company_id, res.company_name or res.company_id, "ledger_payroll:" .. tostring(res.tx_id or "")
+  end
+
+  return nil
+end
+
 local function resolveDiningServiceCompany(citizens)
+  -- First find the dining/cook employee from live MineColonies data, then ask
+  -- the bank which company actually paid that citizen through COMPANY_PAYROLL.
+  -- This avoids guessing from industry labels and avoids picking Tavern when
+  -- the Dining Hall is a separate company.
+  for _, z in ipairs(citizens or {}) do
+    local job = lower(citizenJobRaw(z) .. " " .. citizenTitle(z) .. " " .. tostring(z.name or ""))
+    if serviceDiningText(job) then
+      local cid = serviceCitizenAccountId(z)
+      local company_id, company_name, source = servicePayrollSourceForCitizen(cid)
+      if company_id then return company_id, company_name, source end
+    end
+  end
+
+  -- Fallback only: old employment resolver. Kept so the system still displays
+  -- something if the payroll ledger has no recent entry yet.
   for _, z in ipairs(citizens or {}) do
     local job = lower(citizenJobRaw(z) .. " " .. citizenTitle(z) .. " " .. tostring(z.name or ""))
     if serviceDiningText(job) then
       local e = resolveCitizenEmployment(z)
-      if e and e.company_id then return e.company_id, e.company_name or e.company_id, "employee:" .. tostring(e.citizen_id) end
+      if e and e.company_id then return e.company_id, e.company_name or e.company_id, "fallback_employment:" .. tostring(e.citizen_id) end
     end
-  end
-
-  for _, b in pairs(businesses or {}) do
-    local txt = lower(tostring(b.building_type or "") .. " " .. tostring(b.building_name or "") .. " " .. tostring(b.name or ""))
-    if serviceDiningText(txt) and b.company_id then return b.company_id, b.name or b.company_id, "building:" .. tostring(b.key or "") end
   end
 
   return nil, nil, "unresolved"
-end
-
-
-serviceLoadState = function()
-  service_state = readFile(FILE_SERVICE) or service_state or { known = {}, events = {}, seq = 0 }
-  service_state.known = service_state.known or {}
-  service_state.events = service_state.events or {}
-  service_state.seq = tonumber(service_state.seq) or 0
-end
-
-local function serviceSaveState()
-  service_state.known = service_state.known or {}
-  service_state.events = service_state.events or {}
-  while #service_state.events > 100 do table.remove(service_state.events, 1) end
-  writeFile(FILE_SERVICE, service_state)
-end
-
-local function serviceItemDisplay(items)
-  if type(items) ~= "table" or #items == 0 then return "meal" end
-  local it = items[1]
-  return tostring(it.display or it.item or "meal")
-end
-
-local function servicePrimaryItem(items)
-  if type(items) ~= "table" or #items == 0 then return nil end
-  local it = items[1]
-  return tostring(it.item or it.display or "")
-end
-
-serviceIsDiningRequest = function(req, business, items)
-  if not business then return false end
-
-  local txt = lower(
-    tostring(req and req.name or "") .. " " ..
-    tostring(req and req.desc or "") .. " " ..
-    tostring(req and req.target or "") .. " " ..
-    tostring(business.building_type or "") .. " " ..
-    tostring(business.building_name or "") .. " " ..
-    tostring(business.name or "") .. " " ..
-    tostring(business.company_id or "")
-  )
-
-  if serviceDiningText(txt) then return true end
-
-  -- If the mapped company is the same company selected by the dining worker
-  -- resolver, treat food requests to that company as dining service supply.
-  local company_id = select(1, resolveDiningServiceCompany({}))
-  if company_id and business.company_id == company_id then return true end
-
-  return false
-end
-
-serviceRememberDiningRequest = function(key, req, business, items, fixed_quantity)
-  if not key or not business then return end
-  if not serviceIsDiningRequest(req, business, items) then return end
-
-  local item = servicePrimaryItem(items)
-  if not item or item == "" then return end
-  if serviceIsExcludedFuel(item) then return end
-
-  service_state.known = service_state.known or {}
-  service_state.known[key] = {
-    key = key,
-    active = true,
-    fulfilled = false,
-    company_id = business.company_id,
-    company_name = business.name,
-    item = item,
-    display = serviceItemDisplay(items),
-    qty = math.max(1, math.floor(tonumber(fixed_quantity) or 1)),
-    title = reqTitle(req, fixed_quantity),
-    last_seen = now(),
-  }
-end
-
-serviceFinalizeDiningRequests = function(active_dining_keys)
-  service_state.known = service_state.known or {}
-  service_state.events = service_state.events or {}
-  service_state.seq = tonumber(service_state.seq) or 0
-
-  for key, rec in pairs(service_state.known) do
-    if rec and rec.active and not active_dining_keys[key] and not rec.fulfilled then
-      rec.active = false
-      rec.fulfilled = true
-      rec.fulfilled_at = now()
-
-      service_state.seq = service_state.seq + 1
-      local event_id = "DINING-SUPPLY-" .. tostring(service_state.seq)
-
-      service_state.events[#service_state.events+1] = {
-        event_id = event_id,
-        time = rec.fulfilled_at,
-        company_id = rec.company_id,
-        company_name = rec.company_name,
-        item = rec.item,
-        display = rec.display,
-        qty = tonumber(rec.qty) or 1,
-        title = rec.title,
-        source_key = key,
-      }
-    end
-  end
-
-  serviceSaveState()
 end
 
 local function servicePayrollEmployeesForCompany(company_id)
@@ -1646,13 +1568,32 @@ local function servicePayrollEmployeesForCompany(company_id)
     return set, rows, "missing_company_or_bank"
   end
 
+  -- Primary source: actual COMPANY_PAYROLL transactions from this company.
   local ok, res = bankReq({
+    type = "list_company_payroll_payees",
+    company_id = company_id,
+    limit = 3000,
+  }, 5)
+
+  if ok and type(res) == "table" and type(res.payees) == "table" and #res.payees > 0 then
+    for _, e in ipairs(res.payees) do
+      local cid = tostring(e.citizen_id or "")
+      if cid ~= "" then
+        set[cid] = e
+        rows[#rows + 1] = e
+      end
+    end
+    return set, rows, "ledger_company_payroll"
+  end
+
+  -- Fallback source: central employment mapping.
+  ok, res = bankReq({
     type = "list_employee_mappings",
     include_inactive = false,
   }, 5)
 
   if not ok or type(res) ~= "table" or type(res.employees) ~= "table" then
-    return set, rows, "bank_list_employee_mappings_failed:" .. tostring(res)
+    return set, rows, "employee_mapping_failed:" .. tostring(res)
   end
 
   for _, e in ipairs(res.employees) do
@@ -1665,7 +1606,7 @@ local function servicePayrollEmployeesForCompany(company_id)
     end
   end
 
-  return set, rows, "bank_employee_mappings"
+  return set, rows, "fallback_employee_mappings"
 end
 
 pushDiningServiceObservation = function(citizens)
