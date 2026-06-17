@@ -52,7 +52,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION          = "1.0.11-SECTOR-WORKER-PAY"
+local VERSION          = "1.0.15-GRANT-SEARCH"
 local PROTOCOL         = "quid_bank"
 local TREASURY_ACCOUNT = "treasury:quid_bank"
 local DB_TIMEOUT       = 5
@@ -178,9 +178,9 @@ local function drawBottom()
   fill(1, h, w, 1, colors.black)
   if last_message ~= "" then
     writeAt(2, h, last_message, last_message_colour, colors.black)
+  else
+    writeAt(2, h, "Mouse controls only.", colors.lightGray, colors.black)
   end
-  local q = "[Q] Quit"
-  writeAt(w - #q, h, q, colors.lightGray, colors.black)
 end
 
 -- =============================================================================
@@ -358,7 +358,7 @@ local function formScreen(title, help, fields, submitLabel)
     drawTop(title)
 
     if help and help ~= "" then
-      writeAt(2, 3, help, colors.lightGray, colors.black)
+      writeAt(2, 3, help:sub(1, w - 3), colors.lightGray, colors.black)
     end
 
     local y = help and 5 or 3
@@ -372,15 +372,13 @@ local function formScreen(title, help, fields, submitLabel)
     if err ~= "" then
       writeAt(2, h - 3, err, colors.red, colors.black)
     else
-      writeAt(2, h - 3, "TAB changes field. ESC/B/back button cancels.", colors.lightGray, colors.black)
+      writeAt(2, h - 3, "Click a field to edit. Use the Back button to cancel.", colors.lightGray, colors.black)
     end
 
     local bw = math.floor((w - 6) / 2)
     local bSubmit = button(2, h - 1, bw, submitLabel or "Submit", colors.blue, colors.white)
     local bBack = button(4 + bw, h - 1, bw, "Back", colors.gray, colors.white)
 
-    -- Cursor belongs only inside the selected input field.
-    -- It is positioned after buttons are drawn, so it cannot blink on Back/Review.
     local active = fieldHits[focused]
     if active then
       term.setCursorPos(active.cursor_x, active.cursor_y)
@@ -439,9 +437,6 @@ local function formScreen(title, help, fields, submitLabel)
           if out then return out end
           fieldHits, bSubmit, bBack = draw()
         end
-
-      elseif p1 == keys.escape or p1 == keys.b then
-        return nil
       end
 
     elseif ev == "mouse_click" then
@@ -472,7 +467,7 @@ local function confirmScreen(title, lines, confirmLabel, dangerous)
     drawTop(title)
     local y = 3
     for _, line in ipairs(lines) do
-      writeAt(2, y, tostring(line), colors.white, colors.black)
+      writeAt(2, y, tostring(line):sub(1, w - 3), colors.white, colors.black)
       y = y + 1
       if y > h - 4 then break end
     end
@@ -489,9 +484,6 @@ local function confirmScreen(title, lines, confirmLabel, dangerous)
     if ev == "mouse_click" then
       if hit(bBack, p2, p3) then return false end
       if hit(bConfirm, p2, p3) then return true end
-    elseif ev == "key" then
-      if p1 == keys.enter then return true end
-      if p1 == keys.escape or p1 == keys.b or p1 == keys.backspace then return false end
     end
   end
 end
@@ -552,12 +544,192 @@ local function actionPrintMoney()
   end
 end
 
+local function grantAccountName(acc)
+  if type(acc) ~= "table" then return "Unknown account" end
+  local name = trim(acc.display_name or "")
+  if name ~= "" then return name end
+  return tostring(acc.account_id or "Unknown account")
+end
+
+local function grantAccountTypeLabel(t)
+  t = tostring(t or "")
+  if t == "citizen" then return "Citizen" end
+  if t == "company" then return "Company" end
+  return t
+end
+
+local function matchesGrantSearch(acc, query)
+  query = string.lower(trim(query or ""))
+  if query == "" then return true end
+  local hay = string.lower(
+    tostring(acc.account_id or "") .. " " ..
+    tostring(acc.display_name or "") .. " " ..
+    tostring(acc.owner_id or "")
+  )
+  return hay:find(query, 1, true) ~= nil
+end
+
+local function filteredGrantAccounts(accounts, selectedType, query)
+  local out = {}
+  for _, acc in ipairs(accounts or {}) do
+    if tostring(acc.type or "") == selectedType and tostring(acc.status or "active") == "active" then
+      if matchesGrantSearch(acc, query) then
+        out[#out + 1] = acc
+      end
+    end
+  end
+  table.sort(out, function(a, b)
+    local an = string.lower(grantAccountName(a))
+    local bn = string.lower(grantAccountName(b))
+    if an ~= bn then return an < bn end
+    return tostring(a.account_id or "") < tostring(b.account_id or "")
+  end)
+  return out
+end
+
+local function selectGrantRecipient()
+  local ok, accounts = requestAccounts()
+  if not ok then accounts = last_accounts or {} end
+
+  local selectedType = "citizen"
+  local query = ""
+  local page = 1
+
+  while true do
+    local w, h = getSize()
+    local results = filteredGrantAccounts(accounts, selectedType, query)
+    local rowTop = 9
+    local rowBottom = h - 4
+    local perPage = math.floor(math.max(2, rowBottom - rowTop + 1) / 2)
+    if perPage < 2 then perPage = 2 end
+
+    local totalPages = math.max(1, math.ceil(#results / perPage))
+    if page > totalPages then page = totalPages end
+    if page < 1 then page = 1 end
+
+    clear(colors.black)
+    drawTop("GRANT RECIPIENT")
+
+    writeAt(2, 3, "Choose the account to receive treasury funds.", colors.lightGray, colors.black)
+
+    local tw = math.floor((w - 6) / 2)
+    local bCitizen = button(2, 5, tw, "Citizens", selectedType == "citizen" and colors.blue or colors.gray, colors.white)
+    local bCompany = button(4 + tw, 5, tw, "Companies", selectedType == "company" and colors.blue or colors.gray, colors.white)
+
+    writeAt(2, 7, "Search", colors.white, colors.black)
+    local searchBox = inputBox(10, 7, w - 11, query, true)
+
+    local summary = grantAccountTypeLabel(selectedType) .. " results: " .. tostring(#results)
+    writeAt(2, 8, summary .. "   Page " .. tostring(page) .. "/" .. tostring(totalPages), colors.yellow, colors.black)
+
+    local resultHits = {}
+    local startIndex = ((page - 1) * perPage) + 1
+    local y = rowTop
+
+    if #results == 0 then
+      writeAt(2, y, "No matching " .. selectedType .. " accounts found.", colors.orange, colors.black)
+    else
+      for i = startIndex, math.min(#results, startIndex + perPage - 1) do
+        local acc = results[i]
+        local display = grantAccountName(acc)
+        local id = tostring(acc.account_id or "?")
+        local bal = money(acc.balance or 0)
+        local idx = #resultHits + 1
+
+        fill(2, y, w - 3, 1, colors.gray)
+        writeAt(3, y, display:sub(1, math.max(6, w - 18)), colors.white, colors.gray)
+        writeAt(math.max(3, w - #bal - 1), y, bal, colors.lime, colors.gray)
+
+        fill(2, y + 1, w - 3, 1, colors.black)
+        writeAt(4, y + 1, id:sub(1, w - 5), colors.lightGray, colors.black)
+
+        resultHits[idx] = { x1 = 2, x2 = w - 2, y1 = y, y2 = y + 1, account = acc }
+        y = y + 2
+      end
+    end
+
+    local bw = math.floor((w - 8) / 3)
+    local bPrev = button(2, h - 1, bw, "Prev", colors.gray, colors.white)
+    local bNext = button(3 + bw, h - 1, bw, "Next", colors.gray, colors.white)
+    local bBack = button(4 + (bw * 2), h - 1, bw, "Back", colors.gray, colors.white)
+
+    term.setCursorPos(searchBox.cursor_x, searchBox.cursor_y)
+    term.setCursorBlink(true)
+
+    local ev, p1, p2, p3 = os.pullEvent()
+
+    if ev == "char" then
+      if #query < 40 then query = query .. p1 end
+      page = 1
+
+    elseif ev == "key" then
+      if p1 == keys.backspace then
+        query = query:sub(1, -2)
+        page = 1
+      end
+
+    elseif ev == "mouse_click" then
+      local mx, my = p2, p3
+
+      if hit(bBack, mx, my) then
+        term.setCursorBlink(false)
+        return nil
+
+      elseif hit(bCitizen, mx, my) then
+        selectedType = "citizen"
+        page = 1
+
+      elseif hit(bCompany, mx, my) then
+        selectedType = "company"
+        page = 1
+
+      elseif hit(bPrev, mx, my) then
+        page = math.max(1, page - 1)
+
+      elseif hit(bNext, mx, my) then
+        page = math.min(totalPages, page + 1)
+
+      else
+        for _, box in ipairs(resultHits) do
+          if hit(box, mx, my) then
+            term.setCursorBlink(false)
+            return box.account
+          end
+        end
+      end
+
+    elseif ev == "mouse_scroll" then
+      local dir = p1
+      if dir and dir > 0 then
+        page = math.min(totalPages, page + 1)
+      else
+        page = math.max(1, page - 1)
+      end
+    end
+  end
+end
+
 local function actionGrantFunds()
+  local recipient = selectGrantRecipient()
+
+  if not recipient then
+    setMessage("Grant cancelled.", colors.lightGray)
+    return
+  end
+
+  local recipient_id = tostring(recipient.account_id or "")
+  local recipient_name = grantAccountName(recipient)
+  local recipient_type = grantAccountTypeLabel(recipient.type)
+
+  if recipient_id == "" then
+    setMessage("Invalid recipient.", colors.red)
+    return
+  end
+
   local data = formScreen(
     "GRANT FUNDS",
-    "Sends existing treasury funds to an account.",
+    recipient_type .. ": " .. recipient_name .. " -> " .. recipient_id,
     {
-      { label = "Recipient account or username", key = "recipient", required = true, max = 40 },
       { label = "Amount", key = "amount", required = true, max = 12 },
       { label = "Memo", key = "memo", required = false, max = 48, value = "Treasury grant" },
     },
@@ -569,12 +741,7 @@ local function actionGrantFunds()
     return
   end
 
-  local recipient = normaliseAccountId(data.recipient)
   local amount = positiveInt(data.amount)
-  if recipient == "" then
-    setMessage("Missing recipient.", colors.red)
-    return
-  end
   if not amount then
     setMessage("Invalid grant amount.", colors.red)
     return
@@ -584,10 +751,13 @@ local function actionGrantFunds()
   local okConfirm = confirmScreen("CONFIRM GRANT", {
     "This spends existing treasury funds.",
     "",
-    "From:   " .. TREASURY_ACCOUNT,
-    "To:     " .. recipient,
-    "Amount: " .. money(amount),
-    "Memo:   " .. memo,
+    "Type:    " .. recipient_type,
+    "Name:    " .. recipient_name,
+    "From:    " .. TREASURY_ACCOUNT,
+    "To:      " .. recipient_id,
+    "Balance: " .. money(recipient.balance or 0),
+    "Amount:  " .. money(amount),
+    "Memo:    " .. memo,
   }, "Grant Funds", false)
 
   if not okConfirm then
@@ -597,13 +767,13 @@ local function actionGrantFunds()
 
   local ok, res = dbRequest({
     type = "grant",
-    to_id = recipient,
+    to_id = recipient_id,
     amount = amount,
     memo = memo,
   })
 
   if ok then
-    setMessage("Granted " .. money(amount) .. " to " .. recipient .. ".", colors.lime)
+    setMessage("Granted " .. money(amount) .. " to " .. recipient_name .. ".", colors.lime)
     refreshStatus()
   else
     setMessage("Grant failed: " .. tostring(res), colors.red)
@@ -1141,27 +1311,6 @@ local function mainLoop()
       elseif buttons.reconnect and hit(buttons.reconnect, mx, my) then
         connectServer()
         refreshStatus()
-      end
-
-      buttons = drawMain()
-
-    elseif ev == "key" then
-      if p1 == keys.q then
-        return
-      elseif p1 == keys.r then
-        refreshStatus()
-      elseif p1 == keys.p then
-        actionPrintMoney()
-      elseif p1 == keys.g then
-        actionGrantFunds()
-      elseif p1 == keys.b then
-        actionBurnMoney()
-      elseif p1 == keys.a then
-        screenAccounts()
-      elseif p1 == keys.h then
-        screenFiscalHistory()
-      elseif p1 == keys.w then
-        actionWorkerPay()
       end
 
       buttons = drawMain()
