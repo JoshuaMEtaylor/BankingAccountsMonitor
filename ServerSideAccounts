@@ -22,7 +22,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.4.0-SERVICE-OBSERVATIONS"
+local VERSION  = "1.4.1-PAYROLL-LOOKUP-ENDPOINTS"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -1243,6 +1243,112 @@ handlers["list_employee_mappings"] = function(sender_id, req)
   return true, { employees = result, count = #result }
 end
 
+
+
+-- PAYROLL_SOURCE_FOR_CITIZEN
+-- Finds the latest company that actually paid this citizen through COMPANY_PAYROLL.
+-- This uses the ledger, not employment mappings, because payroll transactions are
+-- the authoritative "who actually pays this worker" trail.
+handlers["payroll_source_for_citizen"] = function(sender_id, req)
+  local citizen_id = tostring(req and req.citizen_id or "")
+  local limit = tonumber(req and req.limit) or 1000
+  if citizen_id == "" then return false, "Missing citizen_id" end
+  if limit < 1 then limit = 1 end
+  if limit > 5000 then limit = 5000 end
+
+  local lines = readLines(FILE.ledger)
+  local checked = 0
+
+  for i = #lines, 1, -1 do
+    local line = lines[i]
+    local tx_id, ts, tx_type, from_id, to_id, amount, memo, status =
+      line:match("(TX%-%d+)%s*|%s*(%d+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*(%d+)%s*|%s*([^|]+)%s*|%s*(.+)")
+
+    if tx_id then
+      checked = checked + 1
+      tx_type = tostring(tx_type or ""):match("^%s*(.-)%s*$")
+      from_id = tostring(from_id or ""):match("^%s*(.-)%s*$")
+      to_id = tostring(to_id or ""):match("^%s*(.-)%s*$")
+
+      if tx_type == "COMPANY_PAYROLL" and to_id == citizen_id then
+        local company = companies[from_id] or {}
+        return true, {
+          citizen_id = citizen_id,
+          company_id = from_id,
+          company_name = company.name or company.display_name or from_id,
+          ticker = company.ticker,
+          tx_id = tx_id,
+          time = tonumber(ts),
+          amount = tonumber(amount) or 0,
+          memo = tostring(memo or ""):match("^%s*(.-)%s*$"),
+          checked = checked,
+        }
+      end
+
+      if checked >= limit then break end
+    end
+  end
+
+  return false, "No COMPANY_PAYROLL transaction found for " .. citizen_id
+end
+
+-- LIST_COMPANY_PAYROLL_PAYEES
+-- Returns the distinct citizens actually paid by a company through COMPANY_PAYROLL.
+handlers["list_company_payroll_payees"] = function(sender_id, req)
+  local company_id = tostring(req and req.company_id or "")
+  local limit = tonumber(req and req.limit) or 2000
+  if company_id == "" then return false, "Missing company_id" end
+  if limit < 1 then limit = 1 end
+  if limit > 5000 then limit = 5000 end
+
+  local lines = readLines(FILE.ledger)
+  local seen = {}
+  local rows = {}
+  local checked = 0
+
+  for i = #lines, 1, -1 do
+    local line = lines[i]
+    local tx_id, ts, tx_type, from_id, to_id, amount, memo, status =
+      line:match("(TX%-%d+)%s*|%s*(%d+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*(%d+)%s*|%s*([^|]+)%s*|%s*(.+)")
+
+    if tx_id then
+      checked = checked + 1
+      tx_type = tostring(tx_type or ""):match("^%s*(.-)%s*$")
+      from_id = tostring(from_id or ""):match("^%s*(.-)%s*$")
+      to_id = tostring(to_id or ""):match("^%s*(.-)%s*$")
+
+      if tx_type == "COMPANY_PAYROLL" and from_id == company_id and to_id ~= "" and not seen[to_id] then
+        seen[to_id] = true
+        local emp = employment_mappings[to_id] or {}
+        rows[#rows+1] = {
+          citizen_id = to_id,
+          display_name = emp.display_name or to_id,
+          job_text = emp.job_text or "",
+          company_id = company_id,
+          company_name = (companies[company_id] and (companies[company_id].name or companies[company_id].display_name)) or company_id,
+          tx_id = tx_id,
+          time = tonumber(ts),
+          amount = tonumber(amount) or 0,
+          memo = tostring(memo or ""):match("^%s*(.-)%s*$"),
+          source = "ledger_company_payroll",
+        }
+      end
+
+      if checked >= limit then break end
+    end
+  end
+
+  table.sort(rows, function(a, b)
+    return tostring(a.display_name or a.citizen_id) < tostring(b.display_name or b.citizen_id)
+  end)
+
+  return true, {
+    company_id = company_id,
+    payees = rows,
+    count = #rows,
+    checked = checked,
+  }
+end
 
 -- SYNC_SERVICE_OBSERVATIONS
 handlers["sync_service_observations"] = function(sender_id, req)
