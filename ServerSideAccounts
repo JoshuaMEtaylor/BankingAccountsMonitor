@@ -22,7 +22,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.3.7-CENTRAL-EMPLOYMENT-MAP"
+local VERSION  = "1.3.8-CONTRACT-PAYOUT"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -1320,6 +1320,30 @@ handlers["hospitality_meal_payment"] = function(sender_id, req)
     tx = tx,
     tx_id = type(tx) == "table" and tx.tx_id or nil,
   }
+end
+
+
+-- CONTRACT_PAYOUT
+-- System-side payout from the posting company to the claimant company/citizen.
+-- Called by ContractServer after a contract is completed.
+-- Allows poster company overdraft so a claimed obligation can still settle.
+handlers["contract_payout"] = function(sender_id, req)
+  local from_id = req.from_id or req.poster
+  local to_id = req.to_id or req.claimant
+  local amount = tonumber(req.amount)
+  local contract_id = tostring(req.contract_id or "")
+  local memo = req.memo or ("Contract payout " .. contract_id)
+
+  if not from_id or from_id == "" then return false, "Missing from_id/poster" end
+  if not to_id or to_id == "" then return false, "Missing to_id/claimant" end
+  if not amount or amount <= 0 then return false, "Invalid amount" end
+  amount = math.floor(amount)
+  if amount <= 0 then return false, "Invalid integer amount" end
+
+  if not accountExists(from_id) then return false, "Poster account not found: " .. tostring(from_id) end
+  if not accountExists(to_id) then return false, "Claimant account not found: " .. tostring(to_id) end
+
+  return transfer(from_id, to_id, amount, "CONTRACT_PAYOUT", memo, "CONTRACT_SERVER:" .. tostring(sender_id), true)
 end
 
 -- GET_WORKER_PAY_RATES
