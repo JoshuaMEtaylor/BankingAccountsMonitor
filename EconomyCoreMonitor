@@ -15,7 +15,7 @@
 -- Read-only. No banking controls. No trade panel. Contract GDP over 365 Minecraft days + in-view MCT clock + tapered money-supply inflation.
 -- =============================================================================
 
-local VERSION         = "0.5.6-MCT"
+local VERSION         = "0.5.7-SECTOR-CPI"
 local PROTOCOL        = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT      = 5
@@ -45,6 +45,9 @@ local history = {
   gdp_per_capita = {},
   inflation = {},
   issued_supply = {},
+  general_index = {},
+  food_index = {},
+  construction_index = {},
   tx_samples = {},
 }
 
@@ -328,6 +331,13 @@ local function fmtPct(v, decimals)
   return string.format("%." .. tostring(decimals) .. "f%%", n)
 end
 
+local function fmtIndex(v, decimals)
+  local n = tonumber(v)
+  if n == nil then return "Awaiting data" end
+  decimals = decimals or 3
+  return "x" .. string.format("%." .. tostring(decimals) .. "f", n)
+end
+
 local function shortText(text, maxLen)
   text = tostring(text or "")
   maxLen = maxLen or 30
@@ -564,6 +574,83 @@ local function contractRequest(req, timeout)
       return msg.success, msg.response
     end
   end
+end
+
+
+-- =============================================================================
+-- PRICE / INFLATION ORACLE
+-- ServerSideAccounts v1.4.3+ exposes a wide sector price oracle. The monitor
+-- treats that as the live inflation source when available. The older adaptive
+-- money-supply inflation remains as a fallback only.
+-- =============================================================================
+local function sectorFromOracle(priceOracle, name)
+  if type(priceOracle) ~= "table" or type(priceOracle.sectors) ~= "table" then return nil end
+  return priceOracle.sectors[name]
+end
+
+local function sectorIndexFromOracle(priceOracle, name)
+  local rec = sectorFromOracle(priceOracle, name)
+  if type(rec) ~= "table" then return nil end
+  return tonumber(rec.index)
+end
+
+local function quoteLabel(q)
+  if type(q) ~= "table" then return nil end
+  local total = tonumber(q.total)
+  if total == nil then return nil end
+  return fmtMoney(total)
+end
+
+local function fetchPriceOracle()
+  local ok, res = dbRequest({ type = "get_price_indices" }, 2)
+  if not ok or type(res) ~= "table" then
+    return {
+      connected = false,
+      status = "Price oracle unavailable: " .. tostring(res),
+      sectors = {},
+      quotes = {},
+    }
+  end
+
+  local inflation = type(res.inflation) == "table" and res.inflation or {}
+  local sectors = type(res.sectors) == "table" and res.sectors or {}
+  local rate = tonumber(inflation.inflation_rate)
+  local percent = tonumber(inflation.inflation_percent)
+  if not percent and rate then percent = rate * 100 end
+
+  local out = {
+    connected = true,
+    model = tostring(res.model or "sector_price_oracle"),
+    status = "Live sector CPI from bank price oracle",
+    note = res.note,
+    time = tonumber(res.time),
+    inflation = inflation,
+    inflation_rate = rate,
+    inflation_percent = percent,
+    old_price_index = tonumber(inflation.price_index),
+    price_index_percent = tonumber(inflation.price_index_percent),
+    sectors = sectors,
+    quotes = {},
+  }
+
+  -- A few visible quote examples give the monitor immediate practical meaning.
+  -- These are intentionally broad, not deep behavioural modelling.
+  local okMeal, meal = dbRequest({ type = "quote_service_price", service = "dining_meal", tier = "normal" }, 2)
+  if okMeal and type(meal) == "table" then out.quotes.dining_meal = meal end
+
+  local okMealLarge, mealLarge = dbRequest({ type = "quote_service_price", service = "dining_meal", tier = "large" }, 2)
+  if okMealLarge and type(mealLarge) == "table" then out.quotes.large_meal = mealLarge end
+
+  local okBuild, build = dbRequest({ type = "quote_item_price", item = "oak_planks", count = 64, sector = "construction" }, 2)
+  if okBuild and type(build) == "table" then out.quotes.oak_planks_64 = build end
+
+  local okIron, iron = dbRequest({ type = "quote_item_price", item = "iron_ingot", count = 8, sector = "tools" }, 2)
+  if okIron and type(iron) == "table" then out.quotes.iron_ingot_8 = iron end
+
+  local okCoal, coal = dbRequest({ type = "quote_item_price", item = "coal", count = 16, sector = "fuel" }, 2)
+  if okCoal and type(coal) == "table" then out.quotes.coal_16 = coal end
+
+  return out
 end
 
 -- =============================================================================
@@ -914,6 +1001,15 @@ local function refreshSnapshot()
     snap = fallback
   end
 
+  local priceOracle = fetchPriceOracle()
+  snap.price_oracle = priceOracle
+  if priceOracle and priceOracle.connected then
+    if priceOracle.inflation_percent ~= nil then
+      snap.inflation = priceOracle.inflation_percent
+      snap.inflation_status = "Live bank inflation rate driving sector CPI"
+    end
+  end
+
   snap.mc_clock = minecraftClock()
   snap.gdp_period_mc_days = GDP_PERIOD_MC_DAYS
 
@@ -929,6 +1025,11 @@ local function refreshSnapshot()
   pushHistory("gdp_per_capita", snap.gdp_per_capita)
   pushHistory("inflation", snap.inflation)
   pushHistory("issued_supply", snap.monetary and snap.monetary.issued_supply)
+  if snap.price_oracle and snap.price_oracle.connected then
+    pushHistory("general_index", sectorIndexFromOracle(snap.price_oracle, "general"))
+    pushHistory("food_index", sectorIndexFromOracle(snap.price_oracle, "food"))
+    pushHistory("construction_index", sectorIndexFromOracle(snap.price_oracle, "construction"))
+  end
   saveHistory()
 
   return true, snap
@@ -1112,6 +1213,59 @@ local function drawMonetaryCard(x, y, w, h, snap)
   writeAt(x + 2, y + h - 1, shortText(m.status or "Awaiting supply data", w - 4), m.status and C.good or C.warn, C.bg)
 end
 
+
+local function drawPriceOracleCard(x, y, w, h, snap)
+  local po = snap and snap.price_oracle or {}
+  card(x, y, w, h, "PRICE / INFLATION ENGINE", C.money)
+
+  if not po.connected then
+    metric(x + 2, y + 2, "Status", shortText(po.status or "Awaiting price oracle", w - 15), C.warn)
+    local m = snap and snap.monetary or {}
+    metric(x + 2, y + 4, "Issued supply", fmtMoney(m.issued_supply), m.issued_supply and C.good or C.warn)
+    metric(x + 2, y + 5, "Fallback inflation", fmtPct(snap and snap.inflation, 2), snap and snap.inflation and colors.white or C.warn)
+    writeAt(x + 2, y + h - 1, "ServerSideAccounts v1.4.3+ needed for sector CPI", C.warn, C.bg)
+    return
+  end
+
+  local food = sectorFromOracle(po, "food") or {}
+  local construction = sectorFromOracle(po, "construction") or {}
+  local fuel = sectorFromOracle(po, "fuel") or {}
+  local logistics = sectorFromOracle(po, "logistics") or {}
+  local tools = sectorFromOracle(po, "tools") or {}
+  local hospitality = sectorFromOracle(po, "hospitality") or {}
+  local general = sectorFromOracle(po, "general") or {}
+
+  metric(x + 2, y + 2, "Bank rate", fmtPct(po.inflation_percent, 2), po.inflation_percent and colors.white or C.warn, 16)
+  metric(x + 2, y + 3, "Old CPI", fmtIndex(po.old_price_index, 3) .. " ignored < x1", colors.gray, 16)
+  metric(x + 2, y + 4, "General CPI", fmtIndex(general.index, 3), general.index and colors.white or C.warn, 16)
+  metric(x + 2, y + 5, "Food CPI", fmtIndex(food.index, 3), food.index and colors.white or C.warn, 16)
+  metric(x + 2, y + 6, "Construction", fmtIndex(construction.index, 3), construction.index and colors.white or C.warn, 16)
+  metric(x + 2, y + 7, "Fuel/Logistics", fmtIndex(fuel.index, 2) .. " / " .. fmtIndex(logistics.index, 2), fuel.index and colors.white or C.warn, 16)
+  metric(x + 2, y + 8, "Tools/Hospital", fmtIndex(tools.index, 2) .. " / " .. fmtIndex(hospitality.index, 2), tools.index and colors.white or C.warn, 16)
+
+  local q = po.quotes or {}
+  local lineY = y + 10
+  if lineY <= y + h - 3 then
+    writeAt(x + 2, lineY, "Live quotes", colors.white, C.bg)
+  end
+  if lineY + 1 <= y + h - 2 then
+    local meal = quoteLabel(q.dining_meal) or "n/a"
+    local large = quoteLabel(q.large_meal) or "n/a"
+    writeAt(x + 2, lineY + 1, shortText("Meal normal/large: " .. meal .. " / " .. large, w - 4), C.text, C.bg)
+  end
+  if lineY + 2 <= y + h - 2 then
+    local build = quoteLabel(q.oak_planks_64) or "n/a"
+    local iron = quoteLabel(q.iron_ingot_8) or "n/a"
+    writeAt(x + 2, lineY + 2, shortText("64 planks: " .. build .. "   8 iron: " .. iron, w - 4), C.text, C.bg)
+  end
+  if lineY + 3 <= y + h - 2 then
+    local coal = quoteLabel(q.coal_16) or "n/a"
+    writeAt(x + 2, lineY + 3, shortText("16 coal: " .. coal, w - 4), C.text, C.bg)
+  end
+
+  writeAt(x + 2, y + h - 1, shortText(po.status or "Live sector CPI", w - 4), C.good, C.bg)
+end
+
 local function drawScaleCard(x, y, w, h, snap)
   local s = snap and snap.scale or {}
   card(x, y, w, h, "POPULATION / COMPANIES / TRANSACTIONS", C.scale)
@@ -1158,16 +1312,23 @@ local function drawHeader(snap)
 
   writeAt(2, 3, "Tick: " .. tostring(clock.tick_text), C.good, C.bg)
   writeAt(18, 3, "GDP window: " .. tostring(GDP_PERIOD_MC_DAYS) .. " MC days", C.warn, C.bg)
-  writeAt(52, 3, "Calendar: 0/0/0000", C.dim, C.bg)
-  if db_id then writeAt(76, 3, "Bank: " .. tostring(db_id), C.dim, C.bg) end
-  if contract_id then writeAt(92, 3, "Contracts: " .. tostring(contract_id), C.dim, C.bg) end
+  local po = snap and snap.price_oracle or nil
+  if po and po.connected then
+    local food = sectorIndexFromOracle(po, "food")
+    local build = sectorIndexFromOracle(po, "construction")
+    writeAt(52, 3, "Food " .. fmtIndex(food, 2) .. "  Build " .. fmtIndex(build, 2), C.good, C.bg)
+  else
+    writeAt(52, 3, "Sector CPI: awaiting oracle", C.warn, C.bg)
+  end
+  if db_id then writeAt(86, 3, "Bank: " .. tostring(db_id), C.dim, C.bg) end
+  if contract_id then writeAt(102, 3, "Contracts: " .. tostring(contract_id), C.dim, C.bg) end
 end
 
 local function drawFooter()
   local w, h = getSize()
   fill(1, h - 1, w, 2, C.bg)
   writeAt(1, h - 1, string.rep("-", w), C.dim, C.bg)
-  local text = "Refresh: " .. REFRESH_SECONDS .. "s   MCT CALENDAR CONTRACT GDP BUILD   Monitor: " .. (monitor and "attached" or "terminal") .. "   [Q] Quit"
+  local text = "Refresh: " .. REFRESH_SECONDS .. "s   SECTOR CPI / CONTRACT GDP BUILD   Monitor: " .. (monitor and "attached" or "terminal") .. "   [Q] Quit"
   writeAt(2, h, text, C.dim, C.bg)
   if last_error ~= "" then writeAt(math.max(2, w - #last_error - 2), h, last_error, C.bad, C.bg) end
 end
@@ -1201,10 +1362,10 @@ local function drawScreen()
 
   graphCard(col1, topY, colW, topH, "GDP", "Rolling GDP (365 MC days)", fmtMoney(snap and snap.gdp), snap and snap.gdp and colors.white or C.warn, history.gdp, C.gdp, snap and snap.output_status or "GDP output data")
   graphCard(col2, topY, colW, topH, "GDP / PER CAPITA", "Rolling GDP / capita", fmtMoney(snap and snap.gdp_per_capita), snap and snap.gdp_per_capita and colors.white or C.warn, history.gdp_per_capita, C.capita, snap and snap.output_status or "GDP output data")
-  graphCard(col3, topY, colW, topH, "INFLATION", "Current inflation", fmtPct(snap and snap.inflation, 2), snap and snap.inflation and colors.white or C.warn, history.inflation, C.inflation, snap and snap.inflation_status or "inflation data")
+  graphCard(col3, topY, colW, topH, "INFLATION", "Bank inflation rate", fmtPct(snap and snap.inflation, 2), snap and snap.inflation and colors.white or C.warn, history.inflation, C.inflation, snap and snap.inflation_status or "inflation data")
 
   drawInequalityCard(col1, bottomY, colW, bottomH, snap)
-  drawMonetaryCard(col2, bottomY, colW, bottomH, snap)
+  drawPriceOracleCard(col2, bottomY, colW, bottomH, snap)
   drawScaleCard(col3, bottomY, colW, bottomH, snap)
 
   drawFooter()
