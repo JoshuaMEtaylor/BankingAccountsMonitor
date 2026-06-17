@@ -22,7 +22,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.4.11-STABLE-ORACLE"
+local VERSION  = "1.4.7-ORACLE-DEFLATION-FIX"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -176,10 +176,6 @@ end
 
 local function trim(s)
   return tostring(s or ""):match("^%s*(.-)%s*$")
-end
-
-local function lower(s)
-  return string.lower(tostring(s or ""))
 end
 
 local function readLines(path)
@@ -402,14 +398,6 @@ end
 
 local function saveEmployment()
   return writeFile(FILE.employment, employment_mappings)
-end
-
--- Compatibility helper for older admin/state terminals.
--- This is a private server economy, so state/admin terminals are trusted.
--- Older handlers already referenced isTrustedManagement(); defining it here
--- prevents nil-call crashes when those tools inspect accounts.
-local function isTrustedManagement(sender_id)
-  return true
 end
 
 
@@ -2204,11 +2192,10 @@ handlers["get_price_indices"] = function(sender_id, req)
   ensureInflationState()
   ensurePriceOracle()
 
-  -- IMPORTANT: read-only endpoints must stay lightweight.
-  -- Do not scan/import the full ledger here; frequent monitor/terminal polling
-  -- would stall the bank server and make unrelated scripts time out.
-  -- Historical mint shock import remains available through import_mint_shocks.
-  local imported, skipped = 0, 0
+  -- Keep the oracle endpoint self-healing. Older installs may have minted before
+  -- the price oracle existed, so import any unprocessed MINT shocks before
+  -- reporting sector CPI. This is idempotent via processed_mint_tx.
+  local imported, skipped = processUnprocessedMintLedgerShocks()
 
   local okSnap, snapOrErr = pcall(sectorIndexSnapshot)
   if not okSnap then
@@ -2357,14 +2344,9 @@ handlers["status"] = function(sender_id, req)
   local okInf, infRes = pcall(ensureInflationState)
   if okInf then inf = infRes else inf = { error = tostring(infRes) } end
 
-  local indices = {
-    available = type(price_oracle) == "table",
-    model = type(price_oracle) == "table" and price_oracle.model or nil,
-    shock_pressure = type(price_oracle) == "table" and tonumber(price_oracle.shock_pressure) or 0,
-    sticky_floor_from_ath = type(price_oracle) == "table" and tonumber(price_oracle.sticky_floor_from_ath) or 0.75,
-    max_daily_deflation = type(price_oracle) == "table" and tonumber(price_oracle.max_daily_deflation) or 0.03,
-    note = "Lightweight status only. Use get_price_indices for live sector CPI."
-  }
+  local indices = nil
+  local okIdx, idxRes = pcall(sectorIndexSnapshot)
+  if okIdx then indices = idxRes else indices = { error = tostring(idxRes) } end
 
   return true, {
     version          = VERSION,
@@ -2736,9 +2718,7 @@ local function initFiles()
   inflation_state = readFile(FILE.inflation) or {}
   ensureInflationState()
   ensurePriceOracle()
-  -- Do not auto-import historical mint shocks on boot. Ledger scans can stall
-  -- the bank server on larger economies. Use import_mint_shocks manually if
-  -- you deliberately want to backfill old MINT transactions.
+  pcall(processUnprocessedMintLedgerShocks)
   config    = readFile(FILE.config)    or {
     economy_status       = "active",
     mint_authority       = "locked"
