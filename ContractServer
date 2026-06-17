@@ -51,7 +51,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION            = "1.0.19-COMPANY-PAYMENT-ENDPOINT"
+local VERSION            = "1.0.21-BOOT-RESCAN"
 local LABEL              = "Quid-Contracts"
 local PROTOCOL           = "quid_contracts"
 local PROTOCOL_BROADCAST = "quid_contracts_discovery"
@@ -62,7 +62,14 @@ local FILE = {
   contracts = "data/contracts.db",
   audit     = "data/contract_audit.log",
   config    = "data/config.db",
+  archive_dir = "data/contract_archives",
 }
+
+-- This economy treats MineColonies contracts as live scan output, not permanent
+-- state. On every ContractServer boot we archive the previous contract table and
+-- start empty, so ColonyBusinessIntegrator can reacquire the current live
+-- MineColonies requests and repost only what is actually valid/affordable now.
+local CLEAR_CONTRACTS_ON_BOOT = true
 
 local contracts = {}
 local config = {}
@@ -1022,6 +1029,10 @@ handlers["status"] = function(sender_id, req)
     pending = pending,
     boot_reopened = config.boot_reopened or 0,
     boot_repaired_cancelled = config.boot_repaired_cancelled or 0,
+    boot_contract_refresh = config.boot_contract_refresh or false,
+    boot_contract_refresh_at = config.boot_contract_refresh_at or 0,
+    boot_contract_refresh_archived = config.boot_contract_refresh_archived or 0,
+    boot_contract_refresh_archive = config.boot_contract_refresh_archive,
     pending_retry_paid = config.pending_retry_paid or 0,
     pending_retry_failed = config.pending_retry_failed or 0,
     audit_count = audit_counter,
@@ -1153,9 +1164,56 @@ end
 -- =============================================================================
 -- BOOT
 -- =============================================================================
+local function loadAuditCounter()
+  audit_counter = 0
+  if fs.exists(FILE.audit) then
+    local f = fs.open(FILE.audit, "r")
+    if f then
+      local line = f.readLine()
+      while line do
+        local n = line:match("CAUD%-(%d+)")
+        n = tonumber(n)
+        if n and n > audit_counter then audit_counter = n end
+        line = f.readLine()
+      end
+      f.close()
+    end
+  end
+end
+
+local function archiveContractsForBootRefresh(existing, ts)
+  local n = countTable(existing or {})
+  if n <= 0 then return nil, 0 end
+
+  local archive_path = FILE.archive_dir .. "/contracts_boot_" .. tostring(ts or timestamp()) .. ".db"
+  writeFile(archive_path, existing)
+  return archive_path, n
+end
+
 local function initFiles()
   contracts = readFile(FILE.contracts) or {}
   config = readFile(FILE.config) or {}
+  loadAuditCounter()
+
+  if CLEAR_CONTRACTS_ON_BOOT then
+    local ts = timestamp()
+    local archived_path, archived_count = archiveContractsForBootRefresh(contracts, ts)
+
+    contracts = {}
+    contract_counter = 0
+    writeFile(FILE.contracts, contracts)
+
+    config.boot_reopened = 0
+    config.boot_repaired_cancelled = 0
+    config.boot_contract_refresh = true
+    config.boot_contract_refresh_at = ts
+    config.boot_contract_refresh_archived = archived_count
+    config.boot_contract_refresh_archive = archived_path
+    writeFile(FILE.config, config)
+
+    audit("BOOT_REFRESH_CLEAR", "SYSTEM", os.getComputerID(), "archived=" .. tostring(archived_count))
+    return
+  end
 
   for id, _ in pairs(contracts) do
     local n = tostring(id):match("CON%-(%d+)")
@@ -1169,20 +1227,6 @@ local function initFiles()
   config.boot_repaired_cancelled = boot_repaired
   if boot_reopened > 0 or boot_repaired > 0 then
     writeFile(FILE.config, config)
-  end
-
-  if fs.exists(FILE.audit) then
-    local f = fs.open(FILE.audit, "r")
-    if f then
-      local line = f.readLine()
-      while line do
-        local n = line:match("CAUD%-(%d+)")
-        n = tonumber(n)
-        if n and n > audit_counter then audit_counter = n end
-        line = f.readLine()
-      end
-      f.close()
-    end
   end
 end
 
@@ -1244,6 +1288,7 @@ local function drawStatus()
   print("  Pending:   " .. tostring(s and s.pending or "?"))
   term.setTextColor(colors.lightGray)
   print("  Boot reset:" .. tostring(s and s.boot_reopened or 0) .. " reopened / " .. tostring(s and s.boot_repaired_cancelled or 0) .. " repaired")
+  print("  Boot clear:" .. tostring(s and s.boot_contract_refresh_archived or 0) .. " archived for rescan")
   print("  Retry paid:" .. tostring(s and s.pending_retry_paid or 0) .. " / failed " .. tostring(s and s.pending_retry_failed or 0))
   term.setTextColor(colors.white)
   print("  Total:     " .. tostring(s and s.total or countTable(contracts)))
@@ -1331,6 +1376,7 @@ local function main()
 
   initFiles()
   print("  Contracts: " .. countTable(contracts))
+  print("  Archived for rescan: " .. tostring(config.boot_contract_refresh_archived or 0))
   print("  Next ID:   CON-" .. pad(contract_counter + 1, 6))
 
   if not openModem() then
