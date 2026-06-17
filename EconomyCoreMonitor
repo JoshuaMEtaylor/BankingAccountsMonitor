@@ -12,15 +12,17 @@
 --   COMPANIES
 --   TRANSACTIONS PER DAY
 --
--- Read-only. No banking controls. No trade panel. Contract GDP + tapered money-supply inflation.
+-- Read-only. No banking controls. No trade panel. Contract GDP over 365 Minecraft days + in-view Minecraft clock + tapered money-supply inflation.
 -- =============================================================================
 
-local VERSION         = "0.5.4-BANK-GDP-READONLY-INFLATION"
+local VERSION         = "0.5.4-MC365-CLOCK"
 local PROTOCOL        = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT      = 5
 local CONTRACT_TIMEOUT = 3
-local GDP_PERIOD_MS   = 24 * 60 * 60 * 1000
+local GDP_PERIOD_MC_DAYS = 365
+local MINECRAFT_DAY_MS = 20 * 60 * 1000 -- standard Minecraft day: 20 real minutes
+local GDP_PERIOD_MS   = GDP_PERIOD_MC_DAYS * MINECRAFT_DAY_MS
 local REFRESH_SECONDS = 5
 local TEXT_SCALE      = 0.5
 local HISTORY_FILE    = "data/economy_core_monitor_history.db"
@@ -52,6 +54,55 @@ local history = {
 local function nowMs()
   if os.epoch then return os.epoch("utc") end
   return math.floor(os.time() * 1000)
+end
+
+local function currentMinecraftDay()
+  if os.day then
+    local ok, day = pcall(os.day, "ingame")
+    if ok and tonumber(day) then return math.floor(tonumber(day)) end
+    ok, day = pcall(os.day)
+    if ok and tonumber(day) then return math.floor(tonumber(day)) end
+  end
+  return math.floor(nowMs() / MINECRAFT_DAY_MS)
+end
+
+local function currentMinecraftTime()
+  if os.time then
+    local ok, t = pcall(os.time, "ingame")
+    if ok and tonumber(t) then return tonumber(t) end
+    ok, t = pcall(os.time)
+    if ok and tonumber(t) then return tonumber(t) end
+  end
+  local dayMs = nowMs() % MINECRAFT_DAY_MS
+  return (dayMs / MINECRAFT_DAY_MS) * 24
+end
+
+local function minecraftClock()
+  local day = currentMinecraftDay()
+  local t = currentMinecraftTime() % 24
+  local hour = math.floor(t)
+  local minute = math.floor(((t - hour) * 60) + 0.5)
+  if minute >= 60 then
+    minute = 0
+    hour = (hour + 1) % 24
+  end
+  local year = math.floor(day / GDP_PERIOD_MC_DAYS) + 1
+  local dayOfYear = (day % GDP_PERIOD_MC_DAYS) + 1
+  return {
+    day = day,
+    year = year,
+    day_of_year = dayOfYear,
+    hour = hour,
+    minute = minute,
+    time_text = string.format("%02d:%02d", hour, minute),
+    date_text = "Y" .. tostring(year) .. " D" .. tostring(dayOfYear) .. "/" .. tostring(GDP_PERIOD_MC_DAYS),
+    full_text = "Y" .. tostring(year) .. " D" .. tostring(dayOfYear) .. "/" .. tostring(GDP_PERIOD_MC_DAYS) .. " " .. string.format("%02d:%02d", hour, minute),
+  }
+end
+
+local function contractMinecraftDay(c)
+  if type(c) ~= "table" then return nil end
+  return tonumber(c.fulfilled_day or c.paid_day or c.closed_day or c.updated_day or c.created_day or c.day)
 end
 
 local function ensureDir(path)
@@ -539,6 +590,7 @@ end
 
 local function analyseContracts(contracts, status)
   local now = nowMs()
+  local currentDay = currentMinecraftDay()
   local gdp = 0
   local gdpEvents = 0
   local fulfilledValue = 0
@@ -557,15 +609,24 @@ local function analyseContracts(contracts, status)
       if st == "claimed" then claimedValue = claimedValue + reward end
       if st == "fulfilled" or st == "paid" or st == "closed" then
         fulfilledValue = fulfilledValue + reward
+        local mcDay = contractMinecraftDay(c)
         local t = tonumber(c.fulfilled_at or c.paid_at or c.closed_at or c.updated or c.created)
-        if t then
-          if not newestFulfilled or t > newestFulfilled then newestFulfilled = t end
-          if now - t <= GDP_PERIOD_MS then
-            gdp = gdp + reward
-            gdpEvents = gdpEvents + 1
-          end
+        if t and (not newestFulfilled or t > newestFulfilled) then newestFulfilled = t end
+
+        local withinWindow = false
+        if mcDay ~= nil then
+          local ageDays = currentDay - math.floor(mcDay)
+          withinWindow = ageDays >= 0 and ageDays < GDP_PERIOD_MC_DAYS
+        elseif t then
+          -- Fallback for older ContractServer builds that only store os.epoch timestamps.
+          -- 365 Minecraft days is treated as 365 standard 20-minute days.
+          withinWindow = (now - t) <= GDP_PERIOD_MS
         else
-          -- If old contracts have no timestamp, count them as visible fulfilled output.
+          -- If old contracts have no timestamp/day, count them as visible fulfilled output.
+          withinWindow = true
+        end
+
+        if withinWindow then
           gdp = gdp + reward
           gdpEvents = gdpEvents + 1
         end
@@ -581,14 +642,16 @@ local function analyseContracts(contracts, status)
     claimed = tonumber(status.claimed) or 0,
     fulfilled = tonumber(status.fulfilled) or 0,
     cancelled = tonumber(status.cancelled) or 0,
+    gdp_365d = gdp,
     gdp_24h = gdp,
+    gdp_period_mc_days = GDP_PERIOD_MC_DAYS,
     gdp_events = gdpEvents,
     fulfilled_value = fulfilledValue,
     open_value = openValue,
     claimed_value = claimedValue,
     total_value = totalValue,
     newest_fulfilled = newestFulfilled,
-    status = "GDP from fulfilled contracts, rolling 24h",
+    status = "GDP from fulfilled contracts, rolling " .. tostring(GDP_PERIOD_MC_DAYS) .. " MC days",
   }
 end
 
@@ -627,47 +690,6 @@ local function fetchContractEconomy()
   return out
 end
 
-local function fetchBankGDP(days)
-  days = tonumber(days) or 7
-  if days < 1 then days = 1 end
-  if days > 30 then days = 30 end
-
-  local ok, res = dbRequest({ type = "economic_gdp", days = days }, 3)
-  if ok and type(res) == "table" then
-    return {
-      connected = true,
-      days = tonumber(res.days) or days,
-      private_gdp = tonumber(res.private_gdp or res.gdp) or 0,
-      gdp = tonumber(res.gdp or res.private_gdp) or 0,
-      gdp_per_capita = tonumber(res.gdp_per_capita) or 0,
-      population = tonumber(res.population) or 0,
-      transaction_count = tonumber(res.transaction_count) or 0,
-      by_type = type(res.by_type) == "table" and res.by_type or {},
-      status = tostring(res.note or "Private GDP from bank ledger economic_gdp"),
-    }
-  end
-
-  return {
-    connected = false,
-    private_gdp = nil,
-    gdp = nil,
-    gdp_per_capita = nil,
-    transaction_count = 0,
-    by_type = {},
-    status = "economic_gdp unavailable: " .. tostring(res),
-  }
-end
-
-local function sortedGDPTypes(by_type)
-  local out = {}
-  if type(by_type) ~= "table" then return out end
-  for k, v in pairs(by_type) do
-    out[#out + 1] = { type = tostring(k), amount = tonumber(v) or 0 }
-  end
-  table.sort(out, function(a, b) return a.amount > b.amount end)
-  return out
-end
-
 local function normaliseNationalStats(raw)
   local monetaryRaw = raw.monetary or raw.supply or {}
   local outputRaw = raw.output or raw.gdp or {}
@@ -688,7 +710,7 @@ local function normaliseNationalStats(raw)
   local population = num(scaleRaw.active_citizens or scaleRaw.citizens or raw.citizen_count)
   local companies = num(scaleRaw.companies or raw.company_count)
   local totalTx = num(scaleRaw.transactions or raw.tx_count or activityRaw.transactions)
-  local gdp = num(outputRaw.nominal_gdp or outputRaw.gdp)
+  local gdp = num(outputRaw.gdp_365d or outputRaw.rolling_gdp_365d or outputRaw.nominal_gdp or outputRaw.gdp)
   local gdpCap = num(outputRaw.gdp_per_capita)
   if not gdpCap and gdp and population and population > 0 then gdpCap = gdp / population end
 
@@ -700,6 +722,8 @@ local function normaliseNationalStats(raw)
     mode = "official national_statistics",
     quality = raw.quality or raw.status or "OFFICIAL",
     time = raw.time or nowMs(),
+    mc_clock = minecraftClock(),
+    gdp_period_mc_days = GDP_PERIOD_MC_DAYS,
     gdp = gdp,
     gdp_per_capita = gdpCap,
     inflation = monetaryInflation,
@@ -754,32 +778,28 @@ local function fallbackSnapshot()
   local inflation, inflationStatus = calculateMonetaryInflation(issued)
   local contractEco = fetchContractEconomy()
 
-  local bankGDP = fetchBankGDP(7)
   local gdp = nil
-  local gdpCap = nil
-  local outputStatus = "Waiting for bank economic_gdp / ContractServer"
-
-  if bankGDP and bankGDP.connected then
-    gdp = tonumber(bankGDP.private_gdp or bankGDP.gdp) or 0
-    gdpCap = tonumber(bankGDP.gdp_per_capita) or 0
-    outputStatus = "Private GDP 7d from bank ledger economic_gdp"
-  elseif contractEco and contractEco.connected then
-    gdp = tonumber(contractEco.gdp_24h) or 0
+  local outputStatus = "Waiting for ContractServer / fulfilled contracts"
+  if contractEco and contractEco.connected then
+    gdp = tonumber(contractEco.gdp_365d or contractEco.gdp_24h) or 0
     outputStatus = contractEco.status or "GDP from fulfilled contracts"
-    local population = num(status.citizen_count)
-    if gdp and population and population > 0 then gdpCap = gdp / population end
   end
 
+  local population = num(status.citizen_count)
+  local gdpCap = nil
+  if gdp and population and population > 0 then gdpCap = gdp / population end
+
   return {
-    mode = "BANK GDP + FALLBACK",
-    quality = bankGDP and bankGDP.connected and "LIVE" or (contractEco and contractEco.connected and "PARTIAL" or "PARTIAL"),
+    mode = "FALLBACK + CONTRACTS",
+    quality = contractEco and contractEco.connected and "LIVE" or "PARTIAL",
     time = status.time or nowMs(),
+    mc_clock = minecraftClock(),
+    gdp_period_mc_days = GDP_PERIOD_MC_DAYS,
     gdp = gdp,
     gdp_per_capita = gdpCap,
     inflation = inflation,
     output_status = outputStatus,
     inflation_status = inflationStatus,
-    gdp_detail = bankGDP,
     inequality = inequalityFromAccounts(accounts),
     monetary = {
       issued_supply = issued,
@@ -811,19 +831,8 @@ local function refreshSnapshot()
 
     local contractEco = fetchContractEconomy()
     snap.contracts = contractEco
-
-    -- Prefer the bank's private GDP endpoint. This includes company payroll and
-    -- later consumption/contract/B2B transaction categories, instead of relying
-    -- only on fulfilled contract board values.
-    local bankGDP = fetchBankGDP(7)
-    snap.gdp_detail = bankGDP
-    if bankGDP and bankGDP.connected then
-      snap.gdp = tonumber(bankGDP.private_gdp or bankGDP.gdp) or 0
-      snap.gdp_per_capita = tonumber(bankGDP.gdp_per_capita) or 0
-      snap.output_status = "Private GDP 7d from bank ledger economic_gdp"
-      snap.quality = "LIVE"
-    elseif (not snap.gdp) and contractEco and contractEco.connected then
-      snap.gdp = tonumber(contractEco.gdp_24h) or 0
+    if (not snap.gdp) and contractEco and contractEco.connected then
+      snap.gdp = tonumber(contractEco.gdp_365d or contractEco.gdp_24h) or 0
       snap.output_status = contractEco.status or "GDP from fulfilled contracts"
       local pop = snap.scale and tonumber(snap.scale.population)
       if pop and pop > 0 then snap.gdp_per_capita = snap.gdp / pop end
@@ -840,20 +849,8 @@ local function refreshSnapshot()
     snap = fallback
   end
 
-  -- Read-only central inflation:
-  -- The bank server owns inflation state. The monitor must not call tick_inflation
-  -- every refresh, otherwise a read-only wall display mutates monetary state.
-  -- Payroll/integrator/control scripts can tick inflation; this screen only reads it.
-  local okInf, infRes = dbRequest({ type = "get_inflation_state" }, 3)
-  if okInf and type(infRes) == "table" then
-    local st = infRes.state or infRes
-    snap.inflation = (tonumber(st.inflation_rate) or 0) * 100
-    snap.inflation_status = "Read-only daily price-change rate. Price index x" .. fmtNum(st.price_index, 3)
-    snap.monetary = snap.monetary or {}
-    snap.monetary.price_index = tonumber(st.price_index) or 1
-    snap.monetary.inflation_rate = tonumber(st.inflation_rate) or 0
-    snap.monetary.inflation_model = tostring(st.model or "daily_rate_price_index")
-  end
+  snap.mc_clock = minecraftClock()
+  snap.gdp_period_mc_days = GDP_PERIOD_MC_DAYS
 
   last_snapshot = snap
   last_error = ""
@@ -943,24 +940,74 @@ local function graphCard(x, y, w, h, title, currentLabel, currentValue, currentC
   local range = maxV - minV
   if range == 0 then range = 1 end
 
-  for row = 0, gh - 1 do
-    writeAt(gx, gy + row, string.rep(".", gw), colors.gray, C.bg)
+  -- Render a connected low-resolution line chart.
+  -- Older builds plotted each sample as a marker, which looked like scattered points.
+  -- This builds a tiny character canvas first, then draws line segments between samples.
+  local canvas = {}
+  for row = 1, gh do
+    canvas[row] = {}
+    for col = 1, gw do
+      canvas[row][col] = " "
+    end
   end
 
-  local lastY = nil
+  -- Light horizontal guide lines, kept subtle so the actual line is the focus.
+  for row = 1, gh do
+    if row == 1 or row == gh or row == math.ceil(gh / 2) then
+      for col = 1, gw do
+        canvas[row][col] = "."
+      end
+    end
+  end
+
+  local points = {}
   for i, v in ipairs(values) do
-    local px = gx + i - 1
-    if px <= gx + gw - 1 then
+    if i <= gw then
       local norm = (v - minV) / range
       local py = gy + gh - 1 - math.floor(norm * (gh - 1) + 0.5)
       py = clamp(py, gy, gy + gh - 1)
-      if lastY and py == lastY then
-        writeAt(px, py, "-", colour, C.bg)
-      else
-        writeAt(px, py, "*", colour, C.bg)
-      end
-      lastY = py
+      points[#points + 1] = { x = i, y = py - gy + 1 }
     end
+  end
+
+  local function put(col, row, ch)
+    if row >= 1 and row <= gh and col >= 1 and col <= gw then
+      canvas[row][col] = ch
+    end
+  end
+
+  for i = 2, #points do
+    local a = points[i - 1]
+    local b = points[i]
+    local dy = b.y - a.y
+
+    if dy == 0 then
+      put(a.x, a.y, "-")
+      put(b.x, b.y, "-")
+    else
+      local ch = dy < 0 and "/" or "\\"
+      put(a.x, a.y, ch)
+      put(b.x, b.y, ch)
+
+      -- When a move is too steep for a one-character diagonal, fill the gap
+      -- vertically in the new column so it reads as one connected move.
+      if math.abs(dy) > 1 then
+        local step = dy > 0 and 1 or -1
+        local row = a.y + step
+        while row ~= b.y do
+          put(b.x, row, "|")
+          row = row + step
+        end
+      end
+    end
+  end
+
+  -- Mark the latest point without turning the whole graph back into markers.
+  local latest = points[#points]
+  if latest then put(latest.x, latest.y, "o") end
+
+  for row = 1, gh do
+    writeAt(gx, gy + row - 1, table.concat(canvas[row]), colour, C.bg)
   end
 
   writeAt(x + 2, y + h - 1, "min " .. fmtNum(minV, 1), C.dim, C.bg)
@@ -997,7 +1044,6 @@ local function drawMonetaryCard(x, y, w, h, snap)
   metric(x + 2, y + 3, "Private supply", fmtMoney(m.private_supply), m.private_supply and colors.white or C.warn)
   metric(x + 2, y + 4, "Treasury reserve", fmtMoney(m.treasury_reserve), m.treasury_reserve and colors.white or C.warn)
   metric(x + 2, y + 5, "Treasury Control", fmtPct(m.reserve_share, 2), m.reserve_share and colors.white or C.warn)
-  metric(x + 2, y + 6, "Price index", m.price_index and ("x" .. fmtNum(m.price_index, 3)) or "Awaiting data", m.price_index and colors.white or C.warn)
   writeAt(x + 2, y + h - 1, shortText(m.status or "Awaiting supply data", w - 4), m.status and C.good or C.warn, C.bg)
 end
 
@@ -1012,40 +1058,23 @@ local function drawScaleCard(x, y, w, h, snap)
   local contractLine = "Contracts O/C/F: " .. tostring(c.open or 0) .. "/" .. tostring(c.claimed or 0) .. "/" .. tostring(c.fulfilled or 0)
   writeAt(x + 2, y + 5, shortText(contractLine, w - 4), c.connected and C.good or C.warn, C.bg)
 
-  local gd = snap and snap.gdp_detail or {}
-  local gdLine = "GDP txs 7d: " .. tostring(gd.transaction_count or 0)
-  writeAt(x + 2, y + 6, shortText(gdLine, w - 4), gd.connected and C.good or C.warn, C.bg)
-
-  local topTypes = sortedGDPTypes(gd.by_type)
-  if #topTypes > 0 then
-    writeAt(x + 2, y + 8, "GDP by type", colors.white, C.bg)
-    local maxRows = math.min(4, #topTypes, math.max(1, h - 14))
-    for i = 1, maxRows do
-      local row = topTypes[i]
-      local label = tostring(i) .. ". " .. shortText(row.type, math.max(8, w - 18))
-      local amt = fmtMoney(row.amount)
-      writeAt(x + 2, y + 8 + i, shortText(label, w - 18), C.text, C.bg)
-      writeAt(x + w - #amt - 2, y + 8 + i, amt, colors.white, C.bg)
-    end
+  writeAt(x + 2, y + 7, "Top companies", colors.white, C.bg)
+  local top = s.top_companies or {}
+  if type(top) ~= "table" or #top == 0 then
+    writeAt(x + 2, y + 8, "No company account data", C.warn, C.bg)
   else
-    writeAt(x + 2, y + 8, "Top companies", colors.white, C.bg)
-    local top = s.top_companies or {}
-    if type(top) ~= "table" or #top == 0 then
-      writeAt(x + 2, y + 9, "No company account data", C.warn, C.bg)
-    else
-      local maxRows = math.min(6, #top, math.max(1, h - 11))
-      for i = 1, maxRows do
-        local company = top[i] or {}
-        local name = shortText(company.name or company.id or ("Company " .. i), math.max(8, w - 18))
-        local bal = fmtMoney(company.balance)
-        local line = tostring(i) .. ". " .. name
-        writeAt(x + 2, y + 8 + i, shortText(line, w - 18), C.text, C.bg)
-        writeAt(x + w - #bal - 2, y + 8 + i, bal, colors.white, C.bg)
-      end
+    local maxRows = math.min(10, #top, math.max(1, h - 10))
+    for i = 1, maxRows do
+      local company = top[i] or {}
+      local name = shortText(company.name or company.id or ("Company " .. i), math.max(8, w - 18))
+      local bal = fmtMoney(company.balance)
+      local line = tostring(i) .. ". " .. name
+      writeAt(x + 2, y + 7 + i, shortText(line, w - 18), C.text, C.bg)
+      writeAt(x + w - #bal - 2, y + 7 + i, bal, colors.white, C.bg)
     end
   end
 
-  writeAt(x + 2, y + h - 1, shortText(gd.status or s.tx_day_status or "Awaiting tx counter", w - 4), C.dim, C.bg)
+  writeAt(x + 2, y + h - 1, shortText(s.tx_day_status or "Awaiting tx counter", w - 4), C.dim, C.bg)
 end
 
 local function drawHeader(snap)
@@ -1054,19 +1083,26 @@ local function drawHeader(snap)
   writeAt(2, 1, "ECONOMY CORE MONITOR", C.title, C.header)
   local v = "v" .. VERSION
   writeAt(w - #v, 1, v, C.title, C.header)
-  fill(1, 2, w, 1, C.bg)
+
+  fill(1, 2, w, 2, C.bg)
   writeAt(2, 2, "Mode: " .. tostring(snap and snap.mode or "CONNECTING"), C.dim, C.bg)
   writeAt(34, 2, "Data: " .. tostring(snap and snap.quality or "NO DATA"), (snap and snap.quality == "OFFICIAL") and C.good or C.warn, C.bg)
   writeAt(54, 2, "Updated: " .. tostring(last_update_text), C.dim, C.bg)
   if db_id then writeAt(82, 2, "Bank: " .. tostring(db_id), C.dim, C.bg) end
   if contract_id then writeAt(96, 2, "Contracts: " .. tostring(contract_id), C.dim, C.bg) end
+
+  local clock = (snap and snap.mc_clock) or minecraftClock()
+  writeAt(2, 3, "MC Date: " .. tostring(clock.date_text), C.good, C.bg)
+  writeAt(28, 3, "MC Time: " .. tostring(clock.time_text), C.good, C.bg)
+  writeAt(54, 3, "GDP window: " .. tostring(GDP_PERIOD_MC_DAYS) .. " MC days", C.warn, C.bg)
+  writeAt(86, 3, "Clock: tick-accurate", C.dim, C.bg)
 end
 
 local function drawFooter()
   local w, h = getSize()
   fill(1, h - 1, w, 2, C.bg)
   writeAt(1, h - 1, string.rep("-", w), C.dim, C.bg)
-  local text = "Refresh: " .. REFRESH_SECONDS .. "s   BANK GDP BUILD   Monitor: " .. (monitor and "attached" or "terminal") .. "   [Q] Quit"
+  local text = "Refresh: " .. REFRESH_SECONDS .. "s   MC365 CONTRACT GDP BUILD   Monitor: " .. (monitor and "attached" or "terminal") .. "   [Q] Quit"
   writeAt(2, h, text, C.dim, C.bg)
   if last_error ~= "" then writeAt(math.max(2, w - #last_error - 2), h, last_error, C.bad, C.bg) end
 end
@@ -1098,8 +1134,8 @@ local function drawScreen()
   local bottomH = h - bottomY - 2
   if bottomH < 11 then bottomH = 11 end
 
-  graphCard(col1, topY, colW, topH, "GDP", "Current GDP", fmtMoney(snap and snap.gdp), snap and snap.gdp and colors.white or C.warn, history.gdp, C.gdp, snap and snap.output_status or "GDP output data")
-  graphCard(col2, topY, colW, topH, "GDP / PER CAPITA", "Current GDP / capita", fmtMoney(snap and snap.gdp_per_capita), snap and snap.gdp_per_capita and colors.white or C.warn, history.gdp_per_capita, C.capita, snap and snap.output_status or "GDP output data")
+  graphCard(col1, topY, colW, topH, "GDP", "Rolling GDP (365 MC days)", fmtMoney(snap and snap.gdp), snap and snap.gdp and colors.white or C.warn, history.gdp, C.gdp, snap and snap.output_status or "GDP output data")
+  graphCard(col2, topY, colW, topH, "GDP / PER CAPITA", "Rolling GDP / capita", fmtMoney(snap and snap.gdp_per_capita), snap and snap.gdp_per_capita and colors.white or C.warn, history.gdp_per_capita, C.capita, snap and snap.output_status or "GDP output data")
   graphCard(col3, topY, colW, topH, "INFLATION", "Current inflation", fmtPct(snap and snap.inflation, 2), snap and snap.inflation and colors.white or C.warn, history.inflation, C.inflation, snap and snap.inflation_status or "inflation data")
 
   drawInequalityCard(col1, bottomY, colW, bottomH, snap)
