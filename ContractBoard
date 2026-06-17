@@ -49,7 +49,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION    = "1.0.12-CLEAN-DROPDOWN-NO-COMPLETE"
+local VERSION    = "1.0.14-PAYOUT-RETRYING-LABEL"
 local PROTOCOL   = "quid_contracts"
 local DB_TIMEOUT = 5
 
@@ -360,7 +360,11 @@ local function detailScreen(c)
       y = y + 1
     end
 
-    if c.claimed_by then
+    if c.status == "pending_payout" then
+      at(4, H - 8, "Claimed by: " .. tostring(c.claimed_by or "?"), C.warn, C.card)
+      at(4, H - 7, "Fulfilment detected. Server is retrying payout.", C.warn, C.card)
+      at(4, H - 6, "Error: " .. tostring(c.payout_error or "unknown"):sub(1, W - 12), C.err, C.card)
+    elseif c.claimed_by then
       at(4, H - 7, "Claimed by: " .. tostring(c.claimed_by), C.warn, C.card)
       at(4, H - 6, "Auto-completes after MineColonies accepts the items.", C.label, C.card)
     elseif c.payout_status then
@@ -368,7 +372,9 @@ local function detailScreen(c)
     end
 
     local action = "Claim"
-    if c.status == "claimed" or c.status == "pending_completion" or c.status == "pending_payout" then
+    if c.status == "pending_payout" then
+      action = "Retrying"
+    elseif c.status == "claimed" or c.status == "pending_completion" then
       action = "Waiting"
     elseif c.status == "fulfilled" then
       action = "Done"
