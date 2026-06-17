@@ -22,7 +22,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.4.11-STABLE-ORACLE"
+local VERSION  = "1.4.12-RECOVERY-SAFE"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -433,6 +433,80 @@ local function createAccount(account_id, acc_type, display_name, owner_id)
   saveAccounts()
   saveBalances()
   return true, account_id
+end
+
+-- =============================================================================
+-- RECOVERY / REGISTRY REPAIR HELPERS
+-- =============================================================================
+local function ensureAccountRecord(account_id, acc_type, display_name, owner_id)
+  if not account_id or account_id == "" then return false, "missing account_id" end
+  local changedAccounts = false
+  local changedBalances = false
+
+  if type(accounts[account_id]) ~= "table" then
+    accounts[account_id] = {
+      type = acc_type or "general",
+      display_name = display_name or account_id,
+      owner_id = owner_id or "SYSTEM",
+      created = timestamp(),
+      status = "active",
+      recovered = true,
+      recovered_at = timestamp(),
+    }
+    changedAccounts = true
+  else
+    local acc = accounts[account_id]
+    if not acc.type and acc_type then acc.type = acc_type; changedAccounts = true end
+    if (not acc.display_name or acc.display_name == "") and display_name then acc.display_name = display_name; changedAccounts = true end
+    if (not acc.owner_id or acc.owner_id == "") and owner_id then acc.owner_id = owner_id; changedAccounts = true end
+    if not acc.status then acc.status = "active"; changedAccounts = true end
+  end
+
+  if balances[account_id] == nil then
+    balances[account_id] = 0
+    changedBalances = true
+  end
+
+  if changedAccounts then saveAccounts() end
+  if changedBalances then saveBalances() end
+  return true, { account_id = account_id, account_created = changedAccounts, balance_created = changedBalances }
+end
+
+local function repairRegistryAccounts()
+  local repaired = { treasury = 0, citizens = 0, companies = 0, balances = 0 }
+
+  local function bump(res)
+    if type(res) == "table" then
+      if res.account_created then repaired.balances = repaired.balances + 1 end
+      if res.balance_created then repaired.balances = repaired.balances + 1 end
+    end
+  end
+
+  local ok, res = ensureAccountRecord("treasury:quid_bank", "treasury", "Quid Treasury", "STATE")
+  if ok then repaired.treasury = repaired.treasury + 1; bump(res) end
+  ensureAccountRecord("market:escrow", "escrow", "Market Escrow", "SYSTEM")
+  ensureAccountRecord("contract:escrow", "escrow", "Contract Escrow", "SYSTEM")
+
+  for citizen_id, citizen in pairs(citizens or {}) do
+    if type(citizen) == "table" then
+      local name = citizen.display_name or citizen.name or citizen_id
+      local ok2, res2 = ensureAccountRecord(citizen_id, "citizen", name, citizen_id)
+      if ok2 then repaired.citizens = repaired.citizens + 1; bump(res2) end
+    end
+  end
+
+  for company_id, company in pairs(companies or {}) do
+    if type(company) == "table" then
+      local name = company.name or company.display_name or company_id
+      local owner = company.owner_id or "treasury:quid_bank"
+      local ok3, res3 = ensureAccountRecord(company_id, "company", name, owner)
+      if ok3 then repaired.companies = repaired.companies + 1; bump(res3) end
+    end
+  end
+
+  saveAccounts()
+  saveBalances()
+  return repaired
 end
 
 local function isCompanyOwner(company_id, citizen_id)
@@ -2144,34 +2218,61 @@ handlers["set_worker_pay_rates"] = function(sender_id, req)
 end
 
 -- REGISTER_COMPANY
+-- Idempotent/recovery-safe. If the company metadata exists but the account was
+-- lost, this recreates the account instead of failing. This is used by the
+-- ColonyBusinessIntegrator rebuild tool after data loss.
 handlers["register_company"] = function(sender_id, req)
   local name         = req.name
-  local ticker       = req.ticker and string.upper(req.ticker)
-  local biz_type     = req.biz_type or "general"
+  local ticker       = req.ticker and string.upper(tostring(req.ticker))
+  local biz_type     = req.biz_type or req.industry or "general"
   local owner_id     = req.owner_id or "treasury:quid_bank"
   local shares       = tonumber(req.shares_total) or 1000
   local public_float = tonumber(req.shares_public) or 0
   if not name or not ticker then return false, "Missing name or ticker" end
-  local company_id = "company:" .. string.lower(ticker)
-  if companies[company_id] then return false, "Company already exists" end
-  companies[company_id] = {
-    name          = name,
-    ticker        = ticker,
-    biz_type      = biz_type,
-    owner_id      = owner_id,
-    founded       = timestamp(),
-    status        = "active",
-    shares_total  = shares,
-    shares_public = public_float
-  }
+
+  local company_id = req.company_id or ("company:" .. string.lower(ticker))
+  local existed = companies[company_id] ~= nil
+
+  if type(companies[company_id]) ~= "table" then
+    companies[company_id] = {
+      name          = name,
+      ticker        = ticker,
+      biz_type      = biz_type,
+      owner_id      = owner_id,
+      founded       = timestamp(),
+      status        = "active",
+      shares_total  = shares,
+      shares_public = public_float,
+      recovered     = req.recovered == true or nil,
+    }
+  else
+    local c = companies[company_id]
+    c.name = c.name or name
+    c.ticker = c.ticker or ticker
+    c.biz_type = c.biz_type or biz_type
+    c.owner_id = c.owner_id or owner_id
+    c.status = c.status or "active"
+    c.shares_total = tonumber(c.shares_total) or shares
+    c.shares_public = tonumber(c.shares_public) or public_float
+    c.recovered_at = c.recovered_at or (req.recovered == true and timestamp() or nil)
+  end
   saveCompanies()
-  local ok, result = createAccount(company_id, "company", name, owner_id)
-  if not ok then return false, "Company registered but account failed: " .. tostring(result) end
-  if shares > 0 then
+
+  local ok, result = ensureAccountRecord(company_id, "company", name, owner_id)
+  if not ok then return false, "Company registered but account repair failed: " .. tostring(result) end
+
+  if not existed and shares > 0 then
     writeShareTx(nextShId(), company_id, "SYSTEM", owner_id, shares, "FOUNDER_GRANT", "Founding shares")
   end
-  audit("ACTION", "STATE", sender_id, "REGISTER_COMPANY", company_id)
-  return true, { company_id = company_id, name = name, ticker = ticker, message = "Company registered" }
+
+  audit("ACTION", "STATE", sender_id, existed and "REPAIR_COMPANY" or "REGISTER_COMPANY", company_id)
+  return true, {
+    company_id = company_id,
+    name = name,
+    ticker = ticker,
+    repaired = existed or (type(result) == "table" and (result.account_created or result.balance_created)) or false,
+    message = existed and "Company registry/account repaired" or "Company registered"
+  }
 end
 
 -- SET_PRICE
@@ -2385,37 +2486,67 @@ handlers["status"] = function(sender_id, req)
 end
 
 
+-- REPAIR_REGISTRY_ACCOUNTS
+-- Recreates missing account/balance records from the local citizens/companies
+-- registries. This does not invent citizen/company metadata; use the colony
+-- rebuild tool first if those registry files were lost too.
+handlers["repair_registry_accounts"] = function(sender_id, req)
+  local repaired = repairRegistryAccounts()
+  audit("ACTION", "STATE", sender_id, "REPAIR_REGISTRY_ACCOUNTS", textutils.serialize(repaired))
+  return true, repaired
+end
+
+
 -- REGISTER_CITIZEN
+-- Idempotent/recovery-safe. ColonyBusinessIntegrator can resend cached colonists
+-- after bank data loss and this will recreate missing records/accounts.
 handlers["register_citizen"] = function(sender_id, req)
   local name     = req.display_name
   local username = req.username
   local password = req.password or "changeme"
   local title    = req.title or "Account Holder"
   if not name or not username then return false, "Missing display_name or username" end
-  local key        = string.lower(username):gsub("%s+", "_")
-  local citizen_id = "citizen:" .. key
-  if citizens[citizen_id] then return false, "Username already exists: " .. username end
-  citizens[citizen_id] = {
-    display_name  = name,
-    username      = key,
-    password_hash = simpleHash(password),
-    joined        = timestamp(),
-    status        = "active",
-    title         = title
-  }
-  saveCitizens()
-  local ok, result = createAccount(citizen_id, "citizen", name, citizen_id)
-  if not ok then
-    citizens[citizen_id] = nil; saveCitizens()
-    return false, "Account creation failed: " .. tostring(result)
+
+  local key        = string.lower(tostring(username)):gsub("%s+", "_")
+  local citizen_id = req.citizen_id or ("citizen:" .. key)
+  local existed = citizens[citizen_id] ~= nil
+
+  if type(citizens[citizen_id]) ~= "table" then
+    citizens[citizen_id] = {
+      display_name  = name,
+      username      = key,
+      password_hash = simpleHash(password),
+      joined        = timestamp(),
+      status        = "active",
+      title         = title,
+      recovered     = req.recovered == true or nil,
+    }
+  else
+    local c = citizens[citizen_id]
+    c.display_name = c.display_name or name
+    c.username = c.username or key
+    c.password_hash = c.password_hash or simpleHash(password)
+    c.joined = c.joined or timestamp()
+    c.status = c.status or "active"
+    c.title = c.title or title
+    c.recovered_at = c.recovered_at or (req.recovered == true and timestamp() or nil)
   end
-  audit("ACTION", "STATE", sender_id, "REGISTER_CITIZEN", citizen_id)
+  saveCitizens()
+
+  local ok, result = ensureAccountRecord(citizen_id, "citizen", name, citizen_id)
+  if not ok then
+    if not existed then citizens[citizen_id] = nil; saveCitizens() end
+    return false, "Account repair failed: " .. tostring(result)
+  end
+
+  audit("ACTION", "STATE", sender_id, existed and "REPAIR_CITIZEN" or "REGISTER_CITIZEN", citizen_id)
   return true, {
     citizen_id   = citizen_id,
     display_name = name,
     username     = key,
     title        = title,
-    message      = "Citizen registered. Default password: " .. password
+    repaired     = existed or (type(result) == "table" and (result.account_created or result.balance_created)) or false,
+    message      = existed and "Citizen registry/account repaired" or ("Citizen registered. Default password: " .. password)
   }
 end
 
@@ -2745,6 +2876,10 @@ local function initFiles()
   }
   ensureWorkerPayRates()
   saveConfig()
+
+  -- Recovery-safe: if accounts.db/balances.db were wiped but citizens.db or
+  -- companies.db survived, rebuild the missing account rows on boot.
+  repairRegistryAccounts()
 
   migrateBalancesFromLedgerIfNeeded()
   recoverPendingTx()
