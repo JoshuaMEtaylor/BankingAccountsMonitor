@@ -51,7 +51,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION            = "1.0.14-HANDLER-TABLE-FIX"
+local VERSION            = "1.0.15-AUTO-COMPLETE-CLAIMS"
 local LABEL              = "Quid-Contracts"
 local PROTOCOL           = "quid_contracts"
 local PROTOCOL_BROADCAST = "quid_contracts_discovery"
@@ -693,10 +693,8 @@ local function markFulfilled(sender_id, req)
     return false, "Contract is not active"
   end
 
-  -- If the MineColonies source request disappeared after the contract was
-  -- claimed, the item delivery has already been accepted by MineColonies.
-  -- In that state, completion is confirmed by the board rather than by asking
-  -- for the items again.
+  -- Manual/admin fulfilment path. Normal MineColonies claimed-request completion
+  -- is handled automatically during source sync when the live request disappears.
   local source_disappeared = c.status == "pending_completion"
 
   if (c.exact_fulfillment or c.source_type == "minecolonies_request") and not source_disappeared then
@@ -763,35 +761,82 @@ local function syncSourceContracts(sender_id, req)
 
   local cancelled = 0
   local kept = 0
+  local auto_completed = 0
+  local payout_failed = 0
 
   for id, c in pairs(contracts) do
     local matches_type = c.source_type == source_type
     local matches_company = (not source_company or c.source_company == source_company)
 
-    -- Scope stale cleanup to the current integrator where possible, but also
-    -- clean older MineColonies contracts that were created before source_terminal
-    -- was stored. This removes fake board entries automatically after requests
-    -- are cancelled in MineColonies.
     local matches_terminal = (not source_terminal)
       or (not c.source_terminal)
       or tostring(c.source_terminal) == tostring(source_terminal)
 
-    local live_status = (c.status == "open" or c.status == "claimed" or c.status == "pending_completion")
+    local live_status = (
+      c.status == "open"
+      or c.status == "claimed"
+      or c.status == "pending_completion"
+      or c.status == "pending_payout"
+    )
+
     local key = c.source_key
 
     if matches_type and matches_company and matches_terminal and live_status then
       if not key or not active[key] then
         if c.status == "claimed" then
-          -- Claimed MineColonies request disappeared. That usually means the
-          -- request was actually satisfied in-game. Do not cancel it; move it
-          -- to a manual completion queue so the claimant can be paid.
-          c.status = "pending_completion"
-          c.pending_completion_at = timestamp()
-          c.updated = timestamp()
-          c.pending_reason = req.reason or "Source request disappeared after claim"
+          -- A claimed MineColonies request disappeared from the live request list.
+          -- That is the valid completion signal: the request was satisfied in-game.
+          -- Pay the claimant automatically. No manual Complete button needed.
+          local paid_ok, paid_res = payContract(c)
+
+          if paid_ok then
+            c.status = "fulfilled"
+            c.fulfilled_at = timestamp()
+            c.updated = timestamp()
+            c.fulfillment_note = "Auto-completed: claimed MineColonies request disappeared after in-game fulfilment."
+            c.completion_confirmed_by = "sync:" .. tostring(sender_id)
+            auto_completed = auto_completed + 1
+            audit("AUTO_FULFILLED", c.claimed_by or "unknown", sender_id, id)
+          else
+            c.status = "pending_payout"
+            c.updated = timestamp()
+            c.fulfillment_note = "Auto-completion detected, but payout failed"
+            c.payout_status = "failed"
+            c.payout_error = tostring(paid_res)
+            c.payout_failed_at = timestamp()
+            payout_failed = payout_failed + 1
+            audit("AUTO_PAYOUT_FAILED", c.claimed_by or "unknown", sender_id, id .. " " .. tostring(paid_res))
+          end
+
           kept = kept + 1
-          audit("PENDING_COMPLETION", c.claimed_by or "unknown", sender_id, id)
+
+        elseif c.status == "pending_completion" then
+          -- Old pending state from earlier versions. Complete it automatically now.
+          local paid_ok, paid_res = payContract(c)
+
+          if paid_ok then
+            c.status = "fulfilled"
+            c.fulfilled_at = timestamp()
+            c.updated = timestamp()
+            c.fulfillment_note = "Auto-completed from old pending_completion state."
+            c.completion_confirmed_by = "sync:" .. tostring(sender_id)
+            auto_completed = auto_completed + 1
+            audit("AUTO_FULFILLED_PENDING", c.claimed_by or "unknown", sender_id, id)
+          else
+            c.status = "pending_payout"
+            c.updated = timestamp()
+            c.payout_status = "failed"
+            c.payout_error = tostring(paid_res)
+            c.payout_failed_at = timestamp()
+            payout_failed = payout_failed + 1
+            audit("AUTO_PAYOUT_FAILED", c.claimed_by or "unknown", sender_id, id .. " " .. tostring(paid_res))
+          end
+
+          kept = kept + 1
+
         else
+          -- Unclaimed/open request disappeared: it was never assigned to a claimant,
+          -- so it is stale and should be cancelled.
           c.status = "cancelled"
           c.cancelled_at = timestamp()
           c.updated = timestamp()
@@ -810,7 +855,13 @@ local function syncSourceContracts(sender_id, req)
 
   writeFile(FILE.contracts, contracts)
   local deduped = dedupeLiveContracts("Duplicate live request contract")
-  return true, { cancelled = cancelled, kept = kept, deduped = deduped }
+  return true, {
+    cancelled = cancelled,
+    kept = kept,
+    auto_completed = auto_completed,
+    payout_failed = payout_failed,
+    deduped = deduped
+  }
 end
 
 -- =============================================================================
