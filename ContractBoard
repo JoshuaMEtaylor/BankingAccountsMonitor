@@ -49,7 +49,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION    = "1.0.9-COMPACT-DROPDOWN"
+local VERSION    = "1.0.10-CLEAN-DROPDOWN"
 local PROTOCOL   = "quid_contracts"
 local DB_TIMEOUT = 5
 
@@ -430,8 +430,7 @@ local function claimScreen(c)
     if not co then return "Select company..." end
     local ticker = tostring(co.ticker or "?")
     local name = tostring(co.display_name or co.company_id or "")
-    local bal = money(co.balance or 0)
-    return ticker .. " - " .. name .. "  (" .. bal .. ")"
+    return ticker .. " - " .. name
   end
 
   local function clampSelection()
@@ -461,17 +460,17 @@ local function claimScreen(c)
     if selectedCompany > scroll + rows then scroll = selectedCompany - rows end
     if scroll < 0 then scroll = 0 end
 
-    -- Border/header line.
-    fill(x, y, w, rows + 2, C.card)
-    at(x, y, string.rep("-", w):sub(1, w), C.label, C.card)
+    -- Visually separate dropdown panel.
+    fill(x, y, w, rows + 2, colors.gray)
+    at(x, y, string.rep("=", w):sub(1, w), colors.white, colors.purple)
 
     for i = 1, rows do
       local idx = scroll + i
       local co = companies[idx]
       local yy = y + i
       local selectedRow = idx == selectedCompany
-      local bg = selectedRow and C.input_bg or C.card
-      local fg = selectedRow and C.card_fg or C.card_fg
+      local bg = selectedRow and colors.purple or colors.gray
+      local fg = selectedRow and colors.white or colors.white
 
       fill(x, yy, w, 1, bg)
 
@@ -482,7 +481,7 @@ local function claimScreen(c)
       end
     end
 
-    at(x, y + rows + 1, string.rep("-", w):sub(1, w), C.label, C.card)
+    at(x, y + rows + 1, string.rep("=", w):sub(1, w), colors.white, colors.purple)
     return rowButtons
   end
 
@@ -500,8 +499,8 @@ local function claimScreen(c)
     local ddX = 4
     local ddY = 11
     local ddW = W - 8
-    local bSelect = button(ddX, ddY, ddW, companyLabel(companies[selectedCompany]), C.input_bg, C.input_fg)
-    at(ddX + ddW - 3, ddY, dropdownOpen and "^" or "v", C.input_fg, C.input_bg)
+    local bSelect = button(ddX, ddY, ddW, companyLabel(companies[selectedCompany]), colors.lightGray, colors.black)
+    at(ddX + ddW - 3, ddY, dropdownOpen and "^" or "v", colors.black, colors.lightGray)
 
     local rowButtons = {}
     if dropdownOpen then
