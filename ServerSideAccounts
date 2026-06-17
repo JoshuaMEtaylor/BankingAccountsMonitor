@@ -46,7 +46,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.4.8-SYNTAX-CHECKED-ORACLE"
+local VERSION  = "1.4.9"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
