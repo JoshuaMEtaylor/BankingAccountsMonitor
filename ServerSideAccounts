@@ -22,7 +22,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.4.4-SECTOR-PRICE-SHOCK"
+local VERSION  = "1.4.5-STICKY-ATH-INFLATION"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -500,6 +500,11 @@ local function transfer(from_id, to_id, amount, tx_type, memo, actor, allow_over
 
   if tx_type == "MINT" then
     monetary_state.total_minted = minted_before + amount
+    if recordMoneyPrintShock then
+      local issued_before = minted_before - burned_before
+      local issued_after = monetary_state.total_minted - burned_before
+      pcall(recordMoneyPrintShock, amount, issued_before, issued_after, tx_id)
+    end
   elseif tx_type == "BURN" then
     monetary_state.total_burned = burned_before + amount
   end
@@ -707,6 +712,14 @@ local DEFAULT_PRICE_ORACLE = {
   -- can start at 0. This floor gives prices the shock the economy should feel
   -- now. Set to 0 later if you want prices to fully rebase.
   price_pressure_floor = 0.26,
+  -- Downward price stickiness. Sector prices can make new ATHs, but deflation
+  -- can only pull them down to 75% of that ATH unless an admin deliberately
+  -- rebases the oracle. This makes money-printing damage persistent.
+  sticky_floor_from_ath = 0.75,
+  shock_pressure = 0.00,
+  money_print_sensitivity = 0.45,
+  max_shock_pressure = 3.00,
+  shock_decay_per_mc_day = 0.82,
   default_markup = 1.00,
   sectors = {
     general =      { label="General CPI",       sensitivity=1.00, bias=0.00 },
@@ -761,6 +774,16 @@ local function ensurePriceOracle()
   price_oracle.immediate_pass_through = tonumber(price_oracle.immediate_pass_through) or DEFAULT_PRICE_ORACLE.immediate_pass_through
   price_oracle.price_pressure_floor = tonumber(price_oracle.price_pressure_floor)
   if price_oracle.price_pressure_floor == nil then price_oracle.price_pressure_floor = DEFAULT_PRICE_ORACLE.price_pressure_floor end
+  price_oracle.sticky_floor_from_ath = tonumber(price_oracle.sticky_floor_from_ath) or DEFAULT_PRICE_ORACLE.sticky_floor_from_ath
+  if price_oracle.sticky_floor_from_ath < 0 then price_oracle.sticky_floor_from_ath = DEFAULT_PRICE_ORACLE.sticky_floor_from_ath end
+  if price_oracle.sticky_floor_from_ath > 1 then price_oracle.sticky_floor_from_ath = 1 end
+  price_oracle.shock_pressure = tonumber(price_oracle.shock_pressure) or DEFAULT_PRICE_ORACLE.shock_pressure
+  if price_oracle.shock_pressure < 0 then price_oracle.shock_pressure = 0 end
+  price_oracle.money_print_sensitivity = tonumber(price_oracle.money_print_sensitivity) or DEFAULT_PRICE_ORACLE.money_print_sensitivity
+  price_oracle.max_shock_pressure = tonumber(price_oracle.max_shock_pressure) or DEFAULT_PRICE_ORACLE.max_shock_pressure
+  price_oracle.shock_decay_per_mc_day = tonumber(price_oracle.shock_decay_per_mc_day) or DEFAULT_PRICE_ORACLE.shock_decay_per_mc_day
+  if price_oracle.shock_decay_per_mc_day < 0 then price_oracle.shock_decay_per_mc_day = DEFAULT_PRICE_ORACLE.shock_decay_per_mc_day end
+  if price_oracle.shock_decay_per_mc_day > 1 then price_oracle.shock_decay_per_mc_day = 1 end
   price_oracle.default_markup = tonumber(price_oracle.default_markup) or DEFAULT_PRICE_ORACLE.default_markup
 
   price_oracle.sectors = type(price_oracle.sectors) == "table" and price_oracle.sectors or {}
@@ -770,6 +793,9 @@ local function ensurePriceOracle()
     rec.label = rec.label or def.label
     rec.sensitivity = tonumber(rec.sensitivity) or def.sensitivity
     rec.bias = tonumber(rec.bias) or def.bias
+    rec.ath_index = math.max(1, tonumber(rec.ath_index) or 1)
+    rec.current_index = math.max(1, tonumber(rec.current_index) or 1)
+    rec.sticky_floor_index = math.max(1, tonumber(rec.sticky_floor_index) or (rec.ath_index * (tonumber(price_oracle.sticky_floor_from_ath) or 0.75)))
   end
 
   price_oracle.service_prices = type(price_oracle.service_prices) == "table" and price_oracle.service_prices or {}
@@ -805,11 +831,14 @@ local function inflationPressure()
   local floor = tonumber(price_oracle.price_pressure_floor) or 0
   if floor < 0 then floor = 0 end
 
-  local pressure = math.max(rate, by_index, floor)
+  local shock = tonumber(price_oracle.shock_pressure) or 0
+  if shock < 0 then shock = 0 end
+
+  local pressure = math.max(rate, by_index, floor, shock)
   pressure = pressure * (tonumber(price_oracle.immediate_pass_through) or 1)
   if pressure < 0 then pressure = 0 end
-  if pressure > 3 then pressure = 3 end
-  return pressure, rate, idx, floor
+  if pressure > (tonumber(price_oracle.max_shock_pressure) or 3) then pressure = tonumber(price_oracle.max_shock_pressure) or 3 end
+  return pressure, rate, idx, floor, shock
 end
 
 local function sectorIndex(sector)
@@ -817,9 +846,40 @@ local function sectorIndex(sector)
   ensurePriceOracle()
   if not price_oracle.sectors[sector] then sector = "general" end
   local rec = price_oracle.sectors[sector] or price_oracle.sectors.general or {}
-  local pressure, rate, bank_index, floor = inflationPressure()
-  local idx = 1 + (pressure * (tonumber(rec.sensitivity) or 1)) + (pressure > 0 and (tonumber(rec.bias) or 0) or 0)
+  local pressure, rate, bank_index, floor, shock = inflationPressure()
+
+  local raw_idx = 1 + (pressure * (tonumber(rec.sensitivity) or 1)) + (pressure > 0 and (tonumber(rec.bias) or 0) or 0)
+  raw_idx = clamp(raw_idx, tonumber(price_oracle.min_index) or 1, tonumber(price_oracle.max_index) or 8)
+
+  -- Sticky ATH rule:
+  -- Sellers raise prices easily during inflation shocks, but rarely lower them
+  -- fully after conditions improve. Each sector records its all-time-high index.
+  -- Deflation can only pull the live index down to 75% of ATH by default.
+  local sticky_ratio = tonumber(price_oracle.sticky_floor_from_ath) or 0.75
+  if sticky_ratio < 0 then sticky_ratio = 0.75 end
+  if sticky_ratio > 1 then sticky_ratio = 1 end
+
+  local old_ath = tonumber(rec.ath_index) or 1
+  local ath = math.max(1, old_ath, raw_idx)
+  local sticky_floor = math.max(tonumber(price_oracle.min_index) or 1, ath * sticky_ratio)
+  local idx = raw_idx
+  local sticky_active = false
+  if raw_idx < sticky_floor then
+    idx = sticky_floor
+    sticky_active = true
+  end
   idx = clamp(idx, tonumber(price_oracle.min_index) or 1, tonumber(price_oracle.max_index) or 8)
+
+  local changed = false
+  if math.abs((tonumber(rec.ath_index) or 0) - ath) > 0.0001 then rec.ath_index = ath; changed = true end
+  if math.abs((tonumber(rec.current_index) or 0) - idx) > 0.0001 then rec.current_index = idx; changed = true end
+  if math.abs((tonumber(rec.raw_index) or 0) - raw_idx) > 0.0001 then rec.raw_index = raw_idx; changed = true end
+  if math.abs((tonumber(rec.sticky_floor_index) or 0) - sticky_floor) > 0.0001 then rec.sticky_floor_index = sticky_floor; changed = true end
+  rec.sticky_active = sticky_active
+  rec.last_pressure = pressure
+  rec.last_updated = timestamp()
+  if changed then savePriceOracle() end
+
   return idx, {
     sector = sector,
     label = rec.label or sector,
@@ -827,8 +887,14 @@ local function sectorIndex(sector)
     bank_inflation_rate = rate,
     old_bank_price_index = bank_index,
     price_pressure_floor = floor,
+    shock_pressure = shock,
     sensitivity = tonumber(rec.sensitivity) or 1,
     bias = tonumber(rec.bias) or 0,
+    raw_index = raw_idx,
+    ath_index = ath,
+    sticky_floor_index = sticky_floor,
+    sticky_floor_from_ath = sticky_ratio,
+    sticky_active = sticky_active,
   }
 end
 
@@ -927,6 +993,11 @@ local function quoteItemPrice(item, count, sector_override)
     base_unit_price = base,
     base_source = base_source,
     sector_index = idx,
+    raw_sector_index = meta.raw_index,
+    ath_index = meta.ath_index,
+    sticky_floor_index = meta.sticky_floor_index,
+    sticky_active = meta.sticky_active,
+    shock_pressure = meta.shock_pressure,
     monetary_pressure = meta.monetary_pressure,
     bank_inflation_rate = meta.bank_inflation_rate,
     old_bank_price_index = meta.old_bank_price_index,
@@ -978,6 +1049,11 @@ local function quoteServicePrice(service, tier, gain, sector_override)
     sector_label = meta.label,
     base_price = tonumber(def.base) or 1,
     sector_index = idx,
+    raw_sector_index = meta.raw_index,
+    ath_index = meta.ath_index,
+    sticky_floor_index = meta.sticky_floor_index,
+    sticky_active = meta.sticky_active,
+    shock_pressure = meta.shock_pressure,
     monetary_pressure = meta.monetary_pressure,
     bank_inflation_rate = meta.bank_inflation_rate,
     old_bank_price_index = meta.old_bank_price_index,
@@ -999,6 +1075,12 @@ local function sectorIndexSnapshot()
       bank_inflation_rate = meta.bank_inflation_rate,
       old_bank_price_index = meta.old_bank_price_index,
       price_pressure_floor = meta.price_pressure_floor,
+      shock_pressure = meta.shock_pressure,
+      raw_index = meta.raw_index,
+      ath_index = meta.ath_index,
+      sticky_floor_index = meta.sticky_floor_index,
+      sticky_floor_from_ath = meta.sticky_floor_from_ath,
+      sticky_active = meta.sticky_active,
       sensitivity = meta.sensitivity,
       bias = meta.bias,
     }
@@ -1006,8 +1088,121 @@ local function sectorIndexSnapshot()
   return out
 end
 
+recordMoneyPrintShock = function(amount, issued_before, issued_after, tx_id)
+  amount = tonumber(amount) or 0
+  issued_before = tonumber(issued_before) or 0
+  issued_after = tonumber(issued_after) or issued_before
+  if amount <= 0 then return false end
 
+  ensurePriceOracle()
+  tx_id = tx_id and tostring(tx_id) or nil
+  price_oracle.processed_mint_tx = type(price_oracle.processed_mint_tx) == "table" and price_oracle.processed_mint_tx or {}
+  if tx_id and price_oracle.processed_mint_tx[tx_id] then
+    return false, "mint shock already processed"
+  end
+  local denominator = math.max(1000, issued_before)
+  local growth = amount / denominator
+  if growth < 0 then growth = 0 end
 
+  -- Log scaling keeps absurd mints from instantly making every item impossible,
+  -- but still makes a 250k print from a tiny economy hurt immediately.
+  local sensitivity = tonumber(price_oracle.money_print_sensitivity) or 0.45
+  local added = math.log(1 + growth) * sensitivity
+  local cap = tonumber(price_oracle.max_shock_pressure) or 3.0
+  if added > cap then added = cap end
+
+  local old = tonumber(price_oracle.shock_pressure) or 0
+  local newShock = old + added
+  if newShock > cap then newShock = cap end
+  price_oracle.shock_pressure = newShock
+  price_oracle.last_money_print = {
+    time = timestamp(),
+    day = currentMinecraftDay(),
+    tx_id = tx_id,
+    amount = amount,
+    issued_before = issued_before,
+    issued_after = issued_after,
+    growth_vs_prior_supply = growth,
+    added_pressure = added,
+    old_shock_pressure = old,
+    new_shock_pressure = newShock,
+    note = "Money-printing shock. Sector ATH indices update immediately; deflation cannot cut below sticky ATH floor.",
+  }
+
+  if tx_id then price_oracle.processed_mint_tx[tx_id] = true end
+
+  -- Force each sector to record the new ATH now rather than waiting for a quote.
+  for sector, _ in pairs(price_oracle.sectors or {}) do
+    sectorIndex(sector)
+  end
+  savePriceOracle()
+  return true, price_oracle.last_money_print
+end
+
+decayPriceOracleShock = function(elapsed_days)
+  elapsed_days = math.max(0, math.floor(tonumber(elapsed_days) or 0))
+  if elapsed_days <= 0 then return false end
+  ensurePriceOracle()
+  local old = tonumber(price_oracle.shock_pressure) or 0
+  if old <= 0 then return false end
+  local decay = tonumber(price_oracle.shock_decay_per_mc_day) or 0.82
+  if decay < 0 then decay = 0.82 end
+  if decay > 1 then decay = 1 end
+  local newShock = old * math.pow(decay, elapsed_days)
+  if newShock < 0.001 then newShock = 0 end
+  price_oracle.shock_pressure = newShock
+  price_oracle.last_shock_decay = {
+    time = timestamp(),
+    day = currentMinecraftDay(),
+    elapsed_days = elapsed_days,
+    old_shock_pressure = old,
+    new_shock_pressure = newShock,
+    sticky_note = "Raw shock decays, but live sector indices remain no lower than 75% of ATH by default.",
+  }
+  for sector, _ in pairs(price_oracle.sectors or {}) do
+    sectorIndex(sector)
+  end
+  savePriceOracle()
+  return true, price_oracle.last_shock_decay
+end
+
+local function processUnprocessedMintLedgerShocks()
+  ensurePriceOracle()
+  price_oracle.processed_mint_tx = type(price_oracle.processed_mint_tx) == "table" and price_oracle.processed_mint_tx or {}
+
+  local issued = 0
+  local processed = 0
+  local skipped = 0
+  for _, line in ipairs(readLines(FILE.ledger)) do
+    local tx_id, ts, tx_type, from_id, to_id, amount, memo, status =
+      line:match("(TX%-%d+)%s*|%s*(%d+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*(%-?%d+)%s*|%s*([^|]+)%s*|%s*(.+)")
+    if tx_id then
+      tx_type = trim(tx_type)
+      status = trim(status)
+      amount = tonumber(amount) or 0
+      if status == "settled" and tx_type == "MINT" and amount > 0 then
+        if not price_oracle.processed_mint_tx[tx_id] then
+          recordMoneyPrintShock(amount, issued, issued + amount, tx_id)
+          processed = processed + 1
+        else
+          skipped = skipped + 1
+        end
+        issued = issued + amount
+      elseif status == "settled" and tx_type == "BURN" and amount > 0 then
+        issued = math.max(0, issued - amount)
+      end
+    end
+  end
+
+  price_oracle.last_mint_ledger_import = {
+    time = timestamp(),
+    processed = processed,
+    skipped = skipped,
+    note = "Imported unprocessed historical MINT transactions into sticky price oracle.",
+  }
+  if processed > 0 then savePriceOracle() end
+  return processed, skipped
+end
 
 
 -- =============================================================================
@@ -1474,8 +1669,13 @@ end
 -- it only advances when os.day() has moved forward.
 handlers["tick_inflation"] = function(sender_id, req)
   local changed, state, elapsed = tickInflation(req and req.day)
+  local oracle_decay = nil
+  if decayPriceOracleShock and elapsed and elapsed > 0 then
+    local okDecay, decayInfo = pcall(decayPriceOracleShock, elapsed)
+    if okDecay then oracle_decay = decayInfo end
+  end
   audit("ACTION", "STATE", sender_id, "TICK_INFLATION", "changed=" .. tostring(changed) .. " elapsed=" .. tostring(elapsed))
-  return true, { changed = changed, elapsed_days = elapsed, state = state }
+  return true, { changed = changed, elapsed_days = elapsed, state = state, oracle_decay = oracle_decay }
 end
 
 -- SET_INFLATION_POLICY
@@ -1919,9 +2119,36 @@ handlers["get_price_indices"] = function(sender_id, req)
     model = price_oracle.model,
     sectors = sectorIndexSnapshot(),
     inflation = inflation_state,
+    shock_pressure = tonumber(price_oracle.shock_pressure) or 0,
+    sticky_floor_from_ath = tonumber(price_oracle.sticky_floor_from_ath) or 0.75,
+    last_money_print = price_oracle.last_money_print,
     time = timestamp(),
-    note = "Sector indices use current inflation plus a visible price-pressure floor; old price_index cannot deflate live prices below x1.00."
+    note = "Sector prices have downward stickiness: each sector records ATH index; deflation cannot pull below sticky_floor_from_ath of ATH."
   }
+end
+
+handlers["import_mint_shocks"] = function(sender_id, req)
+  local processed, skipped = processUnprocessedMintLedgerShocks()
+  audit("ACTION", "STATE", sender_id, "IMPORT_MINT_SHOCKS", "processed=" .. tostring(processed) .. " skipped=" .. tostring(skipped))
+  return true, { processed = processed, skipped = skipped, sectors = sectorIndexSnapshot(), last_money_print = price_oracle.last_money_print }
+end
+
+handlers["rebase_price_oracle_ath"] = function(sender_id, req)
+  ensurePriceOracle()
+  local snap = sectorIndexSnapshot()
+  for sector, rec in pairs(price_oracle.sectors or {}) do
+    local cur = snap[sector] and tonumber(snap[sector].index) or tonumber(rec.current_index) or 1
+    rec.ath_index = math.max(1, cur)
+    rec.raw_index = tonumber(rec.raw_index) or cur
+    rec.current_index = cur
+    rec.sticky_floor_index = math.max(1, cur * (tonumber(price_oracle.sticky_floor_from_ath) or 0.75))
+    rec.sticky_active = false
+  end
+  price_oracle.rebased_at = timestamp()
+  price_oracle.rebased_by = "terminal:" .. tostring(sender_id)
+  savePriceOracle()
+  audit("ACTION", "STATE", sender_id, "REBASE_PRICE_ORACLE_ATH", "ok")
+  return true, { sectors = sectorIndexSnapshot(), note = "ATHs rebased to current live indices." }
 end
 
 -- QUOTE_ITEM_PRICE
@@ -2400,6 +2627,7 @@ local function initFiles()
   inflation_state = readFile(FILE.inflation) or {}
   ensureInflationState()
   ensurePriceOracle()
+  pcall(processUnprocessedMintLedgerShocks)
   config    = readFile(FILE.config)    or {
     economy_status       = "active",
     mint_authority       = "locked"
