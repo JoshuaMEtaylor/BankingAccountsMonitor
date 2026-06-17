@@ -15,38 +15,14 @@ if args[1] ~= "--updated" then
   local cache_bust = tostring(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
   local update_url = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/ServerSideAccounts?cb=" .. cache_bust
 
-  local tmp_file = "startup.lua.new"
-  if fs.exists(tmp_file) then fs.delete(tmp_file) end
-  shell.run("wget " .. update_url .. " " .. tmp_file)
-
-  if not fs.exists(tmp_file) then
-    print("Download failed. No file written.")
-    return
-  end
-
-  local f = fs.open(tmp_file, "r")
-  local head = f and f.read(80) or ""
-  if f then f.close() end
-  head = tostring(head or "")
-
-  -- If GitHub/web access returns an HTML error page, CraftOS later reports:
-  -- /startup: unexpected symbol near '<'. Do not install that as startup.lua.
-  if head:find("<", 1, true) and (head:lower():find("html", 1, true) or head:find("<!DOCTYPE", 1, true)) then
-    print("Download returned HTML, not Lua. Keeping old startup.lua.")
-    fs.delete(tmp_file)
-    return
-  end
-
-  fs.delete("startup.lua")
-  fs.move(tmp_file, "startup.lua")
-
+  shell.run("wget " .. update_url .. " startup.lua")
   print("Relaunching...")
   sleep(0.5)
   shell.run("startup.lua", "--updated")
   return
 end
 
-local VERSION  = "1.4.10-STABLE-COMPAT"
+local VERSION  = "1.4.7-ORACLE-DEFLATION-FIX"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -1457,16 +1433,6 @@ local function calculatePrivateGDP(window_ms)
 end
 
 -- =============================================================================
--- TRUSTED MANAGEMENT COMPATIBILITY
--- Older admin/monitor terminals sometimes ask for management-style reads without
--- a citizen owner context. This project currently runs on a private server, so
--- this deliberately remains permissive to keep legacy terminals working.
--- =============================================================================
-local function isTrustedManagement(sender_id)
-  return true
-end
-
--- =============================================================================
 -- REQUEST HANDLERS
 -- =============================================================================
 local handlers = {}
@@ -2226,12 +2192,10 @@ handlers["get_price_indices"] = function(sender_id, req)
   ensureInflationState()
   ensurePriceOracle()
 
-  -- STABLE-COMPAT:
-  -- Do NOT scan the full ledger from this read endpoint. Monitors and terminals
-  -- call get_price_indices frequently; scanning the whole ledger here can stall
-  -- the bank and make unrelated scripts timeout/flicker. Historical imports are
-  -- now explicit via import_mint_shocks; new MINT transactions are handled live.
-  local imported, skipped = 0, 0
+  -- Keep the oracle endpoint self-healing. Older installs may have minted before
+  -- the price oracle existed, so import any unprocessed MINT shocks before
+  -- reporting sector CPI. This is idempotent via processed_mint_tx.
+  local imported, skipped = processUnprocessedMintLedgerShocks()
 
   local okSnap, snapOrErr = pcall(sectorIndexSnapshot)
   if not okSnap then
@@ -2754,8 +2718,7 @@ local function initFiles()
   inflation_state = readFile(FILE.inflation) or {}
   ensureInflationState()
   ensurePriceOracle()
-  -- Stable compat: do not scan full ledger on every boot. Use import_mint_shocks manually if needed.
-  -- pcall(processUnprocessedMintLedgerShocks)
+  pcall(processUnprocessedMintLedgerShocks)
   config    = readFile(FILE.config)    or {
     economy_status       = "active",
     mint_authority       = "locked"
