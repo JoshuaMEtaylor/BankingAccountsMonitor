@@ -32,7 +32,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION = "1.0.11-LIVE-INFLATION-PRICING"
+local VERSION = "1.0.12-PUSH-EMPLOYMENT-MAP"
 local BANK_PROTOCOL = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT = 5
@@ -78,6 +78,7 @@ local stats = {
   citizens_seen = 0,
   citizen_accounts = 0,
   citizens_registered = 0,
+  employment_synced = 0,
   requests_seen = 0,
   contracts_posted = 0,
   skipped_unfunded = 0,
@@ -881,8 +882,95 @@ local function scanCitizens(citizens)
   writeFile(FILE_CITIZENS, citizens_map)
 end
 
+local function resolveCitizenEmployment(z)
+  if type(z) ~= "table" then return nil end
+
+  local stable = citizenStableId(z)
+  if not stable then return nil end
+
+  local username = citizenUsername(z)
+  local citizen_id = "citizen:" .. username
+  local work = type(z.work) == "table" and z.work or {}
+  local job_raw = citizenJobRaw(z)
+  local job_text = citizenTitle(z)
+
+  local industry = "general"
+  local building_key = nil
+  local company = nil
+
+  if type(work) == "table" and (work.type or work.name or work.location) then
+    building_key = workKey(work)
+    if building_key and businesses[building_key] then
+      local b = businesses[building_key]
+      industry = b.industry or industry
+      if b.company_id then
+        company = {
+          company_id = b.company_id,
+          name = b.name,
+          ticker = b.ticker,
+          industry = b.industry,
+        }
+      end
+    end
+  end
+
+  if not company then
+    industry = classifyIndustryFromType(job_raw, job_text)
+    if industry_companies[industry] then
+      company = industry_companies[industry]
+    end
+  end
+
+  if not company or not company.company_id then return nil end
+
+  return {
+    citizen_id = citizen_id,
+    display_name = tostring(z.name or z.display_name or ("Citizen " .. stable)),
+    job_text = job_text,
+    job_raw = tostring(job_raw or ""),
+    industry = company.industry or industry,
+    company_id = company.company_id,
+    company_name = company.name or company.company_id,
+    ticker = company.ticker,
+    building_key = building_key,
+    work_type = normalType(work.type or work.name or ""),
+    work_name = tostring(work.name or ""),
+    work_location = work.location,
+    active = true,
+  }
+end
+
+local function syncEmployeeMappings(citizens)
+  local employees = {}
+
+  for _, z in ipairs(citizens or {}) do
+    local e = resolveCitizenEmployment(z)
+    if e then employees[#employees+1] = e end
+  end
+
+  if #employees == 0 then
+    stats.employment_synced = 0
+    return false, "no employee mappings"
+  end
+
+  local ok, res = bankReq({
+    type = "sync_employee_mappings",
+    employees = employees,
+  }, 6)
+
+  if ok and type(res) == "table" then
+    stats.employment_synced = tonumber(res.active or res.updated or #employees) or #employees
+    return true, res
+  end
+
+  stats.employment_synced = 0
+  setMsg("Employment sync failed: " .. tostring(res), colors.orange)
+  return false, res
+end
+
 -- =============================================================================
 -- PRICING
+
 -- =============================================================================
 local function refreshPrices()
   local ok, res = bankReq({ type="get_prices" })
@@ -1379,6 +1467,7 @@ local function scanOnce()
 
   scanCitizens(citizens)
   scanBusinesses(buildings)
+  syncEmployeeMappings(citizens)
   scanRequests(requests, citizens)
 
   stats.last_scan = now()
