@@ -32,7 +32,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION = "1.0.14-BUILDER-BUNDLES"
+local VERSION = "1.0.15-REACQUIRE-CONTRACTS"
 local BANK_PROTOCOL = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT = 5
@@ -1336,6 +1336,19 @@ end
 local function shouldUpsertContract(key, reward, item_sig, title)
   local p = posted and posted[key] or nil
   if not p then return true end
+
+  -- If the ContractServer was rebooted in fresh-rescan mode, our local posted
+  -- cache can point at a contract ID that no longer exists. Verify the remote
+  -- record before deciding to skip; if missing, forget the cache and repost.
+  local cached_id = tostring(p.contract_id or "")
+  if cached_id ~= "" and cached_id ~= "unknown" then
+    local ok_remote, remote_res = contractReq({ type = "get_contract", contract_id = cached_id }, 2)
+    if not ok_remote and tostring(remote_res or ""):find("Contract not found", 1, true) then
+      posted[key] = nil
+      writeFile(FILE_POSTED, posted)
+      return true
+    end
+  end
 
   -- Always refresh occasionally so stale source metadata stays alive, but do not
   -- rewrite a contract every scan for tiny changes.
