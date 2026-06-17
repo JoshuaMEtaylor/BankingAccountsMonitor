@@ -1,614 +1,296 @@
 -- =============================================================================
--- QUID BANK OF PLENTY - DATABASE SERVER
--- ServerSideAccounts
+-- ECONOMY CORE MONITOR
+-- Quid national statistics display - contract-aware Minecraft core build
+--
+-- Shows only:
+--   GDP
+--   GDP / PER CAPITA
+--   INFLATION
+--   INEQUALITY (account balance distribution, not income)
+--   MONETARY CONDITIONS
+--   POPULATION
+--   COMPANIES
+--   TRANSACTIONS PER DAY
+--
+-- Read-only. No banking controls. No trade panel. Contract GDP over 365 Minecraft days + in-view MCT clock + tapered money-supply inflation.
 -- =============================================================================
+
+local VERSION         = "0.5.12-NO-FLICKER-MONITOR-LOCK"
+local PROTOCOL        = "quid_bank"
+local CONTRACT_PROTOCOL = "quid_contracts"
+local DB_TIMEOUT      = 5
+local CONTRACT_TIMEOUT = 3
+local GDP_PERIOD_MC_DAYS = 365
+local MINECRAFT_DAY_MS = 20 * 60 * 1000 -- standard Minecraft day length for fallback timing
+local GDP_PERIOD_MS   = GDP_PERIOD_MC_DAYS * MINECRAFT_DAY_MS
+local REFRESH_SECONDS = 5
+local TEXT_SCALE      = 0.5
+local HISTORY_FILE    = "data/economy_core_monitor_history.db"
+local INFLATION_BASE_FILE = "data/economy_monetary_inflation_base.db"
+local INFLATION_HALF_LIFE_MS = 24 * 60 * 60 * 1000 -- no new printing: inflation pressure halves every 24h
+local MAX_HISTORY     = 120
 
 local args = {...}
-if args[1] ~= "--updated" then
-  print("[ Quid Bank of Plenty ]")
-  print("Deleting old version...")
-  fs.delete("startup.lua")
-  print("Downloading latest from GitHub...")
-
-  -- Cache-bust GitHub raw/CDN so ComputerCraft does not keep pulling
-  -- an older copy after the GitHub file has visibly changed.
-  local cache_bust = tostring(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
-  local update_url = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/ServerSideAccounts?cb=" .. cache_bust
-
-  local tmp_file = "startup.lua.new"
-  if fs.exists(tmp_file) then fs.delete(tmp_file) end
-  shell.run("wget " .. update_url .. " " .. tmp_file)
-
-  if not fs.exists(tmp_file) then
-    print("Download failed. No file written.")
-    return
-  end
-
-  local f = fs.open(tmp_file, "r")
-  local head = f and f.read(80) or ""
-  if f then f.close() end
-  head = tostring(head or "")
-
-  -- If GitHub/web access returns an HTML error page, CraftOS later reports:
-  -- /startup: unexpected symbol near '<'. Do not install that as startup.lua.
-  if head:find("<", 1, true) and (head:lower():find("html", 1, true) or head:find("<!DOCTYPE", 1, true)) then
-    print("Download returned HTML, not Lua. Keeping old startup.lua.")
-    fs.delete(tmp_file)
-    return
-  end
-
-  fs.delete("startup.lua")
-  fs.move(tmp_file, "startup.lua")
-
-  print("Relaunching...")
-  sleep(0.5)
-  shell.run("startup.lua", "--updated")
-  return
+-- Optional: pass a monitor/peripheral name when launching, e.g.
+--   startup.lua top
+--   startup.lua monitor_0
+-- This stops several network-visible monitors/scripts fighting over the wrong screen.
+local MONITOR_NAME = nil
+if args[1] and tostring(args[1]) ~= "" and tostring(args[1]) ~= "--updated" then
+  MONITOR_NAME = tostring(args[1])
 end
 
-local VERSION  = "1.4.9"
-local DB_LABEL = "QuidBank-DB"
-local PROTOCOL = "quid_bank"
-local PROTOCOL_BROADCAST = "quid_bank_discovery"
+local native_term = term.current()
+local monitor = nil
+local modem_name = nil
+local monitor_name = nil
+local db_id = nil
+local contract_id = nil
+local last_contract_error = ""
+local last_error = ""
+local last_snapshot = nil
+local last_update_text = "never"
+local first_draw = true
+local last_draw_w = nil
+local last_draw_h = nil
 
--- Tracks when the last successful self-update happened, persisted to disk
-local VERSION_FILE = "data/version.db"
-
-local function saveVersionInfo(info)
-  local f = fs.open(VERSION_FILE, "w")
-  if f then f.write(textutils.serialize(info)); f.close() end
-end
-
-local function loadVersionInfo()
-  if not fs.exists(VERSION_FILE) then return nil end
-  local f = fs.open(VERSION_FILE, "r")
-  if not f then return nil end
-  local text = f.readAll(); f.close()
-  local ok, data = pcall(textutils.unserialize, text)
-  return ok and data or nil
-end
-
-local versionInfo = nil  -- loaded on boot
-
--- =============================================================================
--- FILE PATHS
--- =============================================================================
-local FILE = {
-  ledger       = "data/ledger.log",
-  share_ledger = "data/shares.log",
-  audit        = "data/audit.log",
-  accounts     = "data/accounts.db",
-  balances     = "data/balances.db",
-  monetary     = "data/monetary_state.db",
-  pending_tx   = "data/pending_tx.db",
-  checkpoint   = "data/checkpoint.db",
-  citizens     = "data/citizens.db",
-  companies    = "data/companies.db",
-  contracts    = "data/contracts.db",
-  prices       = "data/prices.db",
-  price_oracle = "data/price_oracle.db",
-  inflation    = "data/inflation_state.db",
-  config       = "data/config.db",
-  employment   = "data/employment_mappings.db",
+local history = {
+  gdp = {},
+  gdp_per_capita = {},
+  inflation = {},
+  issued_supply = {},
+  general_index = {},
+  food_index = {},
+  construction_index = {},
+  tx_samples = {},
 }
 
-local LEDGER_KEEP_RECENT_TX = 500
-local LEDGER_COMPACT_SIZE   = 250000
-local AUDIT_MAX_SIZE        = 50000
-local ARCHIVE_DIR           = "disk/bank_archive"
+-- =============================================================================
+-- SMALL HELPERS
+-- =============================================================================
+local function nowMs()
+  if os.epoch then return os.epoch("utc") end
+  return math.floor(os.time() * 1000)
+end
 
--- =============================================================================
--- RUNTIME STATE
--- =============================================================================
-local accounts  = {}
-local balances  = {}  -- [account_id] = current authoritative balance
-local monetary_state = {
-  total_minted = 0,
-  total_burned = 0,
-  migrated = false,
+local MONTH_NAMES = {
+  "January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December"
 }
-local citizens  = {}  -- [username] = { display_name, password_hash, joined, status, title }
-local companies = {}
-local contracts = {}
-local employment_mappings = {} -- [citizen_id] = central citizen -> employer/company map pushed by ColonyBusinessIntegrator
-local prices    = {}
-local price_oracle = {}
-local inflation_state = {}
-local config    = {}
 
-local tx_counter    = 0
-local sh_counter    = 0
-local audit_counter = 0
+local function isLeapYear(year)
+  year = math.floor(tonumber(year) or 0)
+  if year % 400 == 0 then return true end
+  if year % 100 == 0 then return false end
+  return year % 4 == 0
+end
 
--- =============================================================================
--- SIMPLE HASH
--- Not cryptographic, but stops plaintext passwords sitting in files.
--- =============================================================================
-local function simpleHash(str)
-  local h = 5381
-  for i = 1, #str do
-    h = ((h * 33) + string.byte(str, i)) % 2147483647
+local function monthLength(month_zero, year)
+  local base = {31,28,31,30,31,30,31,31,30,31,30,31}
+  local idx = (math.floor(tonumber(month_zero) or 0) % 12) + 1
+  if idx == 2 and isLeapYear(year) then return 29 end
+  return base[idx]
+end
+
+local function currentMinecraftDay()
+  if os.day then
+    local ok, day = pcall(os.day, "ingame")
+    if ok and tonumber(day) then return math.floor(tonumber(day)) end
+    ok, day = pcall(os.day)
+    if ok and tonumber(day) then return math.floor(tonumber(day)) end
   end
-  return tostring(h)
+  return math.floor(nowMs() / MINECRAFT_DAY_MS)
 end
 
--- =============================================================================
--- UTILITIES
--- =============================================================================
-local function pad(n, width)
-  local s = tostring(n)
-  while #s < width do s = "0" .. s end
-  return s
+local function currentMinecraftTimeHours()
+  if os.time then
+    local ok, t = pcall(os.time, "ingame")
+    if ok and tonumber(t) then return tonumber(t) end
+    ok, t = pcall(os.time)
+    if ok and tonumber(t) then return tonumber(t) end
+  end
+  local dayMs = nowMs() % MINECRAFT_DAY_MS
+  return (dayMs / MINECRAFT_DAY_MS) * 24
 end
 
-local function timestamp()
-  return os.epoch("utc")
+local function calendarFromMinecraftDay(day)
+  day = math.floor(tonumber(day) or 0)
+  if day < 0 then day = 0 end
+
+  local year = 0
+  local remaining = day
+  while true do
+    local year_len = isLeapYear(year) and 366 or 365
+    if remaining < year_len then break end
+    remaining = remaining - year_len
+    year = year + 1
+  end
+
+  local dayOfYear = remaining
+  local month = 0
+  while true do
+    local len = monthLength(month, year)
+    if remaining < len then break end
+    remaining = remaining - len
+    month = month + 1
+  end
+
+  return {
+    absolute_day = day,
+    year = year,
+    month = month, -- zero-indexed so day 0 starts at 0/0/0000
+    month_name = MONTH_NAMES[(month % 12) + 1],
+    day_of_month = remaining,
+    day_of_year = dayOfYear,
+    leap_year = isLeapYear(year),
+  }
+end
+
+local function minecraftClock()
+  local absolute_day = currentMinecraftDay()
+  local cal = calendarFromMinecraftDay(absolute_day)
+
+  local t = currentMinecraftTimeHours() % 24
+  local tick = math.floor(((t / 24) * 24000) + 0.5) % 24000
+  local total_seconds = math.floor((tick / 24000) * 86400)
+  local hour = math.floor(total_seconds / 3600) % 24
+  local minute = math.floor((total_seconds % 3600) / 60)
+  local second = total_seconds % 60
+
+  local date_text = string.format("%02d/%02d/%04d", cal.day_of_month, cal.month, cal.year)
+  local time_text = string.format("%02d:%02dMCT", hour, minute)
+  local time_seconds_text = string.format("%02d:%02d:%02dMCT", hour, minute, second)
+
+  return {
+    day = absolute_day,
+    absolute_day = absolute_day,
+    year = cal.year,
+    month = cal.month,
+    month_name = cal.month_name,
+    day_of_month = cal.day_of_month,
+    day_of_year = cal.day_of_year,
+    leap_year = cal.leap_year,
+    tick = tick,
+    hour = hour,
+    minute = minute,
+    second = second,
+    date_text = date_text,
+    time_text = time_text,
+    time_seconds_text = time_seconds_text,
+    tick_text = tostring(tick),
+    full_text = date_text .. " " .. time_text,
+  }
+end
+
+local function contractMinecraftDay(c)
+  if type(c) ~= "table" then return nil end
+  return tonumber(c.fulfilled_day or c.paid_day or c.closed_day or c.updated_day or c.created_day or c.day)
 end
 
 local function ensureDir(path)
-  local parts = {}
-  for part in string.gmatch(path, "[^/]+") do parts[#parts+1] = part end
-  table.remove(parts)
-  local current = ""
-  for _, part in ipairs(parts) do
-    current = current == "" and part or (current .. "/" .. part)
-    if not fs.exists(current) then fs.makeDir(current) end
+  local dir = fs.getDir(path)
+  if dir and dir ~= "" and not fs.exists(dir) then
+    fs.makeDir(dir)
   end
 end
 
-local function writeFile(path, data)
-  ensureDir(path)
-  local f = fs.open(path, "w")
-  if f then f.write(textutils.serialize(data)); f.close(); return true end
-  return false
-end
-
-local function readFile(path)
+local function readTable(path)
   if not fs.exists(path) then return nil end
   local f = fs.open(path, "r")
   if not f then return nil end
-  local text = f.readAll(); f.close()
+  local text = f.readAll()
+  f.close()
   if not text or text == "" then return nil end
   local ok, data = pcall(textutils.unserialize, text)
   if ok then return data end
   return nil
 end
 
-local function appendLine(path, line)
-  ensureDir(path)
-  local f = fs.open(path, "a")
-  if not f then return false, "open failed" end
-  local ok, err = pcall(function() f.writeLine(line) end)
-  f.close()
-  if not ok then return false, tostring(err) end
-  return true
-end
-
-local function writeLines(path, lines)
+local function writeTable(path, data)
   ensureDir(path)
   local f = fs.open(path, "w")
-  if not f then return false, "open failed" end
-  local ok, err = pcall(function()
-    for _, line in ipairs(lines or {}) do
-      f.writeLine(line)
-    end
-  end)
+  if not f then return false end
+  f.write(textutils.serialize(data))
   f.close()
-  if not ok then return false, tostring(err) end
   return true
 end
 
-local function trim(s)
-  return tostring(s or ""):match("^%s*(.-)%s*$")
-end
-
-local function readLines(path)
-  if not fs.exists(path) then return {} end
-  local f = fs.open(path, "r")
-  if not f then return {} end
-  local lines = {}
-  local line = f.readLine()
-  while line do
-    if line ~= "" then lines[#lines+1] = line end
-    line = f.readLine()
-  end
-  f.close()
-  return lines
-end
-
--- =============================================================================
--- AUDIT
--- =============================================================================
-local function capAuditLog()
-  if not fs.exists(FILE.audit) then return end
-  local size = fs.getSize(FILE.audit) or 0
-  if size <= AUDIT_MAX_SIZE then return end
-
-  local lines = readLines(FILE.audit)
-  local keep = {}
-  local start = math.max(1, #lines - 200)
-  for i = start, #lines do keep[#keep+1] = lines[i] end
-
-  -- Audit is debug evidence only. If trimming fails, delete it rather than
-  -- allowing audit growth to kill the bank.
-  if not writeLines(FILE.audit, keep) then
-    fs.delete(FILE.audit)
-  end
-end
-
-local function audit(action_type, actor, terminal, action, result)
-  audit_counter = audit_counter + 1
-  local id   = "AUDIT-" .. pad(audit_counter, 6)
-  local line = string.format("%s | %d | %-8s | %-20s | %-15s | %-20s | %s",
-    id, timestamp(), action_type, tostring(actor),
-    tostring(terminal), tostring(action), tostring(result))
-  appendLine(FILE.audit, line)
-  if audit_counter % 25 == 0 then capAuditLog() end
-end
-
--- =============================================================================
--- LEDGER
--- =============================================================================
-local function nextTxId()
-  tx_counter = tx_counter + 1
-  return "TX-" .. pad(tx_counter, 6)
-end
-
-local function archiveLines(lines)
-  if not fs.exists("disk") then return false, "no disk" end
-  if not fs.isDir("disk") then return false, "disk unavailable" end
-  if not fs.exists(ARCHIVE_DIR) then fs.makeDir(ARCHIVE_DIR) end
-
-  local archive_name = ARCHIVE_DIR .. "/ledger_archive_" .. tostring(timestamp()) .. ".log"
-  local ok, err = writeLines(archive_name, lines)
-  if ok then return true, archive_name end
-  return false, err
-end
-
-local function compactLedgerIfNeeded(force)
-  if not fs.exists(FILE.ledger) then return true end
-
-  local size = fs.getSize(FILE.ledger) or 0
-  if not force and size < LEDGER_COMPACT_SIZE then return true end
-
-  local lines = readLines(FILE.ledger)
-  if #lines <= LEDGER_KEEP_RECENT_TX then return true end
-
-  local split_at = #lines - LEDGER_KEEP_RECENT_TX
-  local old_lines = {}
-  local keep_lines = {}
-
-  for i = 1, split_at do old_lines[#old_lines+1] = lines[i] end
-  for i = split_at + 1, #lines do keep_lines[#keep_lines+1] = lines[i] end
-
-  -- Archive is best-effort. It preserves old detail when a permanent floppy is
-  -- installed, but the balance snapshot remains authoritative even without it.
-  archiveLines(old_lines)
-
-  local ok = writeLines(FILE.ledger, keep_lines)
-  if ok then
-    local checkpoint = {
-      last_compacted_time = timestamp(),
-      kept_recent = #keep_lines,
-      archived_or_discarded = #old_lines,
-      balance_snapshot = true,
-      note = "Balances are authoritative; compacted ledger is recent history only."
-    }
-    writeFile(FILE.checkpoint, checkpoint)
-  end
-  return ok
-end
-
-local function writeTx(tx_id, tx_type, from_id, to_id, amount, memo, status)
-  local line = string.format("%s | %d | %-12s | %-25s | %-25s | %d | %s | %s",
-    tx_id, timestamp(), tx_type, tostring(from_id), tostring(to_id),
-    amount, tostring(memo), tostring(status))
-
-  -- Try compaction before appending if the ledger is already large.
-  compactLedgerIfNeeded(false)
-
-  local ok, err = appendLine(FILE.ledger, line)
-  if not ok then
-    compactLedgerIfNeeded(true)
-    ok, err = appendLine(FILE.ledger, line)
-  end
-  return ok, err
-end
-
-local function deriveBalance(account_id)
-  return tonumber(balances[account_id]) or 0
-end
-
-local function deriveMonetarySupply()
-  local total_minted   = tonumber(monetary_state.total_minted) or 0
-  local total_burned   = tonumber(monetary_state.total_burned) or 0
-
-  local citizen_holdings = 0
-  local company_holdings = 0
-  local escrow_held      = 0
-
-  for id, acc in pairs(accounts) do
-    if acc.status == "active" then
-      local bal = deriveBalance(id)
-      if acc.type == "citizen"  then citizen_holdings = citizen_holdings + bal
-      elseif acc.type == "company" then company_holdings = company_holdings + bal
-      elseif acc.type == "escrow"  then escrow_held      = escrow_held      + bal
-      end
+local function loadHistory()
+  local data = readTable(HISTORY_FILE)
+  if type(data) == "table" then
+    for k, v in pairs(data) do
+      if type(v) == "table" then history[k] = v end
     end
   end
-
-  return {
-    total_minted     = total_minted,
-    total_burned     = total_burned,
-    in_circulation   = total_minted - total_burned,
-    treasury_balance = deriveBalance("treasury:quid_bank"),
-    citizen_holdings = citizen_holdings,
-    company_holdings = company_holdings,
-    escrow_held      = escrow_held,
-  }
 end
 
--- =============================================================================
--- SHARE LEDGER
--- =============================================================================
-local function nextShId()
-  sh_counter = sh_counter + 1
-  return "SH-" .. pad(sh_counter, 6)
+local function saveHistory()
+  writeTable(HISTORY_FILE, history)
 end
 
-local function writeShareTx(sh_id, company_id, from_id, to_id, shares, tx_type, memo)
-  local line = string.format("%s | %d | %-20s | %-25s | %-25s | %d | %-20s | %s",
-    sh_id, timestamp(), tostring(company_id), tostring(from_id),
-    tostring(to_id), shares, tostring(tx_type), tostring(memo))
-  appendLine(FILE.share_ledger, line)
+local function getSize()
+  return term.getSize()
 end
 
-local function deriveShareHoldings(company_id)
-  if not fs.exists(FILE.share_ledger) then return {} end
-  local lines    = readLines(FILE.share_ledger)
-  local holdings = {}
-  for _, line in ipairs(lines) do
-    local sh_id, ts, cid, from_id, to_id, shares =
-      line:match("(SH%-%d+)%s*|%s*(%d+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*(%d+)")
-    if sh_id then
-      cid     = cid:match("^%s*(.-)%s*$")
-      if cid == company_id then
-        from_id = from_id:match("^%s*(.-)%s*$")
-        to_id   = to_id:match("^%s*(.-)%s*$")
-        shares  = tonumber(shares) or 0
-        if to_id   ~= "SYSTEM" then holdings[to_id]   = (holdings[to_id]   or 0) + shares end
-        if from_id ~= "SYSTEM" then holdings[from_id] = (holdings[from_id] or 0) - shares end
-      end
+local function clear(bg)
+  term.setCursorBlink(false)
+  term.setBackgroundColor(bg or colors.black)
+  term.setTextColor(colors.white)
+  term.clear()
+  term.setCursorPos(1, 1)
+end
+
+local function writeAt(x, y, text, fg, bg)
+  local w, h = getSize()
+  if y < 1 or y > h or x > w then return end
+  if x < 1 then x = 1 end
+  term.setCursorPos(x, y)
+  if bg then term.setBackgroundColor(bg) end
+  if fg then term.setTextColor(fg) end
+  local maxLen = w - x + 1
+  if maxLen > 0 then
+    term.write(tostring(text or ""):sub(1, maxLen))
+  end
+end
+
+local function fill(x, y, w, h, bg)
+  local sw, sh = getSize()
+  if w <= 0 or h <= 0 then return end
+  if x < 1 then x = 1 end
+  if x > sw then return end
+  term.setBackgroundColor(bg or colors.black)
+  local row = string.rep(" ", math.max(0, w))
+  for yy = y, y + h - 1 do
+    if yy >= 1 and yy <= sh then
+      term.setCursorPos(x, yy)
+      term.write(row:sub(1, sw - x + 1))
     end
   end
-  return holdings
 end
 
--- =============================================================================
--- SAVE HELPERS
--- =============================================================================
-local function saveAccounts()  return writeFile(FILE.accounts,  accounts)  end
-local function saveBalances()  return writeFile(FILE.balances,  balances)  end
-local function saveMonetary()  return writeFile(FILE.monetary,  monetary_state) end
-local function saveCitizens()  return writeFile(FILE.citizens,  citizens)  end
-local function saveCompanies() return writeFile(FILE.companies, companies) end
-local function saveContracts() return writeFile(FILE.contracts, contracts) end
-local function savePrices()    return writeFile(FILE.prices,    prices)    end
-local function savePriceOracle() return writeFile(FILE.price_oracle, price_oracle) end
-local function saveInflation() return writeFile(FILE.inflation, inflation_state) end
-local function saveConfig()    return writeFile(FILE.config,    config)    end
-
--- =============================================================================
--- AUTH  — username + password, works from any terminal
--- =============================================================================
-local function authenticateUser(username, password)
-  if not username or not password then
-    return false, "Missing username or password"
-  end
-  local key = string.lower(username):gsub("%s+", "_")
-  local citizen_id = "citizen:" .. key
-  local citizen = citizens[citizen_id]
-  if not citizen then
-    return false, "Account not found"
-  end
-  if citizen.status ~= "active" then
-    return false, "Account suspended"
-  end
-  if citizen.password_hash ~= simpleHash(password) then
-    return false, "Incorrect password"
-  end
-  return true, citizen_id, citizen
+local function centerIn(x, y, w, text, fg, bg)
+  text = tostring(text or "")
+  local tx = x + math.floor((w - #text) / 2)
+  writeAt(tx, y, text, fg, bg)
 end
 
-local function saveEmployment()
-  return writeFile(FILE.employment, employment_mappings)
-end
-
-
--- =============================================================================
--- ACCOUNT OPERATIONS
--- =============================================================================
-local function accountExists(account_id)
-  return accounts[account_id] ~= nil
-end
-
-local function createAccount(account_id, acc_type, display_name, owner_id)
-  if accountExists(account_id) then return false, "Account already exists" end
-  accounts[account_id] = {
-    type         = acc_type,
-    display_name = display_name,
-    owner_id     = owner_id or "SYSTEM",
-    created      = timestamp(),
-    status       = "active"
-  }
-  if balances[account_id] == nil then balances[account_id] = 0 end
-  saveAccounts()
-  saveBalances()
-  return true, account_id
-end
-
-local function isCompanyOwner(company_id, citizen_id)
-  local company = companies[company_id]
-  local account = accounts[company_id]
-  if not company or not citizen_id then return false end
-  local company_owner_id = company.owner_id
-  local account_owner_id = account and account.owner_id or nil
-  return company_owner_id == citizen_id or account_owner_id == citizen_id
-end
-
-local function companyOwnerFields(company_id)
-  local company = companies[company_id]
-  local account = accounts[company_id]
-  return company and company.owner_id or nil, account and account.owner_id or nil
-end
-
-local function ledgerHasTx(tx_id)
-  for _, line in ipairs(readLines(FILE.ledger)) do
-    if line:match("^" .. tostring(tx_id) .. "%s*|") then return true end
-  end
-  return false
-end
-
-local function clearPendingTx()
-  if fs.exists(FILE.pending_tx) then fs.delete(FILE.pending_tx) end
-end
-
-local function transfer(from_id, to_id, amount, tx_type, memo, actor, allow_overdraft)
-  amount = tonumber(amount)
-  tx_type = tx_type or "TRANSFER"
-
-  if not amount or amount <= 0 then return false, "Invalid amount" end
-  if not accountExists(from_id) and from_id ~= "SYSTEM" then
-    return false, "Source account does not exist"
-  end
-  if not accountExists(to_id) and to_id ~= "SYSTEM" then
-    return false, "Destination account does not exist"
-  end
-
-  local from_before = from_id ~= "SYSTEM" and deriveBalance(from_id) or nil
-  local to_before   = to_id   ~= "SYSTEM" and deriveBalance(to_id)   or nil
-
-  if from_id ~= "SYSTEM" and tx_type ~= "MINT" and not allow_overdraft then
-    if from_before < amount then
-      return false, "Insufficient funds. Balance: " .. from_before .. " Quid, Required: " .. amount .. " Quid"
-    end
-  end
-
-  local minted_before = tonumber(monetary_state.total_minted) or 0
-  local burned_before = tonumber(monetary_state.total_burned) or 0
-
-  local tx_id = nextTxId()
-
-  local pending = {
-    tx_id = tx_id,
-    tx_type = tx_type,
-    from = from_id,
-    to = to_id,
-    amount = amount,
-    memo = memo or "",
-    actor = actor or "SYSTEM",
-    from_before = from_before,
-    to_before = to_before,
-    minted_before = minted_before,
-    burned_before = burned_before,
-    created = timestamp(),
-  }
-
-  if not writeFile(FILE.pending_tx, pending) then
-    return false, "Could not create pending transaction file"
-  end
-
-  -- Apply debit/credit to authoritative balances.
-  if from_id ~= "SYSTEM" then balances[from_id] = from_before - amount end
-  if to_id   ~= "SYSTEM" then balances[to_id]   = to_before + amount end
-
-  if tx_type == "MINT" then
-    monetary_state.total_minted = minted_before + amount
-    if recordMoneyPrintShock then
-      local issued_before = minted_before - burned_before
-      local issued_after = monetary_state.total_minted - burned_before
-      pcall(recordMoneyPrintShock, amount, issued_before, issued_after, tx_id)
-    end
-  elseif tx_type == "BURN" then
-    monetary_state.total_burned = burned_before + amount
-  end
-  monetary_state.migrated = true
-
-  pending.from_after = from_id ~= "SYSTEM" and balances[from_id] or nil
-  pending.to_after = to_id ~= "SYSTEM" and balances[to_id] or nil
-  pending.minted_after = monetary_state.total_minted
-  pending.burned_after = monetary_state.total_burned
-  pending.applied = true
-  writeFile(FILE.pending_tx, pending)
-
-  if not saveBalances() then
-    -- Roll back in-memory if balances could not be written.
-    if from_id ~= "SYSTEM" then balances[from_id] = from_before end
-    if to_id   ~= "SYSTEM" then balances[to_id]   = to_before end
-    monetary_state.total_minted = minted_before
-    monetary_state.total_burned = burned_before
-    clearPendingTx()
-    return false, "Could not save balances"
-  end
-
-  if not saveMonetary() then
-    -- Balances are already saved. Keep pending tx for startup repair and report
-    -- success because account balances are authoritative and already changed.
-    audit("ERROR", actor or "SYSTEM", "db", tx_type, "monetary save failed for " .. tx_id)
-  end
-
-  local ledger_ok, ledger_err = writeTx(tx_id, tx_type, from_id, to_id, amount, memo or "", "settled")
-  if ledger_ok then
-    clearPendingTx()
-  else
-    -- Keep the pending file. On next boot the bank will try to write the missing
-    -- ledger line from this settled transaction, without applying balances again.
-    audit("ERROR", actor or "SYSTEM", "db", tx_type, "ledger write deferred for " .. tx_id .. ": " .. tostring(ledger_err))
-  end
-
-  audit("ACTION", actor or "SYSTEM", "db", tx_type,
-    tx_id .. " " .. amount .. "q " .. tostring(from_id) .. "->" .. tostring(to_id))
-
-  return true, {
-    tx_id  = tx_id,
-    from   = from_id,
-    to     = to_id,
-    amount = amount,
-    type   = tx_type,
-    memo   = memo,
-    status = "settled",
-    ledger = ledger_ok and "written" or "deferred"
-  }
-end
-
-
--- =============================================================================
--- INFLATION ENGINE
--- Inflation is now a daily price-change rate, not a direct permanent markup.
---
--- price_index:
---   The accumulated price multiplier used by payroll/contracts.
---
--- inflation_rate:
---   The daily Minecraft-day price movement rate.
---   0.04 means prices rise 4% this Minecraft day.
---  -0.01 means prices fall 1% this Minecraft day.
--- =============================================================================
-local DEFAULT_INFLATION_POLICY = {
-  decay = 0.65,                 -- old inflation pressure retained each Minecraft day
-  print_sensitivity = 0.50,     -- supply growth -> daily inflation pressure
-  no_print_deflation = 0.005,   -- -0.5% daily drag when no new money is issued
-  max_daily_inflation = 0.10,   -- +10% cap per Minecraft day
-  max_daily_deflation = -0.03,  -- -3% cap per Minecraft day
-  min_price_index = 0.25,
-  max_price_index = 10.00,
-}
-
-local function clamp(n, lo, hi)
-  n = tonumber(n) or 0
-  if n < lo then return lo end
-  if n > hi then return hi end
+local function num(v)
+  local n = tonumber(v)
+  if n == nil then return nil end
   return n
+end
+
+local function safeDiv(a, b)
+  a = tonumber(a)
+  b = tonumber(b)
+  if not a or not b or b == 0 then return nil end
+  return a / b
+end
+
+local function clamp(v, lo, hi)
+  if v < lo then return lo end
+  if v > hi then return hi end
+  return v
 end
 
 local function pow(base, exp)
@@ -618,2350 +300,1251 @@ local function pow(base, exp)
   return base ^ exp
 end
 
-local function copyPolicy(src)
+local function countTable(t)
+  local n = 0
+  if type(t) ~= "table" then return 0 end
+  for _ in pairs(t) do n = n + 1 end
+  return n
+end
+
+local function trimHistory(list)
+  while #list > MAX_HISTORY do
+    table.remove(list, 1)
+  end
+end
+
+local function pushHistory(key, value)
+  value = tonumber(value)
+  if value == nil then return end
+  history[key] = history[key] or {}
+  history[key][#history[key] + 1] = value
+  trimHistory(history[key])
+end
+
+local function fmtMoney(v)
+  local n = tonumber(v)
+  if n == nil then return "Awaiting data" end
+  local sign = ""
+  if n < 0 then
+    sign = "-"
+    n = math.abs(n)
+  end
+  local whole = tostring(math.floor(n + 0.5))
+  local out = ""
+  while #whole > 3 do
+    out = "," .. whole:sub(-3) .. out
+    whole = whole:sub(1, -4)
+  end
+  return sign .. whole .. out .. " Q"
+end
+
+local function fmtNum(v, decimals)
+  local n = tonumber(v)
+  if n == nil then return "Awaiting data" end
+  decimals = decimals or 0
+  return string.format("%." .. tostring(decimals) .. "f", n)
+end
+
+local function fmtPct(v, decimals)
+  local n = tonumber(v)
+  if n == nil then return "Awaiting data" end
+  decimals = decimals or 2
+  return string.format("%." .. tostring(decimals) .. "f%%", n)
+end
+
+local function fmtIndex(v, decimals)
+  local n = tonumber(v)
+  if n == nil then return "Awaiting data" end
+  decimals = decimals or 3
+  return "x" .. string.format("%." .. tostring(decimals) .. "f", n)
+end
+
+local function shortText(text, maxLen)
+  text = tostring(text or "")
+  maxLen = maxLen or 30
+  if #text <= maxLen then return text end
+  return text:sub(1, maxLen - 3) .. "..."
+end
+
+local function copyList(values)
   local out = {}
-  for k, v in pairs(DEFAULT_INFLATION_POLICY) do
-    out[k] = tonumber(src and src[k]) or v
-  end
+  if type(values) ~= "table" then return out end
+  for i = 1, #values do out[i] = values[i] end
   return out
 end
 
-local function currentMinecraftDay()
-  if os.day then
-    return math.floor(tonumber(os.day()) or 0)
-  end
-  return math.floor(timestamp() / 1200000)
+local function calculateMedian(values)
+  if type(values) ~= "table" or #values == 0 then return nil end
+  table.sort(values)
+  local n = #values
+  if n % 2 == 1 then return values[math.ceil(n / 2)] end
+  return ((values[n / 2] or 0) + (values[(n / 2) + 1] or 0)) / 2
 end
 
-local function ensureInflationState()
-  local supply = deriveMonetarySupply()
-  local issued = tonumber(supply and supply.in_circulation) or 0
-  inflation_state = type(inflation_state) == "table" and inflation_state or {}
-
-  inflation_state.policy = copyPolicy(inflation_state.policy)
-  inflation_state.price_index = tonumber(inflation_state.price_index) or 1.00
-  inflation_state.inflation_rate = tonumber(inflation_state.inflation_rate) or 0.00
-
-  if not inflation_state.last_day then
-    inflation_state.last_day = currentMinecraftDay()
-  end
-
-  if not inflation_state.last_issued_supply then
-    inflation_state.last_issued_supply = issued
-  end
-
-  inflation_state.updated = inflation_state.updated or timestamp()
-  inflation_state.model = "daily_rate_price_index"
-  inflation_state.note = "Inflation is a daily price-change rate. Price index compounds upward or downward over Minecraft days."
-  return inflation_state
-end
-
-local function tickInflation(target_day)
-  ensureInflationState()
-
-  local supply = deriveMonetarySupply()
-  local currentIssued = tonumber(supply and supply.in_circulation) or 0
-  local day = math.floor(tonumber(target_day) or currentMinecraftDay())
-  local lastDay = math.floor(tonumber(inflation_state.last_day) or day)
-
-  if day <= lastDay then
-    inflation_state.current_issued_supply = currentIssued
-    inflation_state.updated = timestamp()
-    saveInflation()
-    return false, inflation_state, 0
-  end
-
-  local elapsed = math.max(1, math.min(30, day - lastDay))
-  local policy = copyPolicy(inflation_state.policy)
-  local rate = tonumber(inflation_state.inflation_rate) or 0
-  local index = tonumber(inflation_state.price_index) or 1
-  local lastIssued = tonumber(inflation_state.last_issued_supply) or currentIssued
-
-  for i = 1, elapsed do
-    local growth = 0
-    if lastIssued and lastIssued > 0 then
-      growth = (currentIssued - lastIssued) / lastIssued
-    elseif currentIssued > 0 then
-      growth = 1
-    end
-
-    local noPrintDrag = 0
-    if growth <= 0 then
-      noPrintDrag = policy.no_print_deflation
-    end
-
-    rate = (rate * policy.decay) + (growth * policy.print_sensitivity) - noPrintDrag
-    rate = clamp(rate, policy.max_daily_deflation, policy.max_daily_inflation)
-
-    index = index * (1 + rate)
-    index = clamp(index, policy.min_price_index, policy.max_price_index)
-
-    -- If several days elapsed, only the first missed day gets the supply jump.
-    lastIssued = currentIssued
-  end
-
-  inflation_state.price_index = index
-  inflation_state.inflation_rate = rate
-  inflation_state.last_issued_supply = currentIssued
-  inflation_state.current_issued_supply = currentIssued
-  inflation_state.last_day = day
-  inflation_state.updated = timestamp()
-  inflation_state.policy = policy
-  inflation_state.model = "daily_rate_price_index"
-  inflation_state.inflation_percent = rate * 100
-  inflation_state.price_index_percent = (index - 1) * 100
-  saveInflation()
-
-  return true, inflation_state, elapsed
-end
-
-
--- =============================================================================
--- WIDE SECTOR PRICE ORACLE
---
--- This is deliberately broad rather than deep. MineColonies citizens are not
--- real economic agents, so this system does not try to make them change
--- behaviour. It simply gives the Quid economy width: food, construction,
--- logistics, fuel, tools/arms, research, defence, and general services all get
--- their own visible price pressure.
---
--- Important design choice:
---   There is no built-in starter inflation. The oracle starts at x1.00 and only
---   moves from actual bank inflation, money-print shock, or an admin-set floor.
---   Prices rise easily but fall slowly: max 3% per Minecraft day, and never
---   below 75% of the sector ATH unless the oracle is deliberately rebased.
--- =============================================================================
-local DEFAULT_PRICE_ORACLE = {
-  model = "wide_sector_price_oracle_v2_zero_base_sticky_deflation",
-  min_index = 1.00,
-  max_index = 8.00,
-  immediate_pass_through = 1.00,
-  -- No built-in starter inflation. Prices begin at x1.00 unless money-print
-  -- shock, bank inflation, or a deliberate admin floor moves them.
-  price_pressure_floor = 0.00,
-  -- Downward price stickiness. Sector prices can make new ATHs, but deflation
-  -- can only pull them down to 75% of that ATH unless an admin deliberately
-  -- rebases the oracle. This makes money-printing damage persistent.
-  sticky_floor_from_ath = 0.75,
-  -- When target prices fall, the visible CPI can only fall this much per
-  -- Minecraft day. Sellers cut prices slowly, even if conditions improve.
-  max_daily_deflation = 0.03,
-  shock_pressure = 0.00,
-  money_print_sensitivity = 0.45,
-  max_shock_pressure = 3.00,
-  shock_decay_per_mc_day = 0.82,
-  default_markup = 1.00,
-  sectors = {
-    general =      { label="General CPI",       sensitivity=1.00, bias=0.00 },
-    food =         { label="Food CPI",          sensitivity=1.40, bias=0.05 },
-    construction = { label="Construction CPI",  sensitivity=1.30, bias=0.03 },
-    fuel =         { label="Fuel CPI",          sensitivity=1.25, bias=0.03 },
-    logistics =    { label="Logistics CPI",     sensitivity=1.15, bias=0.02 },
-    tools =        { label="Tools/Arms CPI",    sensitivity=1.25, bias=0.03 },
-    defence =      { label="Defence CPI",       sensitivity=1.20, bias=0.03 },
-    research =     { label="Research CPI",      sensitivity=1.10, bias=0.02 },
-    hospitality =  { label="Hospitality CPI",   sensitivity=1.35, bias=0.04 },
-  },
-  service_prices = {
-    dining_meal = { label="Dining Hall meal", sector="food", base=2.00, min_price=2 },
-    courier_job = { label="Courier service", sector="logistics", base=4.00, min_price=4 },
-    guard_service = { label="Guard service", sector="defence", base=5.00, min_price=5 },
-  },
-  item_base_prices = {
-    bread=1, baked_potato=1, potato=1, carrot=1, wheat=1,
-    cooked_beef=3, steak=3, cooked_porkchop=3, cooked_chicken=2,
-    cooked_mutton=2, cooked_cod=2, cooked_salmon=2, fish=2,
-    oak_log=1, spruce_log=1, birch_log=1, jungle_log=1, acacia_log=1, dark_oak_log=1,
-    oak_planks=1, spruce_planks=1, birch_planks=1, cobblestone=1, stone=1,
-    glass=2, torch=1, brick=2, iron_ingot=5, gold_ingot=8, diamond=20,
-    coal=2, charcoal=2, coal_block=18,
-  },
-  observations = {},
-}
-
-local function cloneTable(src)
-  local out = {}
-  if type(src) ~= "table" then return out end
-  for k, v in pairs(src) do
-    if type(v) == "table" then out[k] = cloneTable(v) else out[k] = v end
-  end
-  return out
-end
-
-local function simpleItemName(name)
-  name = lower(name or "")
-  name = name:gsub("^minecraft:", "")
-  name = name:gsub("^minecolonies:", "")
-  name = name:gsub("^%w+:", "")
-  return name
-end
-
-local function ensurePriceOracle()
-  price_oracle = type(price_oracle) == "table" and price_oracle or {}
-
-  local previous_model = tostring(price_oracle.model or "")
-  if previous_model ~= DEFAULT_PRICE_ORACLE.model then
-    price_oracle.model = DEFAULT_PRICE_ORACLE.model
-  end
-
-  price_oracle.min_index = tonumber(price_oracle.min_index) or DEFAULT_PRICE_ORACLE.min_index
-  price_oracle.max_index = tonumber(price_oracle.max_index) or DEFAULT_PRICE_ORACLE.max_index
-  price_oracle.immediate_pass_through = tonumber(price_oracle.immediate_pass_through) or DEFAULT_PRICE_ORACLE.immediate_pass_through
-
-  price_oracle.price_pressure_floor = tonumber(price_oracle.price_pressure_floor)
-  if price_oracle.price_pressure_floor == nil then
-    price_oracle.price_pressure_floor = DEFAULT_PRICE_ORACLE.price_pressure_floor
-  end
-  -- v1.4.6 migration: remove the old hardcoded +26% starter floor. Inflation
-  -- should start at 0 unless printing/real pressure creates it.
-  if price_oracle.zero_base_floor_migrated ~= true then
-    if math.abs((tonumber(price_oracle.price_pressure_floor) or 0) - 0.26) < 0.0001 then
-      price_oracle.price_pressure_floor = 0.00
-    end
-    price_oracle.zero_base_floor_migrated = true
-  end
-
-  price_oracle.sticky_floor_from_ath = tonumber(price_oracle.sticky_floor_from_ath) or DEFAULT_PRICE_ORACLE.sticky_floor_from_ath
-  if price_oracle.sticky_floor_from_ath < 0 then price_oracle.sticky_floor_from_ath = DEFAULT_PRICE_ORACLE.sticky_floor_from_ath end
-  if price_oracle.sticky_floor_from_ath > 1 then price_oracle.sticky_floor_from_ath = 1 end
-
-  price_oracle.max_daily_deflation = tonumber(price_oracle.max_daily_deflation) or DEFAULT_PRICE_ORACLE.max_daily_deflation
-  if price_oracle.max_daily_deflation < 0 then price_oracle.max_daily_deflation = DEFAULT_PRICE_ORACLE.max_daily_deflation end
-  if price_oracle.max_daily_deflation > 0.25 then price_oracle.max_daily_deflation = 0.25 end
-
-  price_oracle.shock_pressure = tonumber(price_oracle.shock_pressure) or DEFAULT_PRICE_ORACLE.shock_pressure
-  if price_oracle.shock_pressure < 0 then price_oracle.shock_pressure = 0 end
-  price_oracle.money_print_sensitivity = tonumber(price_oracle.money_print_sensitivity) or DEFAULT_PRICE_ORACLE.money_print_sensitivity
-  price_oracle.max_shock_pressure = tonumber(price_oracle.max_shock_pressure) or DEFAULT_PRICE_ORACLE.max_shock_pressure
-  price_oracle.shock_decay_per_mc_day = tonumber(price_oracle.shock_decay_per_mc_day) or DEFAULT_PRICE_ORACLE.shock_decay_per_mc_day
-  if price_oracle.shock_decay_per_mc_day < 0 then price_oracle.shock_decay_per_mc_day = DEFAULT_PRICE_ORACLE.shock_decay_per_mc_day end
-  if price_oracle.shock_decay_per_mc_day > 1 then price_oracle.shock_decay_per_mc_day = 1 end
-  price_oracle.default_markup = tonumber(price_oracle.default_markup) or DEFAULT_PRICE_ORACLE.default_markup
-
-  price_oracle.sectors = type(price_oracle.sectors) == "table" and price_oracle.sectors or {}
-  for key, def in pairs(DEFAULT_PRICE_ORACLE.sectors) do
-    price_oracle.sectors[key] = type(price_oracle.sectors[key]) == "table" and price_oracle.sectors[key] or {}
-    local rec = price_oracle.sectors[key]
-    rec.label = rec.label or def.label
-    rec.sensitivity = tonumber(rec.sensitivity) or def.sensitivity
-    rec.bias = tonumber(rec.bias) or def.bias
-    rec.ath_index = math.max(1, tonumber(rec.ath_index) or 1)
-    rec.current_index = math.max(1, tonumber(rec.current_index) or 1)
-    rec.raw_index = math.max(1, tonumber(rec.raw_index) or rec.current_index or 1)
-    rec.sticky_floor_index = math.max(1, tonumber(rec.sticky_floor_index) or (rec.ath_index * (tonumber(price_oracle.sticky_floor_from_ath) or 0.75)))
-    rec.last_index_day = tonumber(rec.last_index_day) or currentMinecraftDay()
-  end
-
-  price_oracle.service_prices = type(price_oracle.service_prices) == "table" and price_oracle.service_prices or {}
-  for key, def in pairs(DEFAULT_PRICE_ORACLE.service_prices) do
-    price_oracle.service_prices[key] = type(price_oracle.service_prices[key]) == "table" and price_oracle.service_prices[key] or cloneTable(def)
-    local rec = price_oracle.service_prices[key]
-    rec.label = rec.label or def.label
-    rec.sector = rec.sector or def.sector
-    rec.base = tonumber(rec.base) or def.base
-    rec.min_price = tonumber(rec.min_price) or def.min_price
-  end
-
-  price_oracle.item_base_prices = type(price_oracle.item_base_prices) == "table" and price_oracle.item_base_prices or {}
-  for key, val in pairs(DEFAULT_PRICE_ORACLE.item_base_prices) do
-    if tonumber(price_oracle.item_base_prices[key]) == nil then price_oracle.item_base_prices[key] = val end
-  end
-  price_oracle.observations = type(price_oracle.observations) == "table" and price_oracle.observations or {}
-  price_oracle.updated = timestamp()
-  return price_oracle
-end
-
-local function inflationPressure()
-  ensureInflationState()
-  ensurePriceOracle()
-  local rate = tonumber(inflation_state.inflation_rate) or 0
-  local idx = tonumber(inflation_state.price_index) or 1
-  local by_index = idx - 1
-  if by_index < 0 then by_index = 0 end
-  if rate < 0 then rate = 0 end
-
-  -- Immediate visible inflation pressure. This is intentionally broad: NPCs are
-  -- not real consumers, so we reflect inflation through sector-wide prices.
-  local floor = tonumber(price_oracle.price_pressure_floor) or 0
-  if floor < 0 then floor = 0 end
-
-  local shock = tonumber(price_oracle.shock_pressure) or 0
-  if shock < 0 then shock = 0 end
-
-  local pressure = math.max(rate, by_index, floor, shock)
-  pressure = pressure * (tonumber(price_oracle.immediate_pass_through) or 1)
-  if pressure < 0 then pressure = 0 end
-  if pressure > (tonumber(price_oracle.max_shock_pressure) or 3) then pressure = tonumber(price_oracle.max_shock_pressure) or 3 end
-  return pressure, rate, idx, floor, shock
-end
-
-local function sectorIndex(sector)
-  sector = lower(sector or "general")
-  ensurePriceOracle()
-  if not price_oracle.sectors[sector] then sector = "general" end
-  local rec = price_oracle.sectors[sector] or price_oracle.sectors.general or {}
-  local pressure, rate, bank_index, floor, shock = inflationPressure()
-
-  local target_idx = 1 + (pressure * (tonumber(rec.sensitivity) or 1)) + (pressure > 0 and (tonumber(rec.bias) or 0) or 0)
-  target_idx = clamp(target_idx, tonumber(price_oracle.min_index) or 1, tonumber(price_oracle.max_index) or 8)
-
-  -- Sticky ATH + slow deflation rule:
-  -- Prices can rise instantly when pressure/shock appears. When pressure eases,
-  -- sellers only cut prices slowly: at most max_daily_deflation per Minecraft
-  -- day, and never below sticky_floor_from_ath of the sector ATH.
-  local sticky_ratio = tonumber(price_oracle.sticky_floor_from_ath) or 0.75
-  if sticky_ratio < 0 then sticky_ratio = 0.75 end
-  if sticky_ratio > 1 then sticky_ratio = 1 end
-
-  local old_ath = tonumber(rec.ath_index) or 1
-  local current = tonumber(rec.current_index) or 1
-  current = clamp(current, tonumber(price_oracle.min_index) or 1, tonumber(price_oracle.max_index) or 8)
-
-  local ath = math.max(1, old_ath, target_idx, current)
-  local sticky_floor = math.max(tonumber(price_oracle.min_index) or 1, ath * sticky_ratio)
-
-  local today = currentMinecraftDay()
-  local lastDay = math.floor(tonumber(rec.last_index_day) or today)
-  local elapsedDays = math.max(0, math.min(30, today - lastDay))
-  local maxDeflation = tonumber(price_oracle.max_daily_deflation) or 0.03
-  if maxDeflation < 0 then maxDeflation = 0.03 end
-  if maxDeflation > 0.25 then maxDeflation = 0.25 end
-
-  local idx = current
-  local deflation_limited = false
-  local sticky_active = false
-
-  if target_idx >= current then
-    -- Inflation is easy: raise immediately.
-    idx = target_idx
-  else
-    -- Deflation is slow and sticky. If this is the same MC day as the last
-    -- update, do not let repeated quote calls keep ratcheting prices down.
-    local allowed_floor_today = current
-    if elapsedDays > 0 then
-      allowed_floor_today = current * pow(1 - maxDeflation, elapsedDays)
-    end
-    idx = math.max(target_idx, allowed_floor_today)
-    if idx > target_idx + 0.0001 then deflation_limited = true end
-  end
-
-  if idx < sticky_floor then
-    idx = sticky_floor
-    sticky_active = true
-  end
-  idx = clamp(idx, tonumber(price_oracle.min_index) or 1, tonumber(price_oracle.max_index) or 8)
-
-  -- A post-limit price can also become the new ATH if current/target was higher.
-  ath = math.max(ath, idx)
-  sticky_floor = math.max(tonumber(price_oracle.min_index) or 1, ath * sticky_ratio)
-  if idx < sticky_floor then
-    idx = sticky_floor
-    sticky_active = true
-  end
-
-  local changed = false
-  if math.abs((tonumber(rec.ath_index) or 0) - ath) > 0.0001 then rec.ath_index = ath; changed = true end
-  if math.abs((tonumber(rec.current_index) or 0) - idx) > 0.0001 then rec.current_index = idx; changed = true end
-  if math.abs((tonumber(rec.raw_index) or 0) - target_idx) > 0.0001 then rec.raw_index = target_idx; changed = true end
-  if math.abs((tonumber(rec.sticky_floor_index) or 0) - sticky_floor) > 0.0001 then rec.sticky_floor_index = sticky_floor; changed = true end
-  if rec.last_index_day ~= today then rec.last_index_day = today; changed = true end
-  rec.sticky_active = sticky_active
-  rec.deflation_limited = deflation_limited
-  rec.last_pressure = pressure
-  rec.last_updated = timestamp()
-  if changed then savePriceOracle() end
-
-  return idx, {
-    sector = sector,
-    label = rec.label or sector,
-    monetary_pressure = pressure,
-    bank_inflation_rate = rate,
-    old_bank_price_index = bank_index,
-    price_pressure_floor = floor,
-    shock_pressure = shock,
-    sensitivity = tonumber(rec.sensitivity) or 1,
-    bias = tonumber(rec.bias) or 0,
-    raw_index = target_idx,
-    target_index = target_idx,
-    ath_index = ath,
-    current_index = idx,
-    sticky_floor_index = sticky_floor,
-    sticky_floor_from_ath = sticky_ratio,
-    max_daily_deflation = maxDeflation,
-    elapsed_days = elapsedDays,
-    sticky_active = sticky_active,
-    deflation_limited = deflation_limited,
-  }
-end
-
-local function classifyItemSector(id)
-  id = simpleItemName(id)
-  if id == "" then return "general" end
-
-  if id:find("bread",1,true) or id:find("potato",1,true) or id:find("carrot",1,true)
-    or id:find("wheat",1,true) or id:find("beef",1,true) or id:find("pork",1,true)
-    or id:find("chicken",1,true) or id:find("mutton",1,true) or id:find("rabbit",1,true)
-    or id:find("cod",1,true) or id:find("salmon",1,true) or id:find("fish",1,true)
-    or id:find("stew",1,true) or id:find("soup",1,true) or id:find("food",1,true) then
-    return "food"
-  end
-
-  if id:find("coal",1,true) or id:find("charcoal",1,true) or id:find("lava",1,true)
-    or id:find("blaze",1,true) or id:find("fuel",1,true) then
-    return "fuel"
-  end
-
-  if id:find("sword",1,true) or id:find("bow",1,true) or id:find("crossbow",1,true)
-    or id:find("armor",1,true) or id:find("helmet",1,true) or id:find("chestplate",1,true)
-    or id:find("leggings",1,true) or id:find("boots",1,true) or id:find("shield",1,true) then
-    return "defence"
-  end
-
-  if id:find("pickaxe",1,true) or id:find("shovel",1,true) or id:find("axe",1,true)
-    or id:find("hoe",1,true) or id:find("tool",1,true) then
-    return "tools"
-  end
-
-  if id:find("book",1,true) or id:find("paper",1,true) or id:find("redstone",1,true)
-    or id:find("lapis",1,true) or id:find("experience",1,true) then
-    return "research"
-  end
-
-  if id:find("log",1,true) or id:find("plank",1,true) or id:find("slab",1,true)
-    or id:find("stair",1,true) or id:find("stone",1,true) or id:find("cobble",1,true)
-    or id:find("glass",1,true) or id:find("brick",1,true) or id:find("sand",1,true)
-    or id:find("gravel",1,true) or id:find("dirt",1,true) or id:find("door",1,true)
-    or id:find("fence",1,true) or id:find("torch",1,true) or id:find("block",1,true) then
-    return "construction"
-  end
-
-  return "general"
-end
-
-local function manualBasePrice(id)
-  local key = simpleItemName(id)
-  ensurePriceOracle()
-
-  local p = prices[key] or prices["minecraft:" .. key]
-  if type(p) == "table" then p = p.unit_price or p.price or p.value end
-  p = tonumber(p)
-  if p and p > 0 then return p, "manual_price" end
-
-  p = tonumber(price_oracle.item_base_prices[key])
-  if p and p > 0 then return p, "oracle_base" end
-
-  -- Fallbacks are broad and chunky on purpose. NPCs will not bargain; the goal
-  -- is visible price width across sectors.
-  if key:find("netherite",1,true) then return 40, "fallback" end
-  if key:find("diamond",1,true) then return 20, "fallback" end
-  if key:find("emerald",1,true) then return 12, "fallback" end
-  if key:find("gold",1,true) then return 8, "fallback" end
-  if key:find("iron",1,true) then return 5, "fallback" end
-  if classifyItemSector(key) == "food" then return 1, "fallback" end
-  if classifyItemSector(key) == "fuel" then return 2, "fallback" end
-  if classifyItemSector(key) == "tools" then return 6, "fallback" end
-  if classifyItemSector(key) == "defence" then return 8, "fallback" end
-  if classifyItemSector(key) == "construction" then return 1, "fallback" end
-  return 1, "fallback"
-end
-
-local function roundPrice(n)
-  n = tonumber(n) or 0
-  if n <= 0 then return 0 end
-  return math.max(1, math.floor(n + 0.5))
-end
-
-local function quoteItemPrice(item, count, sector_override)
-  ensurePriceOracle()
-  item = simpleItemName(item)
-  count = math.max(1, math.floor(tonumber(count) or 1))
-  local base, base_source = manualBasePrice(item)
-  local sector = sector_override and lower(sector_override) or classifyItemSector(item)
-  local idx, meta = sectorIndex(sector)
-  local unit_raw = (tonumber(base) or 1) * idx * (tonumber(price_oracle.default_markup) or 1)
-  local total = roundPrice(unit_raw * count)
-  local unit_display = total / count
-  return {
-    item = item,
-    count = count,
-    sector = sector,
-    sector_label = meta.label,
-    base_unit_price = base,
-    base_source = base_source,
-    sector_index = idx,
-    raw_sector_index = meta.raw_index,
-    ath_index = meta.ath_index,
-    sticky_floor_index = meta.sticky_floor_index,
-    sticky_active = meta.sticky_active,
-    shock_pressure = meta.shock_pressure,
-    monetary_pressure = meta.monetary_pressure,
-    bank_inflation_rate = meta.bank_inflation_rate,
-    old_bank_price_index = meta.old_bank_price_index,
-    unit_price = unit_display,
-    total = total,
-    source = "wide_sector_price_oracle",
-  }
-end
-
-local function serviceTierMultiplier(service, tier, gain)
-  service = lower(service or "")
-  tier = lower(tier or "")
-  gain = tonumber(gain) or nil
-
-  if service == "dining_meal" then
-    if gain then
-      if gain >= 13 then return 2.00, "full refill" end
-      if gain >= 9 then return 1.50, "large meal" end
-      if gain >= 5 then return 1.00, "normal meal" end
-      if gain >= 2 then return 0.50, "snack" end
-      return 0, "none"
-    end
-    if tier:find("full",1,true) then return 2.00, "full refill" end
-    if tier:find("large",1,true) then return 1.50, "large meal" end
-    if tier:find("snack",1,true) or tier:find("small",1,true) then return 0.50, "snack" end
-    return 1.00, "normal meal"
-  end
-
-  return tonumber(tier) or 1.00, tier ~= "" and tier or "standard"
-end
-
-local function quoteServicePrice(service, tier, gain, sector_override)
-  ensurePriceOracle()
-  service = lower(service or "")
-  local def = price_oracle.service_prices[service] or { label=service, sector="general", base=1, min_price=1 }
-  local mult, tier_label = serviceTierMultiplier(service, tier, gain)
-  local sector = sector_override or def.sector or "general"
-  local idx, meta = sectorIndex(sector)
-  local raw = (tonumber(def.base) or 1) * idx * (tonumber(mult) or 1)
-  local min_price = tonumber(def.min_price) or 1
-  local total = raw > 0 and math.max(min_price, roundPrice(raw)) or 0
-
-  return {
-    service = service,
-    label = def.label or service,
-    tier = tier_label,
-    tier_multiplier = mult,
-    sector = sector,
-    sector_label = meta.label,
-    base_price = tonumber(def.base) or 1,
-    sector_index = idx,
-    raw_sector_index = meta.raw_index,
-    ath_index = meta.ath_index,
-    sticky_floor_index = meta.sticky_floor_index,
-    sticky_active = meta.sticky_active,
-    shock_pressure = meta.shock_pressure,
-    monetary_pressure = meta.monetary_pressure,
-    bank_inflation_rate = meta.bank_inflation_rate,
-    old_bank_price_index = meta.old_bank_price_index,
-    raw = raw,
-    total = total,
-    source = "wide_sector_price_oracle",
-  }
-end
-
-local function sectorIndexSnapshot()
-  ensurePriceOracle()
-  local out = {}
-  for sector, _ in pairs(price_oracle.sectors or {}) do
-    local idx, meta = sectorIndex(sector)
-    out[sector] = {
-      index = idx,
-      label = meta.label,
-      monetary_pressure = meta.monetary_pressure,
-      bank_inflation_rate = meta.bank_inflation_rate,
-      old_bank_price_index = meta.old_bank_price_index,
-      price_pressure_floor = meta.price_pressure_floor,
-      shock_pressure = meta.shock_pressure,
-      raw_index = meta.raw_index,
-      ath_index = meta.ath_index,
-      sticky_floor_index = meta.sticky_floor_index,
-      sticky_floor_from_ath = meta.sticky_floor_from_ath,
-      max_daily_deflation = meta.max_daily_deflation,
-      deflation_limited = meta.deflation_limited,
-      current_index = meta.current_index,
-      target_index = meta.target_index,
-      sticky_active = meta.sticky_active,
-      sensitivity = meta.sensitivity,
-      bias = meta.bias,
-    }
-  end
-  return out
-end
-
-recordMoneyPrintShock = function(amount, issued_before, issued_after, tx_id)
-  amount = tonumber(amount) or 0
-  issued_before = tonumber(issued_before) or 0
-  issued_after = tonumber(issued_after) or issued_before
-  if amount <= 0 then return false end
-
-  ensurePriceOracle()
-  tx_id = tx_id and tostring(tx_id) or nil
-  price_oracle.processed_mint_tx = type(price_oracle.processed_mint_tx) == "table" and price_oracle.processed_mint_tx or {}
-  if tx_id and price_oracle.processed_mint_tx[tx_id] then
-    return false, "mint shock already processed"
-  end
-  local denominator = math.max(1000, issued_before)
-  local growth = amount / denominator
-  if growth < 0 then growth = 0 end
-
-  -- Log scaling keeps absurd mints from instantly making every item impossible,
-  -- but still makes a 250k print from a tiny economy hurt immediately.
-  local sensitivity = tonumber(price_oracle.money_print_sensitivity) or 0.45
-  local added = math.log(1 + growth) * sensitivity
-  local cap = tonumber(price_oracle.max_shock_pressure) or 3.0
-  if added > cap then added = cap end
-
-  local old = tonumber(price_oracle.shock_pressure) or 0
-  local newShock = old + added
-  if newShock > cap then newShock = cap end
-  price_oracle.shock_pressure = newShock
-  price_oracle.last_money_print = {
-    time = timestamp(),
-    day = currentMinecraftDay(),
-    tx_id = tx_id,
-    amount = amount,
-    issued_before = issued_before,
-    issued_after = issued_after,
-    growth_vs_prior_supply = growth,
-    added_pressure = added,
-    old_shock_pressure = old,
-    new_shock_pressure = newShock,
-    note = "Money-printing shock. Sector ATH indices update immediately; deflation cannot cut below sticky ATH floor.",
-  }
-
-  if tx_id then price_oracle.processed_mint_tx[tx_id] = true end
-
-  -- Force each sector to record the new ATH now rather than waiting for a quote.
-  for sector, _ in pairs(price_oracle.sectors or {}) do
-    sectorIndex(sector)
-  end
-  savePriceOracle()
-  return true, price_oracle.last_money_print
-end
-
-decayPriceOracleShock = function(elapsed_days)
-  elapsed_days = math.max(0, math.floor(tonumber(elapsed_days) or 0))
-  if elapsed_days <= 0 then return false end
-  ensurePriceOracle()
-  local old = tonumber(price_oracle.shock_pressure) or 0
-  if old <= 0 then return false end
-  local decay = tonumber(price_oracle.shock_decay_per_mc_day) or 0.82
-  if decay < 0 then decay = 0.82 end
-  if decay > 1 then decay = 1 end
-  local newShock = old * pow(decay, elapsed_days)
-  if newShock < 0.001 then newShock = 0 end
-  price_oracle.shock_pressure = newShock
-  price_oracle.last_shock_decay = {
-    time = timestamp(),
-    day = currentMinecraftDay(),
-    elapsed_days = elapsed_days,
-    old_shock_pressure = old,
-    new_shock_pressure = newShock,
-    sticky_note = "Raw shock decays, but live sector indices remain no lower than 75% of ATH by default.",
-  }
-  for sector, _ in pairs(price_oracle.sectors or {}) do
-    sectorIndex(sector)
-  end
-  savePriceOracle()
-  return true, price_oracle.last_shock_decay
-end
-
-local function processUnprocessedMintLedgerShocks()
-  ensurePriceOracle()
-  price_oracle.processed_mint_tx = type(price_oracle.processed_mint_tx) == "table" and price_oracle.processed_mint_tx or {}
-
-  local issued = 0
-  local processed = 0
-  local skipped = 0
-  for _, line in ipairs(readLines(FILE.ledger)) do
-    local tx_id, ts, tx_type, from_id, to_id, amount, memo, status =
-      line:match("(TX%-%d+)%s*|%s*(%d+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*(%-?%d+)%s*|%s*([^|]+)%s*|%s*(.+)")
-    if tx_id then
-      tx_type = trim(tx_type)
-      status = trim(status)
-      amount = tonumber(amount) or 0
-      if status == "settled" and tx_type == "MINT" and amount > 0 then
-        if not price_oracle.processed_mint_tx[tx_id] then
-          recordMoneyPrintShock(amount, issued, issued + amount, tx_id)
-          processed = processed + 1
-        else
-          skipped = skipped + 1
-        end
-        issued = issued + amount
-      elseif status == "settled" and tx_type == "BURN" and amount > 0 then
-        issued = math.max(0, issued - amount)
-      end
-    end
-  end
-
-  price_oracle.last_mint_ledger_import = {
-    time = timestamp(),
-    processed = processed,
-    skipped = skipped,
-    note = "Imported unprocessed historical MINT transactions into sticky price oracle.",
-  }
-  if processed > 0 then savePriceOracle() end
-  return processed, skipped
-end
-
-
--- =============================================================================
--- GOVERNMENT WORKER PAY RATES
--- Stored in config.worker_pay_rates and managed from FiscalControls.
---
--- Public-sector pay is intentionally separate from private company payroll.
--- =============================================================================
-local DEFAULT_WORKER_PAY_RATES = {
-  defence = {
-    unskilled = 2,
-    skilled = 3,
-    elite = 4,
-  },
-  research = {
-    skilled = 3,
-    elite = 5,
-  },
-  logistics = {
-    unskilled = 1,
-    skilled = 2,
-  },
-}
-
-local function copyWorkerPayDefaults()
-  local out = {}
-  for sector, tiers in pairs(DEFAULT_WORKER_PAY_RATES) do
-    out[sector] = {}
-    for tier, amount in pairs(tiers) do
-      out[sector][tier] = amount
-    end
-  end
-  return out
-end
-
-local function normaliseWorkerPayRates(src)
-  src = type(src) == "table" and src or {}
-  local out = copyWorkerPayDefaults()
-
-  -- Backwards compatibility with the old flat keys.
-  if src.researcher then out.research.skilled = math.floor(tonumber(src.researcher) or out.research.skilled) end
-  if src.soldier then out.defence.skilled = math.floor(tonumber(src.soldier) or out.defence.skilled) end
-  if src.courier then out.logistics.unskilled = math.floor(tonumber(src.courier) or out.logistics.unskilled) end
-
-  for sector, tiers in pairs(DEFAULT_WORKER_PAY_RATES) do
-    if type(src[sector]) == "table" then
-      for tier, _ in pairs(tiers) do
-        local n = tonumber(src[sector][tier])
-        if n and n > 0 then out[sector][tier] = math.floor(n) end
-      end
-    end
-  end
-
-  -- Compatibility fields for old payroll terminals.
-  out.researcher = out.research.skilled
-  out.soldier = out.defence.skilled
-  out.courier = out.logistics.unskilled
-
-  return out
-end
-
-local function ensureWorkerPayRates()
-  config.worker_pay_rates = normaliseWorkerPayRates(config.worker_pay_rates)
-  return config.worker_pay_rates
-end
-
--- =============================================================================
--- PRIVATE GDP / ACTIVITY ESTIMATION
--- Company payroll uses this as a simple rolling prosperity signal.
--- =============================================================================
-local function isGovernmentAccount(id)
-  id = tostring(id or "")
-  return id == "SYSTEM"
-    or id == "treasury:quid_bank"
-    or id == "market:escrow"
-    or id == "contract:escrow"
-    or id:find("^treasury:") ~= nil
-end
-
-local GDP_TX_TYPES = {
-  COMPANY_PAYROLL = true,
-  COMPANY_TRANSFER = true,
-  CONTRACT_PAYOUT = true,
-  CONTRACT_REWARD = true,
-  PRIVATE_SERVICE = true,
-  LIVING_COST = true,
-  HOSPITALITY_MEAL = true,
-  TRANSFER = true,
-}
-
-local function isPrivateGDPTransaction(tx_type, from_id, to_id)
-  tx_type = trim(tx_type)
-  from_id = trim(from_id)
-  to_id = trim(to_id)
-
-  if tx_type == "MINT" or tx_type == "BURN" or tx_type == "GRANT" then return false end
-  if tx_type == "COMPANY_DEPOSIT" or tx_type == "COMPANY_WITHDRAW" then return false end
-  if isGovernmentAccount(from_id) or isGovernmentAccount(to_id) then return false end
-
-  return GDP_TX_TYPES[tx_type] == true
-end
-
-local function calculatePrivateGDP(window_ms)
-  window_ms = tonumber(window_ms) or (7 * 1200000)
-  local cutoff = timestamp() - window_ms
+local function calculateTopShare(values, fraction)
+  if type(values) ~= "table" or #values == 0 then return nil end
+  fraction = fraction or 0.1
+  table.sort(values, function(a, b) return a > b end)
   local total = 0
-  local count = 0
-  local by_type = {}
-
-  for _, line in ipairs(readLines(FILE.ledger)) do
-    local tx_id, ts, tx_type, from_id, to_id, amount, memo, status =
-      line:match("(TX%-%d+)%s*|%s*(%d+)%s*|%s*(%S+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*(%-?%d+)%s*|%s*([^|]+)%s*|%s*(.+)")
-    if tx_id then
-      ts = tonumber(ts) or 0
-      amount = tonumber(amount) or 0
-      status = trim(status)
-      tx_type = trim(tx_type)
-      from_id = trim(from_id)
-      to_id = trim(to_id)
-
-      if status == "settled" and ts >= cutoff and amount > 0 and isPrivateGDPTransaction(tx_type, from_id, to_id) then
-        total = total + amount
-        count = count + 1
-        by_type[tx_type] = (by_type[tx_type] or 0) + amount
-      end
-    end
-  end
-
-  local population = 0
-  for id, c in pairs(citizens or {}) do
-    if c.status == "active" then population = population + 1 end
-  end
-  if population <= 0 then
-    for id, acc in pairs(accounts or {}) do
-      if acc.type == "citizen" and acc.status == "active" then population = population + 1 end
-    end
-  end
-
-  local per_capita = 0
-  if population > 0 then per_capita = math.floor(total / population) end
-
-  return {
-    window_ms = window_ms,
-    private_gdp = math.floor(total),
-    gdp = math.floor(total),
-    gdp_per_capita = per_capita,
-    population = population,
-    transaction_count = count,
-    by_type = by_type,
-    note = "Private GDP estimate from recent non-government settled transaction flow."
-  }
+  for _, v in ipairs(values) do total = total + (tonumber(v) or 0) end
+  if total <= 0 then return 0 end
+  local take = math.max(1, math.ceil(#values * fraction))
+  local top = 0
+  for i = 1, take do top = top + (tonumber(values[i]) or 0) end
+  return (top / total) * 100
 end
 
--- =============================================================================
--- REQUEST HANDLERS
--- =============================================================================
-local handlers = {}
-
--- PING
-handlers["ping"] = function(sender_id, req)
-  return true, {
-    message  = "Quid Bank of Plenty DB online",
-    version  = VERSION,
-    time     = timestamp(),
-    computer = os.getComputerID(),
-    label    = os.getComputerLabel()
-  }
+local function growthPct(current, previous)
+  current = tonumber(current)
+  previous = tonumber(previous)
+  if not current or not previous or previous == 0 then return nil end
+  return ((current / previous) - 1) * 100
 end
 
--- LOGIN — username + password
-handlers["login"] = function(sender_id, req)
-  local ok, citizen_id, citizen = authenticateUser(req.username, req.password)
-  if not ok then
-    audit("ACCESS", req.username or "UNKNOWN", sender_id, "LOGIN", "failed: " .. tostring(citizen_id))
-    return false, citizen_id  -- citizen_id holds error string on failure
-  end
-  local balance = deriveBalance(citizen_id)
-  audit("ACCESS", citizen_id, sender_id, "LOGIN", "success")
-  return true, {
-    citizen_id   = citizen_id,
-    display_name = citizen.display_name,
-    username     = req.username,
-    title        = citizen.title or "Account Holder",
-    balance      = balance,
-  }
-end
-
--- CREATE_ACCOUNT — self-registration, instant activation
-handlers["create_account"] = function(sender_id, req)
-  local display_name = req.display_name
-  local username     = req.username
-  local password     = req.password
-
-  if not display_name or not username or not password then
-    return false, "Missing display_name, username, or password"
-  end
-  if #username < 3 then
-    return false, "Username must be at least 3 characters"
-  end
-  if #password < 4 then
-    return false, "Password must be at least 4 characters"
+local function getAdaptiveInflationBase(issued)
+  issued = tonumber(issued)
+  if not issued or issued <= 0 then
+    return nil, "Awaiting issued money supply"
   end
 
-  local key        = string.lower(username):gsub("%s+", "_")
-  local citizen_id = "citizen:" .. key
+  local now = nowMs()
+  local state = readTable(INFLATION_BASE_FILE)
 
-  if citizens[citizen_id] then
-    return false, "Username already taken"
+  -- Backwards-compatible with v0.5.1, which stored issued_supply as a fixed baseline.
+  local baseIssued = nil
+  if type(state) == "table" then
+    baseIssued = tonumber(state.base_issued_supply or state.issued_supply)
   end
 
-  -- Create citizen record
-  citizens[citizen_id] = {
-    display_name  = display_name,
-    username      = key,
-    password_hash = simpleHash(password),
-    joined        = timestamp(),
-    status        = "active",
-    title         = "Account Holder"
-  }
-  saveCitizens()
-
-  -- Create bank account
-  local ok, result = createAccount(citizen_id, "citizen", display_name, citizen_id)
-  if not ok then
-    citizens[citizen_id] = nil
-    saveCitizens()
-    return false, "Account creation failed: " .. tostring(result)
-  end
-
-  audit("ACTION", citizen_id, sender_id, "CREATE_ACCOUNT", citizen_id)
-
-  -- Return same payload as login so client can auto-login
-  return true, {
-    citizen_id   = citizen_id,
-    display_name = display_name,
-    username     = key,
-    title        = "Account Holder",
-    balance      = 0,
-    message      = "Account created successfully"
-  }
-end
-
--- BALANCE
-handlers["balance"] = function(sender_id, req)
-  local ok, citizen_id, citizen = authenticateUser(req.username, req.password)
-  if not ok then return false, citizen_id end
-
-  local target = req.account_id or citizen_id
-  if target ~= citizen_id and not isTrustedManagement(sender_id) then
-    return false, "Unauthorised"
-  end
-  if not accountExists(target) then return false, "Account not found" end
-
-  local balance = deriveBalance(target)
-  audit("ACTION", citizen_id, sender_id, "BALANCE:" .. target, "ok:" .. balance)
-  return true, {
-    account_id   = target,
-    display_name = accounts[target] and accounts[target].display_name or target,
-    balance      = balance,
-    time         = timestamp()
-  }
-end
-
--- TRANSFER
-handlers["transfer"] = function(sender_id, req)
-  local ok, citizen_id, citizen = authenticateUser(req.username, req.password)
-  if not ok then return false, citizen_id end
-
-  local from_id = citizen_id
-  local to_id   = req.to_id
-  local amount  = tonumber(req.amount)
-  local memo    = req.memo or ""
-
-  if not to_id   then return false, "Missing destination account" end
-  if not amount or amount <= 0 then return false, "Invalid amount" end
-
-  -- Resolve friendly username to account id if needed
-  -- Accepts either "citizen:josh" or just "josh"
-  if not to_id:find(":") then
-    local resolved = "citizen:" .. string.lower(to_id):gsub("%s+","_")
-    if accountExists(resolved) then
-      to_id = resolved
-    end
-  end
-
-  if not accountExists(to_id) then
-    return false, "Recipient account not found: " .. tostring(to_id)
-  end
-  if to_id == from_id then
-    return false, "Cannot transfer to yourself"
-  end
-
-  return transfer(from_id, to_id, amount, "TRANSFER", memo, citizen_id)
-end
-
--- LEDGER_HISTORY
-handlers["ledger_history"] = function(sender_id, req)
-  local ok, citizen_id, citizen = authenticateUser(req.username, req.password)
-  if not ok then return false, citizen_id end
-
-  local target = citizen_id
-  local limit  = tonumber(req.limit) or 20
-
-  local lines   = readLines(FILE.ledger)
-  local results = {}
-  for _, line in ipairs(lines) do
-    local tx_id, ts, tx_type, from_id, to_id, amount, memo, status =
-      line:match("(TX%-%d+)%s*|%s*(%d+)%s*|%s*(%S+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*(%d+)%s*|%s*([^|]+)%s*|%s*(.+)")
-    if tx_id then
-      from_id = from_id:match("^%s*(.-)%s*$")
-      to_id   = to_id:match("^%s*(.-)%s*$")
-      if from_id == target or to_id == target then
-        results[#results+1] = {
-          tx_id     = tx_id,
-          time      = tonumber(ts),
-          type      = tx_type:match("^%s*(.-)%s*$"),
-          from      = from_id,
-          to        = to_id,
-          amount    = tonumber(amount) or 0,
-          memo      = memo:match("^%s*(.-)%s*$"),
-          status    = status:match("^%s*(.-)%s*$"),
-          direction = (to_id == target) and "IN" or "OUT"
-        }
-      end
-    end
-  end
-
-  local out   = {}
-  local start = math.max(1, #results - limit + 1)
-  for i = #results, start, -1 do out[#out+1] = results[i] end
-
-  return true, {
-    account_id = target,
-    balance    = deriveBalance(target),
-    history    = out,
-    count      = #out
-  }
-end
-
--- TREASURY_HISTORY
--- State-facing read-only transaction feed for expenditure/income monitors.
--- No citizen login required because this is treasury-wide public state accounting.
-handlers["treasury_history"] = function(sender_id, req)
-  local target = (req and req.account_id) or "treasury:quid_bank"
-  local limit  = tonumber(req and req.limit) or 250
-  if limit < 1 then limit = 1 end
-  if limit > 1000 then limit = 1000 end
-
-  local lines   = readLines(FILE.ledger)
-  local results = {}
-
-  for _, line in ipairs(lines) do
-    local tx_id, ts, tx_type, from_id, to_id, amount, memo, status =
-      line:match("(TX%-%d+)%s*|%s*(%d+)%s*|%s*(%S+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*(%d+)%s*|%s*([^|]+)%s*|%s*(.+)")
-
-    if tx_id then
-      from_id = from_id:match("^%s*(.-)%s*$")
-      to_id   = to_id:match("^%s*(.-)%s*$")
-      tx_type = tx_type:match("^%s*(.-)%s*$")
-
-      if from_id == target or to_id == target or (target == "treasury:quid_bank" and (from_id == "SYSTEM" or to_id == "SYSTEM")) then
-        local direction = "OTHER"
-        if to_id == target then
-          direction = "IN"
-        elseif from_id == target then
-          direction = "OUT"
-        elseif from_id == "SYSTEM" and tx_type == "MINT" then
-          direction = "MINT"
-        elseif to_id == "SYSTEM" and tx_type == "BURN" then
-          direction = "BURN"
-        end
-
-        results[#results+1] = {
-          tx_id     = tx_id,
-          time      = tonumber(ts),
-          type      = tx_type,
-          from      = from_id,
-          to        = to_id,
-          amount    = tonumber(amount) or 0,
-          memo      = memo:match("^%s*(.-)%s*$"),
-          status    = status:match("^%s*(.-)%s*$"),
-          direction = direction
-        }
-      end
-    end
-  end
-
-  local out   = {}
-  local start = math.max(1, #results - limit + 1)
-  for i = #results, start, -1 do
-    out[#out+1] = results[i]
-  end
-
-  return true, {
-    account_id = target,
-    balance    = deriveBalance(target),
-    history    = out,
-    count      = #out,
-    total_seen = #results
-  }
-end
-
--- LIST_ACCOUNTS
-handlers["list_accounts"] = function(sender_id, req)
-  local result = {}
-  for id, acc in pairs(accounts) do
-    result[#result+1] = {
-      account_id   = id,
-      type         = acc.type,
-      display_name = acc.display_name,
-      owner_id     = acc.owner_id,
-      status       = acc.status,
-      balance      = deriveBalance(id)
+  if type(state) ~= "table" or not baseIssued or baseIssued <= 0 then
+    state = {
+      base_issued_supply = issued,
+      last_issued_supply = issued,
+      created = now,
+      updated = now,
+      half_life_ms = INFLATION_HALF_LIFE_MS,
+      note = "Adaptive inflation baseline. Without new printing, the current supply slowly becomes the baseline.",
     }
-  end
-  table.sort(result, function(a,b) return (a.balance or 0) > (b.balance or 0) end)
-  audit("ACTION", "STATE", sender_id, "LIST_ACCOUNTS", tostring(#result))
-  return true, { accounts = result, count = #result }
-end
-
--- MINT
-handlers["mint"] = function(sender_id, req)
-  local to_id  = req.to_id or "treasury:quid_bank"
-  local amount = tonumber(req.amount)
-  local memo   = req.memo or "Treasury mint"
-  if not amount or amount <= 0 then return false, "Invalid amount" end
-  if not accountExists(to_id) then return false, "Destination account not found" end
-  return transfer("SYSTEM", to_id, amount, "MINT", memo, "STATE:" .. sender_id)
-end
-
--- BURN
-handlers["burn"] = function(sender_id, req)
-  local from_id = req.from_id or "treasury:quid_bank"
-  local amount  = tonumber(req.amount)
-  local memo    = req.memo or "Treasury burn"
-  if not amount or amount <= 0 then return false, "Invalid amount" end
-  if not accountExists(from_id) then return false, "Source account not found" end
-  return transfer(from_id, "SYSTEM", amount, "BURN", memo, "STATE:" .. sender_id)
-end
-
--- GRANT
-handlers["grant"] = function(sender_id, req)
-  local to_id  = req.to_id
-  local amount = tonumber(req.amount)
-  local memo   = req.memo or "Treasury grant"
-  if not to_id or not amount then return false, "Missing to_id or amount" end
-  return transfer("treasury:quid_bank", to_id, amount, "GRANT", memo, "STATE:" .. sender_id)
-end
-
--- SUPPLY
-handlers["supply"] = function(sender_id, req)
-  audit("ACTION", "STATE", sender_id, "SUPPLY", "ok")
-  return true, deriveMonetarySupply()
-end
-
--- GET_INFLATION_STATE
-handlers["get_inflation_state"] = function(sender_id, req)
-  ensureInflationState()
-  return true, { state = inflation_state }
-end
-
--- TICK_INFLATION
--- Called by monitor/payroll once per Minecraft day. Safe to call repeatedly;
--- it only advances when os.day() has moved forward.
-handlers["tick_inflation"] = function(sender_id, req)
-  local changed, state, elapsed = tickInflation(req and req.day)
-  local oracle_decay = nil
-  if decayPriceOracleShock and elapsed and elapsed > 0 then
-    local okDecay, decayInfo = pcall(decayPriceOracleShock, elapsed)
-    if okDecay then oracle_decay = decayInfo end
-  end
-  audit("ACTION", "STATE", sender_id, "TICK_INFLATION", "changed=" .. tostring(changed) .. " elapsed=" .. tostring(elapsed))
-  return true, { changed = changed, elapsed_days = elapsed, state = state, oracle_decay = oracle_decay }
-end
-
--- SET_INFLATION_POLICY
-handlers["set_inflation_policy"] = function(sender_id, req)
-  ensureInflationState()
-  inflation_state.policy = copyPolicy(req and req.policy or req)
-  inflation_state.updated = timestamp()
-  saveInflation()
-  audit("ACTION", "STATE", sender_id, "SET_INFLATION_POLICY", "ok")
-  return true, { state = inflation_state }
-end
-
-
--- ECONOMIC_GDP
-handlers["economic_gdp"] = function(sender_id, req)
-  local days = tonumber(req and req.days) or 7
-  if days < 1 then days = 1 end
-  if days > 30 then days = 30 end
-  local window_ms = days * 1200000
-  local snap = calculatePrivateGDP(window_ms)
-  snap.days = days
-  return true, snap
-end
-
-
--- SYNC_EMPLOYEE_MAPPINGS
--- ColonyBusinessIntegrator is the live source of truth for citizen -> employer mapping.
--- This lets CompanyPayroll run on a separate terminal without a colony integrator
--- or local mapping files.
-handlers["sync_employee_mappings"] = function(sender_id, req)
-  local incoming = req and (req.employees or req.mappings) or {}
-  if type(incoming) ~= "table" then return false, "Missing employees table" end
-
-  local now_ts = timestamp()
-  local seen = {}
-  local updated = 0
-  local active = 0
-
-  for _, e in ipairs(incoming) do
-    if type(e) == "table" and e.citizen_id and e.company_id then
-      local citizen_id = tostring(e.citizen_id)
-      local company_id = tostring(e.company_id)
-      if accountExists(citizen_id) and accountExists(company_id) and companies[company_id] then
-        local rec = employment_mappings[citizen_id] or {}
-        rec.citizen_id = citizen_id
-        rec.display_name = e.display_name or e.name or rec.display_name or citizen_id
-        rec.job_text = e.job_text or e.title or e.job or rec.job_text or ""
-        rec.industry = e.industry or rec.industry or "general"
-        rec.company_id = company_id
-        rec.company_name = e.company_name or rec.company_name or company_id
-        rec.building_key = e.building_key or rec.building_key
-        rec.work_type = e.work_type or rec.work_type
-        rec.work_name = e.work_name or rec.work_name
-        rec.work_location = e.work_location or rec.work_location
-        rec.active = e.active ~= false
-        rec.source = "ColonyBusinessIntegrator:" .. tostring(sender_id)
-        rec.updated_at = now_ts
-        employment_mappings[citizen_id] = rec
-        seen[citizen_id] = true
-        updated = updated + 1
-        if rec.active then active = active + 1 end
-      end
-    end
+    writeTable(INFLATION_BASE_FILE, state)
+    return issued, "Adaptive monetary inflation baseline created"
   end
 
-  local source_prefix = "ColonyBusinessIntegrator:" .. tostring(sender_id)
-  for citizen_id, rec in pairs(employment_mappings) do
-    if rec.source == source_prefix and not seen[citizen_id] then
-      rec.active = false
-      rec.missing_since = rec.missing_since or now_ts
-    end
+  local lastUpdate = tonumber(state.updated or state.created or now) or now
+  local elapsed = math.max(0, now - lastUpdate)
+
+  -- Exponential taper: after each half-life, half of the remaining inflation pressure fades.
+  local alpha = 0
+  if elapsed > 0 then
+    alpha = 1 - pow(0.5, elapsed / INFLATION_HALF_LIFE_MS)
+    alpha = clamp(alpha, 0, 1)
   end
 
-  saveEmployment()
-  audit("ACTION", "STATE", sender_id, "SYNC_EMPLOYEE_MAPPINGS", tostring(updated))
-  return true, { updated = updated, active = active, total = updated }
+  local newBase = baseIssued + ((issued - baseIssued) * alpha)
+  if newBase <= 0 then newBase = issued end
+
+  state.base_issued_supply = newBase
+  state.last_issued_supply = issued
+  state.updated = now
+  state.half_life_ms = INFLATION_HALF_LIFE_MS
+  state.note = "Adaptive inflation baseline. Without new printing, current supply slowly becomes the baseline."
+  writeTable(INFLATION_BASE_FILE, state)
+
+  return newBase, nil
 end
 
--- LIST_EMPLOYEE_MAPPINGS
-handlers["list_employee_mappings"] = function(sender_id, req)
-  local result = {}
-  local active_only = not (req and req.include_inactive == true)
-  for citizen_id, rec in pairs(employment_mappings) do
-    if (not active_only) or rec.active ~= false then
-      local row = {}
-      for k, v in pairs(rec) do row[k] = v end
-      row.balance = deriveBalance(citizen_id)
-      result[#result+1] = row
-    end
-  end
-  table.sort(result, function(a,b)
-    return tostring(a.display_name or a.citizen_id or "") < tostring(b.display_name or b.citizen_id or "")
-  end)
-  return true, { employees = result, count = #result }
-end
-
-
-
--- PAYROLL_SOURCE_FOR_CITIZEN
--- Finds the latest company that actually paid this citizen through COMPANY_PAYROLL.
--- This uses the ledger, not employment mappings, because payroll transactions are
--- the authoritative "who actually pays this worker" trail.
-handlers["payroll_source_for_citizen"] = function(sender_id, req)
-  local citizen_id = tostring(req and req.citizen_id or "")
-  local limit = tonumber(req and req.limit) or 1000
-  if citizen_id == "" then return false, "Missing citizen_id" end
-  if limit < 1 then limit = 1 end
-  if limit > 5000 then limit = 5000 end
-
-  local lines = readLines(FILE.ledger)
-  local checked = 0
-
-  for i = #lines, 1, -1 do
-    local line = lines[i]
-    local tx_id, ts, tx_type, from_id, to_id, amount, memo, status =
-      line:match("(TX%-%d+)%s*|%s*(%d+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*(%d+)%s*|%s*([^|]+)%s*|%s*(.+)")
-
-    if tx_id then
-      checked = checked + 1
-      tx_type = tostring(tx_type or ""):match("^%s*(.-)%s*$")
-      from_id = tostring(from_id or ""):match("^%s*(.-)%s*$")
-      to_id = tostring(to_id or ""):match("^%s*(.-)%s*$")
-
-      if tx_type == "COMPANY_PAYROLL" and to_id == citizen_id then
-        local company = companies[from_id] or {}
-        return true, {
-          citizen_id = citizen_id,
-          company_id = from_id,
-          company_name = company.name or company.display_name or from_id,
-          ticker = company.ticker,
-          tx_id = tx_id,
-          time = tonumber(ts),
-          amount = tonumber(amount) or 0,
-          memo = tostring(memo or ""):match("^%s*(.-)%s*$"),
-          checked = checked,
-        }
-      end
-
-      if checked >= limit then break end
-    end
-  end
-
-  return false, "No COMPANY_PAYROLL transaction found for " .. citizen_id
-end
-
--- LIST_COMPANY_PAYROLL_PAYEES
--- Returns the distinct citizens actually paid by a company through COMPANY_PAYROLL.
-handlers["list_company_payroll_payees"] = function(sender_id, req)
-  local company_id = tostring(req and req.company_id or "")
-  local limit = tonumber(req and req.limit) or 2000
-  if company_id == "" then return false, "Missing company_id" end
-  if limit < 1 then limit = 1 end
-  if limit > 5000 then limit = 5000 end
-
-  local lines = readLines(FILE.ledger)
-  local seen = {}
-  local rows = {}
-  local checked = 0
-
-  for i = #lines, 1, -1 do
-    local line = lines[i]
-    local tx_id, ts, tx_type, from_id, to_id, amount, memo, status =
-      line:match("(TX%-%d+)%s*|%s*(%d+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*(%d+)%s*|%s*([^|]+)%s*|%s*(.+)")
-
-    if tx_id then
-      checked = checked + 1
-      tx_type = tostring(tx_type or ""):match("^%s*(.-)%s*$")
-      from_id = tostring(from_id or ""):match("^%s*(.-)%s*$")
-      to_id = tostring(to_id or ""):match("^%s*(.-)%s*$")
-
-      if tx_type == "COMPANY_PAYROLL" and from_id == company_id and to_id ~= "" and not seen[to_id] then
-        seen[to_id] = true
-        local emp = employment_mappings[to_id] or {}
-        rows[#rows+1] = {
-          citizen_id = to_id,
-          display_name = emp.display_name or to_id,
-          job_text = emp.job_text or "",
-          company_id = company_id,
-          company_name = (companies[company_id] and (companies[company_id].name or companies[company_id].display_name)) or company_id,
-          tx_id = tx_id,
-          time = tonumber(ts),
-          amount = tonumber(amount) or 0,
-          memo = tostring(memo or ""):match("^%s*(.-)%s*$"),
-          source = "ledger_company_payroll",
-        }
-      end
-
-      if checked >= limit then break end
-    end
-  end
-
-  table.sort(rows, function(a, b)
-    return tostring(a.display_name or a.citizen_id) < tostring(b.display_name or b.citizen_id)
-  end)
-
-  return true, {
-    company_id = company_id,
-    payees = rows,
-    count = #rows,
-    checked = checked,
-  }
-end
-
--- COMPANY_PAYROLL
--- Private-sector payroll only. Allows company overdraft by design.
-handlers["company_payroll"] = function(sender_id, req)
-  local company_id = req.company_id
-  local citizen_id = req.citizen_id
-  local amount = tonumber(req.amount)
-  local memo = req.memo or "Company payroll"
-
-  if not company_id or company_id == "" then return false, "Missing company_id" end
-  if not citizen_id or citizen_id == "" then return false, "Missing citizen_id" end
-  if not amount or amount <= 0 then return false, "Invalid amount" end
-  amount = math.floor(amount)
-  if amount <= 0 then return false, "Invalid integer amount" end
-
-  if not accountExists(company_id) then return false, "Company account not found: " .. tostring(company_id) end
-  if not accountExists(citizen_id) then return false, "Citizen account not found: " .. tostring(citizen_id) end
-  if not companies[company_id] then return false, "Company not registered: " .. tostring(company_id) end
-  if not citizens[citizen_id] then return false, "Citizen not registered: " .. tostring(citizen_id) end
-
-  local cacc = accounts[company_id]
-  local zacc = accounts[citizen_id]
-  if not cacc or cacc.type ~= "company" then return false, "Source is not a company account" end
-  if not zacc or zacc.type ~= "citizen" then return false, "Destination is not a citizen account" end
-
-  return transfer(company_id, citizen_id, amount, "COMPANY_PAYROLL", memo, "COMPANY_PAYROLL:" .. tostring(sender_id), true)
-end
-
-
-
--- HOSPITALITY_MEAL_PAYMENT
--- System-side charge for inferred Dining Hall / Restaurant meal events.
--- Does not overdraft the citizen and does not auto-charge the treasury.
--- If the citizen cannot cover the full meal, the paid amount is transferred and
--- the unpaid shortfall is returned to the POS terminal for local receivables tracking.
-handlers["hospitality_meal_payment"] = function(sender_id, req)
-  local citizen_id = req.citizen_id
-  local company_id = req.company_id
-  local amount = tonumber(req.amount)
-  local item = tostring(req.item or "meal")
-  local memo = req.memo or ("Hospitality meal: " .. item)
-
-  if not citizen_id or citizen_id == "" then return false, "Missing citizen_id" end
-  if not company_id or company_id == "" then return false, "Missing company_id" end
-  if not amount or amount <= 0 then return false, "Invalid amount" end
-  amount = math.floor(amount)
-  if amount <= 0 then return false, "Invalid integer amount" end
-
-  if not accountExists(citizen_id) then return false, "Citizen account not found: " .. tostring(citizen_id) end
-  if not accountExists(company_id) then return false, "Hospitality company account not found: " .. tostring(company_id) end
-
-  local zacc = accounts[citizen_id]
-  local cacc = accounts[company_id]
-  if not zacc or zacc.type ~= "citizen" then return false, "Source is not a citizen account" end
-  if not cacc or cacc.type ~= "company" then return false, "Destination is not a company account" end
-
-  local bal = deriveBalance(citizen_id)
-  local paid = amount
-  if bal < paid then paid = bal end
-  paid = math.floor(tonumber(paid) or 0)
-
-  local shortfall = amount - paid
-  local tx = nil
-
-  if paid > 0 then
-    local ok, res = transfer(citizen_id, company_id, paid, "HOSPITALITY_MEAL", memo, "HOSPITALITY:" .. tostring(sender_id), false)
-    if not ok then return false, res end
-    tx = res
-  end
-
-  return true, {
-    citizen_id = citizen_id,
-    company_id = company_id,
-    requested = amount,
-    paid = paid,
-    shortfall = shortfall,
-    item = item,
-    tx = tx,
-    tx_id = type(tx) == "table" and tx.tx_id or nil,
-  }
-end
-
-
--- CONTRACT_PAYOUT
--- System-side payout from the posting company to the claimant company/citizen.
--- Called by ContractServer after a contract is completed.
--- Allows poster company overdraft so a claimed obligation can still settle.
-handlers["contract_payout"] = function(sender_id, req)
-  local from_id = req.from_id or req.poster
-  local to_id = req.to_id or req.claimant
-  local amount = tonumber(req.amount)
-  local contract_id = tostring(req.contract_id or "")
-  local memo = req.memo or ("Contract payout " .. contract_id)
-
-  if not from_id or from_id == "" then return false, "Missing from_id/poster" end
-  if not to_id or to_id == "" then return false, "Missing to_id/claimant" end
-  if not amount or amount <= 0 then return false, "Invalid amount" end
-  amount = math.floor(amount)
-  if amount <= 0 then return false, "Invalid integer amount" end
-
-  if not accountExists(from_id) then return false, "Poster account not found: " .. tostring(from_id) end
-  if not accountExists(to_id) then return false, "Claimant account not found: " .. tostring(to_id) end
-
-  return transfer(from_id, to_id, amount, "CONTRACT_PAYOUT", memo, "CONTRACT_SERVER:" .. tostring(sender_id), true)
-end
-
-
--- COMPANY_PAYMENT
--- Trusted system/company-to-account transfer used by ContractServer and other
--- economy controllers. This is the generic version: a company pays the named
--- destination account directly. It does not require owner login because the
--- calling server is acting as the economy system.
-handlers["company_payment"] = function(sender_id, req)
-  local from_id = req.from_id or req.company_id or req.poster
-  local to_id = req.to_id or req.recipient_id or req.claimant
-  local amount = tonumber(req.amount)
-  local memo = req.memo or "Company payment"
-  local tx_type = req.tx_type or "COMPANY_PAYMENT"
-
-  if not from_id or from_id == "" then return false, "Missing source company" end
-  if not to_id or to_id == "" then return false, "Missing destination account" end
-  if not amount or amount <= 0 then return false, "Invalid amount" end
-
-  amount = math.floor(amount)
-  if amount <= 0 then return false, "Invalid integer amount" end
-
-  -- Resolve bare tickers/usernames if needed.
-  if not from_id:find(":") then
-    from_id = "company:" .. string.lower(from_id):gsub("%s+", "_")
-  end
-
-  if not to_id:find(":") then
-    local company_target = "company:" .. string.lower(to_id):gsub("%s+", "_")
-    local citizen_target = "citizen:" .. string.lower(to_id):gsub("%s+", "_")
-    if accountExists(company_target) then
-      to_id = company_target
-    elseif accountExists(citizen_target) then
-      to_id = citizen_target
-    end
-  end
-
-  if not accountExists(from_id) then return false, "Source company account not found: " .. tostring(from_id) end
-  if not companies[from_id] and not tostring(from_id):find("^company:") then
-    return false, "Source is not a company account: " .. tostring(from_id)
-  end
-
-  if not accountExists(to_id) then return false, "Destination account not found: " .. tostring(to_id) end
-  if to_id == from_id then return false, "Cannot pay same company account" end
-
-  -- Contract/business obligations may overdraft the payer.
-  local allow_overdraft = req.allow_overdraft ~= false
-
-  return transfer(from_id, to_id, amount, tx_type, memo, "SYSTEM:" .. tostring(sender_id), allow_overdraft)
-end
-
--- GET_WORKER_PAY_RATES
-handlers["get_worker_pay_rates"] = function(sender_id, req)
-  local rates = ensureWorkerPayRates()
-  return true, {
-    rates = rates,
-    sectors = {
-      { key = "defence", label = "Defence", tiers = { "unskilled", "skilled", "elite" } },
-      { key = "research", label = "Research", tiers = { "skilled", "elite" } },
-      { key = "logistics", label = "Logistics", tiers = { "unskilled", "skilled" } },
-    }
-  }
-end
-
--- SET_WORKER_PAY_RATES
-handlers["set_worker_pay_rates"] = function(sender_id, req)
-  local incoming = req and req.rates or req
-  config.worker_pay_rates = normaliseWorkerPayRates(incoming)
-  saveConfig()
-  audit("ACTION", "STATE", sender_id, "SET_WORKER_PAY_RATES", "sector rates updated")
-  return true, { rates = config.worker_pay_rates }
-end
-
--- REGISTER_COMPANY
-handlers["register_company"] = function(sender_id, req)
-  local name         = req.name
-  local ticker       = req.ticker and string.upper(req.ticker)
-  local biz_type     = req.biz_type or "general"
-  local owner_id     = req.owner_id or "treasury:quid_bank"
-  local shares       = tonumber(req.shares_total) or 1000
-  local public_float = tonumber(req.shares_public) or 0
-  if not name or not ticker then return false, "Missing name or ticker" end
-  local company_id = "company:" .. string.lower(ticker)
-  if companies[company_id] then return false, "Company already exists" end
-  companies[company_id] = {
-    name          = name,
-    ticker        = ticker,
-    biz_type      = biz_type,
-    owner_id      = owner_id,
-    founded       = timestamp(),
-    status        = "active",
-    shares_total  = shares,
-    shares_public = public_float
-  }
-  saveCompanies()
-  local ok, result = createAccount(company_id, "company", name, owner_id)
-  if not ok then return false, "Company registered but account failed: " .. tostring(result) end
-  if shares > 0 then
-    writeShareTx(nextShId(), company_id, "SYSTEM", owner_id, shares, "FOUNDER_GRANT", "Founding shares")
-  end
-  audit("ACTION", "STATE", sender_id, "REGISTER_COMPANY", company_id)
-  return true, { company_id = company_id, name = name, ticker = ticker, message = "Company registered" }
-end
-
--- SET_PRICE
-handlers["set_price"] = function(sender_id, req)
-  local item  = req.item
-  local price = tonumber(req.price)
-  if not item or not price then return false, "Missing item or price" end
-  local old_price = prices[item] and prices[item].unit_price or nil
-  prices[item] = prices[item] or { history = {} }
-  if old_price then
-    local h = prices[item].history or {}
-    h[#h+1] = { price = old_price, time = timestamp() }
-    while #h > 30 do table.remove(h, 1) end
-    prices[item].history = h
-  end
-  prices[item].unit_price   = price
-  prices[item].last_updated = timestamp()
-  savePrices()
-  audit("ACTION", "STATE", sender_id, "SET_PRICE:" .. item, tostring(old_price) .. "->" .. tostring(price))
-  return true, { item = item, price = price, old_price = old_price }
-end
-
--- GET_PRICES
-handlers["get_prices"] = function(sender_id, req)
-  return true, { prices = prices, time = timestamp() }
-end
-
--- GET_PRICE_INDICES
-handlers["get_price_indices"] = function(sender_id, req)
-  ensureInflationState()
-  ensurePriceOracle()
-
-  -- Keep the oracle endpoint self-healing. Older installs may have minted before
-  -- the price oracle existed, so import any unprocessed MINT shocks before
-  -- reporting sector CPI. This is idempotent via processed_mint_tx.
-  local imported, skipped = processUnprocessedMintLedgerShocks()
-
-  local okSnap, snapOrErr = pcall(sectorIndexSnapshot)
-  if not okSnap then
-    audit("ERROR", "SYSTEM", sender_id, "GET_PRICE_INDICES", "snapshot error: " .. tostring(snapOrErr))
-    return false, "Price oracle snapshot error: " .. tostring(snapOrErr)
-  end
-
-  return true, {
-    model = price_oracle.model,
-    sectors = snapOrErr,
-    inflation = inflation_state,
-    shock_pressure = tonumber(price_oracle.shock_pressure) or 0,
-    sticky_floor_from_ath = tonumber(price_oracle.sticky_floor_from_ath) or 0.75,
-    max_daily_deflation = tonumber(price_oracle.max_daily_deflation) or 0.03,
-    last_money_print = price_oracle.last_money_print,
-    imported_mint_shocks = imported or 0,
-    skipped_mint_shocks = skipped or 0,
-    time = timestamp(),
-    note = "Zero baseline inflation. Sector CPI rises easily under pressure, falls slowly at max_daily_deflation, and cannot fall below sticky_floor_from_ath of ATH."
-  }
-end
-
-handlers["import_mint_shocks"] = function(sender_id, req)
-  local processed, skipped = processUnprocessedMintLedgerShocks()
-  audit("ACTION", "STATE", sender_id, "IMPORT_MINT_SHOCKS", "processed=" .. tostring(processed) .. " skipped=" .. tostring(skipped))
-  return true, { processed = processed, skipped = skipped, sectors = sectorIndexSnapshot(), last_money_print = price_oracle.last_money_print }
-end
-
-handlers["rebase_price_oracle_ath"] = function(sender_id, req)
-  ensurePriceOracle()
-  local snap = sectorIndexSnapshot()
-  for sector, rec in pairs(price_oracle.sectors or {}) do
-    local cur = snap[sector] and tonumber(snap[sector].index) or tonumber(rec.current_index) or 1
-    rec.ath_index = math.max(1, cur)
-    rec.raw_index = tonumber(rec.raw_index) or cur
-    rec.current_index = cur
-    rec.sticky_floor_index = math.max(1, cur * (tonumber(price_oracle.sticky_floor_from_ath) or 0.75))
-    rec.sticky_active = false
-  end
-  price_oracle.rebased_at = timestamp()
-  price_oracle.rebased_by = "terminal:" .. tostring(sender_id)
-  savePriceOracle()
-  audit("ACTION", "STATE", sender_id, "REBASE_PRICE_ORACLE_ATH", "ok")
-  return true, { sectors = sectorIndexSnapshot(), note = "ATHs rebased to current live indices." }
-end
-
--- QUOTE_ITEM_PRICE
-handlers["quote_item_price"] = function(sender_id, req)
-  local item = req and (req.item or req.name or req.id)
-  local count = req and (req.count or req.qty or req.quantity) or 1
-  local sector = req and req.sector or nil
-  if not item or tostring(item) == "" then return false, "Missing item" end
-  return true, quoteItemPrice(item, count, sector)
-end
-
--- QUOTE_SERVICE_PRICE
-handlers["quote_service_price"] = function(sender_id, req)
-  local service = req and (req.service or req.name)
-  if not service or tostring(service) == "" then return false, "Missing service" end
-  return true, quoteServicePrice(service, req and req.tier, req and req.saturation_gain, req and req.sector)
-end
-
--- RECORD_PRICE_OBSERVATION
--- Optional simple hook for later: contract/server terminals can report what was
--- actually paid. For now this is stored as evidence, not a deep behavioural sim.
-handlers["record_price_observation"] = function(sender_id, req)
-  ensurePriceOracle()
-  local item = req and (req.item or req.service or req.name)
-  local sector = req and req.sector or (item and classifyItemSector(item) or "general")
-  local total = tonumber(req and (req.total or req.amount or req.price))
-  local count = math.max(1, math.floor(tonumber(req and (req.count or req.qty or req.quantity)) or 1))
-  if not item or item == "" or not total or total <= 0 then return false, "Missing item/service or total" end
-  local obs = {
-    time = timestamp(),
-    source = "terminal:" .. tostring(sender_id),
-    item = simpleItemName(item),
-    sector = sector,
-    total = total,
-    count = count,
-    unit = total / count,
-    memo = req and req.memo or nil,
-  }
-  price_oracle.observations[#price_oracle.observations + 1] = obs
-  while #price_oracle.observations > 300 do table.remove(price_oracle.observations, 1) end
-  savePriceOracle()
-  return true, { recorded = obs, observations = #price_oracle.observations }
-end
-
--- SET_PRICE_ORACLE_SECTOR
-handlers["set_price_oracle_sector"] = function(sender_id, req)
-  req = req or {}
-  ensurePriceOracle()
-  local sector = lower(req.sector or "")
-  if sector == "" then return false, "Missing sector" end
-  price_oracle.sectors[sector] = price_oracle.sectors[sector] or { label=sector }
-  if req.label then price_oracle.sectors[sector].label = tostring(req.label) end
-  if tonumber(req.sensitivity) then price_oracle.sectors[sector].sensitivity = tonumber(req.sensitivity) end
-  if tonumber(req.bias) then price_oracle.sectors[sector].bias = tonumber(req.bias) end
-  savePriceOracle()
-  return true, { sector = sector, config = price_oracle.sectors[sector], indices = sectorIndexSnapshot() }
-end
-
--- REBASE_PRICE_INDICES
--- Keeps money/accounts, but resets oracle settings to sane x1 floors. Because
--- the index is computed live from inflation_rate, prices still rise immediately
--- when current inflation is high.
-handlers["rebase_price_indices"] = function(sender_id, req)
-  price_oracle = cloneTable(DEFAULT_PRICE_ORACLE)
-  price_oracle.rebased_at = timestamp()
-  price_oracle.rebased_by = tostring(sender_id)
-  savePriceOracle()
-  audit("ACTION", "STATE", sender_id, "REBASE_PRICE_INDICES", "wide sector oracle reset to zero baseline")
-  return true, { oracle = price_oracle, indices = sectorIndexSnapshot() }
-end
-
--- SET_PRICE_PRESSURE_FLOOR
--- Example: { type="set_price_pressure_floor", floor=0.26 } means +26%
--- broad price pressure before sector sensitivities.
-handlers["set_price_pressure_floor"] = function(sender_id, req)
-  ensurePriceOracle()
-  local floor = tonumber(req and (req.floor or req.pressure or req.value))
-  if floor == nil then return false, "Missing floor/pressure value" end
-  if floor < 0 then floor = 0 end
-  if floor > 3 then floor = 3 end
-  price_oracle.price_pressure_floor = floor
-  price_oracle.updated = timestamp()
-  savePriceOracle()
-  audit("ACTION", "STATE", sender_id, "SET_PRICE_PRESSURE_FLOOR", tostring(floor))
-  return true, { floor = floor, indices = sectorIndexSnapshot() }
-end
-
--- STATUS
-handlers["status"] = function(sender_id, req)
-  local function count(t)
-    local n = 0
-    if type(t) ~= "table" then return 0 end
-    for _ in pairs(t) do n = n + 1 end
-    return n
-  end
-
-  local supply = nil
-  local okSupply, supplyRes = pcall(deriveMonetarySupply)
-  if okSupply then supply = supplyRes else supply = { error = tostring(supplyRes) } end
-
-  local inf = nil
-  local okInf, infRes = pcall(ensureInflationState)
-  if okInf then inf = infRes else inf = { error = tostring(infRes) } end
-
-  local indices = nil
-  local okIdx, idxRes = pcall(sectorIndexSnapshot)
-  if okIdx then indices = idxRes else indices = { error = tostring(idxRes) } end
-
-  return true, {
-    version          = VERSION,
-    computer_id      = os.getComputerID(),
-    label            = os.getComputerLabel(),
-    time             = timestamp(),
-    uptime           = os.clock(),
-    economy_status   = (type(config) == "table" and config.economy_status) or "active",
-    account_count    = count(accounts),
-    citizen_count    = count(citizens),
-    company_count    = count(companies),
-    tx_count         = tx_counter,
-    audit_count      = audit_counter,
-    supply           = supply,
-    inflation         = inf,
-    price_indices     = indices
-  }
-end
-
-
--- REGISTER_CITIZEN
-handlers["register_citizen"] = function(sender_id, req)
-  local name     = req.display_name
-  local username = req.username
-  local password = req.password or "changeme"
-  local title    = req.title or "Account Holder"
-  if not name or not username then return false, "Missing display_name or username" end
-  local key        = string.lower(username):gsub("%s+", "_")
-  local citizen_id = "citizen:" .. key
-  if citizens[citizen_id] then return false, "Username already exists: " .. username end
-  citizens[citizen_id] = {
-    display_name  = name,
-    username      = key,
-    password_hash = simpleHash(password),
-    joined        = timestamp(),
-    status        = "active",
-    title         = title
-  }
-  saveCitizens()
-  local ok, result = createAccount(citizen_id, "citizen", name, citizen_id)
-  if not ok then
-    citizens[citizen_id] = nil; saveCitizens()
-    return false, "Account creation failed: " .. tostring(result)
-  end
-  audit("ACTION", "STATE", sender_id, "REGISTER_CITIZEN", citizen_id)
-  return true, {
-    citizen_id   = citizen_id,
-    display_name = name,
-    username     = key,
-    title        = title,
-    message      = "Citizen registered. Default password: " .. password
-  }
-end
-
--- COMPANY_INFO — get company details + live shareholdings
-handlers["company_info"] = function(sender_id, req)
-  local company_id = req.company_id
-  if not company_id then return false, "Missing company_id" end
-  local company = companies[company_id]
-  if not company then return false, "Company not found: " .. tostring(company_id) end
-  local account = accounts[company_id]
-  local account_owner_id = account and account.owner_id or nil
-  local balance  = deriveBalance(company_id)
-  local holdings = deriveShareHoldings(company_id)
-  return true, {
-    company_id       = company_id,
-    name             = company.name,
-    ticker           = company.ticker,
-    biz_type         = company.biz_type,
-    owner_id         = company.owner_id,
-    account_owner_id = account_owner_id,
-    status           = company.status,
-    shares_total     = company.shares_total,
-    shares_public    = company.shares_public,
-    cash_balance     = balance,
-    shareholders     = holdings,
-    founded          = company.founded
-  }
-end
-
--- COMPANY_WITHDRAW
--- Owner-authorised payout from a company account back to the logged-in owner citizen account.
--- This is deliberately narrow: company -> owner only, not arbitrary company spending.
-handlers["company_withdraw"] = function(sender_id, req)
-  local ok, citizen_id, citizen = authenticateUser(req.username, req.password)
-  if not ok then return false, citizen_id end
-
-  local company_id = req.company_id
-  local amount     = tonumber(req.amount)
-  local memo       = req.memo or "Owner company payout"
-
-  if not company_id or company_id == "" then return false, "Missing company_id" end
-  if not amount or amount <= 0 then return false, "Invalid amount" end
-  if not companies[company_id] then return false, "Company not found: " .. tostring(company_id) end
-  if not accountExists(company_id) then return false, "Company account not found: " .. tostring(company_id) end
-
-  if not isCompanyOwner(company_id, citizen_id) then
-    return false, "Only the registered owner can withdraw company funds"
-  end
-
-  return transfer(company_id, citizen_id, amount, "COMPANY_WITHDRAW", memo, citizen_id)
-end
-
--- COMPANY_TRANSFER
--- Owner-authorised company spending to another account. This is the controlled
--- version of company transactions: the logged-in owner can spend from their
--- company, but only after ownership and balance checks.
-handlers["company_transfer"] = function(sender_id, req)
-  local ok, citizen_id, citizen = authenticateUser(req.username, req.password)
-  if not ok then return false, citizen_id end
-
-  local company_id = req.company_id
-  local to_id      = req.to_id
-  local amount     = tonumber(req.amount)
-  local memo       = req.memo or "Company payment"
-
-  if not company_id or company_id == "" then return false, "Missing company_id" end
-  if not to_id or to_id == "" then return false, "Missing destination account" end
-  if not amount or amount <= 0 then return false, "Invalid amount" end
-  if not companies[company_id] then return false, "Company not found: " .. tostring(company_id) end
-  if not accountExists(company_id) then return false, "Company account not found: " .. tostring(company_id) end
-
-  if not isCompanyOwner(company_id, citizen_id) then
-    return false, "Only the registered owner can spend company funds"
-  end
-
-  -- Resolve friendly citizen usernames.
-  if not to_id:find(":") then
-    local citizen_target = "citizen:" .. string.lower(to_id):gsub("%s+", "_")
-    local company_target = "company:" .. string.lower(to_id):gsub("%s+", "_")
-    if accountExists(citizen_target) then
-      to_id = citizen_target
-    elseif accountExists(company_target) then
-      to_id = company_target
-    end
-  end
-
-  if not accountExists(to_id) then
-    return false, "Destination account not found: " .. tostring(to_id)
-  end
-  if to_id == company_id then
-    return false, "Cannot transfer company funds to the same company"
-  end
-
-  return transfer(company_id, to_id, amount, "COMPANY_TRANSFER", memo, citizen_id)
-end
-
--- COMPANY_DEPOSIT
--- Owner-authorised injection from the logged-in owner citizen account into one of
--- their companies. Useful for manual owner funding without using the treasury.
-handlers["company_deposit"] = function(sender_id, req)
-  local ok, citizen_id, citizen = authenticateUser(req.username, req.password)
-  if not ok then return false, citizen_id end
-
-  local company_id = req.company_id
-  local amount     = tonumber(req.amount)
-  local memo       = req.memo or "Owner company deposit"
-
-  if not company_id or company_id == "" then return false, "Missing company_id" end
-  if not amount or amount <= 0 then return false, "Invalid amount" end
-  if not companies[company_id] then return false, "Company not found: " .. tostring(company_id) end
-  if not accountExists(company_id) then return false, "Company account not found: " .. tostring(company_id) end
-
-  if not isCompanyOwner(company_id, citizen_id) then
-    return false, "Only the registered owner can deposit into this company"
-  end
-
-  return transfer(citizen_id, company_id, amount, "COMPANY_DEPOSIT", memo, citizen_id)
-end
-
--- LIST_MY_COMPANIES
--- Convenience endpoint for company terminals: shows companies owned by the
--- logged-in citizen, with live balances from data/balances.db.
-local function listOwnedCompanies(sender_id, req)
-  local ok, citizen_id, citizen = authenticateUser(req.username, req.password)
-  if not ok then return false, citizen_id end
-
-  local result = {}
-  for company_id, company in pairs(companies) do
-    local account = accounts[company_id]
-    local account_owner_id = account and account.owner_id or nil
-    local company_owner_id = company.owner_id
-
-    if company_owner_id == citizen_id or account_owner_id == citizen_id then
-      result[#result+1] = {
-        company_id       = company_id,
-        name             = company.name,
-        ticker           = company.ticker,
-        biz_type         = company.biz_type,
-        owner_id         = company_owner_id,
-        account_owner_id = account_owner_id,
-        status           = company.status,
-        shares_total     = company.shares_total,
-        shares_public    = company.shares_public,
-        cash_balance     = deriveBalance(company_id),
-        founded          = company.founded
-      }
-    end
-  end
-
-  table.sort(result, function(a,b) return tostring(a.company_id or "") < tostring(b.company_id or "") end)
-  audit("ACTION", citizen_id, sender_id, "MY_COMPANIES", tostring(#result))
-  return true, { companies = result, count = #result, owner_id = citizen_id }
-end
-
-handlers["list_my_companies"] = listOwnedCompanies
-handlers["my_companies"] = listOwnedCompanies
-
--- LIST_CITIZENS
-handlers["list_citizens"] = function(sender_id, req)
-  local result = {}
-  for citizen_id, citizen in pairs(citizens) do
-    result[#result+1] = {
-      citizen_id   = citizen_id,
-      display_name = citizen.display_name,
-      username     = citizen.username,
-      title        = citizen.title,
-      status       = citizen.status,
-      joined       = citizen.joined,
-      balance      = deriveBalance(citizen_id)
-    }
-  end
-  table.sort(result, function(a,b) return (a.display_name or "") < (b.display_name or "") end)
-  return true, { citizens = result, count = #result }
-end
-
--- SUSPEND_ACCOUNT / UNSUSPEND_ACCOUNT
-handlers["suspend_account"] = function(sender_id, req)
-  local citizen_id = req.citizen_id
-  if not citizens[citizen_id] then return false, "Citizen not found" end
-  citizens[citizen_id].status = "suspended"
-  saveCitizens()
-  if accounts[citizen_id] then accounts[citizen_id].status = "suspended"; saveAccounts() end
-  audit("ACTION", "STATE", sender_id, "SUSPEND", citizen_id)
-  return true, { message = "Account suspended: " .. citizen_id }
-end
-
-handlers["unsuspend_account"] = function(sender_id, req)
-  local citizen_id = req.citizen_id
-  if not citizens[citizen_id] then return false, "Citizen not found" end
-  citizens[citizen_id].status = "active"
-  saveCitizens()
-  if accounts[citizen_id] then accounts[citizen_id].status = "active"; saveAccounts() end
-  audit("ACTION", "STATE", sender_id, "UNSUSPEND", citizen_id)
-  return true, { message = "Account reinstated: " .. citizen_id }
+local function calculateMonetaryInflation(issued)
+  issued = tonumber(issued)
+  local base, err = getAdaptiveInflationBase(issued)
+  if not base then return nil, err or "Awaiting adaptive monetary baseline" end
+
+  local inflation = ((issued / base) - 1) * 100
+  return inflation, "Adaptive money-supply inflation, 24h half-life"
 end
 
 -- =============================================================================
--- BALANCE SNAPSHOT MIGRATION / RECOVERY
+-- DISPLAY SETUP
 -- =============================================================================
-local function migrateBalancesFromLedgerIfNeeded()
-  if monetary_state.migrated and type(balances) == "table" and next(balances) ~= nil then
-    -- Ensure all registered accounts have a balance entry.
-    local changed = false
-    for id, _ in pairs(accounts) do
-      if balances[id] == nil then balances[id] = 0; changed = true end
-    end
-    if changed then saveBalances() end
-    return
+local function chooseMonitor()
+  if MONITOR_NAME and peripheral.isPresent and peripheral.isPresent(MONITOR_NAME) and peripheral.getType(MONITOR_NAME) == "monitor" then
+    return peripheral.wrap(MONITOR_NAME), MONITOR_NAME
   end
 
-  print("  Migrating ledger-derived balances to balance snapshot...")
-
-  local new_balances = {}
-  for id, _ in pairs(accounts) do new_balances[id] = 0 end
-
-  local total_minted = 0
-  local total_burned = 0
-
-  for _, line in ipairs(readLines(FILE.ledger)) do
-    local tx_id, ts, tx_type, from_id, to_id, amount, memo, status =
-      line:match("(TX%-%d+)%s*|%s*(%d+)%s*|%s*(%S+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*(%d+)%s*|%s*([^|]+)%s*|%s*(.+)")
-    if tx_id then
-      tx_type = trim(tx_type)
-      from_id = trim(from_id)
-      to_id   = trim(to_id)
-      status  = trim(status)
-      amount  = tonumber(amount) or 0
-      if status == "settled" then
-        if to_id ~= "SYSTEM" then new_balances[to_id] = (new_balances[to_id] or 0) + amount end
-        if from_id ~= "SYSTEM" then new_balances[from_id] = (new_balances[from_id] or 0) - amount end
-        if tx_type == "MINT" then total_minted = total_minted + amount end
-        if tx_type == "BURN" then total_burned = total_burned + amount end
-      end
+  -- Prefer physically attached side monitors before searching the whole
+  -- peripheral network. peripheral.find("monitor") can grab a monitor exposed
+  -- through wired modem networks, which is how two unrelated programs end up
+  -- painting over each other.
+  local sides = { "top", "bottom", "left", "right", "front", "back" }
+  for _, side in ipairs(sides) do
+    if peripheral.isPresent and peripheral.isPresent(side) and peripheral.getType(side) == "monitor" then
+      return peripheral.wrap(side), side
     end
   end
 
-  balances = new_balances
-  monetary_state = {
-    total_minted = total_minted,
-    total_burned = total_burned,
-    migrated = true,
-    migrated_at = timestamp(),
-    source = "ledger_snapshot",
-  }
+  for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.getType(name) == "monitor" then
+      return peripheral.wrap(name), name
+    end
+  end
 
-  saveBalances()
-  saveMonetary()
-  writeFile(FILE.checkpoint, {
-    migrated_at = timestamp(),
-    source = "ledger_snapshot",
-    note = "Initial migration from full ledger to authoritative balance snapshot."
-  })
+  return nil, nil
 end
 
-local function recoverPendingTx()
-  if not fs.exists(FILE.pending_tx) then return end
-  local p = readFile(FILE.pending_tx)
-  if type(p) ~= "table" or not p.tx_id then
-    fs.delete(FILE.pending_tx)
-    return
+local function setupDisplay()
+  monitor = nil
+  local selected, selected_name = chooseMonitor()
+  if selected then
+    monitor = selected
+    monitor_name = selected_name
+    pcall(function() monitor.setTextScale(TEXT_SCALE) end)
+    term.redirect(monitor)
   end
+  first_draw = true
+  clear(colors.black)
+end
 
-  print("  Recovering pending transaction " .. tostring(p.tx_id) .. "...")
-
-  local from_id = p.from
-  local to_id   = p.to
-
-  local after_matches = true
-  if from_id ~= "SYSTEM" and tonumber(balances[from_id]) ~= tonumber(p.from_after) then after_matches = false end
-  if to_id   ~= "SYSTEM" and tonumber(balances[to_id])   ~= tonumber(p.to_after)   then after_matches = false end
-
-  local before_matches = true
-  if from_id ~= "SYSTEM" and tonumber(balances[from_id]) ~= tonumber(p.from_before) then before_matches = false end
-  if to_id   ~= "SYSTEM" and tonumber(balances[to_id])   ~= tonumber(p.to_before)   then before_matches = false end
-
-  if after_matches then
-    -- Transaction was applied. Make sure monetary state and recent ledger catch up.
-    monetary_state.total_minted = tonumber(p.minted_after) or monetary_state.total_minted or 0
-    monetary_state.total_burned = tonumber(p.burned_after) or monetary_state.total_burned or 0
-    monetary_state.migrated = true
-    saveMonetary()
-
-    if not ledgerHasTx(p.tx_id) then
-      writeTx(p.tx_id, p.tx_type or "TRANSFER", p.from, p.to, tonumber(p.amount) or 0, p.memo or "", "settled")
-    end
-    fs.delete(FILE.pending_tx)
-    print("  Pending transaction completed.")
-    return
-  end
-
-  if before_matches then
-    -- Transaction never applied. Safe to discard pending request.
-    fs.delete(FILE.pending_tx)
-    print("  Pending transaction rolled back.")
-    return
-  end
-
-  print("  WARNING: pending transaction state ambiguous.")
-  print("  Leaving " .. FILE.pending_tx .. " in place for manual inspection.")
+local function restoreDisplay()
+  term.redirect(native_term)
+  term.setBackgroundColor(colors.black)
+  term.setTextColor(colors.white)
+  term.clear()
+  term.setCursorPos(1, 1)
 end
 
 -- =============================================================================
--- BOOT / INIT
+-- NETWORK
 -- =============================================================================
-local function initFiles()
-  print("  Loading data files...")
-  local function count(t) local n=0; for _ in pairs(t) do n=n+1 end; return n end
-
-  accounts  = readFile(FILE.accounts)  or {}
-  balances  = readFile(FILE.balances)  or {}
-  monetary_state = readFile(FILE.monetary) or { total_minted = 0, total_burned = 0, migrated = false }
-  citizens  = readFile(FILE.citizens)  or {}
-  companies = readFile(FILE.companies) or {}
-  contracts = readFile(FILE.contracts) or {}
-  prices    = readFile(FILE.prices)    or {}
-  price_oracle = readFile(FILE.price_oracle) or {}
-  employment_mappings = readFile(FILE.employment) or {}
-  inflation_state = readFile(FILE.inflation) or {}
-  ensureInflationState()
-  ensurePriceOracle()
-  pcall(processUnprocessedMintLedgerShocks)
-  config    = readFile(FILE.config)    or {
-    economy_status       = "active",
-    mint_authority       = "locked"
-  }
-  ensureWorkerPayRates()
-  saveConfig()
-
-  migrateBalancesFromLedgerIfNeeded()
-  recoverPendingTx()
-  capAuditLog()
-  compactLedgerIfNeeded(false)
-
-  print("  Accounts:  " .. count(accounts))
-  print("  Citizens:  " .. count(citizens))
-  print("  Companies: " .. count(companies))
-  print("  Employment mappings: " .. count(employment_mappings))
-  print("  Price oracle sectors: " .. count(price_oracle.sectors or {}))
-end
-
-local function initCounters()
-  if fs.exists(FILE.ledger) then
-    for _, line in ipairs(readLines(FILE.ledger)) do
-      local num = line:match("TX%-(%d+)")
-      if num then local n = tonumber(num) or 0; if n > tx_counter then tx_counter = n end end
-    end
-  end
-  if fs.exists(FILE.share_ledger) then
-    for _, line in ipairs(readLines(FILE.share_ledger)) do
-      local num = line:match("SH%-(%d+)")
-      if num then local n = tonumber(num) or 0; if n > sh_counter then sh_counter = n end end
-    end
-  end
-  if fs.exists(FILE.audit) then
-    for _, line in ipairs(readLines(FILE.audit)) do
-      local num = line:match("AUDIT%-(%d+)")
-      if num then local n = tonumber(num) or 0; if n > audit_counter then audit_counter = n end end
-    end
-  end
-  print("  TX counter at: TX-" .. pad(tx_counter, 6))
-end
-
-local function initSystemAccounts()
-  if not accountExists("treasury:quid_bank") then
-    createAccount("treasury:quid_bank", "treasury", "Quid Bank of Plenty", "SYSTEM")
-    print("  Created treasury:quid_bank")
-  end
-  if not accountExists("market:escrow") then
-    createAccount("market:escrow", "escrow", "Market Escrow", "SYSTEM")
-    print("  Created market:escrow")
-  end
-  if not accountExists("contract:escrow") then
-    createAccount("contract:escrow", "escrow", "Contract Escrow", "SYSTEM")
-    print("  Created contract:escrow")
-  end
-end
-
 local function openModem()
-  -- First pass: prefer wireless/ender modem
   for _, name in ipairs(peripheral.getNames()) do
     if peripheral.getType(name) == "modem" then
-      local modem = peripheral.wrap(name)
-      if modem and modem.isWireless and modem.isWireless() then
+      local m = peripheral.wrap(name)
+      if m and m.isWireless and m.isWireless() then
         rednet.open(name)
-        print("  Modem: " .. name .. " (wireless)")
+        modem_name = name
         return true
       end
     end
   end
-  -- Second pass: fallback to any modem
   for _, name in ipairs(peripheral.getNames()) do
     if peripheral.getType(name) == "modem" then
       rednet.open(name)
-      print("  Modem: " .. name .. " (wired fallback)")
+      modem_name = name
       return true
     end
   end
-  print("  ERROR: No modem found!")
   return false
 end
 
--- =============================================================================
--- DISPLAY
--- =============================================================================
-local function drawStatus()
-  term.clear()
-  term.setCursorPos(1, 1)
-  local w = term.getSize()
-  local function count(t) local n=0; for _ in pairs(t) do n=n+1 end; return n end
-
-  -- Header
-  term.setBackgroundColor(colors.black)
-  term.setTextColor(colors.yellow)
-  print(string.rep("=", w))
-  print("  QUID BANK OF PLENTY  v" .. VERSION)
-  print(string.rep("=", w))
-
-  -- Version / update info
-  term.setTextColor(colors.cyan)
-  print("  Version:  " .. VERSION)
-  if versionInfo and versionInfo.last_updated then
-    local t    = math.floor(versionInfo.last_updated / 1000)
-    local secs = t % 60;  t = math.floor(t/60)
-    local mins = t % 60;  t = math.floor(t/60)
-    local hrs  = t % 24
-    term.setTextColor(colors.lime)
-    print(string.format("  Updated:  %02d:%02d:%02d (this session)", hrs, mins, secs))
-  else
-    term.setTextColor(colors.lightGray)
-    print("  Updated:  no update this session")
-  end
-
-  -- System info
-  term.setTextColor(colors.white)
-  print("  ID:       " .. os.getComputerID())
-  print("  Label:    " .. (os.getComputerLabel() or "unlabelled"))
-  term.setTextColor(colors.lime)
-  print("  Status:   " .. (config.economy_status or "active"):upper())
-  term.setTextColor(colors.white)
-  print("  Uptime:   " .. string.format("%.0f", os.clock()) .. "s")
-  print("  TX Log:   TX-" .. pad(tx_counter, 6) .. " (recent)")
-  print("  Audits:   " .. audit_counter)
-  print("  Handlers: " .. count(handlers))
-
-  term.setTextColor(colors.yellow)
-  print(string.rep("-", w))
-  term.setTextColor(colors.white)
-  print("  Accounts:  " .. count(accounts))
-  print("  Citizens:  " .. count(citizens))
-  print("  Companies: " .. count(companies))
-  print("  Employment mappings: " .. count(employment_mappings))
-  print("  Price oracle sectors: " .. count(price_oracle.sectors or {}))
-  term.setTextColor(colors.lime)
-  print("  Treasury:  " .. deriveBalance("treasury:quid_bank") .. " Quid")
-  term.setTextColor(colors.lightGray)
-  print("  Free:      " .. tostring(fs.getFreeSpace("/")) .. " bytes")
-  if fs.exists("disk") then print("  Archive:   disk detected") end
-  term.setTextColor(colors.yellow)
-  print(string.rep("-", w))
-  term.setTextColor(colors.cyan)
-  print("  Protocol: " .. PROTOCOL)
-  term.setTextColor(colors.lightGray)
-  print("  [Running. Ctrl+T to terminate]")
-  term.setTextColor(colors.white)
-end
-
--- =============================================================================
--- MAIN SERVER LOOP
--- =============================================================================
-local function handleRequest(sender_id, request)
-  if type(request) ~= "table" then return false, "Invalid request format" end
-  local req_type = request.type
-  if not req_type then return false, "Missing request type" end
-  local handler = handlers[req_type]
-  if not handler then
-    audit("ACTION", "UNKNOWN", sender_id, req_type, "unknown request type")
-    return false, "Unknown request type: " .. tostring(req_type)
-  end
-  local ok, success, response = pcall(handler, sender_id, request)
-  if not ok then
-    audit("ERROR", "SYSTEM", sender_id, req_type, "handler error: " .. tostring(success))
-    return false, "Internal server error"
-  end
-  return success, response
-end
-
-local function serverLoop()
-  local request_count = 0
+local function dbRequest(req, timeout)
+  timeout = timeout or DB_TIMEOUT
+  if not db_id then return false, "No server connected" end
+  rednet.send(db_id, req, PROTOCOL)
+  local deadline = os.clock() + timeout
   while true do
-    local sender_id, message, protocol = rednet.receive(PROTOCOL, 5)
-    if sender_id then
-      request_count = request_count + 1
-      local success, response = handleRequest(sender_id, message)
-      rednet.send(sender_id, {
-        success  = success,
-        response = response,
-        time     = timestamp(),
-        server   = os.getComputerID()
-      }, PROTOCOL)
-      if request_count % 5 == 0 then drawStatus() end
-    else
-      drawStatus()
-      rednet.broadcast({
-        type    = "treasury_online",
-        version = VERSION,
-        id      = os.getComputerID(),
-        time    = timestamp()
-      }, PROTOCOL)
-      rednet.broadcast({
-        type    = "treasury_online",
-        version = VERSION,
-        id      = os.getComputerID(),
-        time    = timestamp()
-      }, PROTOCOL_BROADCAST)
+    local remaining = deadline - os.clock()
+    if remaining <= 0 then return false, "No response from server" end
+    local sender, msg = rednet.receive(PROTOCOL, remaining)
+    if sender == db_id and type(msg) == "table" and msg.success ~= nil then
+      return msg.success, msg.response
     end
   end
 end
 
+local function connectServer()
+  db_id = nil
+  clear(colors.black)
+  local w, h = getSize()
+  centerIn(1, math.floor(h / 2) - 2, w, "ECONOMY CORE MONITOR", colors.yellow, colors.black)
+  centerIn(1, math.floor(h / 2), w, "Connecting to Quid Bank server...", colors.lightGray, colors.black)
+  centerIn(1, math.floor(h / 2) + 1, w, "Modem: " .. tostring(modem_name or "none"), colors.gray, colors.black)
+  for attempt = 1, 8 do
+    centerIn(1, math.floor(h / 2) + 3, w, "Bank attempt " .. attempt .. " of 8", colors.gray, colors.black)
+    rednet.broadcast({ type = "ping" }, PROTOCOL)
+    local sender, msg = rednet.receive(PROTOCOL, 4)
+    if sender and type(msg) == "table" then
+      if msg.type == "treasury_online" or msg.success == true then
+        db_id = sender
+        centerIn(1, math.floor(h / 2) + 5, w, "Connected to bank " .. tostring(db_id), colors.lime, colors.black)
+        sleep(0.4)
+        return true
+      end
+    end
+  end
+  last_error = "Unable to discover bank server"
+  return false
+end
+
+local function connectContractServer(silent)
+  contract_id = nil
+  last_contract_error = ""
+
+  if not silent then
+    local w, h = getSize()
+    centerIn(1, math.floor(h / 2) + 7, w, "Looking for ContractServer...", colors.lightGray, colors.black)
+  end
+
+  rednet.broadcast({ type = "ping" }, CONTRACT_PROTOCOL)
+  local deadline = os.clock() + CONTRACT_TIMEOUT
+  while true do
+    local remaining = deadline - os.clock()
+    if remaining <= 0 then break end
+    local sender, msg = rednet.receive(CONTRACT_PROTOCOL, remaining)
+    if sender and type(msg) == "table" then
+      if msg.success == true or msg.type == "contract_server_online" then
+        contract_id = sender
+        return true
+      end
+    end
+  end
+
+  last_contract_error = "No ContractServer"
+  return false
+end
+
+local function contractRequest(req, timeout)
+  timeout = timeout or CONTRACT_TIMEOUT
+  if not contract_id then return false, "No ContractServer connected" end
+  rednet.send(contract_id, req, CONTRACT_PROTOCOL)
+  local deadline = os.clock() + timeout
+  while true do
+    local remaining = deadline - os.clock()
+    if remaining <= 0 then return false, "No response from ContractServer" end
+    local sender, msg = rednet.receive(CONTRACT_PROTOCOL, remaining)
+    if sender == contract_id and type(msg) == "table" and msg.success ~= nil then
+      return msg.success, msg.response
+    end
+  end
+end
+
+
 -- =============================================================================
--- ENTRY POINT
+-- PRICE / INFLATION ORACLE
+-- ServerSideAccounts v1.4.6+ exposes a zero-baseline wide sector price oracle.
+-- Prices rise easily under money-print/inflation pressure, but deflate slowly
+-- and cannot fall below the sticky ATH floor.
+-- =============================================================================
+local function sectorFromOracle(priceOracle, name)
+  if type(priceOracle) ~= "table" or type(priceOracle.sectors) ~= "table" then return nil end
+  return priceOracle.sectors[name]
+end
+
+local function sectorIndexFromOracle(priceOracle, name)
+  local rec = sectorFromOracle(priceOracle, name)
+  if type(rec) ~= "table" then return nil end
+  return tonumber(rec.index)
+end
+
+local function quoteLabel(q)
+  if type(q) ~= "table" then return nil end
+  local total = tonumber(q.total)
+  if total == nil then return nil end
+  return fmtMoney(total)
+end
+
+local function fetchPriceOracle()
+  local ok, res = dbRequest({ type = "get_price_indices" }, 2)
+  if not ok or type(res) ~= "table" then
+    return {
+      connected = false,
+      status = "Price oracle unavailable: " .. tostring(res),
+      sectors = {},
+      quotes = {},
+    }
+  end
+
+  local inflation = type(res.inflation) == "table" and res.inflation or {}
+  local sectors = type(res.sectors) == "table" and res.sectors or {}
+  local rate = tonumber(inflation.inflation_rate)
+  local percent = tonumber(inflation.inflation_percent)
+  if not percent and rate then percent = rate * 100 end
+
+  local out = {
+    connected = true,
+    model = tostring(res.model or "sector_price_oracle"),
+    status = "Live sector CPI from bank price oracle",
+    note = res.note,
+    time = tonumber(res.time),
+    inflation = inflation,
+    inflation_rate = rate,
+    inflation_percent = percent,
+    old_price_index = tonumber(inflation.price_index),
+    price_index_percent = tonumber(inflation.price_index_percent),
+    sectors = sectors,
+    quotes = {},
+  }
+
+  -- A few visible quote examples give the monitor immediate practical meaning.
+  -- These are intentionally broad, not deep behavioural modelling.
+  local okMeal, meal = dbRequest({ type = "quote_service_price", service = "dining_meal", tier = "normal" }, 2)
+  if okMeal and type(meal) == "table" then out.quotes.dining_meal = meal end
+
+  local okMealLarge, mealLarge = dbRequest({ type = "quote_service_price", service = "dining_meal", tier = "large" }, 2)
+  if okMealLarge and type(mealLarge) == "table" then out.quotes.large_meal = mealLarge end
+
+  local okBuild, build = dbRequest({ type = "quote_item_price", item = "oak_planks", count = 64, sector = "construction" }, 2)
+  if okBuild and type(build) == "table" then out.quotes.oak_planks_64 = build end
+
+  local okIron, iron = dbRequest({ type = "quote_item_price", item = "iron_ingot", count = 8, sector = "tools" }, 2)
+  if okIron and type(iron) == "table" then out.quotes.iron_ingot_8 = iron end
+
+  local okCoal, coal = dbRequest({ type = "quote_item_price", item = "coal", count = 16, sector = "fuel" }, 2)
+  if okCoal and type(coal) == "table" then out.quotes.coal_16 = coal end
+
+  return out
+end
+
+-- =============================================================================
+-- DATA CALCULATION
+-- =============================================================================
+local function inequalityFromAccounts(accounts)
+  if type(accounts) ~= "table" then
+    return { status = "Awaiting account aggregation" }
+  end
+
+  local balances = {}
+  for _, acc in ipairs(accounts) do
+    if type(acc) == "table" and acc.type == "citizen" and acc.status ~= "suspended" then
+      balances[#balances + 1] = tonumber(acc.balance) or 0
+    end
+  end
+
+  if #balances < 2 then
+    return { status = "Need 2+ citizen accounts", observations = #balances }
+  end
+
+  local total = 0
+  for _, v in ipairs(balances) do
+    total = total + v
+  end
+
+  local average = total / #balances
+  -- This is account-balance inequality, not income inequality.
+  -- With small Minecraft populations, top 1% effectively means the richest citizen account.
+  local top1 = calculateTopShare(copyList(balances), 0.01)
+
+  return {
+    top1_share = top1,
+    average_balance = average,
+    total_balance = total,
+    observations = #balances,
+    status = "Live citizen balance distribution",
+  }
+end
+
+local function topCompaniesFromAccounts(accounts)
+  local companies = {}
+  if type(accounts) ~= "table" then return companies end
+
+  for _, acc in ipairs(accounts) do
+    if type(acc) == "table" and acc.type == "company" and acc.status ~= "suspended" then
+      companies[#companies + 1] = {
+        id = tostring(acc.account_id or acc.display_name or "company"),
+        name = tostring(acc.display_name or acc.account_id or "company"),
+        balance = tonumber(acc.balance) or 0,
+      }
+    end
+  end
+
+  table.sort(companies, function(a, b)
+    return (tonumber(a.balance) or 0) > (tonumber(b.balance) or 0)
+  end)
+
+  local out = {}
+  for i = 1, math.min(10, #companies) do
+    out[#out + 1] = companies[i]
+  end
+  return out
+end
+
+local function trimTxSamples()
+  history.tx_samples = history.tx_samples or {}
+  while #history.tx_samples > 288 do
+    table.remove(history.tx_samples, 1)
+  end
+end
+
+local function estimateTxPerDay(currentTx)
+  currentTx = tonumber(currentTx)
+  if currentTx == nil then return nil, "Awaiting transaction counter" end
+  history.tx_samples = history.tx_samples or {}
+  local now = nowMs()
+  history.tx_samples[#history.tx_samples + 1] = { t = now, tx = currentTx }
+  trimTxSamples()
+  if #history.tx_samples < 2 then return nil, "Collecting baseline" end
+  local oldest = history.tx_samples[1]
+  local elapsedMs = now - (tonumber(oldest.t) or now)
+  local delta = currentTx - (tonumber(oldest.tx) or currentTx)
+  if elapsedMs <= 0 then return nil, "Collecting baseline" end
+  if delta < 0 then delta = 0 end
+  local perDay = delta / (elapsedMs / 86400000)
+  return perDay, "Estimated from local monitor history"
+end
+
+local function analyseContracts(contracts, status)
+  local now = nowMs()
+  local currentDay = currentMinecraftDay()
+  local gdp = 0
+  local gdpEvents = 0
+  local fulfilledValue = 0
+  local openValue = 0
+  local claimedValue = 0
+  local totalValue = 0
+  local newestFulfilled = nil
+
+  contracts = type(contracts) == "table" and contracts or {}
+  for _, c in ipairs(contracts) do
+    if type(c) == "table" then
+      local reward = tonumber(c.reward or c.value or c.amount) or 0
+      local st = tostring(c.status or "")
+      totalValue = totalValue + reward
+      if st == "open" then openValue = openValue + reward end
+      if st == "claimed" then claimedValue = claimedValue + reward end
+      if st == "fulfilled" or st == "paid" or st == "closed" then
+        fulfilledValue = fulfilledValue + reward
+        local mcDay = contractMinecraftDay(c)
+        local t = tonumber(c.fulfilled_at or c.paid_at or c.closed_at or c.updated or c.created)
+        if t and (not newestFulfilled or t > newestFulfilled) then newestFulfilled = t end
+
+        local withinWindow = false
+        if mcDay ~= nil then
+          local ageDays = currentDay - math.floor(mcDay)
+          withinWindow = ageDays >= 0 and ageDays < GDP_PERIOD_MC_DAYS
+        elseif t then
+          -- Fallback for older ContractServer builds that only store os.epoch timestamps.
+          -- 365 Minecraft days is treated as 365 standard 20-minute days.
+          withinWindow = (now - t) <= GDP_PERIOD_MS
+        else
+          -- If old contracts have no timestamp/day, count them as visible fulfilled output.
+          withinWindow = true
+        end
+
+        if withinWindow then
+          gdp = gdp + reward
+          gdpEvents = gdpEvents + 1
+        end
+      end
+    end
+  end
+
+  status = type(status) == "table" and status or {}
+  return {
+    connected = contract_id ~= nil,
+    total = tonumber(status.total) or #contracts,
+    open = tonumber(status.open) or 0,
+    claimed = tonumber(status.claimed) or 0,
+    fulfilled = tonumber(status.fulfilled) or 0,
+    cancelled = tonumber(status.cancelled) or 0,
+    gdp_365d = gdp,
+    gdp_24h = gdp,
+    gdp_period_mc_days = GDP_PERIOD_MC_DAYS,
+    gdp_events = gdpEvents,
+    fulfilled_value = fulfilledValue,
+    open_value = openValue,
+    claimed_value = claimedValue,
+    total_value = totalValue,
+    newest_fulfilled = newestFulfilled,
+    status = "GDP from fulfilled contracts, rolling " .. tostring(GDP_PERIOD_MC_DAYS) .. " MC days",
+  }
+end
+
+local function fetchContractEconomy()
+  if not contract_id then
+    connectContractServer(true)
+  end
+  if not contract_id then
+    return {
+      connected = false,
+      status = "Waiting for ContractServer",
+      open = 0,
+      claimed = 0,
+      fulfilled = 0,
+      cancelled = 0,
+      total = 0,
+    }
+  end
+
+  local okStatus, status = contractRequest({ type = "status" }, 2)
+  if not okStatus or type(status) ~= "table" then
+    local err = tostring(status or "status unavailable")
+    contract_id = nil
+    last_contract_error = err
+    return { connected = false, status = err, open = 0, claimed = 0, fulfilled = 0, cancelled = 0, total = 0 }
+  end
+
+  local okList, listRes = contractRequest({ type = "list_contracts", status = "all" }, 3)
+  local contracts = {}
+  if okList and type(listRes) == "table" then
+    contracts = listRes.contracts or {}
+  end
+
+  local out = analyseContracts(contracts, status)
+  out.server_id = contract_id
+  return out
+end
+
+local function normaliseNationalStats(raw)
+  local monetaryRaw = raw.monetary or raw.supply or {}
+  local outputRaw = raw.output or raw.gdp or {}
+  local pricesRaw = raw.prices or {}
+  local scaleRaw = raw.population or raw.scale or {}
+  local inequalityRaw = raw.inequality or raw.wealth_inequality or {}
+  local activityRaw = raw.activity or {}
+
+  local issued = num(monetaryRaw.issued_supply or monetaryRaw.in_circulation or monetaryRaw.total_supply)
+  local treasury = num(monetaryRaw.treasury_reserve or monetaryRaw.treasury_balance)
+  local private = num(monetaryRaw.private_supply)
+  if not private and issued and treasury then private = issued - treasury end
+  local reserveShare = nil
+  if issued and issued > 0 and treasury then reserveShare = (treasury / issued) * 100 end
+
+  local monetaryInflation, monetaryInflationStatus = calculateMonetaryInflation(issued)
+
+  local population = num(scaleRaw.active_citizens or scaleRaw.citizens or raw.citizen_count)
+  local companies = num(scaleRaw.companies or raw.company_count)
+  local totalTx = num(scaleRaw.transactions or raw.tx_count or activityRaw.transactions)
+  local gdp = num(outputRaw.gdp_365d or outputRaw.rolling_gdp_365d or outputRaw.nominal_gdp or outputRaw.gdp)
+  local gdpCap = num(outputRaw.gdp_per_capita)
+  if not gdpCap and gdp and population and population > 0 then gdpCap = gdp / population end
+
+  local txDay = num(activityRaw.transactions_per_day or scaleRaw.transactions_per_day)
+  local txStatus = activityRaw.status or "Live / estimated"
+  if not txDay then txDay, txStatus = estimateTxPerDay(totalTx) end
+
+  return {
+    mode = "official national_statistics",
+    quality = raw.quality or raw.status or "OFFICIAL",
+    time = raw.time or nowMs(),
+    mc_clock = minecraftClock(),
+    gdp_period_mc_days = GDP_PERIOD_MC_DAYS,
+    gdp = gdp,
+    gdp_per_capita = gdpCap,
+    inflation = monetaryInflation,
+    output_status = outputRaw.status or (gdp and "Live" or "Awaiting GDP output data"),
+    inflation_status = monetaryInflationStatus or "Awaiting monetary supply baseline",
+    inequality = {
+      top1_share = num(inequalityRaw.top1_share or inequalityRaw.top_1_share),
+      average_balance = num(inequalityRaw.average_balance or inequalityRaw.mean),
+      total_balance = num(inequalityRaw.total_balance),
+      observations = num(inequalityRaw.observations),
+      status = inequalityRaw.status or "Awaiting citizen balance distribution",
+    },
+    monetary = {
+      issued_supply = issued,
+      private_supply = private,
+      treasury_reserve = treasury,
+      reserve_share = reserveShare,
+      status = monetaryRaw.status or "Live",
+    },
+    scale = {
+      population = population,
+      companies = companies,
+      transactions_total = totalTx,
+      transactions_per_day = txDay,
+      tx_day_status = txStatus,
+      top_companies = scaleRaw.top_companies or scaleRaw.company_top10 or raw.top_companies or {},
+      source = raw.source or "national_statistics",
+    },
+    contracts = raw.contracts or raw.contract_activity or {},
+  }
+end
+
+local function fallbackSnapshot()
+  -- v0.5.8: do not let one broken/old endpoint blank the entire monitor.
+  -- The v1.4.3 bank does not expose national_statistics, and in some worlds the
+  -- status handler may fail while supply/list_accounts/price-oracle still work.
+  -- So this snapshot is assembled from separate narrow endpoints.
+  local endpointErrors = {}
+
+  local okStatus, status = dbRequest({ type = "status" }, 2)
+  if not okStatus or type(status) ~= "table" then
+    endpointErrors[#endpointErrors + 1] = "status=" .. shortText(tostring(status), 36)
+    status = {}
+  end
+
+  local okSupply, supplyRes = dbRequest({ type = "supply" }, 2)
+  local supply = {}
+  if okSupply and type(supplyRes) == "table" then
+    supply = supplyRes
+  else
+    endpointErrors[#endpointErrors + 1] = "supply=" .. shortText(tostring(supplyRes), 36)
+    if type(status.supply) == "table" then supply = status.supply end
+  end
+
+  local okAccounts, accRes = dbRequest({ type = "list_accounts" }, 3)
+  local accounts = nil
+  if okAccounts and type(accRes) == "table" then
+    accounts = accRes.accounts or {}
+  else
+    endpointErrors[#endpointErrors + 1] = "accounts=" .. shortText(tostring(accRes), 36)
+  end
+
+  local issued = num(supply.in_circulation or supply.total_supply)
+  if not issued then
+    local minted = num(supply.total_minted) or 0
+    local burned = num(supply.total_burned) or 0
+    if minted > 0 or burned > 0 then issued = minted - burned end
+  end
+
+  local treasury = num(supply.treasury_balance or supply.treasury_reserve)
+  local private = num(supply.private_supply)
+
+  local derivedPopulation = 0
+  local derivedCompanies = 0
+  local derivedCitizenWealth = 0
+  local derivedTreasury = nil
+  if type(accounts) == "table" then
+    for _, acc in ipairs(accounts) do
+      if type(acc) == "table" and acc.status ~= "suspended" then
+        if acc.account_id == "treasury:quid_bank" then derivedTreasury = num(acc.balance) end
+        if acc.type == "citizen" then
+          derivedPopulation = derivedPopulation + 1
+          derivedCitizenWealth = derivedCitizenWealth + (num(acc.balance) or 0)
+        elseif acc.type == "company" then
+          derivedCompanies = derivedCompanies + 1
+        end
+      end
+    end
+  end
+
+  if not treasury then treasury = derivedTreasury end
+  if not private and issued and treasury then private = issued - treasury end
+  local reserveShare = nil
+  if issued and issued > 0 and treasury then reserveShare = (treasury / issued) * 100 end
+
+  local population = num(status.citizen_count)
+  if not population and derivedPopulation > 0 then population = derivedPopulation end
+
+  local companyCount = num(status.company_count)
+  if not companyCount and derivedCompanies > 0 then companyCount = derivedCompanies end
+
+  local txTotal = num(status.tx_count)
+  local txDay, txStatus = nil, "Status tx counter unavailable"
+  if txTotal then txDay, txStatus = estimateTxPerDay(txTotal) end
+
+  -- Prefer the bank's actual inflation state. The older adaptive monetary
+  -- calculation remains only as a fallback if that endpoint is unavailable.
+  local inflation, inflationStatus = nil, nil
+  local okInf, infRes = dbRequest({ type = "get_inflation_state" }, 2)
+  if okInf and type(infRes) == "table" then
+    local st = infRes.state or infRes
+    local rate = num(st.inflation_rate)
+    inflation = num(st.inflation_percent)
+    if not inflation and rate then inflation = rate * 100 end
+    inflationStatus = "Bank inflation state"
+  else
+    endpointErrors[#endpointErrors + 1] = "inflation=" .. shortText(tostring(infRes), 36)
+    inflation, inflationStatus = calculateMonetaryInflation(issued)
+  end
+
+  local contractEco = fetchContractEconomy()
+  local gdp = nil
+  local outputStatus = "Waiting for ContractServer / fulfilled contracts"
+  if contractEco and contractEco.connected then
+    gdp = tonumber(contractEco.gdp_365d or contractEco.gdp_24h) or 0
+    outputStatus = contractEco.status or "GDP from fulfilled contracts"
+  else
+    local okGdp, gdpRes = dbRequest({ type = "economic_gdp", days = 30 }, 2)
+    if okGdp and type(gdpRes) == "table" then
+      gdp = num(gdpRes.total or gdpRes.gdp or gdpRes.private_gdp)
+      outputStatus = "Private GDP fallback from bank ledger"
+    else
+      endpointErrors[#endpointErrors + 1] = "gdp=" .. shortText(tostring(gdpRes), 36)
+    end
+  end
+
+  local gdpCap = nil
+  if gdp and population and population > 0 then gdpCap = gdp / population end
+
+  local quality = "LIVE"
+  if #endpointErrors > 0 then quality = "PARTIAL" end
+
+  local sourceText = "direct endpoints"
+  if #endpointErrors > 0 then
+    sourceText = "direct endpoints; degraded: " .. table.concat(endpointErrors, "; ")
+  end
+
+  return {
+    mode = "DIRECT ENDPOINTS",
+    quality = quality,
+    time = num(status.time) or nowMs(),
+    mc_clock = minecraftClock(),
+    gdp_period_mc_days = GDP_PERIOD_MC_DAYS,
+    gdp = gdp,
+    gdp_per_capita = gdpCap,
+    inflation = inflation,
+    output_status = outputStatus,
+    inflation_status = inflationStatus or "Awaiting inflation state",
+    inequality = inequalityFromAccounts(accounts),
+    monetary = {
+      issued_supply = issued,
+      private_supply = private,
+      treasury_reserve = treasury,
+      reserve_share = reserveShare,
+      status = (okSupply and "Live from supply endpoint") or "Supply degraded",
+    },
+    scale = {
+      population = population,
+      companies = companyCount,
+      transactions_total = txTotal,
+      transactions_per_day = txDay,
+      tx_day_status = txStatus,
+      top_companies = topCompaniesFromAccounts(accounts),
+      source = sourceText,
+    },
+    contracts = contractEco,
+  }
+end
+
+local function refreshSnapshot()
+  if not db_id then return false, "No server connected" end
+
+  -- Advance the bank-side inflation clock if the server supports it. This only
+  -- updates the inflation/index state; it does not move money or control accounts.
+  pcall(function()
+    dbRequest({ type = "tick_inflation", day = currentMinecraftDay() }, 2)
+  end)
+
+  local snap, err = fallbackSnapshot()
+  if not snap then return false, err or "Could not build snapshot" end
+
+  local priceOracle = fetchPriceOracle()
+  snap.price_oracle = priceOracle
+  if priceOracle and priceOracle.connected then
+    if priceOracle.inflation_percent ~= nil then
+      snap.inflation = priceOracle.inflation_percent
+      snap.inflation_status = "Live bank inflation rate driving sector CPI"
+    end
+    if snap.quality == "PARTIAL" then
+      snap.quality = "PARTIAL + CPI"
+    end
+  end
+
+  snap.mc_clock = minecraftClock()
+  snap.gdp_period_mc_days = GDP_PERIOD_MC_DAYS
+
+  last_snapshot = snap
+  last_error = ""
+
+  local okTime, timeText = pcall(function()
+    return os.date("!%H:%M:%S", math.floor(nowMs() / 1000))
+  end)
+  if okTime and timeText then last_update_text = timeText .. " UTC" else last_update_text = textutils.formatTime(os.time(), true) end
+
+  pushHistory("gdp", snap.gdp)
+  pushHistory("gdp_per_capita", snap.gdp_per_capita)
+  pushHistory("inflation", snap.inflation)
+  pushHistory("issued_supply", snap.monetary and snap.monetary.issued_supply)
+  if snap.price_oracle and snap.price_oracle.connected then
+    pushHistory("general_index", sectorIndexFromOracle(snap.price_oracle, "general"))
+    pushHistory("food_index", sectorIndexFromOracle(snap.price_oracle, "food"))
+    pushHistory("construction_index", sectorIndexFromOracle(snap.price_oracle, "construction"))
+  end
+  saveHistory()
+
+  return true, snap
+end
+
+-- =============================================================================
+-- DRAWING
+-- =============================================================================
+local C = {
+  bg = colors.black,
+  header = colors.blue,
+  title = colors.white,
+  text = colors.lightGray,
+  dim = colors.gray,
+  good = colors.lime,
+  warn = colors.orange,
+  bad = colors.red,
+  gdp = colors.blue,
+  capita = colors.cyan,
+  inflation = colors.purple,
+  inequality = colors.red,
+  money = colors.green,
+  scale = colors.brown,
+}
+
+local function card(x, y, w, h, title, colour)
+  fill(x, y, w, h, C.bg)
+  fill(x, y, w, 1, colour or colors.gray)
+  writeAt(x + 1, y, string.upper(title or ""), colors.white, colour or colors.gray)
+end
+
+local function metric(x, y, label, value, valueColour, labelW)
+  labelW = labelW or 20
+  writeAt(x, y, tostring(label):sub(1, labelW), C.text, C.bg)
+  writeAt(x + labelW + 1, y, tostring(value or "Awaiting data"), valueColour or colors.white, C.bg)
+end
+
+local function graphCard(x, y, w, h, title, currentLabel, currentValue, currentColour, series, colour, missingReason)
+  card(x, y, w, h, title, colour)
+
+  writeAt(x + 2, y + 2, string.upper(currentLabel or "CURRENT"), C.text, C.bg)
+  writeAt(x + 2, y + 3, tostring(currentValue or "Awaiting data"), currentColour or C.warn, C.bg)
+
+  local gx = x + 2
+  local gy = y + 6
+  local gw = w - 4
+  local gh = h - 9
+  if gh < 4 then gh = 4 end
+
+  if not series or #series < 2 then
+    fill(gx, gy, gw, gh, C.bg)
+    centerIn(x, gy + math.floor(gh / 2), w, "Awaiting live history", C.warn, C.bg)
+    writeAt(x + 2, y + h - 2, "Waiting: " .. shortText(missingReason or "source data", w - 13), C.dim, C.bg)
+    return
+  end
+
+  local start = math.max(1, #series - gw + 1)
+  local values = {}
+  for i = start, #series do
+    local v = tonumber(series[i])
+    if v then values[#values + 1] = v end
+  end
+  if #values < 2 then
+    centerIn(x, gy + math.floor(gh / 2), w, "Awaiting live history", C.warn, C.bg)
+    return
+  end
+
+  local minV = values[1]
+  local maxV = values[1]
+  for _, v in ipairs(values) do
+    if v < minV then minV = v end
+    if v > maxV then maxV = v end
+  end
+  local range = maxV - minV
+  if range == 0 then range = 1 end
+
+  -- Render a connected low-resolution line chart.
+  -- Older builds plotted each sample as a marker, which looked like scattered points.
+  -- This builds a tiny character canvas first, then draws line segments between samples.
+  local canvas = {}
+  for row = 1, gh do
+    canvas[row] = {}
+    for col = 1, gw do
+      canvas[row][col] = " "
+    end
+  end
+
+  -- Light horizontal guide lines, kept subtle so the actual line is the focus.
+  for row = 1, gh do
+    if row == 1 or row == gh or row == math.ceil(gh / 2) then
+      for col = 1, gw do
+        canvas[row][col] = "."
+      end
+    end
+  end
+
+  local points = {}
+  for i, v in ipairs(values) do
+    if i <= gw then
+      local norm = (v - minV) / range
+      local py = gy + gh - 1 - math.floor(norm * (gh - 1) + 0.5)
+      py = clamp(py, gy, gy + gh - 1)
+      points[#points + 1] = { x = i, y = py - gy + 1 }
+    end
+  end
+
+  local function put(col, row, ch)
+    if row >= 1 and row <= gh and col >= 1 and col <= gw then
+      canvas[row][col] = ch
+    end
+  end
+
+  for i = 2, #points do
+    local a = points[i - 1]
+    local b = points[i]
+    local dy = b.y - a.y
+
+    if dy == 0 then
+      put(a.x, a.y, "-")
+      put(b.x, b.y, "-")
+    else
+      local ch = dy < 0 and "/" or "\\"
+      put(a.x, a.y, ch)
+      put(b.x, b.y, ch)
+
+      -- When a move is too steep for a one-character diagonal, fill the gap
+      -- vertically in the new column so it reads as one connected move.
+      if math.abs(dy) > 1 then
+        local step = dy > 0 and 1 or -1
+        local row = a.y + step
+        while row ~= b.y do
+          put(b.x, row, "|")
+          row = row + step
+        end
+      end
+    end
+  end
+
+  -- Mark the latest point without turning the whole graph back into markers.
+  local latest = points[#points]
+  if latest then put(latest.x, latest.y, "o") end
+
+  for row = 1, gh do
+    writeAt(gx, gy + row - 1, table.concat(canvas[row]), colour, C.bg)
+  end
+
+  writeAt(x + 2, y + h - 1, "min " .. fmtNum(minV, 1), C.dim, C.bg)
+  local maxText = "max " .. fmtNum(maxV, 1)
+  writeAt(x + w - #maxText - 1, y + h - 1, maxText, C.dim, C.bg)
+end
+
+local function drawInequalityCard(x, y, w, h, snap)
+  local q = snap and snap.inequality or {}
+  card(x, y, w, h, "INEQUALITY", C.inequality)
+
+  metric(x + 2, y + 2, "Top 1% share", q.top1_share and fmtPct(q.top1_share, 1) or "Awaiting data", q.top1_share and colors.white or C.warn)
+  metric(x + 2, y + 3, "Average balance", fmtMoney(q.average_balance), q.average_balance and colors.white or C.warn)
+  metric(x + 2, y + 4, "Citizen wealth", fmtMoney(q.total_balance), q.total_balance and colors.white or C.warn)
+  metric(x + 2, y + 5, "Accounts", tostring(q.observations or "Awaiting data"), q.observations and colors.white or C.warn)
+
+  local barW = math.max(10, w - 6)
+  local filled = 0
+  if q.top1_share then filled = math.floor(clamp(q.top1_share / 100, 0, 1) * barW) end
+  local barY = math.min(y + 7, y + h - 3)
+  fill(x + 2, barY, barW, 1, colors.gray)
+  if filled > 0 then fill(x + 2, barY, filled, 1, C.inequality) end
+  if barY + 1 <= y + h - 2 then
+    writeAt(x + 2, barY + 1, "Top 1% share of citizen balances", C.dim, C.bg)
+  end
+
+  writeAt(x + 2, y + h - 1, shortText(q.status or "Awaiting account aggregation", w - 4), q.status and q.status:find("Live") and C.good or C.warn, C.bg)
+end
+
+local function drawMonetaryCard(x, y, w, h, snap)
+  local m = snap and snap.monetary or {}
+  card(x, y, w, h, "MONETARY CONDITIONS", C.money)
+  metric(x + 2, y + 2, "Issued supply", fmtMoney(m.issued_supply), m.issued_supply and C.good or C.warn)
+  metric(x + 2, y + 3, "Private supply", fmtMoney(m.private_supply), m.private_supply and colors.white or C.warn)
+  metric(x + 2, y + 4, "Treasury reserve", fmtMoney(m.treasury_reserve), m.treasury_reserve and colors.white or C.warn)
+  metric(x + 2, y + 5, "Treasury Control", fmtPct(m.reserve_share, 2), m.reserve_share and colors.white or C.warn)
+  writeAt(x + 2, y + h - 1, shortText(m.status or "Awaiting supply data", w - 4), m.status and C.good or C.warn, C.bg)
+end
+
+
+local function drawPriceOracleCard(x, y, w, h, snap)
+  local po = snap and snap.price_oracle or {}
+  card(x, y, w, h, "PRICE / INFLATION ENGINE", C.money)
+
+  if not po.connected then
+    metric(x + 2, y + 2, "Status", shortText(po.status or "Awaiting price oracle", w - 15), C.warn)
+    local m = snap and snap.monetary or {}
+    metric(x + 2, y + 4, "Issued supply", fmtMoney(m.issued_supply), m.issued_supply and C.good or C.warn)
+    metric(x + 2, y + 5, "Fallback inflation", fmtPct(snap and snap.inflation, 2), snap and snap.inflation and colors.white or C.warn)
+    writeAt(x + 2, y + h - 1, "Bank oracle endpoint failed; reboot/patched ServerSideAccounts required", C.warn, C.bg)
+    return
+  end
+
+  local food = sectorFromOracle(po, "food") or {}
+  local construction = sectorFromOracle(po, "construction") or {}
+  local fuel = sectorFromOracle(po, "fuel") or {}
+  local logistics = sectorFromOracle(po, "logistics") or {}
+  local tools = sectorFromOracle(po, "tools") or {}
+  local hospitality = sectorFromOracle(po, "hospitality") or {}
+  local general = sectorFromOracle(po, "general") or {}
+
+  local floor = tonumber(food.price_pressure_floor or general.price_pressure_floor)
+  local pressure = tonumber(food.monetary_pressure or general.monetary_pressure)
+  local shock = tonumber(food.shock_pressure or general.shock_pressure)
+  local sticky = tonumber(food.sticky_floor_from_ath or general.sticky_floor_from_ath)
+  local defCap = tonumber(food.max_daily_deflation or general.max_daily_deflation)
+
+  metric(x + 2, y + 2, "Bank rate", fmtPct(po.inflation_percent, 2), po.inflation_percent and colors.white or C.warn, 16)
+  metric(x + 2, y + 3, "Price pressure", fmtPct(pressure and (pressure * 100) or nil, 1), pressure and colors.white or C.warn, 16)
+  metric(x + 2, y + 4, "Admin floor", fmtPct(floor and (floor * 100) or nil, 1), floor and floor > 0 and C.warn or C.dim, 16)
+  metric(x + 2, y + 5, "Print shock", fmtPct(shock and (shock * 100) or nil, 1), shock and shock > 0 and C.warn or C.dim, 16)
+  metric(x + 2, y + 6, "Deflation cap", fmtPct(defCap and (defCap * 100) or nil, 1), defCap and colors.white or C.warn, 16)
+  metric(x + 2, y + 7, "ATH floor", sticky and (fmtPct(sticky * 100, 0) .. " of ATH") or "Awaiting data", sticky and colors.white or C.warn, 16)
+  metric(x + 2, y + 8, "General/Food", fmtIndex(general.index, 2) .. " / " .. fmtIndex(food.index, 2), food.index and colors.white or C.warn, 16)
+  metric(x + 2, y + 9, "Construct/Fuel", fmtIndex(construction.index, 2) .. " / " .. fmtIndex(fuel.index, 2), construction.index and colors.white or C.warn, 16)
+
+  local q = po.quotes or {}
+  local lineY = y + 11
+  if lineY <= y + h - 3 then
+    writeAt(x + 2, lineY, "Live quotes", colors.white, C.bg)
+  end
+  if lineY + 1 <= y + h - 2 then
+    local meal = quoteLabel(q.dining_meal) or "n/a"
+    local large = quoteLabel(q.large_meal) or "n/a"
+    writeAt(x + 2, lineY + 1, shortText("Meal normal/large: " .. meal .. " / " .. large, w - 4), C.text, C.bg)
+  end
+  if lineY + 2 <= y + h - 2 then
+    local build = quoteLabel(q.oak_planks_64) or "n/a"
+    local iron = quoteLabel(q.iron_ingot_8) or "n/a"
+    writeAt(x + 2, lineY + 2, shortText("64 planks: " .. build .. "   8 iron: " .. iron, w - 4), C.text, C.bg)
+  end
+  if lineY + 3 <= y + h - 2 then
+    local coal = quoteLabel(q.coal_16) or "n/a"
+    writeAt(x + 2, lineY + 3, shortText("16 coal: " .. coal, w - 4), C.text, C.bg)
+  end
+
+  writeAt(x + 2, y + h - 1, shortText(po.status or "Live sector CPI", w - 4), C.good, C.bg)
+end
+
+local function drawScaleCard(x, y, w, h, snap)
+  local s = snap and snap.scale or {}
+  card(x, y, w, h, "POPULATION / COMPANIES / TRANSACTIONS", C.scale)
+  metric(x + 2, y + 2, "Population", tostring(s.population or "Awaiting data"), s.population and colors.white or C.warn)
+  metric(x + 2, y + 3, "Companies", tostring(s.companies or "Awaiting data"), s.companies and colors.white or C.warn)
+  metric(x + 2, y + 4, "Transactions / day", s.transactions_per_day and (fmtNum(s.transactions_per_day, 1) .. " / day") or "Collecting baseline", s.transactions_per_day and colors.white or C.warn)
+
+  local c = snap and snap.contracts or {}
+  local contractLine = "Contracts O/C/F: " .. tostring(c.open or 0) .. "/" .. tostring(c.claimed or 0) .. "/" .. tostring(c.fulfilled or 0)
+  writeAt(x + 2, y + 5, shortText(contractLine, w - 4), c.connected and C.good or C.warn, C.bg)
+
+  writeAt(x + 2, y + 7, "Top companies", colors.white, C.bg)
+  local top = s.top_companies or {}
+  if type(top) ~= "table" or #top == 0 then
+    writeAt(x + 2, y + 8, "No company account data", C.warn, C.bg)
+  else
+    local maxRows = math.min(10, #top, math.max(1, h - 10))
+    for i = 1, maxRows do
+      local company = top[i] or {}
+      local name = shortText(company.name or company.id or ("Company " .. i), math.max(8, w - 18))
+      local bal = fmtMoney(company.balance)
+      local line = tostring(i) .. ". " .. name
+      writeAt(x + 2, y + 7 + i, shortText(line, w - 18), C.text, C.bg)
+      writeAt(x + w - #bal - 2, y + 7 + i, bal, colors.white, C.bg)
+    end
+  end
+
+  writeAt(x + 2, y + h - 1, shortText(s.tx_day_status or "Awaiting tx counter", w - 4), C.dim, C.bg)
+end
+
+local function drawHeader(snap)
+  local w = getSize()
+  fill(1, 1, w, 1, C.header)
+  writeAt(2, 1, "ECONOMY CORE MONITOR", C.title, C.header)
+  local v = "v" .. VERSION
+  writeAt(w - #v, 1, v, C.title, C.header)
+
+  fill(1, 2, w, 2, C.bg)
+  local clock = (snap and snap.mc_clock) or minecraftClock()
+  writeAt(2, 2, "Mode: " .. tostring(snap and snap.mode or "CONNECTING"), C.dim, C.bg)
+  writeAt(34, 2, "Data: " .. tostring(snap and snap.quality or "NO DATA"), (snap and snap.quality == "OFFICIAL") and C.good or C.warn, C.bg)
+  writeAt(54, 2, "Date: " .. tostring(clock.date_text), C.good, C.bg)
+  writeAt(76, 2, "Time: " .. tostring(clock.time_text), C.good, C.bg)
+
+  writeAt(2, 3, "Tick: " .. tostring(clock.tick_text), C.good, C.bg)
+  writeAt(18, 3, "GDP window: " .. tostring(GDP_PERIOD_MC_DAYS) .. " MC days", C.warn, C.bg)
+  local po = snap and snap.price_oracle or nil
+  if po and po.connected then
+    local food = sectorIndexFromOracle(po, "food")
+    local build = sectorIndexFromOracle(po, "construction")
+    writeAt(52, 3, "Food " .. fmtIndex(food, 2) .. "  Build " .. fmtIndex(build, 2), C.good, C.bg)
+  else
+    writeAt(52, 3, "Sector CPI: awaiting oracle", C.warn, C.bg)
+  end
+  if db_id then writeAt(86, 3, "Bank: " .. tostring(db_id), C.dim, C.bg) end
+  if contract_id then writeAt(102, 3, "Contracts: " .. tostring(contract_id), C.dim, C.bg) end
+end
+
+local function drawFooter()
+  local w, h = getSize()
+  fill(1, h - 1, w, 2, C.bg)
+  writeAt(1, h - 1, string.rep("-", w), C.dim, C.bg)
+  local text = "Refresh: " .. REFRESH_SECONDS .. "s   NO-FLICKER SECTOR CPI / CONTRACT GDP   Monitor: " .. (monitor and (monitor_name or "attached") or "terminal") .. "   [Q] Quit"
+  writeAt(2, h, text, C.dim, C.bg)
+  if last_error ~= "" then writeAt(math.max(2, w - #last_error - 2), h, last_error, C.bad, C.bg) end
+end
+
+local function drawScreen()
+  local w, h = getSize()
+  if first_draw or w ~= last_draw_w or h ~= last_draw_h then
+    clear(C.bg)
+    first_draw = false
+    last_draw_w = w
+    last_draw_h = h
+  else
+    term.setCursorBlink(false)
+    term.setBackgroundColor(C.bg)
+    term.setTextColor(colors.white)
+  end
+  local snap = last_snapshot
+
+  if w < 80 or h < 24 then
+    centerIn(1, 2, w, "ECONOMY CORE MONITOR", colors.yellow, C.bg)
+    centerIn(1, 4, w, "Monitor too small. Use a bigger monitor or lower text scale.", C.bad, C.bg)
+    drawFooter()
+    return
+  end
+
+  drawHeader(snap)
+
+  local margin = 2
+  local gap = 2
+  local colW = math.floor((w - (margin * 2) - (gap * 2)) / 3)
+  local col1 = margin
+  local col2 = col1 + colW + gap
+  local col3 = col2 + colW + gap
+
+  local topY = 4
+  local topH = math.max(14, math.floor((h - 7) * 0.55))
+  local bottomY = topY + topH + 1
+  local bottomH = h - bottomY - 2
+  if bottomH < 11 then bottomH = 11 end
+
+  graphCard(col1, topY, colW, topH, "GDP", "Rolling GDP (365 MC days)", fmtMoney(snap and snap.gdp), snap and snap.gdp and colors.white or C.warn, history.gdp, C.gdp, snap and snap.output_status or "GDP output data")
+  graphCard(col2, topY, colW, topH, "GDP / PER CAPITA", "Rolling GDP / capita", fmtMoney(snap and snap.gdp_per_capita), snap and snap.gdp_per_capita and colors.white or C.warn, history.gdp_per_capita, C.capita, snap and snap.output_status or "GDP output data")
+  graphCard(col3, topY, colW, topH, "INFLATION", "Bank inflation rate", fmtPct(snap and snap.inflation, 2), snap and snap.inflation and colors.white or C.warn, history.inflation, C.inflation, snap and snap.inflation_status or "inflation data")
+
+  drawInequalityCard(col1, bottomY, colW, bottomH, snap)
+  drawPriceOracleCard(col2, bottomY, colW, bottomH, snap)
+  drawScaleCard(col3, bottomY, colW, bottomH, snap)
+
+  drawFooter()
+end
+
+-- =============================================================================
+-- MAIN LOOP
 -- =============================================================================
 local function main()
-  term.clear()
-  term.setCursorPos(1, 1)
-  if os.getComputerLabel() ~= DB_LABEL then os.setComputerLabel(DB_LABEL) end
-  print("QUID BANK OF PLENTY v" .. VERSION)
-  print("Booting...")
-  initFiles()
-  initCounters()
-  initSystemAccounts()
-  if not openModem() then print("FATAL: No modem. Halting."); return end
-  versionInfo = loadVersionInfo()
-  saveConfig()
-  audit("SYSTEM", "SYSTEM", os.getComputerID(), "BOOT", "v" .. VERSION)
-  print("Boot complete.")
-  sleep(1)
-  drawStatus()
-  rednet.broadcast({ type="treasury_online", version=VERSION, id=os.getComputerID() }, PROTOCOL)
-  rednet.broadcast({ type="treasury_online", version=VERSION, id=os.getComputerID() }, PROTOCOL_BROADCAST)
-  serverLoop()
+  setupDisplay()
+  loadHistory()
+
+  if not openModem() then
+    last_error = "No modem found"
+    drawScreen()
+    sleep(5)
+    restoreDisplay()
+    print("ERROR: No modem found. Attach a modem and reboot.")
+    return
+  end
+
+  while not connectServer() do
+    drawScreen()
+    sleep(3)
+  end
+  connectContractServer(true)
+
+  local ok, err = refreshSnapshot()
+  if not ok then last_error = tostring(err) end
+  drawScreen()
+
+  local timer = os.startTimer(REFRESH_SECONDS)
+  while true do
+    local ev, p1 = os.pullEvent()
+    if ev == "timer" and p1 == timer then
+      if not db_id then connectServer() end
+      local refreshOk, refreshErr = refreshSnapshot()
+      if not refreshOk then last_error = tostring(refreshErr) end
+      drawScreen()
+      timer = os.startTimer(REFRESH_SECONDS)
+    elseif ev == "key" then
+      if p1 == keys.q then break end
+      if p1 == keys.r then
+        local refreshOk, refreshErr = refreshSnapshot()
+        if not refreshOk then last_error = tostring(refreshErr) end
+        drawScreen()
+      end
+    elseif ev == "terminate" then
+      break
+    end
+  end
+
+  saveHistory()
+  restoreDisplay()
+  print("Economy Core Monitor closed.")
 end
 
 main()
