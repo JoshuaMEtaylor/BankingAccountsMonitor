@@ -32,7 +32,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION = "1.0.23-WIDE-SECTOR-PRICING"
+local VERSION = "1.0.14-BUILDER-BUNDLES"
 local BANK_PROTOCOL = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT = 5
@@ -42,10 +42,8 @@ local STARTING_CAPITAL = 0
 local AUTO_GRANT_CAPITAL = false
 local DEFAULT_OWNER_ID = "treasury:quid_bank"
 
-local PRICE_INDEX = 1.00          -- legacy/general fallback only
-local INFLATION_RATE = 0.00       -- current bank inflation pressure
-local PRICE_SOURCE = "legacy"
-local SECTOR_INDICES = {}
+local PRICE_INDEX = 1.00          -- central inflation price index from bank
+local INFLATION_RATE = 0.00       -- daily inflation/deflation rate from bank
 local BASE_CONTRACT_FEE = 0       -- contract price is unit base price * quantity, then inflation; no separate job fee
 local SPEND_LIMIT = 0.50          -- max % of business balance per job; bulk supply jobs need room to pay by quantity
 local MIN_FAIR_RATIO = 0.50       -- don't post if affordable price is under this share of fair value
@@ -235,7 +233,7 @@ local function draw()
   at(2, 10, "Citizens:  " .. tostring(stats.citizens_seen) .. "   Accounts: " .. tostring(countTable(citizens_map)) .. " (new " .. tostring(stats.citizens_registered) .. ")", colors.lightGray)
   at(2, 11, "Requests:  " .. tostring(stats.requests_seen) .. "   Contracts: " .. tostring(stats.contracts_posted), colors.lime)
   at(2, 12, "Skipped:   unmapped " .. tostring(stats.skipped_unmapped) .. " / unfunded " .. tostring(stats.skipped_unfunded), colors.orange)
-  at(2, 13, "Pricing:   oracle " .. tostring(PRICE_SOURCE) .. " | cons x" .. string.format("%.3f", (SECTOR_INDICES.construction and SECTOR_INDICES.construction.index) or PRICE_INDEX) .. " food x" .. string.format("%.3f", (SECTOR_INDICES.food and SECTOR_INDICES.food.index) or PRICE_INDEX), colors.lightGray)
+  at(2, 13, "Pricing:   base " .. tostring(BASE_CONTRACT_FEE) .. " Q, index x" .. string.format("%.3f", PRICE_INDEX) .. ", rate " .. string.format("%.2f%%", INFLATION_RATE * 100), colors.lightGray)
 
   local last = "never"
   if stats.last_scan > 0 then last = tostring(math.floor((now() - stats.last_scan) / 1000)) .. "s ago" end
@@ -972,29 +970,22 @@ end
 
 -- =============================================================================
 -- PRICING
+
 -- =============================================================================
 local function refreshPrices()
-  -- Legacy manual price table is still useful as a fallback, but live contract
-  -- pricing should use the bank's wide sector price oracle when available.
   local ok, res = bankReq({ type="get_prices" })
   if ok and type(res) == "table" and type(res.prices) == "table" then prices = res.prices end
 end
 
+
 local function refreshInflation()
   local day = os.day and math.floor(tonumber(os.day()) or 0) or nil
 
-  -- Safe to call repeatedly; the bank only advances when the Minecraft day moves.
-  bankReq({ type = "tick_inflation", day = day }, 4)
-
-  local ok, res = bankReq({ type = "get_price_indices" }, 5)
-  if ok and type(res) == "table" and type(res.sectors) == "table" then
-    SECTOR_INDICES = res.sectors
-    local g = SECTOR_INDICES.general or {}
-    PRICE_INDEX = tonumber(g.index) or PRICE_INDEX
-    if type(res.inflation) == "table" then
-      INFLATION_RATE = tonumber(res.inflation.inflation_rate) or INFLATION_RATE
-    end
-    PRICE_SOURCE = tostring(res.model or "wide_sector_oracle")
+  local ok, res = bankReq({ type = "tick_inflation", day = day }, 4)
+  if ok and type(res) == "table" then
+    local st = res.state or res
+    PRICE_INDEX = tonumber(st.price_index) or PRICE_INDEX
+    INFLATION_RATE = tonumber(st.inflation_rate) or INFLATION_RATE
     return true
   end
 
@@ -1003,7 +994,6 @@ local function refreshInflation()
     local st = res.state or res
     PRICE_INDEX = tonumber(st.price_index) or PRICE_INDEX
     INFLATION_RATE = tonumber(st.inflation_rate) or INFLATION_RATE
-    PRICE_SOURCE = "legacy_inflation"
     return true
   end
 
@@ -1011,24 +1001,17 @@ local function refreshInflation()
   if config.price_index then PRICE_INDEX = tonumber(config.price_index) or PRICE_INDEX end
   if config.inflation_multiplier then PRICE_INDEX = tonumber(config.inflation_multiplier) or PRICE_INDEX end
   if config.inflation then PRICE_INDEX = tonumber(config.inflation) or PRICE_INDEX end
-  PRICE_SOURCE = "local_config"
   return false
 end
 
-local function simpleItemName(id)
-  id = lower(id or "")
-  id = id:gsub("^minecraft:", "")
-  id = id:gsub("^minecolonies:", "")
-  id = id:gsub("^%w+:", "")
-  return id
-end
-
 local function officialPrice(id)
-  id = simpleItemName(id)
-  local p = prices[id] or prices["minecraft:" .. id]
-  if type(p) == "table" then p = p.unit_price or p.price or p.value end
+  local p = prices[id]
+  if type(p) == "table" then p = p.unit_price end
   p = tonumber(p)
   if not p then return nil end
+
+  -- Quid has no decimal sub-unit. Even if an old/manual price table contains a
+  -- decimal, contract pricing normalises it to a whole-number unit price.
   p = math.floor(p + 0.5)
   if p < 1 then p = 1 end
   return p
@@ -1037,19 +1020,24 @@ end
 local function fallbackPrice(id)
   id = lower(id)
 
-  -- Broad, chunky per-item fallback prices. The bank oracle uses the same style:
-  -- width, not depth. These are only used if the bank is too old/offline.
-  if id:find("netherite",1,true) then return 40 end
-  if id:find("diamond",1,true) then return 20 end
-  if id:find("emerald",1,true) then return 12 end
-  if id:find("gold",1,true) then return 8 end
-  if id:find("iron",1,true) then return 5 end
-  if id:find("coal",1,true) or id:find("charcoal",1,true) then return 2 end
+  -- Fallback prices are PER ITEM and are ALWAYS integer Quid.
+  -- Absolute minimum unit price is 1 Q. No item may be valued at 0.x Q.
+  -- Contract reward later multiplies this by requested quantity, then applies
+  -- positive inflation pressure.
+  if id:find("netherite",1,true) then return 20 end
+  if id:find("diamond",1,true) then return 8 end
+  if id:find("emerald",1,true) then return 6 end
+  if id:find("gold",1,true) then return 3 end
+  if id:find("iron",1,true) then return 2 end
+  if id:find("redstone",1,true) then return 1 end
+  if id:find("lapis",1,true) then return 1 end
+  if id:find("copper",1,true) then return 1 end
+  if id:find("brick",1,true) or id:find("glass",1,true) then return 1 end
+  if id:find("coal",1,true) or id:find("charcoal",1,true) then return 1 end
 
-  if id:find("pickaxe",1,true) or id:find("shovel",1,true) or id:find("axe",1,true) or id:find("hoe",1,true) or id:find("tool",1,true) then return 6 end
-  if id:find("sword",1,true) or id:find("bow",1,true) or id:find("armor",1,true) or id:find("helmet",1,true) or id:find("chestplate",1,true) then return 8 end
+  if id:find("pickaxe",1,true) or id:find("shovel",1,true) or id:find("axe",1,true) or id:find("hoe",1,true) or id:find("tool",1,true) then return 3 end
+  if id:find("sword",1,true) or id:find("bow",1,true) or id:find("armor",1,true) or id:find("helmet",1,true) or id:find("chestplate",1,true) then return 4 end
 
-  if id:find("glass",1,true) or id:find("brick",1,true) then return 2 end
   if id:find("log",1,true) then return 1 end
   if id:find("plank",1,true) or id:find("stair",1,true) or id:find("slab",1,true) then return 1 end
   if id:find("cobble",1,true) or id:find("stone",1,true) or id:find("dirt",1,true) or id:find("sand",1,true) or id:find("gravel",1,true) then return 1 end
@@ -1074,33 +1062,11 @@ local function unitPrice(id)
 end
 
 local function positiveInflationIndex()
-  -- Legacy fallback: use the sector oracle's general index if known. Never allow
-  -- old bank deflation to push requested contracts below base price.
+  -- Inflation can raise contract prices. Deflation does not push contracts below
+  -- their integer base value because contracts are priced in whole Quid.
   local idx = tonumber(PRICE_INDEX) or 1
   if idx < 1 then idx = 1 end
   return idx
-end
-
-local function quoteItemTotal(item, qty)
-  qty = math.max(1, math.floor(tonumber(qty) or 1))
-  local ok, res = bankReq({
-    type = "quote_item_price",
-    item = item,
-    count = qty,
-  }, 5)
-
-  if ok and type(res) == "table" and tonumber(res.total) then
-    PRICE_SOURCE = tostring(res.source or PRICE_SOURCE)
-    if res.sector and tonumber(res.sector_index) then
-      SECTOR_INDICES[res.sector] = SECTOR_INDICES[res.sector] or {}
-      SECTOR_INDICES[res.sector].index = tonumber(res.sector_index)
-    end
-    return math.max(1, math.floor(tonumber(res.total) + 0.5)), res
-  end
-
-  local fallback = math.ceil(unitPrice(item) * qty * positiveInflationIndex())
-  if fallback < qty then fallback = qty end
-  return math.max(1, fallback), { source="local_fallback", total=fallback }
 end
 
 local function companyBalance(company_id)
@@ -1111,6 +1077,8 @@ end
 
 local function wealthMult(balance)
   balance = tonumber(balance) or 0
+  -- Slower wealth scaling: a 5,000 Q company only pays about +5% above base.
+  -- This stops early companies from overpaying before the economy has grown.
   return 1.0 + math.min(0.35, balance / 100000)
 end
 
@@ -1173,6 +1141,8 @@ local function extractItems(req, fixed_quantity)
     if type(item) == "table" then
       local id = trim(item.name or item.item or item.id or "")
       local display = trim(item.displayName or item.display or item.label or id)
+
+      -- All accepted alternatives satisfy the same exact quantity.
       local count = requested_count
 
       if id ~= "" and count > 0 then
@@ -1185,12 +1155,12 @@ end
 
 local function requestItemValue(items)
   if #items <= 0 then return 0 end
-  -- MineColonies request.items are usually alternatives; price by cheapest valid
-  -- option. The bank quote applies the correct sector CPI immediately.
+  -- MineColonies request.items are usually alternatives; price by cheapest valid option.
+  -- Price is always integer: unit base price * exact quantity.
   local cheapest = nil
   for _, it in ipairs(items) do
     local qty = math.max(1, math.floor(tonumber(it.count) or 1))
-    local v = quoteItemTotal(it.item, qty)
+    local v = unitPrice(it.item) * qty
     if v < 1 then v = 1 end
     if not cheapest or v < cheapest then cheapest = v end
   end
@@ -1201,11 +1171,23 @@ local function priceJob(business, items)
   local bal = companyBalance(business.company_id)
   if bal <= 0 then return nil, "no funds", bal, 0 end
 
-  -- Wide-sector pricing:
-  --   each requested item is quoted by the bank's sector oracle
-  --   construction materials use Construction CPI, food uses Food CPI, etc.
-  --   if the bank is old/offline, local fallback uses a non-deflationary index.
-  local fair = requestItemValue(items)
+  -- Integer quantity pricing:
+  --   base value = cheapest accepted integer unit price * requested quantity
+  --   fair value = base value + positive inflation adjustment
+  --
+  -- There are no decimal item prices. Absolute minimum unit price is 1 Q.
+  --
+  -- Example at price index x1:
+  --   3 birch planks at 1 Q each = 3 Q
+  --   10 dark oak planks at 1 Q each = 10 Q
+  --
+  -- Example at price index x1.25:
+  --   10 planks = ceil(10 * 1.25) = 13 Q
+  local raw_item_value = requestItemValue(items)
+  if raw_item_value < 1 then raw_item_value = 1 end
+
+  local fair = math.ceil(raw_item_value * positiveInflationIndex())
+  if fair < raw_item_value then fair = raw_item_value end
   if fair < 1 then fair = 1 end
 
   local max_pay = math.floor(bal * SPEND_LIMIT)
@@ -1436,6 +1418,161 @@ local function postContract(req, business, items, reward, fixed_quantity, min_q,
 end
 
 
+
+local function isBuilderMaterialBusiness(business)
+  if type(business) ~= "table" then return false end
+  local industry = lower(business.industry or "")
+  local btype = lower(business.building_type or "")
+  local bname = lower(business.building_name or "")
+  return industry == "construction" or btype:find("builder", 1, true) or bname:find("builder", 1, true)
+end
+
+local function builderBundleKey(business)
+  local company = business and business.company_id or "unknown_company"
+  local building = business and (business.key or business.building_name or business.company_id) or "unknown_builder"
+  return "mc_builder_bundle:" .. tostring(company) .. "|" .. simpleHash(tostring(building))
+end
+
+local function addBundleItem(bundle, item)
+  if not bundle or type(item) ~= "table" then return end
+  local id = trim(item.item or item.id or item.name or "")
+  if id == "" then return end
+  local display = trim(item.display or item.display_name or item.label or id)
+  local count = math.max(1, math.floor(tonumber(item.count or 1) or 1))
+  local key = id .. "|" .. display
+
+  bundle.item_map = bundle.item_map or {}
+  bundle.items = bundle.items or {}
+
+  local existing = bundle.item_map[key]
+  if existing then
+    existing.count = (tonumber(existing.count) or 0) + count
+  else
+    local rec = { item = id, display = display ~= "" and display or id, count = count, exact_count = true }
+    bundle.item_map[key] = rec
+    bundle.items[#bundle.items + 1] = rec
+  end
+end
+
+local function newBuilderBundle(business, key)
+  return {
+    key = key,
+    business = business,
+    items = {},
+    item_map = {},
+    children = {},
+    raw_value = 0,
+  }
+end
+
+local function addBuilderRequest(bundle, req, items, fixed_quantity, min_q, max_q, child_key)
+  if not bundle then return end
+  bundle.children[#bundle.children + 1] = {
+    req = req,
+    items = items,
+    fixed_quantity = fixed_quantity,
+    quantity_min = min_q,
+    quantity_max = max_q,
+    child_key = child_key,
+    family = requestFamily(req),
+    title = reqTitle(req, fixed_quantity),
+  }
+
+  for _, item in ipairs(items or {}) do
+    addBundleItem(bundle, item)
+  end
+
+  local value = requestItemValue(items or {})
+  if value < 1 then value = 1 end
+  bundle.raw_value = (tonumber(bundle.raw_value) or 0) + value
+end
+
+local function builderBundleTitle(bundle)
+  local b = bundle and bundle.business or nil
+  local name = tostring((b and (b.building_name or b.name)) or "Builder Hut")
+  local n = #(bundle and bundle.children or {})
+  return "Builder Materials - " .. name .. " (" .. tostring(n) .. " requests)"
+end
+
+local function builderBundleDescription(bundle)
+  local parts = {}
+  for _, child in ipairs(bundle.children or {}) do
+    parts[#parts + 1] = tostring(child.title or "Build material request")
+  end
+  return "Condensed Builder Hut build-material request. Complete all live MineColonies build material requirements for this builder. Child requests: " .. table.concat(parts, "; ")
+end
+
+local function priceBuilderBundle(bundle)
+  local raw = math.max(1, math.floor(tonumber(bundle and bundle.raw_value) or 0))
+  local reward = math.ceil(raw * positiveInflationIndex())
+  if reward < raw then reward = raw end
+  if reward < 1 then reward = 1 end
+  return reward
+end
+
+local function postBuilderBundleContract(bundle)
+  if not bundle or not bundle.business or #(bundle.children or {}) <= 0 then return false, nil end
+  if #(bundle.items or {}) <= 0 then return false, nil end
+
+  local key = bundle.key
+  local title = builderBundleTitle(bundle)
+  local reward = priceBuilderBundle(bundle)
+  local item_sig = itemSignature(bundle.items)
+
+  if not shouldUpsertContract(key, reward, item_sig, title) then
+    return true, key
+  end
+
+  local ok, res = contractReq({
+    type = "post_contract",
+    upsert = true,
+    source_key = key,
+    title = title,
+    description = builderBundleDescription(bundle),
+    poster = bundle.business.company_id,
+    reward = reward,
+    source_type = "minecolonies_request",
+    source_company = bundle.business.company_id,
+    request_id = key,
+    minecolonies_request_id = key,
+    source_family = "builder_material_bundle",
+    building_id = bundle.business.key,
+    exact_fulfillment = false,
+    min_fulfillment = false,
+    overdelivery_allowed = true,
+    bundle_contract = true,
+    bundle_child_count = #(bundle.children or {}),
+    keep_claim_on_refresh = true,
+    items = bundle.items,
+  }, 8)
+
+  if ok and type(res) == "table" then
+    local cid = res.contract and res.contract.contract_id or (posted[key] and posted[key].contract_id) or "unknown"
+    local action = res.posted and "Posted" or (res.updated and "Updated" or "Refreshed")
+
+    posted[key] = {
+      contract_id = cid,
+      source_key = key,
+      business = bundle.business.company_id,
+      reward = reward,
+      posted_at = posted[key] and posted[key].posted_at or now(),
+      refreshed_at = now(),
+      title = title,
+      item_signature = item_sig,
+      bundle_contract = true,
+      bundle_child_count = #(bundle.children or {})
+    }
+    writeFile(FILE_POSTED, posted)
+
+    if res.posted then stats.contracts_posted = stats.contracts_posted + 1 end
+    setMsg(action .. " builder bundle for " .. money(reward), colors.lime)
+    return true, key
+  end
+
+  setMsg("Builder bundle post/update failed: " .. tostring(res), colors.red)
+  return false, nil
+end
+
 local function syncStaleContracts(active_keys)
   local active_list = {}
   for key, _ in pairs(active_keys or {}) do active_list[#active_list+1] = key end
@@ -1462,6 +1599,7 @@ end
 
 local function scanRequests(requests, citizens)
   local active_keys = {}
+  local builder_bundles = {}
 
   for _, req in ipairs(requests or {}) do
     stats.requests_seen = stats.requests_seen + 1
@@ -1471,20 +1609,29 @@ local function scanRequests(requests, citizens)
       stats.skipped_unmapped = stats.skipped_unmapped + 1
     else
       local provisional_items = {}
-      local key = reqKey(req, provisional_items, business)
-      local fixed_quantity, min_q, max_q = chooseContractQuantity(req, key)
+      local child_key = reqKey(req, provisional_items, business)
+      local fixed_quantity, min_q, max_q = chooseContractQuantity(req, child_key)
       local items = extractItems(req, fixed_quantity)
 
       if #items > 0 then
-        local reward, reason, bal = priceJob(business, items)
-        if reward then
-          local posted_ok, active_key = postContract(req, business, items, reward, fixed_quantity, min_q, max_q, key)
-          if posted_ok and active_key then
-            active_keys[active_key] = true
-          end
+        if isBuilderMaterialBusiness(business) then
+          -- Builder Huts often generate a long pile of separate build-material
+          -- requests. Treat all currently live requests from the same builder
+          -- location as one contract so the board shows one job with a scrollable
+          -- requirements list instead of dozens of tiny rows.
+          local bundle_key = builderBundleKey(business)
+          builder_bundles[bundle_key] = builder_bundles[bundle_key] or newBuilderBundle(business, bundle_key)
+          addBuilderRequest(builder_bundles[bundle_key], req, items, fixed_quantity, min_q, max_q, child_key)
+          active_keys[bundle_key] = true
         else
-          stats.skipped_unfunded = stats.skipped_unfunded + 1
-          setMsg("Skipped " .. reqTitle(req, fixed_quantity) .. ": " .. tostring(reason) .. " (" .. money(bal) .. ")", colors.orange)
+          local reward, reason, bal = priceJob(business, items)
+          if reward then
+            local posted_ok, active_key = postContract(req, business, items, reward, fixed_quantity, min_q, max_q, child_key)
+            if posted_ok and active_key then active_keys[active_key] = true end
+          else
+            stats.skipped_unfunded = stats.skipped_unfunded + 1
+            setMsg("Skipped " .. reqTitle(req, fixed_quantity) .. ": " .. tostring(reason) .. " (" .. money(bal) .. ")", colors.orange)
+          end
         end
       else
         stats.skipped_unmapped = stats.skipped_unmapped + 1
@@ -1493,9 +1640,13 @@ local function scanRequests(requests, citizens)
     end
   end
 
+  for key, bundle in pairs(builder_bundles) do
+    local ok, active_key = postBuilderBundleContract(bundle)
+    if ok and active_key then active_keys[active_key] = true end
+  end
+
   syncStaleContracts(active_keys)
 end
-
 
 -- =============================================================================
 -- SCAN LOOP
