@@ -1,17 +1,33 @@
 -- =============================================================================
--- DINING HALL DIAGNOSTIC
--- DiningHallDiagnostic
+-- SERVICE PAYMENT DIAGNOSTIC
+-- ServicePaymentDiagnostic
 --
--- Dumps exactly what ComputerCraft / Advanced Peripherals can see for:
---   * Dining Hall / Restaurant / Cook buildings
---   * storageBlocks fields
---   * Waiter / Cook / Chef citizens
---   * attached inventory peripherals with list()
+-- Purpose:
+--   Serious diagnosis for Dining Hall service payments.
 --
--- Run on the same terminal as the ServicePaymentTerminal.
+-- Checks:
+--   1. Local mapping files on THIS terminal:
+--      data/building_companies.db
+--      data/industry_companies.db
+--      data/service_payment_config.db
+--
+--   2. Whether the bank can list company accounts.
+--
+--   3. Whether this terminal can see the colony integrator.
+--
+--   4. Whether getCitizens exposes saturation fields.
+--
+--   5. Whether getCitizens exposes inventory-like fields for citizens/waiters.
+--
+--   6. Whether any attached peripheral exposes list().
+--
+-- Output:
+--   data/service_payment_diagnostic.txt
 -- =============================================================================
 
-local OUT = "data/dining_hall_diagnostic.txt"
+local OUT = "data/service_payment_diagnostic.txt"
+local BANK_PROTOCOL = "quid_bank"
+local db_id = nil
 
 local function ensureDir(path)
   local dir = fs.getDir(path)
@@ -21,8 +37,13 @@ end
 local function writeLines(lines)
   ensureDir(OUT)
   local f = fs.open(OUT, "w")
+  if not f then
+    print("Failed to write " .. OUT)
+    return false
+  end
   for _, line in ipairs(lines) do f.writeLine(line) end
   f.close()
+  return true
 end
 
 local function safeSerialize(v)
@@ -31,137 +52,327 @@ local function safeSerialize(v)
   return "<unserializable>"
 end
 
+local function readFile(path)
+  if not fs.exists(path) then return nil, "missing" end
+  local f = fs.open(path, "r")
+  if not f then return nil, "open failed" end
+  local text = f.readAll()
+  f.close()
+  if not text or text == "" then return nil, "empty" end
+  local ok, data = pcall(textutils.unserialize, text)
+  if ok then return data, nil end
+  return nil, "unserialize failed: " .. tostring(data)
+end
+
 local function lower(s)
   return string.lower(tostring(s or ""))
 end
 
-local function normalType(s)
-  s = tostring(s or "")
-  s = s:gsub("com%.minecolonies%.building%.", "")
-  s = s:gsub("com%.minecolonies%.job%.", "")
-  return lower(s)
+local function trim(s)
+  return tostring(s or ""):match("^%s*(.-)%s*$")
 end
 
-local function isDiningBuilding(b)
-  local t = normalType(b and (b.type or b.name) or "")
-  local n = normalType(b and b.name or "")
-  return t:find("dining",1,true)
-    or t:find("restaurant",1,true)
-    or t:find("cook",1,true)
-    or t:find("tavern",1,true)
-    or n:find("dining",1,true)
-    or n:find("restaurant",1,true)
-    or n:find("cook",1,true)
-    or n:find("tavern",1,true)
+local function simpleItemName(name)
+  name = tostring(name or "")
+  name = name:gsub("^minecraft:", "")
+  name = name:gsub("^minecolonies:", "")
+  name = name:gsub("^%w+:", "")
+  return lower(name)
+end
+
+local function isExcludedFuel(item)
+  local id = simpleItemName(item)
+  return id == "coal"
+    or id == "charcoal"
+    or id == "coal_block"
+    or id == "block_of_coal"
+    or id:find("coal_block", 1, true)
+    or id:find("charcoal", 1, true)
+end
+
+local function isChargeableDiningStock(item)
+  item = trim(item or "")
+  if item == "" then return false end
+  if isExcludedFuel(item) then return false end
+  return true
+end
+
+local function openModem()
+  for _, n in ipairs(peripheral.getNames()) do
+    if peripheral.getType(n) == "modem" then
+      rednet.open(n)
+      return true, n
+    end
+  end
+  return false, nil
+end
+
+local function discoverBank()
+  for _ = 1, 5 do
+    rednet.broadcast({ type = "ping" }, BANK_PROTOCOL)
+    local sender, msg = rednet.receive(BANK_PROTOCOL, 2)
+    if sender and type(msg) == "table" then
+      if msg.type == "treasury_online" or msg.success == true then
+        db_id = sender
+        return true
+      end
+    end
+  end
+  return false
+end
+
+local function bankReq(req, timeout)
+  timeout = timeout or 5
+  if not db_id then discoverBank() end
+  if not db_id then return false, "No bank server connected" end
+
+  rednet.send(db_id, req, BANK_PROTOCOL)
+  local deadline = os.clock() + timeout
+
+  while true do
+    local rem = deadline - os.clock()
+    if rem <= 0 then return false, "No response from bank" end
+    local sender, msg = rednet.receive(BANK_PROTOCOL, rem)
+    if sender == db_id and type(msg) == "table" and msg.success ~= nil then
+      return msg.success, msg.response
+    end
+  end
+end
+
+local function looksDiningRecord(r)
+  local parts = {}
+  if type(r) ~= "table" then return false, "" end
+  for _, k in ipairs({ "building_type", "building_name", "type", "name", "industry", "company_name", "ticker", "company_id" }) do
+    if r[k] then parts[#parts+1] = tostring(r[k]) end
+  end
+  local txt = lower(table.concat(parts, " "))
+  local dining = txt:find("dining", 1, true)
+    or txt:find("dininghall", 1, true)
+    or txt:find("dining_hall", 1, true)
+    or txt:find("restaurant", 1, true)
+  local tavern = txt:find("tavern", 1, true)
+    or txt:find("bar", 1, true)
+    or txt:find("inn", 1, true)
+  return dining and not tavern, txt
 end
 
 local function citizenJobText(z)
   local parts = {}
-  if z.job then parts[#parts+1] = tostring(z.job) end
-  if z.title then parts[#parts+1] = tostring(z.title) end
-  if type(z.work) == "table" then
-    if z.work.job then parts[#parts+1] = tostring(z.work.job) end
-    if z.work.type then parts[#parts+1] = tostring(z.work.type) end
-    if z.work.name then parts[#parts+1] = tostring(z.work.name) end
+  if type(z) ~= "table" then return "" end
+
+  for _, k in ipairs({ "job", "title", "profession", "name" }) do
+    if z[k] then parts[#parts+1] = tostring(z[k]) end
   end
+
+  if type(z.work) == "table" then
+    for _, k in ipairs({ "job", "type", "name" }) do
+      if z.work[k] then parts[#parts+1] = tostring(z.work[k]) end
+    end
+  end
+
   return lower(table.concat(parts, " "))
 end
 
-local function isDiningCitizen(z)
-  local txt = citizenJobText(z) .. " " .. lower(z.name)
-  return txt:find("waiter",1,true)
-    or txt:find("cook",1,true)
-    or txt:find("chef",1,true)
-    or txt:find("restaurant",1,true)
-    or txt:find("dining",1,true)
+local function isWaiterLike(z)
+  local txt = citizenJobText(z)
+  return txt:find("waiter", 1, true)
+    or txt:find("cook", 1, true)
+    or txt:find("chef", 1, true)
+    or txt:find("restaurant", 1, true)
+    or txt:find("dining", 1, true)
 end
 
-term.clear()
-term.setCursorPos(1, 1)
-term.setTextColor(colors.yellow)
-print("Dining Hall Diagnostic")
-term.setTextColor(colors.white)
-print("Scanning...")
+local function scanValueForInventory(v, path, out, depth, seen)
+  if type(v) ~= "table" then return end
+  if depth > 6 then return end
+  if seen[v] then return end
+  seen[v] = true
+
+  local item_name = v.name or v.item or v.id or v.item_id or v.itemName or v.displayName
+  local qty = v.count or v.qty or v.amount or v.size or v.quantity
+
+  if item_name and qty then
+    local chargeable = isChargeableDiningStock(item_name)
+    out[#out+1] = {
+      path = path,
+      item = tostring(item_name),
+      qty = tonumber(qty) or 0,
+      chargeable = chargeable,
+    }
+  end
+  end
+
+  -- Inventory-ish keys worth checking explicitly.
+  local keys = {
+    "inventory", "items", "stacks", "contents", "mainInventory",
+    "main_inventory", "heldItems", "held_items", "food", "foods",
+    "slots", "backpack", "equipment", "armor", "offhand"
+  }
+
+  for _, k in ipairs(keys) do
+    if type(v[k]) == "table" then
+      scanValueForInventory(v[k], path .. "." .. k, out, depth + 1, seen)
+    end
+  end
+
+  -- Also scan numeric array children because inventory lists often use slot indices.
+  for k, child in pairs(v) do
+    if type(k) == "number" and type(child) == "table" then
+      scanValueForInventory(child, path .. "[" .. tostring(k) .. "]", out, depth + 1, seen)
+    end
+  end
+end
 
 local lines = {}
 local function log(s)
   lines[#lines+1] = tostring(s or "")
 end
 
-log("DINING HALL DIAGNOSTIC")
+term.clear()
+term.setCursorPos(1,1)
+term.setTextColor(colors.yellow)
+print("Service Payment Diagnostic")
+term.setTextColor(colors.white)
+print("Scanning...")
+
+log("SERVICE PAYMENT DIAGNOSTIC")
 log("Time: " .. tostring(os.epoch and os.epoch("utc") or os.clock()))
 log("Computer: " .. tostring(os.getComputerLabel() or os.getComputerID()))
 log("")
 
-local colony = peripheral.find("colonyIntegrator") or peripheral.find("colony_integrator")
-log("COLONY INTEGRATOR")
-log("Found: " .. tostring(colony ~= nil))
-
-if colony then
-  if colony.getColonyName then
-    local ok, name = pcall(colony.getColonyName)
-    log("Colony name: " .. tostring(ok and name or "<error>"))
+log("MODEM / BANK")
+local modem_ok, modem_name = openModem()
+log("Modem opened: " .. tostring(modem_ok) .. " " .. tostring(modem_name or ""))
+local bank_ok = discoverBank()
+log("Bank found: " .. tostring(bank_ok) .. " id=" .. tostring(db_id or ""))
+if bank_ok then
+  local ok, res = bankReq({ type = "list_accounts" }, 6)
+  log("Bank list_accounts ok: " .. tostring(ok))
+  if ok and type(res) == "table" and type(res.accounts) == "table" then
+    local company_count = 0
+    log("Company accounts from bank:")
+    for _, acc in ipairs(res.accounts) do
+      local id = tostring(acc.account_id or acc.id or "")
+      local typ = lower(acc.type or acc.account_type or "")
+      if typ == "company" or id:find("^company:") then
+        company_count = company_count + 1
+        log("  " .. tostring(id) .. " | type=" .. tostring(acc.type) .. " | name=" .. tostring(acc.display_name or acc.name or "") .. " | owner=" .. tostring(acc.owner_id or ""))
+      end
+    end
+    log("Company count: " .. tostring(company_count))
+  else
+    log("Bank list_accounts response/error:")
+    log(safeSerialize(res))
   end
+end
+log("")
 
+log("LOCAL MAPPING FILES ON THIS TERMINAL")
+for _, path in ipairs({
+  "data/service_payment_config.db",
+  "data/building_companies.db",
+  "data/industry_companies.db",
+}) do
+  local data, err = readFile(path)
   log("")
-  log("BUILDINGS")
-  if colony.getBuildings then
-    local ok, buildings = pcall(colony.getBuildings)
-    log("getBuildings ok: " .. tostring(ok))
-    if ok and type(buildings) == "table" then
-      log("Building count: " .. tostring(#buildings))
-      for i, b in ipairs(buildings) do
-        if isDiningBuilding(b) then
-          log("")
-          log("---- DINING BUILDING #" .. tostring(i) .. " ----")
-          log(safeSerialize(b))
+  log(path .. ": " .. (data and "present" or ("not usable - " .. tostring(err))))
+  if data then
+    log(safeSerialize(data))
+
+    if path == "data/building_companies.db" then
+      log("")
+      log("Dining Hall candidate records from building_companies.db:")
+      local found = 0
+      for key, rec in pairs(data) do
+        local isDining, txt = looksDiningRecord(rec)
+        if isDining then
+          found = found + 1
+          log("  KEY=" .. tostring(key) .. " -> company_id=" .. tostring(rec.company_id) .. " name=" .. tostring(rec.name or rec.company_name or "") .. " text=" .. txt)
         end
       end
-    else
-      log("getBuildings returned: " .. tostring(buildings))
+      log("Dining candidate count: " .. tostring(found))
     end
-  else
-    log("getBuildings unavailable")
-  end
-
-  log("")
-  log("DINING CITIZENS / WORKERS")
-  if colony.getCitizens then
-    local ok, citizens = pcall(colony.getCitizens)
-    log("getCitizens ok: " .. tostring(ok))
-    if ok and type(citizens) == "table" then
-      log("Citizen count: " .. tostring(#citizens))
-      for i, z in ipairs(citizens) do
-        if isDiningCitizen(z) then
-          log("")
-          log("---- DINING CITIZEN #" .. tostring(i) .. " ----")
-          log(safeSerialize(z))
-        end
-      end
-    else
-      log("getCitizens returned: " .. tostring(citizens))
-    end
-  else
-    log("getCitizens unavailable")
   end
 end
 
 log("")
-log("ATTACHED INVENTORY PERIPHERALS")
+log("PERIPHERALS")
 for _, name in ipairs(peripheral.getNames()) do
   local typ = peripheral.getType(name)
   local obj = peripheral.wrap(name)
   local hasList = obj and type(obj.list) == "function"
-  log("")
-  log("Peripheral: " .. tostring(name) .. " type=" .. tostring(typ) .. " has list()=" .. tostring(hasList))
+  log("Peripheral: " .. tostring(name) .. " type=" .. tostring(typ) .. " list()=" .. tostring(hasList))
   if hasList then
     local ok, items = pcall(obj.list)
-    log("list() ok: " .. tostring(ok))
+    log("  list ok=" .. tostring(ok))
     if ok then
-      log(safeSerialize(items))
+      log("  items=" .. safeSerialize(items))
     else
-      log("list() error: " .. tostring(items))
+      log("  error=" .. tostring(items))
     end
+  end
+end
+
+log("")
+log("COLONY INTEGRATOR")
+local colony = peripheral.find("colonyIntegrator") or peripheral.find("colony_integrator")
+log("Found: " .. tostring(colony ~= nil))
+if colony then
+  if colony.getColonyName then
+    local ok, name = pcall(colony.getColonyName)
+    log("Colony name ok=" .. tostring(ok) .. " value=" .. tostring(name))
+  end
+
+  if colony.getCitizens then
+    local ok, citizens = pcall(colony.getCitizens)
+    log("getCitizens ok=" .. tostring(ok))
+    if ok and type(citizens) == "table" then
+      log("Citizen count=" .. tostring(#citizens))
+      local inv_sources = 0
+      local chargeable_items = 0
+      local waiter_like = 0
+
+      for i, z in ipairs(citizens) do
+        local waiter = isWaiterLike(z)
+        if waiter then waiter_like = waiter_like + 1 end
+
+        local foundItems = {}
+        scanValueForInventory(z, "citizen[" .. tostring(i) .. "]", foundItems, 0, {})
+
+        local hasChargeable = false
+        for _, item in ipairs(foundItems) do
+          if item.chargeable and item.qty > 0 then
+            hasChargeable = true
+            chargeable_items = chargeable_items + item.qty
+          end
+        end
+        if hasChargeable then inv_sources = inv_sources + 1 end
+
+        if waiter or hasChargeable then
+          log("")
+          log("CITIZEN #" .. tostring(i) .. " name=" .. tostring(z.name) .. " id=" .. tostring(z.id) .. " waiter_like=" .. tostring(waiter))
+          log("  job_text=" .. citizenJobText(z))
+          log("  saturation=" .. tostring(z.saturation) .. " food=" .. tostring(z.food) .. " state=" .. tostring(z.state))
+          if #foundItems > 0 then
+            log("  inventory-like item candidates:")
+            for _, item in ipairs(foundItems) do
+              log("    " .. item.path .. " item=" .. item.item .. " qty=" .. tostring(item.qty) .. " chargeable=" .. tostring(item.chargeable))
+            end
+          else
+            log("  no inventory-like item candidates found")
+          end
+        end
+      end
+
+      log("")
+      log("Waiter-like citizen count: " .. tostring(waiter_like))
+      log("Citizen inventory sources with chargeable items: " .. tostring(inv_sources))
+      log("Chargeable item units found in citizen data: " .. tostring(chargeable_items))
+    else
+      log("getCitizens result/error=" .. tostring(citizens))
+    end
+  else
+    log("getCitizens unavailable")
   end
 end
 
@@ -170,7 +381,7 @@ writeLines(lines)
 term.clear()
 term.setCursorPos(1, 1)
 term.setTextColor(colors.lime)
-print("Dining diagnostic complete.")
+print("Service diagnostic complete.")
 term.setTextColor(colors.white)
 print("")
 print("Saved:")
@@ -179,4 +390,7 @@ print("")
 print("Open with:")
 print("edit " .. OUT)
 print("")
-print("Send me the output if you want me to wire the service terminal to the actual exposed fields.")
+print("Important sections:")
+print("- building_companies.db")
+print("- Dining Hall candidates")
+print("- getCitizens / waiter inventory candidates")
