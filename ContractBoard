@@ -49,7 +49,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION    = "1.0.11-NO-COMPLETE-BUTTON"
+local VERSION    = "1.0.12-CLEAN-DROPDOWN-NO-COMPLETE"
 local PROTOCOL   = "quid_contracts"
 local DB_TIMEOUT = 5
 
@@ -368,9 +368,7 @@ local function detailScreen(c)
     end
 
     local action = "Claim"
-    if c.status == "claimed" then
-      action = "Waiting"
-    elseif c.status == "pending_completion" or c.status == "pending_payout" then
+    if c.status == "claimed" or c.status == "pending_completion" or c.status == "pending_payout" then
       action = "Waiting"
     elseif c.status == "fulfilled" then
       action = "Done"
@@ -396,13 +394,213 @@ local function detailScreen(c)
       end
       if hit(bAction, p2, p3) then
         if action == "Claim" then return "claim" end
-        -- Claimed MineColonies contracts auto-complete on the server when
-        -- the source request disappears after in-game fulfilment.
+        -- Waiting/Done/Closed are informational states.
       end
     end
   end
 end
 
+local function claimScreen(c)
+  if not c then return end
+
+  local companies = loadCompanies()
+  local selectedCompany = 1
+  local dropdownOpen = false
+  local scroll = 0
+
+  local function companyLabel(co)
+    if not co then return "Select company..." end
+    local ticker = tostring(co.ticker or "?")
+    local name = tostring(co.display_name or co.company_id or "")
+    return ticker .. " - " .. name
+  end
+
+  local function clampSelection()
+    if #companies == 0 then
+      selectedCompany = 0
+      scroll = 0
+      return
+    end
+    if selectedCompany < 1 then selectedCompany = 1 end
+    if selectedCompany > #companies then selectedCompany = #companies end
+  end
+
+  local function dropdownRows()
+    -- Keep the dropdown bounded so it never overlaps the bottom buttons/status.
+    return math.max(3, math.min(6, H - 18))
+  end
+
+  local function drawDropdown(x, y, w, rows)
+    local rowButtons = {}
+    if #companies == 0 then
+      return rowButtons
+    end
+
+    clampSelection()
+
+    if selectedCompany <= scroll then scroll = selectedCompany - 1 end
+    if selectedCompany > scroll + rows then scroll = selectedCompany - rows end
+    if scroll < 0 then scroll = 0 end
+
+    -- Visually separate dropdown panel.
+    fill(x, y, w, rows + 2, colors.gray)
+    at(x, y, string.rep("=", w):sub(1, w), colors.white, colors.purple)
+
+    for i = 1, rows do
+      local idx = scroll + i
+      local co = companies[idx]
+      local yy = y + i
+      local selectedRow = idx == selectedCompany
+      local bg = selectedRow and colors.purple or colors.gray
+      local fg = selectedRow and colors.white or colors.white
+
+      fill(x, yy, w, 1, bg)
+
+      if co then
+        local text = companyLabel(co)
+        at(x + 1, yy, text:sub(1, w - 2), fg, bg)
+        rowButtons[#rowButtons + 1] = { x1 = x, x2 = x + w - 1, y1 = yy, y2 = yy, idx = idx }
+      end
+    end
+
+    at(x, y + rows + 1, string.rep("=", w):sub(1, w), colors.white, colors.purple)
+    return rowButtons
+  end
+
+  local function draw()
+    cls()
+    topBar()
+    card(2, 4, W - 2, H - 5)
+
+    at(4, 5, "Claim Contract", C.card_fg, C.card)
+    at(4, 7, c.contract_id .. " - " .. tostring(c.title or ""), C.label, C.card)
+    at(4, 8, "Reward: " .. money(c.reward or 0), C.label, C.card)
+
+    at(4, 10, "Claimant company", C.card_fg, C.card)
+
+    local ddX = 4
+    local ddY = 11
+    local ddW = W - 8
+    local bSelect = button(ddX, ddY, ddW, companyLabel(companies[selectedCompany]), colors.lightGray, colors.black)
+    at(ddX + ddW - 3, ddY, dropdownOpen and "^" or "v", colors.black, colors.lightGray)
+
+    local rowButtons = {}
+    if dropdownOpen then
+      rowButtons = drawDropdown(ddX, ddY + 1, ddW, dropdownRows())
+      at(4, H - 6, "Click a company, use Scroll/Up/Down, then Claim.", C.label, C.card)
+    elseif #companies == 0 then
+      at(4, 13, "No companies loaded from bank.", C.err, C.card)
+      at(4, 14, "ContractServer could not read company accounts.", C.label, C.card)
+    else
+      local co = companies[selectedCompany]
+      at(4, 13, "Claim as: " .. tostring(co and co.company_id or "none"), C.label, C.card)
+    end
+
+    local third = math.floor((W - 10) / 3)
+    local bBack = button(4, H - 2, third, "Back", C.btn_sec, C.card_fg)
+    local bScroll = button(5 + third, H - 2, third, "Scroll", C.btn_sec, C.card_fg)
+    local bClaim = button(10 + (third * 2), H - 2, third, "Claim", C.btn_pri, C.btn_fg)
+
+    statusBar()
+    term.setCursorBlink(false)
+    return bBack, bScroll, bClaim, bSelect, rowButtons
+  end
+
+  local function doClaim()
+    local co = companies[selectedCompany]
+    if not co then
+      setMessage("Choose a company first.", C.err)
+      return false
+    end
+
+    local ok, res = contractRequest({
+      type = "claim_contract",
+      contract_id = c.contract_id,
+      claimant = co.company_id,
+      claimant_type = "company",
+    })
+
+    if ok then
+      setMessage("Claimed " .. c.contract_id .. " as " .. tostring(co.company_id), C.ok)
+      refreshContracts()
+      return true
+    end
+
+    setMessage("Claim failed: " .. tostring(res), C.err)
+    return false
+  end
+
+  local bBack, bScroll, bClaim, bSelect, rowButtons = draw()
+
+  while true do
+    local ev, p1, p2, p3 = os.pullEvent()
+
+    if ev == "mouse_click" then
+      local mx, my = p2, p3
+
+      if hit(bBack, mx, my) then return end
+
+      if hit(bSelect, mx, my) then
+        dropdownOpen = not dropdownOpen
+
+      elseif dropdownOpen then
+        local picked = false
+        for _, rb in ipairs(rowButtons or {}) do
+          if hit(rb, mx, my) then
+            selectedCompany = rb.idx
+            dropdownOpen = false
+            picked = true
+            break
+          end
+        end
+
+        if not picked and hit(bScroll, mx, my) and #companies > dropdownRows() then
+          scroll = scroll + dropdownRows()
+          if scroll >= #companies then scroll = 0 end
+          selectedCompany = math.min(#companies, scroll + 1)
+        elseif not picked and hit(bClaim, mx, my) then
+          if doClaim() then return end
+        end
+
+      elseif hit(bScroll, mx, my) then
+        dropdownOpen = true
+
+      elseif hit(bClaim, mx, my) then
+        if doClaim() then return end
+      end
+
+      bBack, bScroll, bClaim, bSelect, rowButtons = draw()
+
+    elseif ev == "mouse_scroll" then
+      if #companies > 0 then
+        dropdownOpen = true
+        selectedCompany = selectedCompany + (p1 > 0 and 1 or -1)
+        clampSelection()
+      end
+      bBack, bScroll, bClaim, bSelect, rowButtons = draw()
+
+    elseif ev == "key" then
+      if p1 == keys.up and selectedCompany > 1 then
+        dropdownOpen = true
+        selectedCompany = selectedCompany - 1
+      elseif p1 == keys.down and selectedCompany < #companies then
+        dropdownOpen = true
+        selectedCompany = selectedCompany + 1
+      elseif p1 == keys.enter then
+        if dropdownOpen then
+          dropdownOpen = false
+        else
+          if doClaim() then return end
+        end
+      elseif p1 == keys.space then
+        dropdownOpen = not dropdownOpen
+      elseif p1 == keys.escape or p1 == keys.backspace then
+        return
+      end
+      bBack, bScroll, bClaim, bSelect, rowButtons = draw()
+    end
+  end
+end
 
 -- =============================================================================
 -- MAIN DRAW
