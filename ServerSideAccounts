@@ -22,7 +22,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.4.6-ZERO-BASE-STICKY-DEFLATION"
+local VERSION  = "1.4.7-ORACLE-DEFLATION-FIX"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -587,6 +587,13 @@ local function clamp(n, lo, hi)
   return n
 end
 
+local function pow(base, exp)
+  base = tonumber(base) or 0
+  exp = tonumber(exp) or 0
+  if math.pow then return math.pow(base, exp) end
+  return base ^ exp
+end
+
 local function copyPolicy(src)
   local out = {}
   for k, v in pairs(DEFAULT_INFLATION_POLICY) do
@@ -908,7 +915,7 @@ local function sectorIndex(sector)
     -- update, do not let repeated quote calls keep ratcheting prices down.
     local allowed_floor_today = current
     if elapsedDays > 0 then
-      allowed_floor_today = current * math.pow(1 - maxDeflation, elapsedDays)
+      allowed_floor_today = current * pow(1 - maxDeflation, elapsedDays)
     end
     idx = math.max(target_idx, allowed_floor_today)
     if idx > target_idx + 0.0001 then deflation_limited = true end
@@ -1217,7 +1224,7 @@ decayPriceOracleShock = function(elapsed_days)
   local decay = tonumber(price_oracle.shock_decay_per_mc_day) or 0.82
   if decay < 0 then decay = 0.82 end
   if decay > 1 then decay = 1 end
-  local newShock = old * math.pow(decay, elapsed_days)
+  local newShock = old * pow(decay, elapsed_days)
   if newShock < 0.001 then newShock = 0 end
   price_oracle.shock_pressure = newShock
   price_oracle.last_shock_decay = {
@@ -2184,13 +2191,28 @@ end
 handlers["get_price_indices"] = function(sender_id, req)
   ensureInflationState()
   ensurePriceOracle()
+
+  -- Keep the oracle endpoint self-healing. Older installs may have minted before
+  -- the price oracle existed, so import any unprocessed MINT shocks before
+  -- reporting sector CPI. This is idempotent via processed_mint_tx.
+  local imported, skipped = processUnprocessedMintLedgerShocks()
+
+  local okSnap, snapOrErr = pcall(sectorIndexSnapshot)
+  if not okSnap then
+    audit("ERROR", "SYSTEM", sender_id, "GET_PRICE_INDICES", "snapshot error: " .. tostring(snapOrErr))
+    return false, "Price oracle snapshot error: " .. tostring(snapOrErr)
+  end
+
   return true, {
     model = price_oracle.model,
-    sectors = sectorIndexSnapshot(),
+    sectors = snapOrErr,
     inflation = inflation_state,
     shock_pressure = tonumber(price_oracle.shock_pressure) or 0,
     sticky_floor_from_ath = tonumber(price_oracle.sticky_floor_from_ath) or 0.75,
+    max_daily_deflation = tonumber(price_oracle.max_daily_deflation) or 0.03,
     last_money_print = price_oracle.last_money_print,
+    imported_mint_shocks = imported or 0,
+    skipped_mint_shocks = skipped or 0,
     time = timestamp(),
     note = "Zero baseline inflation. Sector CPI rises easily under pressure, falls slowly at max_daily_deflation, and cannot fall below sticky_floor_from_ath of ATH."
   }
