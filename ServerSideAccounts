@@ -22,7 +22,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.3.9-COMPANY-PAYMENT-ENDPOINT"
+local VERSION  = "1.4.0-SERVICE-OBSERVATIONS"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -65,6 +65,7 @@ local FILE = {
   inflation    = "data/inflation_state.db",
   config       = "data/config.db",
   employment   = "data/employment_mappings.db",
+  service_obs  = "data/service_observations.db",
 }
 
 local LEDGER_KEEP_RECENT_TX = 500
@@ -86,6 +87,7 @@ local citizens  = {}  -- [username] = { display_name, password_hash, joined, sta
 local companies = {}
 local contracts = {}
 local employment_mappings = {} -- [citizen_id] = central citizen -> employer/company map pushed by ColonyBusinessIntegrator
+local service_observations = {} -- [service_key] = latest service snapshot pushed by ColonyBusinessIntegrator
 local prices    = {}
 local inflation_state = {}
 local config    = {}
@@ -1241,6 +1243,33 @@ handlers["list_employee_mappings"] = function(sender_id, req)
   return true, { employees = result, count = #result }
 end
 
+
+-- SYNC_SERVICE_OBSERVATIONS
+handlers["sync_service_observations"] = function(sender_id, req)
+  local key = tostring(req.service_key or req.service or "dining_hall")
+  local obs = req.observation or req
+  if type(obs) ~= "table" then return false, "Missing observation table" end
+
+  local copy = {}
+  for k, v in pairs(obs) do copy[k] = v end
+  copy.service_key = key
+  copy.source = "ColonyBusinessIntegrator:" .. tostring(sender_id)
+  copy.updated_at = timestamp()
+
+  service_observations[key] = copy
+  writeFile(FILE.service_obs, service_observations)
+  audit("ACTION", "STATE", sender_id, "SYNC_SERVICE_OBSERVATIONS", key)
+  return true, { service_key = key, updated_at = copy.updated_at }
+end
+
+-- GET_SERVICE_OBSERVATIONS
+handlers["get_service_observations"] = function(sender_id, req)
+  local key = tostring(req and (req.service_key or req.service) or "dining_hall")
+  local obs = service_observations[key]
+  if not obs then return false, "No service observation found for " .. key end
+  return true, { observation = obs }
+end
+
 -- COMPANY_PAYROLL
 -- Private-sector payroll only. Allows company overdraft by design.
 handlers["company_payroll"] = function(sender_id, req)
@@ -1841,6 +1870,7 @@ local function initFiles()
   contracts = readFile(FILE.contracts) or {}
   prices    = readFile(FILE.prices)    or {}
   employment_mappings = readFile(FILE.employment) or {}
+  service_observations = readFile(FILE.service_obs) or {}
   inflation_state = readFile(FILE.inflation) or {}
   ensureInflationState()
   config    = readFile(FILE.config)    or {
@@ -1859,6 +1889,7 @@ local function initFiles()
   print("  Citizens:  " .. count(citizens))
   print("  Companies: " .. count(companies))
   print("  Employment mappings: " .. count(employment_mappings))
+  print("  Service observations: " .. count(service_observations))
 end
 
 local function initCounters()
@@ -1972,6 +2003,7 @@ local function drawStatus()
   print("  Citizens:  " .. count(citizens))
   print("  Companies: " .. count(companies))
   print("  Employment mappings: " .. count(employment_mappings))
+  print("  Service observations: " .. count(service_observations))
   term.setTextColor(colors.lime)
   print("  Treasury:  " .. deriveBalance("treasury:quid_bank") .. " Quid")
   term.setTextColor(colors.lightGray)
