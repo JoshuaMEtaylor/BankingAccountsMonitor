@@ -52,7 +52,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION          = "1.0.15-GRANT-SEARCH"
+local VERSION          = "1.0.16-STIMULUS"
 local PROTOCOL         = "quid_bank"
 local TREASURY_ACCOUNT = "treasury:quid_bank"
 local DB_TIMEOUT       = 5
@@ -132,6 +132,14 @@ end
 local function trim(s)
   s = tostring(s or "")
   return s:match("^%s*(.-)%s*$")
+end
+
+local function shortText(text, maxLen)
+  text = tostring(text or "")
+  maxLen = tonumber(maxLen) or 30
+  if maxLen < 4 then return text:sub(1, maxLen) end
+  if #text <= maxLen then return text end
+  return text:sub(1, maxLen - 3) .. "..."
 end
 
 local function normaliseAccountId(s)
@@ -780,6 +788,172 @@ local function actionGrantFunds()
   end
 end
 
+
+local function activeAccountsOfType(accounts, targetType)
+  local out = {}
+  targetType = tostring(targetType or "")
+
+  for _, acc in ipairs(accounts or {}) do
+    if type(acc) == "table"
+      and tostring(acc.type or "") == targetType
+      and tostring(acc.status or "active") == "active" then
+      out[#out + 1] = acc
+    end
+  end
+
+  table.sort(out, function(a, b)
+    local an = string.lower(grantAccountName(a))
+    local bn = string.lower(grantAccountName(b))
+    if an ~= bn then return an < bn end
+    return tostring(a.account_id or "") < tostring(b.account_id or "")
+  end)
+
+  return out
+end
+
+local function stimulusTargetLabel(targetType)
+  if targetType == "citizen" then return "Citizens" end
+  if targetType == "company" then return "Businesses" end
+  return tostring(targetType or "Accounts")
+end
+
+local function actionStimulus(targetType)
+  local label = stimulusTargetLabel(targetType)
+  local ok, accounts = requestAccounts()
+  if not ok then accounts = last_accounts or {} end
+
+  local recipients = activeAccountsOfType(accounts, targetType)
+  if #recipients == 0 then
+    setMessage("No active " .. string.lower(label) .. " found.", colors.orange)
+    return
+  end
+
+  local defaultMemo = label .. " stimulus payment"
+  local data = formScreen(
+    string.upper(label) .. " STIMULUS",
+    "Pays every active " .. string.lower(label) .. " account from the treasury.",
+    {
+      { label = "Amount per account", key = "amount", required = true, max = 12 },
+      { label = "Memo", key = "memo", required = false, max = 48, value = defaultMemo },
+    },
+    "Review"
+  )
+
+  if not data then
+    setMessage(label .. " stimulus cancelled.", colors.lightGray)
+    return
+  end
+
+  local amount = positiveInt(data.amount)
+  if not amount then
+    setMessage("Invalid stimulus amount.", colors.red)
+    return
+  end
+
+  local memo = data.memo ~= "" and data.memo or defaultMemo
+  local total = amount * #recipients
+
+  -- Refresh status for a current treasury warning, but do not block the flow if
+  -- the status endpoint is unavailable. The grant calls themselves remain
+  -- authoritative.
+  refreshStatus()
+  local treasuryBalance = nil
+  if type(last_status) == "table" and type(last_status.supply) == "table" then
+    treasuryBalance = tonumber(last_status.supply.treasury_balance)
+  end
+
+  local lines = {
+    "This spends existing treasury funds.",
+    "",
+    "Target:       " .. label,
+    "Recipients:   " .. tostring(#recipients),
+    "Each payment: " .. money(amount),
+    "Total cost:   " .. money(total),
+    "From:         " .. TREASURY_ACCOUNT,
+    "Memo:         " .. memo,
+  }
+
+  if treasuryBalance then
+    lines[#lines + 1] = "Treasury now: " .. money(treasuryBalance)
+    if treasuryBalance < total then
+      lines[#lines + 1] = ""
+      lines[#lines + 1] = "WARNING: Treasury may not cover the full run."
+      lines[#lines + 1] = "Payments stop only when the bank rejects a grant."
+    end
+  end
+
+  local okConfirm = confirmScreen("CONFIRM " .. string.upper(label) .. " STIMULUS", lines, "Issue Stimulus", treasuryBalance and treasuryBalance < total)
+  if not okConfirm then
+    setMessage(label .. " stimulus cancelled.", colors.lightGray)
+    return
+  end
+
+  local w, h = getSize()
+  clear(colors.black)
+  drawTop(string.upper(label) .. " STIMULUS")
+  writeAt(2, 3, "Issuing " .. money(amount) .. " to " .. tostring(#recipients) .. " accounts...", colors.white, colors.black)
+  writeAt(2, 4, "Do not close until complete.", colors.orange, colors.black)
+
+  local paid = 0
+  local failed = 0
+  local firstError = nil
+
+  for i, acc in ipairs(recipients) do
+    local accountId = tostring(acc.account_id or "")
+    local name = grantAccountName(acc)
+
+    fill(2, 6, w - 3, 4, colors.black)
+    writeAt(2, 6, "Progress: " .. tostring(i) .. " / " .. tostring(#recipients), colors.lightGray, colors.black)
+    writeAt(2, 7, "Paying: " .. shortText(name, w - 12), colors.white, colors.black)
+    writeAt(2, 8, accountId:sub(1, w - 3), colors.gray, colors.black)
+    writeAt(2, 9, "Paid: " .. tostring(paid) .. "   Failed: " .. tostring(failed), failed > 0 and colors.orange or colors.lime, colors.black)
+
+    if accountId ~= "" then
+      local okGrant, res = dbRequest({
+        type = "grant",
+        to_id = accountId,
+        amount = amount,
+        memo = memo,
+      })
+
+      if okGrant then
+        paid = paid + 1
+      else
+        failed = failed + 1
+        if not firstError then firstError = tostring(res) end
+      end
+    else
+      failed = failed + 1
+      if not firstError then firstError = "Missing account id" end
+    end
+  end
+
+  refreshStatus()
+
+  local resultLines = {
+    "Stimulus run complete.",
+    "",
+    "Target: " .. label,
+    "Paid:   " .. tostring(paid) .. " / " .. tostring(#recipients),
+    "Failed: " .. tostring(failed),
+    "Each:   " .. money(amount),
+    "Total:  " .. money(paid * amount),
+  }
+  if firstError then
+    resultLines[#resultLines + 1] = ""
+    resultLines[#resultLines + 1] = "First error: " .. tostring(firstError)
+  end
+
+  confirmScreen(string.upper(label) .. " STIMULUS COMPLETE", resultLines, "Back", false)
+
+  if failed > 0 then
+    setMessage(label .. " stimulus partly complete: " .. tostring(paid) .. " paid, " .. tostring(failed) .. " failed.", colors.orange)
+  else
+    setMessage(label .. " stimulus complete: " .. tostring(paid) .. " payments, " .. money(paid * amount) .. ".", colors.lime)
+  end
+end
+
+
 local function actionBurnMoney()
   local data = formScreen(
     "BURN MONEY",
@@ -1270,13 +1444,16 @@ local function drawMain()
   buttons.accounts = button(2, y + 4, bw, "Accounts", colors.gray, colors.white)
   buttons.history  = button(4 + bw, y + 4, bw, "Gov History", colors.orange, colors.black)
 
+  buttons.stim_citizens = button(2, y + 6, bw, "Citizen Stimulus", colors.cyan, colors.black)
+  buttons.stim_business = button(4 + bw, y + 6, bw, "Business Stimulus", colors.cyan, colors.black)
+
   if h < 22 then
-    buttons.workerpay = button(2, y + 6, bw, "Worker Pay", colors.purple, colors.white)
-    buttons.reconnect = button(4 + bw, y + 6, bw, "Reconnect", colors.gray, colors.white)
+    buttons.workerpay = button(2, y + 8, bw, "Worker Pay", colors.purple, colors.white)
+    buttons.reconnect = button(4 + bw, y + 8, bw, "Reconnect", colors.gray, colors.white)
   else
-    buttons.workerpay = button(2, y + 6, w - 3, "Worker Pay", colors.purple, colors.white)
+    buttons.workerpay = button(2, y + 8, w - 3, "Worker Pay", colors.purple, colors.white)
     if h >= 24 then
-      buttons.reconnect = button(2, y + 8, w - 3, "Reconnect", colors.gray, colors.white)
+      buttons.reconnect = button(2, y + 10, w - 3, "Reconnect", colors.gray, colors.white)
     end
   end
 
@@ -1306,6 +1483,10 @@ local function mainLoop()
         screenAccounts()
       elseif hit(buttons.history, mx, my) then
         screenFiscalHistory()
+      elseif hit(buttons.stim_citizens, mx, my) then
+        actionStimulus("citizen")
+      elseif hit(buttons.stim_business, mx, my) then
+        actionStimulus("company")
       elseif hit(buttons.workerpay, mx, my) then
         actionWorkerPay()
       elseif buttons.reconnect and hit(buttons.reconnect, mx, my) then
