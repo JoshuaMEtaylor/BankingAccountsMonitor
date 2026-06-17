@@ -15,7 +15,7 @@
 -- Read-only. No banking controls. No trade panel. Contract GDP over 365 Minecraft days + in-view MCT clock + tapered money-supply inflation.
 -- =============================================================================
 
-local VERSION         = "0.5.10-ZERO-BASE-STICKY-DEFLATION"
+local VERSION         = "0.5.11-ORACLE-ERROR-FIX"
 local PROTOCOL        = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT      = 5
@@ -279,6 +279,13 @@ local function clamp(v, lo, hi)
   return v
 end
 
+local function pow(base, exp)
+  base = tonumber(base) or 0
+  exp = tonumber(exp) or 0
+  if math.pow then return math.pow(base, exp) end
+  return base ^ exp
+end
+
 local function countTable(t)
   local n = 0
   if type(t) ~= "table" then return 0 end
@@ -414,7 +421,7 @@ local function getAdaptiveInflationBase(issued)
   -- Exponential taper: after each half-life, half of the remaining inflation pressure fades.
   local alpha = 0
   if elapsed > 0 then
-    alpha = 1 - math.pow(0.5, elapsed / INFLATION_HALF_LIFE_MS)
+    alpha = 1 - pow(0.5, elapsed / INFLATION_HALF_LIFE_MS)
     alpha = clamp(alpha, 0, 1)
   end
 
@@ -1292,7 +1299,7 @@ local function drawPriceOracleCard(x, y, w, h, snap)
     local m = snap and snap.monetary or {}
     metric(x + 2, y + 4, "Issued supply", fmtMoney(m.issued_supply), m.issued_supply and C.good or C.warn)
     metric(x + 2, y + 5, "Fallback inflation", fmtPct(snap and snap.inflation, 2), snap and snap.inflation and colors.white or C.warn)
-    writeAt(x + 2, y + h - 1, "ServerSideAccounts v1.4.6+ needed for zero-base sticky CPI", C.warn, C.bg)
+    writeAt(x + 2, y + h - 1, "Bank oracle endpoint failed; reboot/patched ServerSideAccounts required", C.warn, C.bg)
     return
   end
 
