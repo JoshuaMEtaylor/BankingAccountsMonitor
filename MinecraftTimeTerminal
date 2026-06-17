@@ -1,0 +1,331 @@
+-- =============================================================================
+-- MINECRAFT TIME TERMINAL
+-- MinecraftTimeTerminal
+--
+-- Baseline Quid-world timekeeper.
+-- Day 0 begins at date 00/00/0000.
+-- Month/day are zero-indexed but month lengths follow the real Gregorian calendar:
+-- January 31, February 28/29, leap years, century rules, etc.
+-- Time is a 24-hour clock driven by Minecraft ingame time/ticks.
+-- =============================================================================
+
+local args = {...}
+
+-- =============================================================================
+-- SELF UPDATE
+-- =============================================================================
+if args[1] ~= "--updated" then
+  print("[ Minecraft Time Terminal ]")
+  print("Deleting old version...")
+  fs.delete("startup.lua")
+  print("Downloading latest from GitHub...")
+
+  local cache_bust = tostring(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
+  local update_url = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/MinecraftTimeTerminal?cb=" .. cache_bust
+  shell.run("wget " .. update_url .. " startup.lua")
+
+  if not fs.exists("startup.lua") then
+    print("")
+    print("Download failed.")
+    print("Expected GitHub file: MinecraftTimeTerminal")
+    print("")
+    print("Manual install:")
+    print("delete startup")
+    print("wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/MinecraftTimeTerminal?cb=001 startup.lua")
+    print("startup.lua")
+    return
+  end
+
+  print("Relaunching...")
+  sleep(0.5)
+  shell.run("startup.lua", "--updated")
+  return
+end
+
+-- =============================================================================
+-- CONFIG
+-- =============================================================================
+local VERSION = "1.0.0-MC-CALENDAR"
+local TEXT_SCALE = 0.5
+local MINECRAFT_DAY_MS = 20 * 60 * 1000
+local REFRESH_SECONDS = 0.25
+
+local native_term = term.current()
+local monitor = nil
+local W, H = term.getSize()
+
+local C = {
+  bg = colors.black,
+  panel = colors.gray,
+  header = colors.purple,
+  header_fg = colors.white,
+  title = colors.yellow,
+  label = colors.lightGray,
+  value = colors.lime,
+  dim = colors.gray,
+  warn = colors.orange,
+  btn = colors.gray,
+  btn_fg = colors.white,
+}
+
+-- =============================================================================
+-- TIME ENGINE - keep this matched with EconomyCoreMonitor
+-- =============================================================================
+local MONTH_NAMES = {
+  "January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December"
+}
+
+local function nowMs()
+  if os.epoch then return os.epoch("utc") end
+  return math.floor(os.time() * 1000)
+end
+
+local function isLeapYear(year)
+  year = math.floor(tonumber(year) or 0)
+  if year % 400 == 0 then return true end
+  if year % 100 == 0 then return false end
+  return year % 4 == 0
+end
+
+local function monthLength(month_zero, year)
+  local base = {31,28,31,30,31,30,31,31,30,31,30,31}
+  local idx = (math.floor(tonumber(month_zero) or 0) % 12) + 1
+  if idx == 2 and isLeapYear(year) then return 29 end
+  return base[idx]
+end
+
+local function currentMinecraftDay()
+  if os.day then
+    local ok, day = pcall(os.day, "ingame")
+    if ok and tonumber(day) then return math.floor(tonumber(day)) end
+    ok, day = pcall(os.day)
+    if ok and tonumber(day) then return math.floor(tonumber(day)) end
+  end
+  return math.floor(nowMs() / MINECRAFT_DAY_MS)
+end
+
+local function currentMinecraftTimeHours()
+  if os.time then
+    local ok, t = pcall(os.time, "ingame")
+    if ok and tonumber(t) then return tonumber(t) end
+    ok, t = pcall(os.time)
+    if ok and tonumber(t) then return tonumber(t) end
+  end
+  local dayMs = nowMs() % MINECRAFT_DAY_MS
+  return (dayMs / MINECRAFT_DAY_MS) * 24
+end
+
+local function calendarFromMinecraftDay(day)
+  day = math.floor(tonumber(day) or 0)
+  if day < 0 then day = 0 end
+
+  local year = 0
+  local remaining = day
+  while true do
+    local year_len = isLeapYear(year) and 366 or 365
+    if remaining < year_len then break end
+    remaining = remaining - year_len
+    year = year + 1
+  end
+
+  local dayOfYear = remaining
+  local month = 0
+  while true do
+    local len = monthLength(month, year)
+    if remaining < len then break end
+    remaining = remaining - len
+    month = month + 1
+  end
+
+  return {
+    absolute_day = day,
+    year = year,
+    month = month,
+    month_name = MONTH_NAMES[(month % 12) + 1],
+    day_of_month = remaining,
+    day_of_year = dayOfYear,
+    leap_year = isLeapYear(year),
+  }
+end
+
+local function minecraftClock()
+  local absolute_day = currentMinecraftDay()
+  local cal = calendarFromMinecraftDay(absolute_day)
+
+  local t = currentMinecraftTimeHours() % 24
+  local tick = math.floor(((t / 24) * 24000) + 0.5) % 24000
+  local total_seconds = math.floor((tick / 24000) * 86400)
+  local hour = math.floor(total_seconds / 3600) % 24
+  local minute = math.floor((total_seconds % 3600) / 60)
+  local second = total_seconds % 60
+
+  local date_text = string.format("%02d/%02d/%04d", cal.day_of_month, cal.month, cal.year)
+  local time_text = string.format("%02d:%02d:%02d", hour, minute, second)
+
+  return {
+    day = absolute_day,
+    absolute_day = absolute_day,
+    year = cal.year,
+    month = cal.month,
+    month_name = cal.month_name,
+    day_of_month = cal.day_of_month,
+    day_of_year = cal.day_of_year,
+    leap_year = cal.leap_year,
+    tick = tick,
+    hour = hour,
+    minute = minute,
+    second = second,
+    date_text = date_text,
+    time_text = time_text,
+    tick_text = tostring(tick),
+    full_text = date_text .. " " .. time_text,
+  }
+end
+
+-- =============================================================================
+-- DISPLAY
+-- =============================================================================
+local function refreshSize()
+  W, H = term.getSize()
+end
+
+local function setupDisplay()
+  monitor = nil
+  if peripheral.find then monitor = peripheral.find("monitor") end
+  if not monitor then
+    for _, name in ipairs(peripheral.getNames()) do
+      if peripheral.getType(name) == "monitor" then
+        monitor = peripheral.wrap(name)
+        break
+      end
+    end
+  end
+  if monitor then
+    pcall(function() monitor.setTextScale(TEXT_SCALE) end)
+    term.redirect(monitor)
+  end
+  refreshSize()
+end
+
+local function restoreDisplay()
+  term.redirect(native_term)
+  term.setBackgroundColor(colors.black)
+  term.setTextColor(colors.white)
+  term.clear()
+  term.setCursorPos(1, 1)
+end
+
+local function fill(x, y, w, h, bg)
+  refreshSize()
+  if w <= 0 or h <= 0 then return end
+  if x < 1 then x = 1 end
+  if x > W then return end
+  term.setBackgroundColor(bg or C.bg)
+  local row = string.rep(" ", math.max(0, w))
+  for yy = y, y + h - 1 do
+    if yy >= 1 and yy <= H then
+      term.setCursorPos(x, yy)
+      term.write(row:sub(1, W - x + 1))
+    end
+  end
+end
+
+local function at(x, y, text, fg, bg)
+  refreshSize()
+  if y < 1 or y > H or x > W then return end
+  if x < 1 then x = 1 end
+  term.setCursorPos(x, y)
+  term.setBackgroundColor(bg or C.bg)
+  term.setTextColor(fg or C.label)
+  local maxw = W - x + 1
+  if maxw > 0 then term.write(tostring(text or ""):sub(1, maxw)) end
+end
+
+local function center(y, text, fg, bg)
+  text = tostring(text or "")
+  at(math.max(1, math.floor((W - #text) / 2) + 1), y, text, fg, bg)
+end
+
+local function button(x, y, w, label, bg, fg)
+  fill(x, y, w, 1, bg or C.btn)
+  local tx = x + math.floor((w - #label) / 2)
+  at(tx, y, label, fg or C.btn_fg, bg or C.btn)
+  return {x1=x, x2=x+w-1, y1=y, y2=y}
+end
+
+local function hit(b, mx, my)
+  return b and mx >= b.x1 and mx <= b.x2 and my >= b.y1 and my <= b.y2
+end
+
+local function drawTop()
+  fill(1, 1, W, 1, C.header)
+  at(2, 1, "MINECRAFT TIME TERMINAL", C.header_fg, C.header)
+  local v = VERSION
+  at(W - #v, 1, v, colors.lightGray, C.header)
+end
+
+local function draw()
+  local c = minecraftClock()
+  term.setCursorBlink(false)
+  fill(1, 1, W, H, C.bg)
+  drawTop()
+
+  center(3, "WORLD CALENDAR", C.title, C.bg)
+
+  local boxX = 3
+  local boxY = 5
+  local boxW = W - 4
+  if boxW < 30 then boxW = W - 2; boxX = 2 end
+  fill(boxX, boxY, boxW, math.min(10, H - 7), colors.black)
+
+  at(boxX + 2, boxY + 1, "Date", C.label, colors.black)
+  at(boxX + 16, boxY + 1, c.date_text, C.value, colors.black)
+
+  at(boxX + 2, boxY + 2, "Time", C.label, colors.black)
+  at(boxX + 16, boxY + 2, c.time_text, C.value, colors.black)
+
+  at(boxX + 2, boxY + 3, "Tick", C.label, colors.black)
+  at(boxX + 16, boxY + 3, tostring(c.tick), C.value, colors.black)
+
+  at(boxX + 2, boxY + 4, "Abs Day", C.label, colors.black)
+  at(boxX + 16, boxY + 4, tostring(c.absolute_day), C.value, colors.black)
+
+  at(boxX + 2, boxY + 5, "Month", C.label, colors.black)
+  at(boxX + 16, boxY + 5, tostring(c.month) .. " - " .. c.month_name, C.value, colors.black)
+
+  at(boxX + 2, boxY + 6, "Year", C.label, colors.black)
+  at(boxX + 16, boxY + 6, tostring(c.year) .. (c.leap_year and "  leap" or ""), C.value, colors.black)
+
+  at(boxX + 2, boxY + 8, "Day 0 = 00/00/0000", C.warn, colors.black)
+  at(boxX + 2, boxY + 9, "1 MC day = 20 real minutes, 24h clock", C.dim, colors.black)
+
+  local bClose = button(3, H - 1, math.max(12, W - 5), "Close", colors.gray, colors.white)
+  return bClose
+end
+
+-- =============================================================================
+-- MAIN
+-- =============================================================================
+local function main()
+  setupDisplay()
+  local bClose = draw()
+  local timer = os.startTimer(REFRESH_SECONDS)
+
+  while true do
+    local ev, p1, p2, p3 = os.pullEvent()
+    if ev == "timer" and p1 == timer then
+      bClose = draw()
+      timer = os.startTimer(REFRESH_SECONDS)
+    elseif ev == "mouse_click" then
+      if hit(bClose, p2, p3) then break end
+    elseif ev == "term_resize" or ev == "monitor_resize" then
+      bClose = draw()
+    end
+  end
+
+  restoreDisplay()
+  print("Minecraft Time Terminal closed.")
+end
+
+main()
