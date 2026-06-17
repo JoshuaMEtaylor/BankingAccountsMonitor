@@ -22,7 +22,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.4.5-STICKY-ATH-INFLATION"
+local VERSION  = "1.4.6-ZERO-BASE-STICKY-DEFLATION"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -695,27 +695,26 @@ end
 -- their own visible price pressure.
 --
 -- Important design choice:
---   inflation_state.price_index can be below 1 because of the older bank CPI
---   model. The price oracle does NOT let that deflate live prices. For immediate
---   impact it uses the current positive inflation_rate as a price-pressure
---   floor. If the monitor says current inflation is 25%, sector prices should
---   visibly rise by roughly that order of magnitude.
+--   There is no built-in starter inflation. The oracle starts at x1.00 and only
+--   moves from actual bank inflation, money-print shock, or an admin-set floor.
+--   Prices rise easily but fall slowly: max 3% per Minecraft day, and never
+--   below 75% of the sector ATH unless the oracle is deliberately rebased.
 -- =============================================================================
 local DEFAULT_PRICE_ORACLE = {
-  model = "wide_sector_price_oracle_v1",
+  model = "wide_sector_price_oracle_v2_zero_base_sticky_deflation",
   min_index = 1.00,
   max_index = 8.00,
   immediate_pass_through = 1.00,
-  -- Bootstrap visible inflation into prices immediately.
-  -- The old monitor may already show high money-supply inflation, but if this
-  -- oracle is installed after the money was printed the bank daily-rate model
-  -- can start at 0. This floor gives prices the shock the economy should feel
-  -- now. Set to 0 later if you want prices to fully rebase.
-  price_pressure_floor = 0.26,
+  -- No built-in starter inflation. Prices begin at x1.00 unless money-print
+  -- shock, bank inflation, or a deliberate admin floor moves them.
+  price_pressure_floor = 0.00,
   -- Downward price stickiness. Sector prices can make new ATHs, but deflation
   -- can only pull them down to 75% of that ATH unless an admin deliberately
   -- rebases the oracle. This makes money-printing damage persistent.
   sticky_floor_from_ath = 0.75,
+  -- When target prices fall, the visible CPI can only fall this much per
+  -- Minecraft day. Sellers cut prices slowly, even if conditions improve.
+  max_daily_deflation = 0.03,
   shock_pressure = 0.00,
   money_print_sensitivity = 0.45,
   max_shock_pressure = 3.00,
@@ -768,15 +767,37 @@ end
 
 local function ensurePriceOracle()
   price_oracle = type(price_oracle) == "table" and price_oracle or {}
-  if not price_oracle.model then price_oracle.model = DEFAULT_PRICE_ORACLE.model end
+
+  local previous_model = tostring(price_oracle.model or "")
+  if previous_model ~= DEFAULT_PRICE_ORACLE.model then
+    price_oracle.model = DEFAULT_PRICE_ORACLE.model
+  end
+
   price_oracle.min_index = tonumber(price_oracle.min_index) or DEFAULT_PRICE_ORACLE.min_index
   price_oracle.max_index = tonumber(price_oracle.max_index) or DEFAULT_PRICE_ORACLE.max_index
   price_oracle.immediate_pass_through = tonumber(price_oracle.immediate_pass_through) or DEFAULT_PRICE_ORACLE.immediate_pass_through
+
   price_oracle.price_pressure_floor = tonumber(price_oracle.price_pressure_floor)
-  if price_oracle.price_pressure_floor == nil then price_oracle.price_pressure_floor = DEFAULT_PRICE_ORACLE.price_pressure_floor end
+  if price_oracle.price_pressure_floor == nil then
+    price_oracle.price_pressure_floor = DEFAULT_PRICE_ORACLE.price_pressure_floor
+  end
+  -- v1.4.6 migration: remove the old hardcoded +26% starter floor. Inflation
+  -- should start at 0 unless printing/real pressure creates it.
+  if price_oracle.zero_base_floor_migrated ~= true then
+    if math.abs((tonumber(price_oracle.price_pressure_floor) or 0) - 0.26) < 0.0001 then
+      price_oracle.price_pressure_floor = 0.00
+    end
+    price_oracle.zero_base_floor_migrated = true
+  end
+
   price_oracle.sticky_floor_from_ath = tonumber(price_oracle.sticky_floor_from_ath) or DEFAULT_PRICE_ORACLE.sticky_floor_from_ath
   if price_oracle.sticky_floor_from_ath < 0 then price_oracle.sticky_floor_from_ath = DEFAULT_PRICE_ORACLE.sticky_floor_from_ath end
   if price_oracle.sticky_floor_from_ath > 1 then price_oracle.sticky_floor_from_ath = 1 end
+
+  price_oracle.max_daily_deflation = tonumber(price_oracle.max_daily_deflation) or DEFAULT_PRICE_ORACLE.max_daily_deflation
+  if price_oracle.max_daily_deflation < 0 then price_oracle.max_daily_deflation = DEFAULT_PRICE_ORACLE.max_daily_deflation end
+  if price_oracle.max_daily_deflation > 0.25 then price_oracle.max_daily_deflation = 0.25 end
+
   price_oracle.shock_pressure = tonumber(price_oracle.shock_pressure) or DEFAULT_PRICE_ORACLE.shock_pressure
   if price_oracle.shock_pressure < 0 then price_oracle.shock_pressure = 0 end
   price_oracle.money_print_sensitivity = tonumber(price_oracle.money_print_sensitivity) or DEFAULT_PRICE_ORACLE.money_print_sensitivity
@@ -795,7 +816,9 @@ local function ensurePriceOracle()
     rec.bias = tonumber(rec.bias) or def.bias
     rec.ath_index = math.max(1, tonumber(rec.ath_index) or 1)
     rec.current_index = math.max(1, tonumber(rec.current_index) or 1)
+    rec.raw_index = math.max(1, tonumber(rec.raw_index) or rec.current_index or 1)
     rec.sticky_floor_index = math.max(1, tonumber(rec.sticky_floor_index) or (rec.ath_index * (tonumber(price_oracle.sticky_floor_from_ath) or 0.75)))
+    rec.last_index_day = tonumber(rec.last_index_day) or currentMinecraftDay()
   end
 
   price_oracle.service_prices = type(price_oracle.service_prices) == "table" and price_oracle.service_prices or {}
@@ -848,34 +871,71 @@ local function sectorIndex(sector)
   local rec = price_oracle.sectors[sector] or price_oracle.sectors.general or {}
   local pressure, rate, bank_index, floor, shock = inflationPressure()
 
-  local raw_idx = 1 + (pressure * (tonumber(rec.sensitivity) or 1)) + (pressure > 0 and (tonumber(rec.bias) or 0) or 0)
-  raw_idx = clamp(raw_idx, tonumber(price_oracle.min_index) or 1, tonumber(price_oracle.max_index) or 8)
+  local target_idx = 1 + (pressure * (tonumber(rec.sensitivity) or 1)) + (pressure > 0 and (tonumber(rec.bias) or 0) or 0)
+  target_idx = clamp(target_idx, tonumber(price_oracle.min_index) or 1, tonumber(price_oracle.max_index) or 8)
 
-  -- Sticky ATH rule:
-  -- Sellers raise prices easily during inflation shocks, but rarely lower them
-  -- fully after conditions improve. Each sector records its all-time-high index.
-  -- Deflation can only pull the live index down to 75% of ATH by default.
+  -- Sticky ATH + slow deflation rule:
+  -- Prices can rise instantly when pressure/shock appears. When pressure eases,
+  -- sellers only cut prices slowly: at most max_daily_deflation per Minecraft
+  -- day, and never below sticky_floor_from_ath of the sector ATH.
   local sticky_ratio = tonumber(price_oracle.sticky_floor_from_ath) or 0.75
   if sticky_ratio < 0 then sticky_ratio = 0.75 end
   if sticky_ratio > 1 then sticky_ratio = 1 end
 
   local old_ath = tonumber(rec.ath_index) or 1
-  local ath = math.max(1, old_ath, raw_idx)
+  local current = tonumber(rec.current_index) or 1
+  current = clamp(current, tonumber(price_oracle.min_index) or 1, tonumber(price_oracle.max_index) or 8)
+
+  local ath = math.max(1, old_ath, target_idx, current)
   local sticky_floor = math.max(tonumber(price_oracle.min_index) or 1, ath * sticky_ratio)
-  local idx = raw_idx
+
+  local today = currentMinecraftDay()
+  local lastDay = math.floor(tonumber(rec.last_index_day) or today)
+  local elapsedDays = math.max(0, math.min(30, today - lastDay))
+  local maxDeflation = tonumber(price_oracle.max_daily_deflation) or 0.03
+  if maxDeflation < 0 then maxDeflation = 0.03 end
+  if maxDeflation > 0.25 then maxDeflation = 0.25 end
+
+  local idx = current
+  local deflation_limited = false
   local sticky_active = false
-  if raw_idx < sticky_floor then
+
+  if target_idx >= current then
+    -- Inflation is easy: raise immediately.
+    idx = target_idx
+  else
+    -- Deflation is slow and sticky. If this is the same MC day as the last
+    -- update, do not let repeated quote calls keep ratcheting prices down.
+    local allowed_floor_today = current
+    if elapsedDays > 0 then
+      allowed_floor_today = current * math.pow(1 - maxDeflation, elapsedDays)
+    end
+    idx = math.max(target_idx, allowed_floor_today)
+    if idx > target_idx + 0.0001 then deflation_limited = true end
+  end
+
+  if idx < sticky_floor then
     idx = sticky_floor
     sticky_active = true
   end
   idx = clamp(idx, tonumber(price_oracle.min_index) or 1, tonumber(price_oracle.max_index) or 8)
 
+  -- A post-limit price can also become the new ATH if current/target was higher.
+  ath = math.max(ath, idx)
+  sticky_floor = math.max(tonumber(price_oracle.min_index) or 1, ath * sticky_ratio)
+  if idx < sticky_floor then
+    idx = sticky_floor
+    sticky_active = true
+  end
+
   local changed = false
   if math.abs((tonumber(rec.ath_index) or 0) - ath) > 0.0001 then rec.ath_index = ath; changed = true end
   if math.abs((tonumber(rec.current_index) or 0) - idx) > 0.0001 then rec.current_index = idx; changed = true end
-  if math.abs((tonumber(rec.raw_index) or 0) - raw_idx) > 0.0001 then rec.raw_index = raw_idx; changed = true end
+  if math.abs((tonumber(rec.raw_index) or 0) - target_idx) > 0.0001 then rec.raw_index = target_idx; changed = true end
   if math.abs((tonumber(rec.sticky_floor_index) or 0) - sticky_floor) > 0.0001 then rec.sticky_floor_index = sticky_floor; changed = true end
+  if rec.last_index_day ~= today then rec.last_index_day = today; changed = true end
   rec.sticky_active = sticky_active
+  rec.deflation_limited = deflation_limited
   rec.last_pressure = pressure
   rec.last_updated = timestamp()
   if changed then savePriceOracle() end
@@ -890,11 +950,16 @@ local function sectorIndex(sector)
     shock_pressure = shock,
     sensitivity = tonumber(rec.sensitivity) or 1,
     bias = tonumber(rec.bias) or 0,
-    raw_index = raw_idx,
+    raw_index = target_idx,
+    target_index = target_idx,
     ath_index = ath,
+    current_index = idx,
     sticky_floor_index = sticky_floor,
     sticky_floor_from_ath = sticky_ratio,
+    max_daily_deflation = maxDeflation,
+    elapsed_days = elapsedDays,
     sticky_active = sticky_active,
+    deflation_limited = deflation_limited,
   }
 end
 
@@ -1080,6 +1145,10 @@ local function sectorIndexSnapshot()
       ath_index = meta.ath_index,
       sticky_floor_index = meta.sticky_floor_index,
       sticky_floor_from_ath = meta.sticky_floor_from_ath,
+      max_daily_deflation = meta.max_daily_deflation,
+      deflation_limited = meta.deflation_limited,
+      current_index = meta.current_index,
+      target_index = meta.target_index,
       sticky_active = meta.sticky_active,
       sensitivity = meta.sensitivity,
       bias = meta.bias,
@@ -2123,7 +2192,7 @@ handlers["get_price_indices"] = function(sender_id, req)
     sticky_floor_from_ath = tonumber(price_oracle.sticky_floor_from_ath) or 0.75,
     last_money_print = price_oracle.last_money_print,
     time = timestamp(),
-    note = "Sector prices have downward stickiness: each sector records ATH index; deflation cannot pull below sticky_floor_from_ath of ATH."
+    note = "Zero baseline inflation. Sector CPI rises easily under pressure, falls slowly at max_daily_deflation, and cannot fall below sticky_floor_from_ath of ATH."
   }
 end
 
@@ -2216,7 +2285,7 @@ handlers["rebase_price_indices"] = function(sender_id, req)
   price_oracle.rebased_at = timestamp()
   price_oracle.rebased_by = tostring(sender_id)
   savePriceOracle()
-  audit("ACTION", "STATE", sender_id, "REBASE_PRICE_INDICES", "wide sector oracle reset")
+  audit("ACTION", "STATE", sender_id, "REBASE_PRICE_INDICES", "wide sector oracle reset to zero baseline")
   return true, { oracle = price_oracle, indices = sectorIndexSnapshot() }
 end
 
