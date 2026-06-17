@@ -2,7 +2,7 @@
 -- SERVICE PAYMENT TERMINAL
 -- ServicePaymentTerminal
 --
--- v1.2.0-SATURATION-INFLATION-POS
+-- v1.2.1-SATURATION-INFLATION-POS-STAFF-SAFE
 --
 -- Dining Hall / Restaurant point-of-sale for MineColonies citizens.
 --
@@ -44,7 +44,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION = "1.2.0-SATURATION-INFLATION-POS"
+local VERSION = "1.2.1-SATURATION-INFLATION-POS-STAFF-SAFE"
 local BANK_PROTOCOL = "quid_bank"
 local TARGET_COMPANY = "company:grki"
 
@@ -118,6 +118,7 @@ local stats = {
   skipped_cooldown = 0,
   skipped_not_near = 0,
   skipped_small_gain = 0,
+  skipped_staff = 0,
   pricing_refreshes = 0,
   last_gain = 0,
   last_charge = 0,
@@ -486,6 +487,57 @@ local function isNearDining(pos, dining)
   return false, best, bestDist
 end
 
+
+local function collectWorkText(v, out, depth, seen)
+  out = out or {}
+  depth = depth or 0
+  if depth > 4 then return out end
+  seen = seen or {}
+
+  local tv = type(v)
+  if tv == "string" or tv == "number" or tv == "boolean" then
+    out[#out + 1] = tostring(v)
+    return out
+  end
+  if tv ~= "table" then return out end
+  if seen[v] then return out end
+  seen[v] = true
+
+  local keys = {
+    "work", "workBuilding", "work_building", "job", "jobName", "job_name",
+    "profession", "occupation", "role", "title", "name", "type", "buildingType"
+  }
+  for _, k in ipairs(keys) do
+    if v[k] ~= nil then collectWorkText(v[k], out, depth + 1, seen) end
+  end
+  return out
+end
+
+local function isDiningStaffCitizen(z)
+  if type(z) ~= "table" then return false end
+
+  -- Prefer the citizen's explicit work/job fields. Do not scan the whole citizen
+  -- table, because unrelated fields can contain building/location metadata.
+  local chunks = {}
+  local fields = {
+    "work", "workBuilding", "work_building", "job", "jobName", "job_name",
+    "profession", "occupation", "role", "title"
+  }
+
+  for _, k in ipairs(fields) do
+    if z[k] ~= nil then collectWorkText(z[k], chunks, 0, {}) end
+  end
+
+  local text = lower(table.concat(chunks, " "))
+  if text == "" then return false end
+
+  return text:find("waiter", 1, true) ~= nil
+    or text:find("cook", 1, true) ~= nil
+    or text:find("restaurant", 1, true) ~= nil
+    or text:find("dining", 1, true) ~= nil
+    or text:find("kitchen", 1, true) ~= nil
+end
+
 -- =============================================================================
 -- PAYMENT
 -- =============================================================================
@@ -581,6 +633,8 @@ local function processCitizen(z, dining)
   state.citizens = state.citizens or {}
   local rec = state.citizens[cid] or {}
   rec.name = name
+  local diningStaff = isDiningStaffCitizen(z)
+  rec.dining_staff = diningStaff and true or false
 
   if near then
     rec.near_at = t
@@ -612,7 +666,20 @@ local function processCitizen(z, dining)
 
       local amount, label = priceMeal(gain)
 
-      if not recentlyNear then
+      if diningStaff then
+        stats.skipped_staff = stats.skipped_staff + 1
+        rec.last_staff_exempt_at = t
+        rec.last_staff_exempt_gain = gain
+        addEvent({
+          type = "staff_meal_exempt",
+          citizen_id = cid,
+          name = name,
+          label = label,
+          gain = gain,
+          reason = "Dining Hall staff are not charged by their own workplace POS.",
+        })
+        setMsg("Ignored staff meal event for " .. tostring(name) .. " (+" .. string.format("%.1f", gain) .. " sat)", colors.lightGray)
+      elseif not recentlyNear then
         stats.skipped_not_near = stats.skipped_not_near + 1
       elseif not cooldownOk then
         stats.skipped_cooldown = stats.skipped_cooldown + 1
@@ -740,7 +807,7 @@ local function draw()
 
   at(2, 15, "Sat rises:    " .. tostring(stats.saturation_rises) .. "   Last gain: +" .. string.format("%.1f", stats.last_gain), colors.lightGray)
   at(2, 16, "Meals:        " .. tostring(stats.meals_charged) .. "   Charged: " .. money(stats.charged) .. "   Unpaid: " .. money(stats.unpaid), colors.lime)
-  at(2, 17, "Skipped:      cooldown " .. tostring(stats.skipped_cooldown) .. " / not near " .. tostring(stats.skipped_not_near) .. " / tiny " .. tostring(stats.skipped_small_gain), colors.orange)
+  at(2, 17, "Skipped:      staff " .. tostring(stats.skipped_staff) .. " / cooldown " .. tostring(stats.skipped_cooldown) .. " / not near " .. tostring(stats.skipped_not_near) .. " / tiny " .. tostring(stats.skipped_small_gain), colors.orange)
   at(2, 18, "Receivables:  " .. money(totalReceivables()), totalReceivables() > 0 and colors.orange or colors.gray)
 
   local third = math.floor((W - 8) / 3)
