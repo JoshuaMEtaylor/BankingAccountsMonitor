@@ -1,0 +1,410 @@
+-- =============================================================================
+-- COLONY BANK REBUILDER
+-- Rebuilds Quid bank citizens/companies from ColonyBusinessIntegrator local data
+-- Run this on the ColonyBusinessIntegrator computer, not the bank server.
+-- =============================================================================
+
+local VERSION = "1.0-REBUILD-BANK-FROM-COLONY-INTEGRATOR"
+local BANK_PROTOCOL = "quid_bank"
+local DB_TIMEOUT = 5
+
+local FILE_BUSINESSES = "data/building_companies.db"
+local FILE_CITIZENS   = "data/colony_citizens.db"
+local FILE_INDUSTRIES = "data/industry_companies.db"
+
+local bank_id = nil
+local modem_name = nil
+
+local function now()
+  if os.epoch then return os.epoch("utc") end
+  return math.floor(os.clock() * 1000)
+end
+
+local function readFile(path)
+  if not fs.exists(path) then return nil end
+  local f = fs.open(path, "r")
+  if not f then return nil end
+  local text = f.readAll()
+  f.close()
+  if not text or text == "" then return nil end
+  local ok, data = pcall(textutils.unserialize, text)
+  if ok then return data end
+  return nil
+end
+
+local function trim(s)
+  return tostring(s or ""):match("^%s*(.-)%s*$")
+end
+
+local function lower(s)
+  return string.lower(tostring(s or ""))
+end
+
+local function countTable(t)
+  local n = 0
+  if type(t) ~= "table" then return 0 end
+  for _ in pairs(t) do n = n + 1 end
+  return n
+end
+
+local function normalType(t)
+  t = tostring(t or "")
+  t = t:gsub("com%.minecolonies%.building%.", "")
+  t = t:gsub("com%.minecolonies%.job%.", "")
+  t = t:gsub("[^%w_%-]", "")
+  return lower(t)
+end
+
+local function locString(loc)
+  if type(loc) ~= "table" then return "0,0,0" end
+  local x = loc.x or loc[1] or 0
+  local y = loc.y or loc[2] or 0
+  local z = loc.z or loc[3] or 0
+  return tostring(x) .. "," .. tostring(y) .. "," .. tostring(z)
+end
+
+local function workKeyFromRecord(rec)
+  if type(rec) ~= "table" then return nil end
+  local typ = rec.work_type or rec.work_name or rec.job or rec.title or ""
+  local loc = rec.work_location
+  if typ == "" or type(loc) ~= "table" then return nil end
+  return normalType(typ) .. "@" .. locString(loc)
+end
+
+local INDUSTRY_BY_TYPE = {
+  builder="construction",
+  cook="hospitality", restaurant="hospitality", dininghall="hospitality", tavern="hospitality", baker="hospitality", bakery="hospitality",
+  deliveryman="logistics", courier="logistics", warehouse="logistics",
+  miner="mining", mine="mining", quarry="mining",
+  lumberjack="timber", forester="timber", sawmill="timber",
+  farmer="agriculture", farm="agriculture", fisher="agriculture", composter="agriculture",
+  blacksmith="manufacturing", smeltery="manufacturing", crusher="manufacturing", mechanic="manufacturing", stonesmeltery="manufacturing",
+  university="research", researcher="research", teacher="research",
+  guardtower="defence", guard="defence", barracks="defence", combatacademy="defence", soldier="defence", knight="defence", archer="defence", ranger="defence",
+}
+
+local function classifyIndustry(typ, name)
+  typ = normalType(typ or name)
+  local n = lower(name or "")
+  if INDUSTRY_BY_TYPE[typ] then return INDUSTRY_BY_TYPE[typ] end
+  if n:find("cook",1,true) or n:find("restaurant",1,true) or n:find("dining",1,true) then return "hospitality" end
+  if n:find("builder",1,true) then return "construction" end
+  if n:find("warehouse",1,true) or n:find("courier",1,true) or n:find("delivery",1,true) then return "logistics" end
+  if n:find("miner",1,true) or n:find("mine",1,true) or n:find("quarry",1,true) then return "mining" end
+  if n:find("lumber",1,true) or n:find("forester",1,true) or n:find("sawmill",1,true) then return "timber" end
+  if n:find("farm",1,true) or n:find("fisher",1,true) or n:find("compost",1,true) then return "agriculture" end
+  if n:find("smith",1,true) or n:find("smeltery",1,true) or n:find("crusher",1,true) then return "manufacturing" end
+  if n:find("university",1,true) or n:find("research",1,true) then return "research" end
+  if n:find("guard",1,true) or n:find("barracks",1,true) or n:find("combat",1,true) then return "defence" end
+  return "general"
+end
+
+local function tickerFromCompanyId(company_id)
+  local s = tostring(company_id or "")
+  s = s:gsub("^company:", "")
+  s = s:gsub("[^%w]", "")
+  s = s:upper()
+  if #s < 2 then s = "RC" .. s end
+  if #s > 6 then s = s:sub(1, 6) end
+  return s
+end
+
+local function openModem()
+  for _, n in ipairs(peripheral.getNames()) do
+    if peripheral.getType(n) == "modem" then
+      local m = peripheral.wrap(n)
+      if m and m.isWireless and m.isWireless() then
+        rednet.open(n)
+        modem_name = n
+        return true
+      end
+    end
+  end
+  for _, n in ipairs(peripheral.getNames()) do
+    if peripheral.getType(n) == "modem" then
+      rednet.open(n)
+      modem_name = n
+      return true
+    end
+  end
+  return false
+end
+
+local function discoverBank()
+  for attempt = 1, 6 do
+    rednet.broadcast({ type = "ping" }, BANK_PROTOCOL)
+    local sender, msg = rednet.receive(BANK_PROTOCOL, 3)
+    if sender and type(msg) == "table" then
+      if msg.type == "treasury_online" then return sender end
+      if msg.success == true and type(msg.response) == "table" then return sender end
+    end
+  end
+  return nil
+end
+
+local function bankReq(req, timeout)
+  timeout = timeout or DB_TIMEOUT
+  if not bank_id then return false, "No bank server" end
+  rednet.send(bank_id, req, BANK_PROTOCOL)
+  local deadline = os.clock() + timeout
+  while true do
+    local rem = deadline - os.clock()
+    if rem <= 0 then return false, "No response from bank" end
+    local sender, msg = rednet.receive(BANK_PROTOCOL, rem)
+    if sender == bank_id and type(msg) == "table" and msg.success ~= nil then
+      return msg.success, msg.response
+    end
+  end
+end
+
+local function printHeader()
+  term.setBackgroundColor(colors.black)
+  term.setTextColor(colors.white)
+  term.clear()
+  term.setCursorPos(1,1)
+  print("COLONY BANK REBUILDER " .. VERSION)
+  print("Run on: ColonyBusinessIntegrator computer")
+  print("Target: Quid Bank over rednet")
+  print(string.rep("-", 48))
+end
+
+local function addCompany(out, rec, source)
+  if type(rec) ~= "table" then return end
+  local company_id = rec.company_id or rec.company or rec.account_id
+  local ticker = rec.ticker or tickerFromCompanyId(company_id)
+  if not ticker or ticker == "" then return end
+  company_id = company_id or ("company:" .. lower(ticker))
+  local key = tostring(company_id)
+  if out[key] then return end
+  local industry = rec.industry or rec.biz_type or classifyIndustry(rec.building_type or rec.type, rec.building_name or rec.name)
+  out[key] = {
+    company_id = key,
+    name = rec.name or rec.display_name or rec.company_name or ("Recovered " .. tostring(ticker)),
+    ticker = tostring(ticker):upper(),
+    biz_type = industry or "general",
+    owner_id = rec.owner_id or "treasury:quid_bank",
+    source = source,
+  }
+end
+
+local function collectCompanies(industry_companies, businesses)
+  local out = {}
+  for _, rec in pairs(industry_companies or {}) do
+    addCompany(out, rec, "industry_companies")
+  end
+  for _, rec in pairs(businesses or {}) do
+    addCompany(out, rec, "building_companies")
+  end
+  local list = {}
+  for _, rec in pairs(out) do list[#list+1] = rec end
+  table.sort(list, function(a,b) return tostring(a.name) < tostring(b.name) end)
+  return list
+end
+
+local function citizenFromStable(stable, rec)
+  if type(rec) ~= "table" then return nil end
+  local username = rec.username
+  local citizen_id = rec.citizen_id
+  if (not username or username == "") and citizen_id then
+    username = tostring(citizen_id):gsub("^citizen:", "")
+  end
+  if not username or username == "" then
+    local safe = tostring(stable or rec.id or rec.name or now()):gsub("[^%w_%-]", "_")
+    username = "mc_" .. safe
+  end
+  citizen_id = citizen_id or ("citizen:" .. username)
+  local title = rec.title or rec.job_text or rec.job or "Citizen"
+  return {
+    stable = tostring(stable or username),
+    citizen_id = citizen_id,
+    username = username,
+    display_name = rec.display_name or rec.name or ("Citizen " .. tostring(stable or username)),
+    title = title,
+    password = rec.password or ("mc" .. tostring(stable or username)),
+    raw = rec,
+  }
+end
+
+local function collectCitizens(citizens_map)
+  local out = {}
+  for stable, rec in pairs(citizens_map or {}) do
+    local c = citizenFromStable(stable, rec)
+    if c then out[#out+1] = c end
+  end
+  table.sort(out, function(a,b) return tostring(a.display_name) < tostring(b.display_name) end)
+  return out
+end
+
+local function companyForCitizen(rec, businesses, industry_companies)
+  if type(rec) ~= "table" then return nil end
+  if rec.company_id then return rec.company_id, rec.company_name, rec.industry end
+
+  local key = workKeyFromRecord(rec)
+  if key and type(businesses) == "table" and businesses[key] then
+    local b = businesses[key]
+    return b.company_id, b.name, b.industry
+  end
+
+  local industry = classifyIndustry(rec.work_type or rec.job, rec.work_name or rec.title or rec.job)
+  local company = type(industry_companies) == "table" and industry_companies[industry] or nil
+  if company then
+    return company.company_id, company.name, company.industry or industry
+  end
+  return nil
+end
+
+local function buildEmployeeMappings(citizens_map, businesses, industry_companies)
+  local employees = {}
+  for stable, rec in pairs(citizens_map or {}) do
+    if type(rec) == "table" and rec.active ~= false then
+      local c = citizenFromStable(stable, rec)
+      local company_id, company_name, industry = companyForCitizen(rec, businesses, industry_companies)
+      if c and company_id then
+        employees[#employees+1] = {
+          citizen_id = c.citizen_id,
+          display_name = c.display_name,
+          job_text = rec.title or rec.job_text or rec.job or "Citizen",
+          job_raw = rec.job or rec.work_type or "",
+          industry = industry or "general",
+          company_id = company_id,
+          company_name = company_name or company_id,
+          building_key = workKeyFromRecord(rec),
+          work_type = rec.work_type,
+          work_name = rec.work_name,
+          work_location = rec.work_location,
+          active = true,
+        }
+      end
+    end
+  end
+  table.sort(employees, function(a,b) return tostring(a.display_name) < tostring(b.display_name) end)
+  return employees
+end
+
+local function okish(ok, res, alreadyText)
+  if ok then return true end
+  local s = tostring(res or "")
+  if alreadyText and s:find(alreadyText, 1, true) then return true end
+  if s:find("already exists", 1, true) then return true end
+  if s:find("already taken", 1, true) then return true end
+  return false
+end
+
+local function main()
+  printHeader()
+
+  local citizens_map = readFile(FILE_CITIZENS) or {}
+  local industry_companies = readFile(FILE_INDUSTRIES) or {}
+  local businesses = readFile(FILE_BUSINESSES) or {}
+
+  print("Local cache:")
+  print("  Citizens:  " .. countTable(citizens_map))
+  print("  Industries: " .. countTable(industry_companies))
+  print("  Buildings:  " .. countTable(businesses))
+  print("")
+
+  if not openModem() then
+    print("ERROR: No modem found.")
+    return
+  end
+  print("Modem: " .. tostring(modem_name))
+
+  bank_id = discoverBank()
+  if not bank_id then
+    print("ERROR: Could not find Quid bank server.")
+    return
+  end
+  print("Bank: " .. tostring(bank_id))
+  print("")
+
+  local companies = collectCompanies(industry_companies, businesses)
+  local citizens = collectCitizens(citizens_map)
+  local employees = buildEmployeeMappings(citizens_map, businesses, industry_companies)
+
+  print("Rebuild plan:")
+  print("  Companies to resend: " .. tostring(#companies))
+  print("  Citizens to resend:  " .. tostring(#citizens))
+  print("  Employee mappings:   " .. tostring(#employees))
+  print("")
+  print("Press Y to rebuild bank registry, or any other key to cancel.")
+  local ev, key = os.pullEvent("key")
+  if key ~= keys.y then
+    print("Cancelled.")
+    return
+  end
+  print("")
+
+  local company_ok, company_fail = 0, 0
+  for _, c in ipairs(companies) do
+    local ok, res = bankReq({
+      type = "register_company",
+      company_id = c.company_id,
+      name = c.name,
+      ticker = c.ticker,
+      biz_type = c.biz_type,
+      owner_id = c.owner_id,
+      shares_total = 1000,
+      shares_public = 0,
+      recovered = true,
+    }, 6)
+    if okish(ok, res, "Company already exists") then
+      company_ok = company_ok + 1
+      print("OK company: " .. tostring(c.name) .. " / " .. tostring(c.ticker))
+    else
+      company_fail = company_fail + 1
+      print("FAIL company: " .. tostring(c.name) .. " -> " .. tostring(res))
+    end
+    sleep(0.05)
+  end
+
+  local citizen_ok, citizen_fail = 0, 0
+  for _, c in ipairs(citizens) do
+    local ok, res = bankReq({
+      type = "register_citizen",
+      citizen_id = c.citizen_id,
+      display_name = c.display_name,
+      username = c.username,
+      password = c.password,
+      title = c.title,
+      recovered = true,
+    }, 6)
+    if okish(ok, res, "Username already exists") then
+      citizen_ok = citizen_ok + 1
+      print("OK citizen: " .. tostring(c.display_name) .. " / " .. tostring(c.citizen_id))
+    else
+      citizen_fail = citizen_fail + 1
+      print("FAIL citizen: " .. tostring(c.display_name) .. " -> " .. tostring(res))
+    end
+    sleep(0.05)
+  end
+
+  local emp_ok, emp_res = false, nil
+  if #employees > 0 then
+    emp_ok, emp_res = bankReq({ type = "sync_employee_mappings", employees = employees }, 10)
+    if emp_ok then
+      print("OK employment sync: " .. tostring(type(emp_res) == "table" and (emp_res.active or emp_res.updated or #employees) or #employees))
+    else
+      print("FAIL employment sync: " .. tostring(emp_res))
+    end
+  else
+    print("No employee mappings found in local cache.")
+  end
+
+  local rok, rres = bankReq({ type = "repair_registry_accounts" }, 10)
+  if rok then
+    print("OK bank registry/account repair pass.")
+  else
+    print("Repair pass unavailable/failed: " .. tostring(rres))
+    print("This is fine on older bank builds if companies/citizens were just recreated.")
+  end
+
+  print("")
+  print("DONE")
+  print("  Companies OK/FAIL: " .. company_ok .. "/" .. company_fail)
+  print("  Citizens  OK/FAIL: " .. citizen_ok .. "/" .. citizen_fail)
+  print("  Employment sent:   " .. tostring(#employees))
+  print("")
+  print("Reboot/restart FiscalControls and EconomyCoreMonitor after the bank has settled.")
+end
+
+main()
