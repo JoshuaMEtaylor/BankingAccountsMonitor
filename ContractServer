@@ -51,7 +51,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION            = "1.0.11-BOOT-REOPEN-ROBUST-COMPANIES"
+local VERSION            = "1.0.12-DROPDOWN-HANDLER-FIX"
 local LABEL              = "Quid-Contracts"
 local PROTOCOL           = "quid_contracts"
 local PROTOCOL_BROADCAST = "quid_contracts_discovery"
@@ -712,7 +712,6 @@ handlers["ping"] = function(sender_id, req)
   return true, {
     message = "Quid Contract Server online",
     version = VERSION,
-    computer = os.getComputerID(),
     label = os.getComputerLabel(),
     time = timestamp(),
   }
@@ -730,7 +729,6 @@ handlers["status"] = function(sender_id, req)
 
   return true, {
     version = VERSION,
-    computer_id = os.getComputerID(),
     label = os.getComputerLabel(),
     time = timestamp(),
     uptime = os.clock(),
@@ -755,7 +753,6 @@ handlers["unclaim_contract"] = unclaimContract
 handlers["mark_fulfilled"] = markFulfilled
 handlers["cancel_contract"] = cancelContract
 handlers["sync_source_contracts"] = syncSourceContracts
-handlers["list_claimant_companies"] = listClaimantCompanies
 
 
 local function bootReopenActiveContracts()
@@ -982,6 +979,8 @@ local function listClaimantCompanies(sender_id, req)
   return true, { companies = companies, count = #companies, bank_id = bank_id }
 end
 
+handlers["list_claimant_companies"] = listClaimantCompanies
+
 local function drawStatus()
   term.clear()
   term.setCursorPos(1, 1)
@@ -996,7 +995,6 @@ local function drawStatus()
   print(string.rep("=", w))
 
   term.setTextColor(colors.white)
-  print("  ID:       " .. os.getComputerID())
   print("  Label:    " .. (os.getComputerLabel() or "unlabelled"))
   print("  Protocol: " .. PROTOCOL)
   print("  Uptime:   " .. string.format("%.0f", os.clock()) .. "s")
@@ -1060,7 +1058,6 @@ local function serverLoop()
         success = success,
         response = response,
         time = timestamp(),
-        server = os.getComputerID(),
       }, PROTOCOL)
 
       if request_count % 5 == 0 then drawStatus() end
@@ -1111,8 +1108,8 @@ local function main()
   sleep(1)
 
   drawStatus()
-  rednet.broadcast({ type = "contract_server_online", version = VERSION, id = os.getComputerID() }, PROTOCOL)
-  rednet.broadcast({ type = "contract_server_online", version = VERSION, id = os.getComputerID() }, PROTOCOL_BROADCAST)
+  rednet.broadcast({ type = "contract_server_online", version = VERSION }, PROTOCOL)
+  rednet.broadcast({ type = "contract_server_online", version = VERSION }, PROTOCOL_BROADCAST)
 
   serverLoop()
 end
