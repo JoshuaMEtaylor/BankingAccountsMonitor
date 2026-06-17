@@ -22,7 +22,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.3.8-CONTRACT-PAYOUT"
+local VERSION  = "1.3.9-COMPANY-PAYMENT-ENDPOINT"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -1344,6 +1344,55 @@ handlers["contract_payout"] = function(sender_id, req)
   if not accountExists(to_id) then return false, "Claimant account not found: " .. tostring(to_id) end
 
   return transfer(from_id, to_id, amount, "CONTRACT_PAYOUT", memo, "CONTRACT_SERVER:" .. tostring(sender_id), true)
+end
+
+
+-- COMPANY_PAYMENT
+-- Trusted system/company-to-account transfer used by ContractServer and other
+-- economy controllers. This is the generic version: a company pays the named
+-- destination account directly. It does not require owner login because the
+-- calling server is acting as the economy system.
+handlers["company_payment"] = function(sender_id, req)
+  local from_id = req.from_id or req.company_id or req.poster
+  local to_id = req.to_id or req.recipient_id or req.claimant
+  local amount = tonumber(req.amount)
+  local memo = req.memo or "Company payment"
+  local tx_type = req.tx_type or "COMPANY_PAYMENT"
+
+  if not from_id or from_id == "" then return false, "Missing source company" end
+  if not to_id or to_id == "" then return false, "Missing destination account" end
+  if not amount or amount <= 0 then return false, "Invalid amount" end
+
+  amount = math.floor(amount)
+  if amount <= 0 then return false, "Invalid integer amount" end
+
+  -- Resolve bare tickers/usernames if needed.
+  if not from_id:find(":") then
+    from_id = "company:" .. string.lower(from_id):gsub("%s+", "_")
+  end
+
+  if not to_id:find(":") then
+    local company_target = "company:" .. string.lower(to_id):gsub("%s+", "_")
+    local citizen_target = "citizen:" .. string.lower(to_id):gsub("%s+", "_")
+    if accountExists(company_target) then
+      to_id = company_target
+    elseif accountExists(citizen_target) then
+      to_id = citizen_target
+    end
+  end
+
+  if not accountExists(from_id) then return false, "Source company account not found: " .. tostring(from_id) end
+  if not companies[from_id] and not tostring(from_id):find("^company:") then
+    return false, "Source is not a company account: " .. tostring(from_id)
+  end
+
+  if not accountExists(to_id) then return false, "Destination account not found: " .. tostring(to_id) end
+  if to_id == from_id then return false, "Cannot pay same company account" end
+
+  -- Contract/business obligations may overdraft the payer.
+  local allow_overdraft = req.allow_overdraft ~= false
+
+  return transfer(from_id, to_id, amount, tx_type, memo, "SYSTEM:" .. tostring(sender_id), allow_overdraft)
 end
 
 -- GET_WORKER_PAY_RATES
