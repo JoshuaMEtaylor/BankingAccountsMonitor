@@ -2,18 +2,20 @@
 -- SERVICE PAYMENT TERMINAL
 -- ServicePaymentTerminal
 --
--- Dining Hall service payments.
+-- v1.1.4-DIRECT-COLONY-EMPLOYEE-INVENTORY
 --
--- Data source:
---   ColonyBusinessIntegrator observes the real colony integrator.
---   CBI resolves the Dining Hall company, asks the bank for that company's
---   employee/payroll mappings, scans only those employees' citizen data, and
---   pushes a service observation to the bank.
+-- This version is for a terminal that has its OWN colonyIntegrator attached.
 --
--- This terminal only consumes bank observations and creates payments.
+-- It uses:
+--   1. local colonyIntegrator.getCitizens()
+--   2. bank list_company_payroll_payees for company:grki
+--   3. direct recursive scan of those employees' live citizen tables
+--
+-- It does not use local company mapping files or industry fallback state.
 -- =============================================================================
 
 local args = {...}
+
 if args[1] ~= "--updated" then
   print("[ Service Payment Terminal ]")
   print("Deleting old version...")
@@ -32,20 +34,21 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION = "1.1.3-PAYROLL-EMPLOYEE-STOCK"
+local VERSION = "1.1.4-DIRECT-COLONY-EMPLOYEE-INVENTORY"
 local BANK_PROTOCOL = "quid_bank"
-local SERVICE_KEY = "dining_hall"
+local TARGET_COMPANY = "company:grki"
+
 local SCAN_SECONDS = 2
 local EAT_DELAY_SECONDS = 2
 local MATCH_WINDOW_SECONDS = 6
 local SAT_DELTA_MIN = 0.50
 
 local db_id = nil
+local colony = nil
 local auto_charge = true
 local last_message = "Booting..."
 local last_colour = colors.lightGray
 
-local obs = nil
 local prev_stock = nil
 local prev_citizens = nil
 local pending_food = {}
@@ -53,9 +56,9 @@ local sat_events = {}
 
 local stats = {
   citizens_seen = 0,
-  payroll_employee_count = 0,
-  employees_seen_live = 0,
-  employee_inventory_sources = 0,
+  payroll_employees = 0,
+  employees_live_seen = 0,
+  employee_inv_sources = 0,
   stock_kinds = 0,
   stock_units = 0,
   last_loss = 0,
@@ -87,6 +90,24 @@ local function money(n)
   return sign .. tostring(math.floor(n + 0.5)) .. " Q"
 end
 
+local function simpleItemName(name)
+  name = tostring(name or "")
+  name = name:gsub("^minecraft:", "")
+  name = name:gsub("^minecolonies:", "")
+  name = name:gsub("^%w+:", "")
+  return lower(name)
+end
+
+local function isCoalOrCharcoal(item)
+  local id = simpleItemName(item)
+  return id == "coal"
+    or id == "charcoal"
+    or id == "coal_block"
+    or id == "block_of_coal"
+    or id:find("coal_block", 1, true)
+    or id:find("charcoal", 1, true)
+end
+
 local function openModem()
   for _, n in ipairs(peripheral.getNames()) do
     if peripheral.getType(n) == "modem" then
@@ -95,6 +116,11 @@ local function openModem()
     end
   end
   return false
+end
+
+local function connectColony()
+  colony = peripheral.find("colonyIntegrator") or peripheral.find("colony_integrator")
+  return colony ~= nil
 end
 
 local function discoverBank()
@@ -127,12 +153,113 @@ local function bankReq(req, timeout)
   end
 end
 
-local function stockCopy(t)
-  local out = {}
-  for k, v in pairs(t or {}) do
-    out[tostring(k)] = tonumber(v) or 0
+local function citizenStableId(z)
+  if type(z) ~= "table" then return nil end
+  local id = z.id or z.citizen_id or z.citizenId or z.uuid or z.name
+  if id == nil then return nil end
+  return tostring(id)
+end
+
+local function citizenUsername(z)
+  local id = citizenStableId(z)
+  if not id then return nil end
+  id = id:gsub("[^%w_%-]", "_")
+  if id:find("^mc_") then return id end
+  return "mc_" .. id
+end
+
+local function citizenAccountId(z)
+  local u = citizenUsername(z)
+  if not u then return nil end
+  return "citizen:" .. u
+end
+
+local function serviceSaturation(z)
+  return tonumber(z and (z.saturation or z.food or z.foodLevel or z.food_level) or 0) or 0
+end
+
+local function scanValueForInventory(v, counts, depth, seen)
+  if type(v) ~= "table" then return end
+  depth = depth or 0
+  if depth > 7 then return end
+  seen = seen or {}
+  if seen[v] then return end
+  seen[v] = true
+
+  local item_name = v.name or v.item or v.id or v.item_id or v.itemName or v.displayName or v.display
+  local qty = v.count or v.qty or v.amount or v.size or v.quantity
+
+  if item_name ~= nil and qty ~= nil then
+    qty = tonumber(qty) or 0
+    if qty > 0 and not isCoalOrCharcoal(item_name) then
+      local id = simpleItemName(item_name)
+      counts[id] = (counts[id] or 0) + qty
+    end
   end
-  return out
+
+  local keys = {
+    "inventory", "items", "stacks", "contents", "mainInventory",
+    "main_inventory", "heldItems", "held_items", "food", "foods",
+    "slots", "backpack", "equipment", "armor", "offhand",
+    "hand", "mainHand", "mainhand", "heldItem", "held_item"
+  }
+
+  for _, k in ipairs(keys) do
+    if type(v[k]) == "table" then
+      scanValueForInventory(v[k], counts, depth + 1, seen)
+    end
+  end
+
+  for k, child in pairs(v) do
+    if type(k) == "number" and type(child) == "table" then
+      scanValueForInventory(child, counts, depth + 1, seen)
+    end
+  end
+end
+
+local function getLiveCitizens()
+  if not colony or type(colony.getCitizens) ~= "function" then return {} end
+  local ok, citizens = pcall(colony.getCitizens)
+  if ok and type(citizens) == "table" then return citizens end
+  return {}
+end
+
+local function getPayrollEmployees()
+  local set = {}
+  local rows = {}
+
+  local ok, res = bankReq({
+    type = "list_company_payroll_payees",
+    company_id = TARGET_COMPANY,
+    limit = 3000,
+  }, 6)
+
+  if ok and type(res) == "table" and type(res.payees) == "table" then
+    for _, e in ipairs(res.payees) do
+      local cid = tostring(e.citizen_id or "")
+      if cid ~= "" then
+        set[cid] = e
+        rows[#rows + 1] = e
+      end
+    end
+    return set, rows, "ledger_company_payroll"
+  end
+
+  ok, res = bankReq({ type = "list_employee_mappings", include_inactive = false }, 6)
+  if ok and type(res) == "table" and type(res.employees) == "table" then
+    for _, e in ipairs(res.employees) do
+      if type(e) == "table" and e.active ~= false and tostring(e.company_id or "") == TARGET_COMPANY then
+        local cid = tostring(e.citizen_id or "")
+        if cid ~= "" then
+          set[cid] = e
+          rows[#rows + 1] = e
+        end
+      end
+    end
+    return set, rows, "fallback_employee_mappings"
+  end
+
+  return set, rows, "none"
 end
 
 local function stockStats(t)
@@ -182,13 +309,14 @@ local function summary(losses)
   return table.concat(out, ", ")
 end
 
-local function citizenMap(rows)
+local function citizenMap(citizens)
   local out = {}
-  for _, z in ipairs(rows or {}) do
-    if z.citizen_id then
-      out[z.citizen_id] = {
-        name = z.display_name or z.citizen_id,
-        saturation = tonumber(z.saturation) or 0,
+  for _, z in ipairs(citizens or {}) do
+    local cid = citizenAccountId(z)
+    if cid then
+      out[cid] = {
+        name = tostring(z.name or z.display_name or cid),
+        saturation = serviceSaturation(z),
       }
     end
   end
@@ -240,12 +368,12 @@ local function processPending()
     if t >= p.due then
       local ev = findLastSat(p.detected_at, p.due + (MATCH_WINDOW_SECONDS * 1000))
 
-      if ev and obs and obs.company_id then
+      if ev then
         local amount = math.max(1, math.floor(p.value or 1))
         local ok, res = bankReq({
           type = "hospitality_meal_payment",
           citizen_id = ev.citizen_id,
-          company_id = obs.company_id,
+          company_id = TARGET_COMPANY,
           amount = amount,
           item = p.summary,
           memo = "Dining Hall meal: " .. p.summary,
@@ -262,7 +390,7 @@ local function processPending()
         end
       else
         stats.unattributed = stats.unattributed + (tonumber(p.qty) or 0)
-        setMsg("Food decrease had no saturation match: " .. p.summary, colors.orange)
+        setMsg("Stock decrease had no saturation match: " .. p.summary, colors.orange)
       end
     else
       keep[#keep + 1] = p
@@ -274,26 +402,45 @@ local function processPending()
 end
 
 local function poll()
-  local ok, res = bankReq({ type = "get_service_observations", service_key = SERVICE_KEY }, 6)
-  if not ok then
-    setMsg("No service observation: " .. tostring(res), colors.red)
+  if not connectColony() then
+    setMsg("No local colonyIntegrator on this terminal.", colors.red)
     return
   end
 
-  obs = res.observation or res
+  local citizens = getLiveCitizens()
+  local employee_set, employees, source = getPayrollEmployees()
 
-  stats.citizens_seen = tonumber(obs.citizens_seen) or 0
-  stats.payroll_employee_count = tonumber(obs.payroll_employee_count) or #(obs.payroll_employees or {})
-  stats.employees_seen_live = tonumber(obs.employees_seen_live) or #(obs.citizens or {})
-  stats.employee_inventory_sources = tonumber(obs.employee_inventory_sources or obs.citizen_inventory_sources) or 0
+  stats.citizens_seen = #citizens
+  stats.payroll_employees = #employees
+  stats.employees_live_seen = 0
+  stats.employee_inv_sources = 0
 
-  local st = stockCopy(obs.dining_stock or {})
-  local cits = citizenMap(obs.citizens or {})
+  local stock = {}
 
+  for _, z in ipairs(citizens) do
+    local cid = citizenAccountId(z)
+    if cid and employee_set[cid] then
+      stats.employees_live_seen = stats.employees_live_seen + 1
+
+      local before_units = 0
+      for _, q in pairs(stock) do before_units = before_units + (tonumber(q) or 0) end
+
+      scanValueForInventory(z, stock, 0, {})
+
+      local after_units = 0
+      for _, q in pairs(stock) do after_units = after_units + (tonumber(q) or 0) end
+
+      if after_units > before_units then
+        stats.employee_inv_sources = stats.employee_inv_sources + 1
+      end
+    end
+  end
+
+  local cits = citizenMap(citizens)
   updateSaturationEvents(prev_citizens, cits)
 
   if prev_stock then
-    local losses, qty, value = stockLoss(prev_stock, st)
+    local losses, qty, value = stockLoss(prev_stock, stock)
     stats.last_loss = qty
 
     if qty > 0 then
@@ -305,13 +452,15 @@ local function poll()
         value = math.max(1, value),
         summary = summary(losses),
       }
-      setMsg("Employee stock decrease: " .. summary(losses), colors.yellow)
+      setMsg("Employee inventory decrease: " .. summary(losses), colors.yellow)
     end
+  else
+    setMsg("Baseline taken from direct colony employee scan.", colors.lime)
   end
 
-  prev_stock = st
+  prev_stock = stock
   prev_citizens = cits
-  stats.stock_kinds, stats.stock_units = stockStats(st)
+  stats.stock_kinds, stats.stock_units = stockStats(stock)
 
   processPending()
 end
@@ -359,18 +508,18 @@ local function draw()
   at(2, 1, "SERVICE PAYMENT TERMINAL", colors.white, colors.purple)
   at(math.max(2, W - #VERSION), 1, VERSION, colors.lightGray, colors.purple)
 
-  at(2, 3, "Source:       CBI payroll employees -> Bank", colors.white)
+  at(2, 3, "Source:       local colonyIntegrator", colors.white)
   at(2, 4, "Bank:         " .. tostring(db_id or "not connected"), db_id and colors.lime or colors.red)
-  at(2, 5, "Company:      " .. tostring(obs and (obs.company_name or obs.company_id) or "unknown"), (obs and obs.company_id) and colors.lime or colors.red)
-  at(2, 6, "Company src:  " .. tostring(obs and obs.company_source or "none"), colors.lightGray)
-  at(2, 7, "Employee src: " .. tostring(obs and obs.employee_source or "none"), colors.lightGray)
+  at(2, 5, "Colony:       " .. tostring(colony and "connected" or "missing"), colony and colors.lime or colors.red)
+  at(2, 6, "Company:      " .. TARGET_COMPANY, colors.lime)
 
-  at(2, 9,  "Citizens seen:       " .. tostring(stats.citizens_seen), stats.citizens_seen > 0 and colors.lime or colors.orange)
-  at(2, 10, "Payroll employees:   " .. tostring(stats.payroll_employee_count), stats.payroll_employee_count > 0 and colors.lime or colors.orange)
-  at(2, 11, "Employees live seen: " .. tostring(stats.employees_seen_live), stats.employees_seen_live > 0 and colors.lime or colors.orange)
-  at(2, 12, "Employee inv sources:" .. tostring(stats.employee_inventory_sources), stats.employee_inventory_sources > 0 and colors.lime or colors.orange)
-  at(2, 13, "Stock kinds/units:   " .. tostring(stats.stock_kinds) .. " / " .. tostring(stats.stock_units), stats.stock_units > 0 and colors.lime or colors.orange)
-  at(2, 14, "Last stock decrease: " .. tostring(stats.last_loss), stats.last_loss > 0 and colors.yellow or colors.gray)
+  at(2, 8,  "Citizens seen:       " .. tostring(stats.citizens_seen), stats.citizens_seen > 0 and colors.lime or colors.orange)
+  at(2, 9,  "Payroll employees:   " .. tostring(stats.payroll_employees), stats.payroll_employees > 0 and colors.lime or colors.orange)
+  at(2, 10, "Employees live seen: " .. tostring(stats.employees_live_seen), stats.employees_live_seen > 0 and colors.lime or colors.orange)
+  at(2, 11, "Employee inv sources:" .. tostring(stats.employee_inv_sources), stats.employee_inv_sources > 0 and colors.lime or colors.orange)
+  at(2, 12, "Stock kinds/units:   " .. tostring(stats.stock_kinds) .. " / " .. tostring(stats.stock_units), stats.stock_units > 0 and colors.lime or colors.orange)
+  at(2, 13, "Last stock decrease: " .. tostring(stats.last_loss), stats.last_loss > 0 and colors.yellow or colors.gray)
+  at(2, 14, "Pending meals:       " .. tostring(stats.pending), stats.pending > 0 and colors.yellow or colors.gray)
   at(2, 15, "Saturation events:   " .. tostring(stats.sat_events), colors.cyan)
 
   at(2, 17, "Matched: " .. tostring(stats.matched) .. "  Charged: " .. money(stats.charged) .. "  Unpaid: " .. money(stats.unpaid), colors.lime)
@@ -392,6 +541,7 @@ local function main()
   end
 
   discoverBank()
+  connectColony()
   poll()
 
   local bScan, bAuto, bRecon = draw()
@@ -413,6 +563,7 @@ local function main()
         setMsg("Auto " .. (auto_charge and "on" or "off"), colors.yellow)
       elseif hit(bRecon, p2, p3) then
         discoverBank()
+        connectColony()
         setMsg("Reconnected.", colors.lime)
       end
       bScan, bAuto, bRecon = draw()
