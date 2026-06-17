@@ -5,7 +5,7 @@
 -- Current service module: Hospitality / Dining Hall meals.
 --
 -- Flow:
---   1. Watch Waiter/Cook inventory first, then Dining Hall / Restaurant / Cook stock.
+--   1. Watch Waiter/Cook inventory first, then configured/attached dining stock inventories.
 --   2. Ignore coal/charcoal only; everything else in dining stock is treated as chargeable stock.
 --   3. When food stock decreases, wait the configured eating delay.
 --   4. Find the citizen who last increased saturation after that stock decrease.
@@ -48,7 +48,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION = "1.0.6-NO-GETBUILDINGS-HELPER"
+local VERSION = "1.0.7-NO-BUILDING-SCAN"
 local BANK_PROTOCOL = "quid_bank"
 local DB_TIMEOUT = 5
 
@@ -347,40 +347,6 @@ local function hospitalityCompany()
   return "company:hrth", "Hospitality"
 end
 
-local function isHospitalityBuilding(b)
-  local t = normalType(b and (b.type or b.name) or "")
-  local n = normalType(b and b.name or "")
-  return t:find("dining",1,true)
-    or t:find("restaurant",1,true)
-    or t:find("cook",1,true)
-    or t:find("tavern",1,true)
-    or n:find("dining",1,true)
-    or n:find("restaurant",1,true)
-    or n:find("cook",1,true)
-    or n:find("tavern",1,true)
-end
-
-local function hospitalityBuildings()
-  local out = {}
-
-  if not colony or not colony.getBuildings then
-    return out
-  end
-
-  local ok, buildings = pcall(colony.getBuildings)
-  if not ok or type(buildings) ~= "table" then
-    return out
-  end
-
-  for _, b in ipairs(buildings) do
-    if isHospitalityBuilding(b) then
-      out[#out + 1] = b
-    end
-  end
-
-  return out
-end
-
 local function citizenJobText(z)
   local parts = {}
 
@@ -558,24 +524,6 @@ local function readFoodStock()
         if countFromInventory(obj, counts) then sources = sources + 1 end
       end
     end
-  end
-
-  -- MineColonies building storage fields, if Advanced Peripherals exposes contents
-  -- or useful peripheral names.
-  for _, b in ipairs(hospitalityBuildings()) do
-    if type(b.storageBlocks) == "table" then
-      for _, sb in pairs(b.storageBlocks) do
-        if countFromStorageTable(sb, counts) then sources = sources + 1 end
-
-        if type(sb) == "table" then
-          tryPeripheral(sb.peripheral)
-          tryPeripheral(sb.peripheral_name)
-          tryPeripheral(sb.name)
-        end
-      end
-    end
-
-    if countFromStorageTable(b, counts) then sources = sources + 1 end
   end
 
   -- Configured inventory peripheral names.
@@ -1017,7 +965,7 @@ local function draw()
   at(2, 6, "Company:      " .. tostring(company_name) .. " (" .. tostring(company_id) .. ")", colors.lime)
   at(2, 7, "Auto charge:  " .. (auto_charge and "ON" or "OFF"), auto_charge and colors.lime or colors.orange)
 
-  at(2, 9,  "Dining stock sources: " .. tostring(stats.stock_sources), stats.stock_sources > 0 and colors.lime or colors.orange)
+  at(2, 9,  "Stock sources:        " .. tostring(stats.stock_sources), stats.stock_sources > 0 and colors.lime or colors.orange)
   at(2, 10, "Waiter/Cook sources:  " .. tostring(stats.worker_stock_sources or 0), (stats.worker_stock_sources or 0) > 0 and colors.lime or colors.orange)
   at(2, 11, "Tracked kinds/units:  " .. tostring(stats.food_kinds) .. " / " .. tostring(stats.food_units), colors.white)
   at(2, 12, "Last food decrease:   " .. tostring(stats.last_food_loss), stats.last_food_loss > 0 and colors.yellow or colors.gray)
