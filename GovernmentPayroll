@@ -43,7 +43,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION = "1.0.3-SAFE-MAIN-CALL"
+local VERSION = "1.0.4-FIXED-MISSING-END"
 local BANK_PROTOCOL = "quid_bank"
 local DB_TIMEOUT = 5
 local CHECK_INTERVAL = 10
@@ -247,7 +247,7 @@ local function jobTextFromCitizen(z)
   return table.concat(parts, " ")
 end
 
-local function classifyIndustryFromText(text)local function classifyIndustryFromText(text)
+local function classifyIndustryFromText(text)
   local j = normalType(text)
 
   if j:find("guard",1,true) or j:find("soldier",1,true) or j:find("knight",1,true)
@@ -614,7 +614,6 @@ local function eligibleWorkers()
 end
 
 -- =============================================================================
--- PAYROLL HISTORY-- =============================================================================
 -- PAYROLL HISTORY
 -- =============================================================================
 local function loadHistory()
@@ -816,7 +815,7 @@ local function draw()
 
   at(2, 3, "Colony:       " .. tostring(colony_name), colors.white)
   at(2, 4, "Bank:         " .. tostring(db_id or "not connected"), db_id and colors.lime or colors.red)
-  at(2, 5, "Source:       " .. tostring(stats.source), (stats.source == "colony" or stats.source == "bank") and colors.lime or colors.orange)
+  at(2, 5, "Source:       " .. tostring(stats.source), (stats.source == "colony" or stats.source == "bank" or stats.source == "employment") and colors.lime or colors.orange)
   at(2, 6, "Citizens seen:" .. tostring(stats.citizens_seen) .. "   Auto: " .. (auto_mode and "ON" or "OFF"), auto_mode and colors.lime or colors.orange)
 
   at(2, 8,  "Minecraft day:       " .. tostring(mcDay()), colors.white)
