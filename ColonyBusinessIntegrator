@@ -32,7 +32,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION = "1.0.22-NO-SERVICE-OBS"
+local VERSION = "1.0.23-WIDE-SECTOR-PRICING"
 local BANK_PROTOCOL = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT = 5
@@ -42,8 +42,10 @@ local STARTING_CAPITAL = 0
 local AUTO_GRANT_CAPITAL = false
 local DEFAULT_OWNER_ID = "treasury:quid_bank"
 
-local PRICE_INDEX = 1.00          -- central inflation price index from bank
-local INFLATION_RATE = 0.00       -- daily inflation/deflation rate from bank
+local PRICE_INDEX = 1.00          -- legacy/general fallback only
+local INFLATION_RATE = 0.00       -- current bank inflation pressure
+local PRICE_SOURCE = "legacy"
+local SECTOR_INDICES = {}
 local BASE_CONTRACT_FEE = 0       -- contract price is unit base price * quantity, then inflation; no separate job fee
 local SPEND_LIMIT = 0.50          -- max % of business balance per job; bulk supply jobs need room to pay by quantity
 local MIN_FAIR_RATIO = 0.50       -- don't post if affordable price is under this share of fair value
@@ -233,7 +235,7 @@ local function draw()
   at(2, 10, "Citizens:  " .. tostring(stats.citizens_seen) .. "   Accounts: " .. tostring(countTable(citizens_map)) .. " (new " .. tostring(stats.citizens_registered) .. ")", colors.lightGray)
   at(2, 11, "Requests:  " .. tostring(stats.requests_seen) .. "   Contracts: " .. tostring(stats.contracts_posted), colors.lime)
   at(2, 12, "Skipped:   unmapped " .. tostring(stats.skipped_unmapped) .. " / unfunded " .. tostring(stats.skipped_unfunded), colors.orange)
-  at(2, 13, "Pricing:   base " .. tostring(BASE_CONTRACT_FEE) .. " Q, index x" .. string.format("%.3f", PRICE_INDEX) .. ", rate " .. string.format("%.2f%%", INFLATION_RATE * 100), colors.lightGray)
+  at(2, 13, "Pricing:   oracle " .. tostring(PRICE_SOURCE) .. " | cons x" .. string.format("%.3f", (SECTOR_INDICES.construction and SECTOR_INDICES.construction.index) or PRICE_INDEX) .. " food x" .. string.format("%.3f", (SECTOR_INDICES.food and SECTOR_INDICES.food.index) or PRICE_INDEX), colors.lightGray)
 
   local last = "never"
   if stats.last_scan > 0 then last = tostring(math.floor((now() - stats.last_scan) / 1000)) .. "s ago" end
@@ -970,22 +972,29 @@ end
 
 -- =============================================================================
 -- PRICING
-
 -- =============================================================================
 local function refreshPrices()
+  -- Legacy manual price table is still useful as a fallback, but live contract
+  -- pricing should use the bank's wide sector price oracle when available.
   local ok, res = bankReq({ type="get_prices" })
   if ok and type(res) == "table" and type(res.prices) == "table" then prices = res.prices end
 end
 
-
 local function refreshInflation()
   local day = os.day and math.floor(tonumber(os.day()) or 0) or nil
 
-  local ok, res = bankReq({ type = "tick_inflation", day = day }, 4)
-  if ok and type(res) == "table" then
-    local st = res.state or res
-    PRICE_INDEX = tonumber(st.price_index) or PRICE_INDEX
-    INFLATION_RATE = tonumber(st.inflation_rate) or INFLATION_RATE
+  -- Safe to call repeatedly; the bank only advances when the Minecraft day moves.
+  bankReq({ type = "tick_inflation", day = day }, 4)
+
+  local ok, res = bankReq({ type = "get_price_indices" }, 5)
+  if ok and type(res) == "table" and type(res.sectors) == "table" then
+    SECTOR_INDICES = res.sectors
+    local g = SECTOR_INDICES.general or {}
+    PRICE_INDEX = tonumber(g.index) or PRICE_INDEX
+    if type(res.inflation) == "table" then
+      INFLATION_RATE = tonumber(res.inflation.inflation_rate) or INFLATION_RATE
+    end
+    PRICE_SOURCE = tostring(res.model or "wide_sector_oracle")
     return true
   end
 
@@ -994,6 +1003,7 @@ local function refreshInflation()
     local st = res.state or res
     PRICE_INDEX = tonumber(st.price_index) or PRICE_INDEX
     INFLATION_RATE = tonumber(st.inflation_rate) or INFLATION_RATE
+    PRICE_SOURCE = "legacy_inflation"
     return true
   end
 
@@ -1001,17 +1011,24 @@ local function refreshInflation()
   if config.price_index then PRICE_INDEX = tonumber(config.price_index) or PRICE_INDEX end
   if config.inflation_multiplier then PRICE_INDEX = tonumber(config.inflation_multiplier) or PRICE_INDEX end
   if config.inflation then PRICE_INDEX = tonumber(config.inflation) or PRICE_INDEX end
+  PRICE_SOURCE = "local_config"
   return false
 end
 
+local function simpleItemName(id)
+  id = lower(id or "")
+  id = id:gsub("^minecraft:", "")
+  id = id:gsub("^minecolonies:", "")
+  id = id:gsub("^%w+:", "")
+  return id
+end
+
 local function officialPrice(id)
-  local p = prices[id]
-  if type(p) == "table" then p = p.unit_price end
+  id = simpleItemName(id)
+  local p = prices[id] or prices["minecraft:" .. id]
+  if type(p) == "table" then p = p.unit_price or p.price or p.value end
   p = tonumber(p)
   if not p then return nil end
-
-  -- Quid has no decimal sub-unit. Even if an old/manual price table contains a
-  -- decimal, contract pricing normalises it to a whole-number unit price.
   p = math.floor(p + 0.5)
   if p < 1 then p = 1 end
   return p
@@ -1020,24 +1037,19 @@ end
 local function fallbackPrice(id)
   id = lower(id)
 
-  -- Fallback prices are PER ITEM and are ALWAYS integer Quid.
-  -- Absolute minimum unit price is 1 Q. No item may be valued at 0.x Q.
-  -- Contract reward later multiplies this by requested quantity, then applies
-  -- positive inflation pressure.
-  if id:find("netherite",1,true) then return 20 end
-  if id:find("diamond",1,true) then return 8 end
-  if id:find("emerald",1,true) then return 6 end
-  if id:find("gold",1,true) then return 3 end
-  if id:find("iron",1,true) then return 2 end
-  if id:find("redstone",1,true) then return 1 end
-  if id:find("lapis",1,true) then return 1 end
-  if id:find("copper",1,true) then return 1 end
-  if id:find("brick",1,true) or id:find("glass",1,true) then return 1 end
-  if id:find("coal",1,true) or id:find("charcoal",1,true) then return 1 end
+  -- Broad, chunky per-item fallback prices. The bank oracle uses the same style:
+  -- width, not depth. These are only used if the bank is too old/offline.
+  if id:find("netherite",1,true) then return 40 end
+  if id:find("diamond",1,true) then return 20 end
+  if id:find("emerald",1,true) then return 12 end
+  if id:find("gold",1,true) then return 8 end
+  if id:find("iron",1,true) then return 5 end
+  if id:find("coal",1,true) or id:find("charcoal",1,true) then return 2 end
 
-  if id:find("pickaxe",1,true) or id:find("shovel",1,true) or id:find("axe",1,true) or id:find("hoe",1,true) or id:find("tool",1,true) then return 3 end
-  if id:find("sword",1,true) or id:find("bow",1,true) or id:find("armor",1,true) or id:find("helmet",1,true) or id:find("chestplate",1,true) then return 4 end
+  if id:find("pickaxe",1,true) or id:find("shovel",1,true) or id:find("axe",1,true) or id:find("hoe",1,true) or id:find("tool",1,true) then return 6 end
+  if id:find("sword",1,true) or id:find("bow",1,true) or id:find("armor",1,true) or id:find("helmet",1,true) or id:find("chestplate",1,true) then return 8 end
 
+  if id:find("glass",1,true) or id:find("brick",1,true) then return 2 end
   if id:find("log",1,true) then return 1 end
   if id:find("plank",1,true) or id:find("stair",1,true) or id:find("slab",1,true) then return 1 end
   if id:find("cobble",1,true) or id:find("stone",1,true) or id:find("dirt",1,true) or id:find("sand",1,true) or id:find("gravel",1,true) then return 1 end
@@ -1062,11 +1074,33 @@ local function unitPrice(id)
 end
 
 local function positiveInflationIndex()
-  -- Inflation can raise contract prices. Deflation does not push contracts below
-  -- their integer base value because contracts are priced in whole Quid.
+  -- Legacy fallback: use the sector oracle's general index if known. Never allow
+  -- old bank deflation to push requested contracts below base price.
   local idx = tonumber(PRICE_INDEX) or 1
   if idx < 1 then idx = 1 end
   return idx
+end
+
+local function quoteItemTotal(item, qty)
+  qty = math.max(1, math.floor(tonumber(qty) or 1))
+  local ok, res = bankReq({
+    type = "quote_item_price",
+    item = item,
+    count = qty,
+  }, 5)
+
+  if ok and type(res) == "table" and tonumber(res.total) then
+    PRICE_SOURCE = tostring(res.source or PRICE_SOURCE)
+    if res.sector and tonumber(res.sector_index) then
+      SECTOR_INDICES[res.sector] = SECTOR_INDICES[res.sector] or {}
+      SECTOR_INDICES[res.sector].index = tonumber(res.sector_index)
+    end
+    return math.max(1, math.floor(tonumber(res.total) + 0.5)), res
+  end
+
+  local fallback = math.ceil(unitPrice(item) * qty * positiveInflationIndex())
+  if fallback < qty then fallback = qty end
+  return math.max(1, fallback), { source="local_fallback", total=fallback }
 end
 
 local function companyBalance(company_id)
@@ -1077,8 +1111,6 @@ end
 
 local function wealthMult(balance)
   balance = tonumber(balance) or 0
-  -- Slower wealth scaling: a 5,000 Q company only pays about +5% above base.
-  -- This stops early companies from overpaying before the economy has grown.
   return 1.0 + math.min(0.35, balance / 100000)
 end
 
@@ -1141,8 +1173,6 @@ local function extractItems(req, fixed_quantity)
     if type(item) == "table" then
       local id = trim(item.name or item.item or item.id or "")
       local display = trim(item.displayName or item.display or item.label or id)
-
-      -- All accepted alternatives satisfy the same exact quantity.
       local count = requested_count
 
       if id ~= "" and count > 0 then
@@ -1155,12 +1185,12 @@ end
 
 local function requestItemValue(items)
   if #items <= 0 then return 0 end
-  -- MineColonies request.items are usually alternatives; price by cheapest valid option.
-  -- Price is always integer: unit base price * exact quantity.
+  -- MineColonies request.items are usually alternatives; price by cheapest valid
+  -- option. The bank quote applies the correct sector CPI immediately.
   local cheapest = nil
   for _, it in ipairs(items) do
     local qty = math.max(1, math.floor(tonumber(it.count) or 1))
-    local v = unitPrice(it.item) * qty
+    local v = quoteItemTotal(it.item, qty)
     if v < 1 then v = 1 end
     if not cheapest or v < cheapest then cheapest = v end
   end
@@ -1171,23 +1201,11 @@ local function priceJob(business, items)
   local bal = companyBalance(business.company_id)
   if bal <= 0 then return nil, "no funds", bal, 0 end
 
-  -- Integer quantity pricing:
-  --   base value = cheapest accepted integer unit price * requested quantity
-  --   fair value = base value + positive inflation adjustment
-  --
-  -- There are no decimal item prices. Absolute minimum unit price is 1 Q.
-  --
-  -- Example at price index x1:
-  --   3 birch planks at 1 Q each = 3 Q
-  --   10 dark oak planks at 1 Q each = 10 Q
-  --
-  -- Example at price index x1.25:
-  --   10 planks = ceil(10 * 1.25) = 13 Q
-  local raw_item_value = requestItemValue(items)
-  if raw_item_value < 1 then raw_item_value = 1 end
-
-  local fair = math.ceil(raw_item_value * positiveInflationIndex())
-  if fair < raw_item_value then fair = raw_item_value end
+  -- Wide-sector pricing:
+  --   each requested item is quoted by the bank's sector oracle
+  --   construction materials use Construction CPI, food uses Food CPI, etc.
+  --   if the bank is old/offline, local fallback uses a non-deflationary index.
+  local fair = requestItemValue(items)
   if fair < 1 then fair = 1 end
 
   local max_pay = math.floor(bal * SPEND_LIMIT)
