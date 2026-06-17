@@ -1,6 +1,7 @@
 -- =============================================================================
 -- SERVICE PAYMENT DIAGNOSTIC
 -- ServicePaymentDiagnostic
+-- Version: 1.0.1-FIXED-END
 --
 -- Purpose:
 --   Serious diagnosis for Dining Hall service payments.
@@ -199,7 +200,6 @@ local function scanValueForInventory(v, path, out, depth, seen)
       qty = tonumber(qty) or 0,
       chargeable = chargeable,
     }
-  end
   end
 
   -- Inventory-ish keys worth checking explicitly.
