@@ -1,16 +1,18 @@
 
 -- =============================================================================
--- QUID CONTRACT BOARD
--- ContractBoard
+-- QUID CONTRACT SERVER
+-- ContractServer
 --
--- Public contract posting browser for the Quid economy.
+-- Central contract posting server for the Quid economy.
 --
 -- Purpose:
---   * Browse open / claimed / fulfilled contracts
---   * View contract details and required items
---   * Claim contracts as a citizen or company
+--   * Store contract postings
+--   * Let site terminals / future colony terminals post contracts
+--   * Let public contract boards list contracts
+--   * Let citizens/companies claim contracts
 --
--- Can complete claimed/pending contracts. ContractServer handles payout.
+-- This does NOT move money yet.
+-- Escrow/payment hooks come next once the posting/claim flow is proven.
 -- =============================================================================
 
 local args = {...}
@@ -19,23 +21,23 @@ local args = {...}
 -- SELF UPDATE
 -- =============================================================================
 if args[1] ~= "--updated" then
-  print("[ Quid Contract Board ]")
+  print("[ Quid Contract Server ]")
   print("Deleting old version...")
   fs.delete("startup.lua")
   print("Downloading latest from GitHub...")
 
   local cache_bust = tostring(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
-  local update_url = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/ContractBoard?cb=" .. cache_bust
+  local update_url = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/ContractServer?cb=" .. cache_bust
   shell.run("wget " .. update_url .. " startup.lua")
 
   if not fs.exists("startup.lua") then
     print("")
     print("Download failed.")
-    print("Expected GitHub file: ContractBoard")
+    print("Expected GitHub file: ContractServer")
     print("")
     print("Manual install:")
     print("delete startup")
-    print("wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/ContractBoard?cb=001 startup.lua")
+    print("wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/ContractServer?cb=001 startup.lua")
     print("startup.lua")
     return
   end
@@ -49,58 +51,86 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION    = "1.0.5-COMPANY-DROPDOWN-RESET"
-local PROTOCOL   = "quid_contracts"
-local DB_TIMEOUT = 5
+local VERSION            = "1.0.9-DROPDOWN-CLAIM-RESET"
+local LABEL              = "Quid-Contracts"
+local PROTOCOL           = "quid_contracts"
+local PROTOCOL_BROADCAST = "quid_contracts_discovery"
+local BANK_PROTOCOL      = "quid_bank"
+local bank_id = nil
 
-local W, H = term.getSize()
-
-local C = {
-  bg        = colors.lightGray,
-  card      = colors.white,
-  card_fg   = colors.black,
-  header    = colors.purple,
-  hdr_fg    = colors.white,
-  accent    = colors.purple,
-  accent_fg = colors.white,
-  label     = colors.gray,
-  body      = colors.black,
-  dim       = colors.gray,
-  ok        = colors.green,
-  err       = colors.red,
-  warn      = colors.orange,
-  btn_pri   = colors.purple,
-  btn_sec   = colors.lightGray,
-  btn_dan   = colors.red,
-  btn_fg    = colors.white,
-  input_bg  = colors.lightGray,
-  input_fg  = colors.black,
-  tab_act   = colors.purple,
-  tab_inact = colors.gray,
-  tab_fg_a  = colors.white,
-  tab_fg_i  = colors.white,
+local FILE = {
+  contracts = "data/contracts.db",
+  audit     = "data/contract_audit.log",
+  config    = "data/config.db",
 }
 
-local contract_id = nil
-local modem_name = nil
-local last_message = ""
-local last_message_colour = C.dim
-
-local filter = "open"
 local contracts = {}
-local selected = 1
-local page = 1
-
-local claim = {
-  claimant = "",
-  claimant_type = "company",
-}
+local config = {}
+local contract_counter = 0
+local audit_counter = 0
 
 -- =============================================================================
 -- HELPERS
 -- =============================================================================
-local function refreshSize()
-  W, H = term.getSize()
+local function timestamp()
+  return os.epoch("utc")
+end
+
+local function pad(n, width)
+  local s = tostring(n)
+  while #s < width do s = "0" .. s end
+  return s
+end
+
+local function ensureDir(path)
+  local parts = {}
+  for part in string.gmatch(path, "[^/]+") do
+    parts[#parts + 1] = part
+  end
+  table.remove(parts)
+
+  local current = ""
+  for _, part in ipairs(parts) do
+    current = current == "" and part or (current .. "/" .. part)
+    if not fs.exists(current) then fs.makeDir(current) end
+  end
+end
+
+local function readFile(path)
+  if not fs.exists(path) then return nil end
+  local f = fs.open(path, "r")
+  if not f then return nil end
+  local text = f.readAll()
+  f.close()
+  if not text or text == "" then return nil end
+
+  local ok, data = pcall(textutils.unserialize, text)
+  if ok then return data end
+  return nil
+end
+
+local function writeFile(path, data)
+  ensureDir(path)
+  local f = fs.open(path, "w")
+  if not f then return false end
+  f.write(textutils.serialize(data))
+  f.close()
+  return true
+end
+
+local function appendLine(path, line)
+  ensureDir(path)
+  local f = fs.open(path, "a")
+  if not f then return false end
+  f.writeLine(line)
+  f.close()
+  return true
+end
+
+local function countTable(t)
+  local n = 0
+  for _ in pairs(t or {}) do n = n + 1 end
+  return n
 end
 
 local function trim(s)
@@ -108,123 +138,697 @@ local function trim(s)
   return s:match("^%s*(.-)%s*$")
 end
 
-local function money(n)
-  n = tonumber(n) or 0
-  local sign = ""
-  if n < 0 then sign = "-"; n = math.abs(n) end
-  local s = tostring(math.floor(n))
-  local out = ""
-  while #s > 3 do
-    out = "," .. s:sub(-3) .. out
-    s = s:sub(1, -4)
+local function nextContractId()
+  contract_counter = contract_counter + 1
+  return "CON-" .. pad(contract_counter, 6)
+end
+
+local function audit(action, actor, terminal, result)
+  audit_counter = audit_counter + 1
+  local id = "CAUD-" .. pad(audit_counter, 6)
+  local line = string.format("%s | %d | %-20s | %-20s | %-10s | %s",
+    id, timestamp(), tostring(actor), tostring(action), tostring(terminal), tostring(result))
+  appendLine(FILE.audit, line)
+end
+
+local function normaliseItems(items)
+  if type(items) ~= "table" then return {} end
+  local out = {}
+  for _, item in ipairs(items) do
+    if type(item) == "table" then
+      local id = trim(item.item or item.id or item.name or "")
+      local display = trim(item.display or item.display_name or item.label or id)
+      local count = tonumber(item.count or item.needed or item.amount or item.qty) or 0
+      count = math.floor(count)
+      if id ~= "" and count > 0 then
+        out[#out + 1] = {
+          item = id,
+          display = display ~= "" and display or id,
+          count = count,
+        }
+      end
+    end
   end
-  return sign .. s .. " Q"
+  return out
 end
 
-local function normaliseClaimant(s)
-  s = trim(s)
-  if s == "" then return "" end
-  if s:find(":") then return s end
-  return "company:" .. string.lower(s):gsub("%s+", "_")
-end
-
-local function setMessage(msg, colour)
-  last_message = tostring(msg or "")
-  last_message_colour = colour or C.dim
-end
-
-local function cls()
-  refreshSize()
-  term.setCursorBlink(false)
-  term.setBackgroundColor(C.bg)
-  term.setTextColor(C.body)
-  term.clear()
-  term.setCursorPos(1, 1)
-end
-
-local function at(x, y, text, fg, bg)
-  refreshSize()
-  if y < 1 or y > H or x > W then return end
-  if x < 1 then x = 1 end
-  term.setCursorPos(x, y)
-  if bg then term.setBackgroundColor(bg) end
-  if fg then term.setTextColor(fg) end
-  local maxw = W - x + 1
-  if maxw > 0 then
-    term.write(tostring(text or ""):sub(1, maxw))
+local function itemSignature(items)
+  local norm = normaliseItems(items or {})
+  local parts = {}
+  for _, it in ipairs(norm) do
+    parts[#parts + 1] = tostring(it.item) .. ":" .. tostring(it.count)
   end
+  table.sort(parts)
+  return table.concat(parts, ";")
 end
 
-local function fill(x, y, w, h, bg)
-  refreshSize()
-  if w <= 0 or h <= 0 then return end
-  if x < 1 then x = 1 end
-  term.setBackgroundColor(bg or C.card)
-  local row = string.rep(" ", math.max(0, w))
-  for yy = y, y + h - 1 do
-    if yy >= 1 and yy <= H then
-      term.setCursorPos(x, yy)
-      term.write(row:sub(1, math.max(0, W - x + 1)))
+local function sameFulfilmentItem(required, supplied)
+  if not required or not supplied then return false, "Missing fulfilment item" end
+
+  local required_item = trim(required.item or required.id or required.name or "")
+  local supplied_item = trim(supplied.item or supplied.id or supplied.name or "")
+  local required_count = math.floor(tonumber(required.count or 0) or 0)
+  local supplied_count = math.floor(tonumber(supplied.count or supplied.amount or supplied.qty or 0) or 0)
+
+  if required_item ~= supplied_item then
+    return false, "Wrong item type"
+  end
+  if supplied_count < required_count then
+    return false, "Insufficient quantity. Required at least " .. tostring(required_count) .. ", supplied " .. tostring(supplied_count)
+  end
+
+  -- Over-delivery is allowed because MineColonies fulfilment is a bit finicky.
+  -- The contract pays the fixed contract reward only; excess items do not earn
+  -- extra Quid.
+  return true
+end
+
+local function fulfilmentMatchesContract(c, supplied_items)
+  local required = normaliseItems(c and c.items or {})
+  local supplied = normaliseItems(supplied_items or {})
+
+  if #required <= 0 then return false, "Contract has no required items" end
+  if #supplied ~= 1 then return false, "Provide exactly one accepted item type for fulfilment" end
+
+  local last_error = "Fulfilment must use one accepted item and meet or exceed the required quantity"
+  for _, req_item in ipairs(required) do
+    local ok, err = sameFulfilmentItem(req_item, supplied[1])
+    if ok then
+      return true
+    end
+    last_error = err or last_error
+  end
+
+  return false, last_error
+end
+
+local function sourceKey(req)
+  local key = trim(req.source_key or "")
+  if key ~= "" then return key end
+
+  local source_type = trim(req.source_type or "manual")
+  local source_company = trim(req.source_company or req.poster or req.source_account or "")
+  local request_id = trim(req.request_id or req.work_order_id or "")
+  local building_id = trim(req.building_id or "")
+
+  if request_id ~= "" then
+    return source_type .. "|" .. source_company .. "|" .. building_id .. "|" .. request_id
+  end
+
+  return ""
+end
+
+local function findLiveContractBySourceKey(key)
+  if not key or key == "" then return nil, nil end
+  for id, c in pairs(contracts) do
+    if c.source_key == key and (c.status == "open" or c.status == "claimed" or c.status == "pending_completion") then
+      return id, c
+    end
+  end
+  return nil, nil
+end
+
+local function duplicateKey(c)
+  if not c then return nil end
+  local live_status = c.status == "open" or c.status == "claimed"
+  if not live_status then return nil end
+
+  -- Prefer explicit stable source keys from v1.0.7+ integrator.
+  if c.source_key and tostring(c.source_key) ~= "" then
+    return "source|" .. tostring(c.source_key)
+  end
+
+  -- Fallback for old contracts created before source_key existed. This cleans
+  -- old duplicate rows already present in data/contracts.db.
+  local poster = tostring(c.poster or c.source_company or "")
+  local title = tostring(c.title or "")
+  local sig = c.item_signature or itemSignature(c.items or {})
+  if poster ~= "" and title ~= "" and sig ~= "" then
+    return "legacy|" .. poster .. "|" .. title .. "|" .. sig
+  end
+  return nil
+end
+
+local function dedupeLiveContracts(reason)
+  local seen = {}
+  local cancelled = 0
+
+  local ids = {}
+  for id, _ in pairs(contracts or {}) do ids[#ids+1] = id end
+  table.sort(ids, function(a,b)
+    local ca, cb = contracts[a], contracts[b]
+    return tonumber(ca and ca.created or 0) > tonumber(cb and cb.created or 0)
+  end)
+
+  for _, id in ipairs(ids) do
+    local c = contracts[id]
+    local key = duplicateKey(c)
+    if key then
+      if not seen[key] then
+        seen[key] = id
+      else
+        c.status = "cancelled"
+        c.cancelled_at = timestamp()
+        c.updated = timestamp()
+        c.cancel_reason = reason or ("Duplicate live contract superseded by " .. tostring(seen[key]))
+        c.claimed_by = nil
+        c.claimed_type = nil
+        c.claimed_at = nil
+        cancelled = cancelled + 1
+        audit("DEDUP_CANCEL", c.poster or "unknown", "server", id)
+      end
+    end
+  end
+
+  if cancelled > 0 then writeFile(FILE.contracts, contracts) end
+  return cancelled
+end
+
+local function publicContract(c)
+  local copy = {}
+  for k, v in pairs(c) do
+    if k ~= "_internal" then copy[k] = v end
+  end
+  return copy
+end
+
+-- =============================================================================
+-- CONTRACT OPERATIONS
+-- =============================================================================
+local function postContract(sender_id, req)
+  local title = trim(req.title or "")
+  local poster = trim(req.poster or req.source_account or "")
+  local reward = tonumber(req.reward) or 0
+  reward = math.floor(reward)
+
+  if title == "" then return false, "Missing title" end
+  if poster == "" then return false, "Missing poster/source account" end
+  if reward <= 0 then return false, "Invalid reward" end
+
+  local items = normaliseItems(req.items or {})
+  if #items <= 0 then return false, "Contract needs at least one item" end
+
+  local src_key = sourceKey(req)
+  local sig = itemSignature(items)
+
+  -- Live request upsert mode. MineColonies requests can change while the same
+  -- contract is already open/claimed. The contract must mirror the live request
+  -- rather than becoming stale and uncompleteable.
+  if req.upsert and src_key ~= "" then
+    local existing_id, existing = findLiveContractBySourceKey(src_key)
+    if existing then
+      local old_sig = existing.item_signature or itemSignature(existing.items or {})
+      local new_description = trim(req.description or "")
+      local old_reward = tonumber(existing.reward or 0) or 0
+      local reward_changed = old_reward ~= reward
+      local request_changed = (
+        old_sig ~= sig or
+        trim(existing.title or "") ~= title or
+        trim(existing.description or "") ~= new_description or
+        tonumber(existing.fixed_quantity or 0) ~= tonumber(req.fixed_quantity or existing.fixed_quantity or 0)
+      )
+
+      local changed = request_changed or reward_changed
+
+      existing.title = title
+      existing.description = new_description
+      existing.poster = poster
+
+      -- Open jobs float with live inflation. Claimed jobs keep the price that
+      -- the player accepted unless the underlying request itself changed.
+      if existing.status == "open" or request_changed then
+        existing.reward = reward
+      else
+        existing.reward_locked = true
+        existing.locked_reward = old_reward
+      end
+
+      existing.currency = "Q"
+      existing.items = items
+      existing.updated = timestamp()
+      existing.source_type = req.source_type or existing.source_type or "manual"
+      existing.source_terminal = sender_id
+      existing.source_company = req.source_company or poster
+      existing.work_order_id = req.work_order_id
+      existing.request_id = req.request_id or existing.request_id
+      existing.minecolonies_request_id = req.minecolonies_request_id or existing.minecolonies_request_id
+      existing.source_family = req.source_family or existing.source_family
+      existing.fixed_quantity = req.fixed_quantity or existing.fixed_quantity
+      existing.quantity_min = req.quantity_min or existing.quantity_min
+      existing.quantity_max = req.quantity_max or existing.quantity_max
+      existing.exact_fulfillment = req.exact_fulfillment or existing.exact_fulfillment
+      existing.min_fulfillment = req.min_fulfillment or existing.min_fulfillment
+      existing.overdelivery_allowed = req.overdelivery_allowed or existing.overdelivery_allowed
+      existing.building_id = req.building_id
+      existing.location = req.location
+      existing.escrow_status = req.escrow_status or existing.escrow_status or "not_locked"
+      existing.source_key = src_key
+      existing.item_signature = sig
+
+      if request_changed and existing.status == "claimed" then
+        existing.status = "open"
+        existing.claimed_by = nil
+        existing.claimed_type = nil
+        existing.claimed_at = nil
+        existing.reopened_at = timestamp()
+        existing.reopen_reason = "Live source request changed; old claim cleared"
+        existing.reward_locked = nil
+        existing.locked_reward = nil
+      end
+
+      writeFile(FILE.contracts, contracts)
+      dedupeLiveContracts("Duplicate after live request refresh")
+      audit(changed and "UPDATE" or "REFRESH", poster, sender_id, existing_id)
+      return true, {
+        contract = publicContract(existing),
+        message = changed and "Contract reconciled from live request" or "Contract already current",
+        updated = changed,
+        reward_updated = (existing.status == "open" and reward_changed) or request_changed,
+        reward_locked = existing.reward_locked or false
+      }
+    end
+  end
+
+  local contract_id = req.contract_id or nextContractId()
+  if contracts[contract_id] then return false, "Contract already exists: " .. contract_id end
+
+  local c = {
+    contract_id     = contract_id,
+    title           = title,
+    description     = trim(req.description or ""),
+    poster          = poster,
+    reward          = reward,
+    currency        = "Q",
+    status          = "open",
+    items           = items,
+    item_signature  = sig,
+    created         = timestamp(),
+    updated         = timestamp(),
+    claimed_by      = nil,
+    claimed_type    = nil,
+    claimed_at      = nil,
+
+    source_type     = req.source_type or "manual",
+    source_terminal = sender_id,
+    source_company  = req.source_company or poster,
+    source_key      = src_key ~= "" and src_key or nil,
+    request_id      = req.request_id,
+    minecolonies_request_id = req.minecolonies_request_id,
+    source_family   = req.source_family,
+    fixed_quantity  = req.fixed_quantity,
+    quantity_min    = req.quantity_min,
+    quantity_max    = req.quantity_max,
+    exact_fulfillment = req.exact_fulfillment,
+    work_order_id   = req.work_order_id,
+    building_id     = req.building_id,
+    location        = req.location,
+    escrow_status   = req.escrow_status or "not_locked",
+  }
+
+  contracts[contract_id] = c
+  writeFile(FILE.contracts, contracts)
+  dedupeLiveContracts("Duplicate after live request post")
+  audit("POST", poster, sender_id, contract_id)
+
+  return true, { contract = publicContract(c), message = "Contract posted", posted = true }
+end
+
+local function listContracts(sender_id, req)
+  local status = req.status or "open"
+  local source_type = req.source_type
+  local source_company = req.source_company
+  local out = {}
+
+  for _, c in pairs(contracts) do
+    local status_ok = (status == "all" or c.status == status)
+    local type_ok = (not source_type or c.source_type == source_type)
+    local company_ok = (not source_company or c.source_company == source_company)
+    if status_ok and type_ok and company_ok then
+      out[#out + 1] = publicContract(c)
+    end
+  end
+
+  table.sort(out, function(a, b)
+    return (a.created or 0) > (b.created or 0)
+  end)
+
+  return true, { contracts = out, count = #out }
+end
+
+local function getContract(sender_id, req)
+  local id = req.contract_id
+  if not id then return false, "Missing contract_id" end
+  local c = contracts[id]
+  if not c then return false, "Contract not found: " .. tostring(id) end
+  return true, { contract = publicContract(c) }
+end
+
+local function claimContract(sender_id, req)
+  local id = req.contract_id
+  local claimant = trim(req.claimant or "")
+  local claimant_type = req.claimant_type or "company"
+
+  if not id then return false, "Missing contract_id" end
+  if claimant == "" then return false, "Missing claimant" end
+
+  local c = contracts[id]
+  if not c then return false, "Contract not found: " .. tostring(id) end
+  if c.status ~= "open" then return false, "Contract is not open" end
+
+  if claimant_type == "company" then
+    if not claimant:find("^company:") then
+      claimant = "company:" .. string.lower(claimant):gsub("%s+", "_")
+    end
+    local exists, acc_or_err = bankCompanyExists(claimant)
+    if not exists then return false, acc_or_err end
+  end
+
+  c.status = "claimed"
+  c.claimed_by = claimant
+  c.claimed_type = claimant_type
+  c.claimed_at = timestamp()
+  c.updated = timestamp()
+
+  writeFile(FILE.contracts, contracts)
+  audit("CLAIM", claimant, sender_id, id)
+
+  return true, { contract = publicContract(c), message = "Contract claimed" }
+end
+
+local function unclaimContract(sender_id, req)
+  local id = req.contract_id
+  if not id then return false, "Missing contract_id" end
+
+  local c = contracts[id]
+  if not c then return false, "Contract not found: " .. tostring(id) end
+  if c.status ~= "claimed" then return false, "Contract is not claimed" end
+
+  local old = c.claimed_by or "unknown"
+
+  c.status = "open"
+  c.claimed_by = nil
+  c.claimed_type = nil
+  c.claimed_at = nil
+  c.updated = timestamp()
+
+  writeFile(FILE.contracts, contracts)
+  audit("UNCLAIM", old, sender_id, id)
+
+  return true, { contract = publicContract(c), message = "Contract reopened" }
+end
+
+
+local function payContract(c)
+  if not c then return false, "missing contract" end
+  if c.payout_status == "paid" then return true, { already_paid = true, tx_id = c.payout_tx_id } end
+
+  local from_id = trim(c.poster or c.source_company or "")
+  local to_id = trim(c.claimed_by or "")
+  local amount = tonumber(c.reward) or 0
+  amount = math.floor(amount)
+
+  if from_id == "" then return false, "Missing poster account for payout" end
+  if to_id == "" then return false, "Missing claimant account for payout" end
+  if amount <= 0 then return false, "Invalid payout amount" end
+
+  local ok, res = bankReq({
+    type = "contract_payout",
+    from_id = from_id,
+    to_id = to_id,
+    amount = amount,
+    contract_id = c.contract_id,
+    memo = "Contract payout " .. tostring(c.contract_id) .. ": " .. tostring(c.title or ""),
+  }, 6)
+
+  if ok and type(res) == "table" then
+    c.payout_status = "paid"
+    c.payout_tx_id = res.tx_id
+    c.paid_at = timestamp()
+    return true, res
+  end
+
+  c.payout_status = "failed"
+  c.payout_error = tostring(res)
+  c.payout_failed_at = timestamp()
+  return false, res
+end
+
+local function markFulfilled(sender_id, req)
+  local id = req.contract_id
+  if not id then return false, "Missing contract_id" end
+
+  local c = contracts[id]
+  if not c then return false, "Contract not found: " .. tostring(id) end
+  if c.status ~= "claimed" and c.status ~= "open" and c.status ~= "pending_completion" and c.status ~= "pending_payout" then
+    return false, "Contract is not active"
+  end
+
+  -- If the MineColonies source request disappeared after the contract was
+  -- claimed, the item delivery has already been accepted by MineColonies.
+  -- In that state, completion is confirmed by the board rather than by asking
+  -- for the items again.
+  local source_disappeared = c.status == "pending_completion"
+
+  if (c.exact_fulfillment or c.source_type == "minecolonies_request") and not source_disappeared then
+    local ok, err = fulfilmentMatchesContract(c, req.fulfilled_items or req.items or {})
+    if not ok then return false, err end
+    c.fulfilled_items = normaliseItems(req.fulfilled_items or req.items or {})
+  end
+
+  local paid_ok, paid_res = payContract(c)
+  if not paid_ok then
+    c.status = "pending_payout"
+    c.updated = timestamp()
+    c.fulfillment_note = req.note or "Fulfilled but payout failed"
+    writeFile(FILE.contracts, contracts)
+    audit("PAYOUT_FAILED", c.claimed_by or "unknown", sender_id, id .. " " .. tostring(paid_res))
+    return false, "Contract completion detected, but payout failed: " .. tostring(paid_res)
+  end
+
+  c.status = "fulfilled"
+  c.fulfilled_at = timestamp()
+  c.updated = timestamp()
+  c.fulfillment_note = req.note or (source_disappeared and "MineColonies request disappeared after claim; manually confirmed." or "")
+  c.completion_confirmed_by = sender_id
+
+  writeFile(FILE.contracts, contracts)
+  audit("FULFILLED", c.claimed_by or "unknown", sender_id, id)
+
+  return true, { contract = publicContract(c), payout = paid_res, message = "Contract marked fulfilled and paid" }
+end
+
+local function cancelContract(sender_id, req)
+  local id = req.contract_id
+  if not id then return false, "Missing contract_id" end
+
+  local c = contracts[id]
+  if not c then return false, "Contract not found: " .. tostring(id) end
+  if c.status == "fulfilled" then return false, "Cannot cancel fulfilled contract" end
+
+  c.status = "cancelled"
+  c.cancelled_at = timestamp()
+  c.updated = timestamp()
+  c.cancel_reason = req.reason or ""
+
+  writeFile(FILE.contracts, contracts)
+  audit("CANCEL", c.poster or "unknown", sender_id, id)
+
+  return true, { contract = publicContract(c), message = "Contract cancelled" }
+end
+
+local function syncSourceContracts(sender_id, req)
+  local source_type = req.source_type
+  local source_company = req.source_company
+  local source_terminal = req.source_terminal or sender_id
+  local active = {}
+
+  if type(req.active_source_keys) == "table" then
+    for _, key in pairs(req.active_source_keys) do
+      key = trim(key)
+      if key ~= "" then active[key] = true end
+    end
+  end
+
+  if not source_type then return false, "Missing source_type" end
+
+  local cancelled = 0
+  local kept = 0
+
+  for id, c in pairs(contracts) do
+    local matches_type = c.source_type == source_type
+    local matches_company = (not source_company or c.source_company == source_company)
+
+    -- Scope stale cleanup to the current integrator where possible, but also
+    -- clean older MineColonies contracts that were created before source_terminal
+    -- was stored. This removes fake board entries automatically after requests
+    -- are cancelled in MineColonies.
+    local matches_terminal = (not source_terminal)
+      or (not c.source_terminal)
+      or tostring(c.source_terminal) == tostring(source_terminal)
+
+    local live_status = (c.status == "open" or c.status == "claimed" or c.status == "pending_completion")
+    local key = c.source_key
+
+    if matches_type and matches_company and matches_terminal and live_status then
+      if not key or not active[key] then
+        if c.status == "claimed" then
+          -- Claimed MineColonies request disappeared. That usually means the
+          -- request was actually satisfied in-game. Do not cancel it; move it
+          -- to a manual completion queue so the claimant can be paid.
+          c.status = "pending_completion"
+          c.pending_completion_at = timestamp()
+          c.updated = timestamp()
+          c.pending_reason = req.reason or "Source request disappeared after claim"
+          kept = kept + 1
+          audit("PENDING_COMPLETION", c.claimed_by or "unknown", sender_id, id)
+        else
+          c.status = "cancelled"
+          c.cancelled_at = timestamp()
+          c.updated = timestamp()
+          c.cancel_reason = req.reason or "Source request no longer exists"
+          c.claimed_by = nil
+          c.claimed_type = nil
+          c.claimed_at = nil
+          cancelled = cancelled + 1
+          audit("STALE_CANCEL", c.poster or "unknown", sender_id, id)
+        end
+      else
+        kept = kept + 1
+      end
+    end
+  end
+
+  writeFile(FILE.contracts, contracts)
+  local deduped = dedupeLiveContracts("Duplicate live request contract")
+  return true, { cancelled = cancelled, kept = kept, deduped = deduped }
+end
+
+-- =============================================================================
+-- HANDLERS
+-- =============================================================================
+local handlers = {}
+
+handlers["ping"] = function(sender_id, req)
+  return true, {
+    message = "Quid Contract Server online",
+    version = VERSION,
+    computer = os.getComputerID(),
+    label = os.getComputerLabel(),
+    time = timestamp(),
+  }
+end
+
+handlers["status"] = function(sender_id, req)
+  local open, claimed, fulfilled, cancelled, pending = 0, 0, 0, 0, 0
+  for _, c in pairs(contracts) do
+    if c.status == "open" then open = open + 1
+    elseif c.status == "claimed" then claimed = claimed + 1
+    elseif c.status == "fulfilled" then fulfilled = fulfilled + 1
+    elseif c.status == "cancelled" then cancelled = cancelled + 1
+    elseif c.status == "pending_completion" or c.status == "pending_payout" then pending = pending + 1 end
+  end
+
+  return true, {
+    version = VERSION,
+    computer_id = os.getComputerID(),
+    label = os.getComputerLabel(),
+    time = timestamp(),
+    uptime = os.clock(),
+    total = countTable(contracts),
+    open = open,
+    claimed = claimed,
+    fulfilled = fulfilled,
+    cancelled = cancelled,
+    pending = pending,
+    audit_count = audit_counter,
+  }
+end
+
+
+local function resetLiveContracts(sender_id, req)
+  local source_type = req and req.source_type or "minecolonies_request"
+  local include_claimed = req and req.include_claimed ~= false
+
+  local reset = 0
+  local skipped_claimed = 0
+
+  for id, c in pairs(contracts) do
+    local is_live_source = (not source_type) or c.source_type == source_type
+    local is_active = c.status == "open"
+      or c.status == "claimed"
+      or c.status == "pending_completion"
+      or c.status == "pending_payout"
+
+    if is_live_source and is_active then
+      if c.status == "claimed" and not include_claimed then
+        skipped_claimed = skipped_claimed + 1
+      else
+        c.status = "cancelled"
+        c.cancelled_at = timestamp()
+        c.updated = timestamp()
+        c.cancel_reason = req and req.reason or "Manual live request reset"
+        c.reset_by = sender_id
+        c.claimed_by = nil
+        c.claimed_type = nil
+        c.claimed_at = nil
+        reset = reset + 1
+        audit("LIVE_RESET", c.poster or "unknown", sender_id, id)
+      end
+    end
+  end
+
+  writeFile(FILE.contracts, contracts)
+  return true, { reset = reset, skipped_claimed = skipped_claimed, message = "Live request contracts reset" }
+end
+
+handlers["post_contract"] = postContract
+handlers["list_contracts"] = listContracts
+handlers["get_contract"] = getContract
+handlers["claim_contract"] = claimContract
+handlers["unclaim_contract"] = unclaimContract
+handlers["mark_fulfilled"] = markFulfilled
+handlers["cancel_contract"] = cancelContract
+handlers["sync_source_contracts"] = syncSourceContracts
+handlers["reset_live_contracts"] = resetLiveContracts
+handlers["list_claimant_companies"] = listClaimantCompanies
+
+-- =============================================================================
+-- BOOT
+-- =============================================================================
+local function initFiles()
+  contracts = readFile(FILE.contracts) or {}
+  config = readFile(FILE.config) or {}
+
+  for id, _ in pairs(contracts) do
+    local n = tostring(id):match("CON%-(%d+)")
+    n = tonumber(n)
+    if n and n > contract_counter then contract_counter = n end
+  end
+
+  dedupeLiveContracts("Duplicate contract cleanup on boot")
+
+  if fs.exists(FILE.audit) then
+    local f = fs.open(FILE.audit, "r")
+    if f then
+      local line = f.readLine()
+      while line do
+        local n = line:match("CAUD%-(%d+)")
+        n = tonumber(n)
+        if n and n > audit_counter then audit_counter = n end
+        line = f.readLine()
+      end
+      f.close()
     end
   end
 end
 
-local function centre(y, text, fg, bg)
-  text = tostring(text or "")
-  at(math.max(1, math.floor((W - #text) / 2) + 1), y, text, fg, bg)
-end
-
-local function topBar()
-  fill(1, 1, W, 1, C.header)
-  at(2, 1, "QUID CONTRACT BOARD", C.hdr_fg, C.header)
-  at(W - #VERSION, 1, VERSION, C.dim, C.header)
-end
-
-local function statusBar()
-  fill(1, H, W, 1, C.bg)
-  if last_message ~= "" then
-    at(2, H, last_message:sub(1, W - 2), last_message_colour, C.bg)
-  end
-end
-
-local function card(x, y, w, h)
-  fill(x, y, w, h, C.card)
-end
-
-local function button(x, y, w, label, bg, fg)
-  bg = bg or C.btn_pri
-  fg = fg or C.btn_fg
-  fill(x, y, w, 1, bg)
-  local tx = x + math.floor((w - #label) / 2)
-  at(tx, y, label, fg, bg)
-  return { x1 = x, x2 = x + w - 1, y1 = y, y2 = y }
-end
-
-local function hit(b, mx, my)
-  return b and mx >= b.x1 and mx <= b.x2 and my >= b.y1 and my <= b.y2
-end
-
-local function inputField(x, y, w, value)
-  value = tostring(value or "")
-  fill(x, y, w, 1, C.input_bg)
-  at(x, y, (value .. string.rep(" ", w)):sub(1, w), C.input_fg, C.input_bg)
-  return {
-    x1 = x, x2 = x + w - 1, y1 = y, y2 = y,
-    cursor_x = x + math.min(#value, w - 1),
-    cursor_y = y,
-  }
-end
-
--- =============================================================================
--- NETWORK
--- =============================================================================
 local function openModem()
   for _, name in ipairs(peripheral.getNames()) do
     if peripheral.getType(name) == "modem" then
       local m = peripheral.wrap(name)
       if m and m.isWireless and m.isWireless() then
         rednet.open(name)
-        modem_name = name
+        print("  Modem: " .. name .. " (wireless)")
         return true
       end
     end
@@ -233,523 +837,232 @@ local function openModem()
   for _, name in ipairs(peripheral.getNames()) do
     if peripheral.getType(name) == "modem" then
       rednet.open(name)
-      modem_name = name
+      print("  Modem: " .. name .. " (wired fallback)")
       return true
     end
   end
 
+  print("  ERROR: No modem found")
   return false
 end
 
-local function connectServer()
-  cls()
-  topBar()
-  centre(math.floor(H / 2) - 1, "Connecting to contract server...", C.dim, C.bg)
 
-  for attempt = 1, 8 do
-    fill(1, math.floor(H / 2) + 1, W, 1, C.bg)
-    centre(math.floor(H / 2) + 1, "Attempt " .. attempt .. " of 8", C.dim, C.bg)
-
-    rednet.broadcast({ type = "ping" }, PROTOCOL)
-    local sender, msg = rednet.receive(PROTOCOL, 4)
-
+local function discoverBank()
+  for _ = 1, 5 do
+    rednet.broadcast({ type = "ping" }, BANK_PROTOCOL)
+    local sender, msg = rednet.receive(BANK_PROTOCOL, 2)
     if sender and type(msg) == "table" then
-      if msg.type == "contract_server_online" or (msg.success == true and type(msg.response) == "table") then
-        contract_id = sender
-        centre(math.floor(H / 2) + 1, "Connected.", C.ok, C.bg)
-        sleep(0.4)
+      if msg.type == "treasury_online" or msg.success == true then
+        bank_id = sender
+        print("  Bank: " .. tostring(bank_id))
         return true
       end
     end
   end
-
-  centre(math.floor(H / 2) + 1, "Connection failed.", C.err, C.bg)
-  sleep(2)
+  print("  WARN: Quid bank not found. Payouts will fail until bank is online.")
   return false
 end
 
-local function contractRequest(request, timeout)
-  timeout = timeout or DB_TIMEOUT
-  if not contract_id then return false, "No contract server connected" end
+local function bankReq(req, timeout)
+  timeout = timeout or 5
+  if not bank_id then discoverBank() end
+  if not bank_id then return false, "No bank server connected" end
 
-  rednet.send(contract_id, request, PROTOCOL)
-
+  rednet.send(bank_id, req, BANK_PROTOCOL)
   local deadline = os.clock() + timeout
+
   while true do
     local remaining = deadline - os.clock()
-    if remaining <= 0 then
-      return false, "No response from contract server"
-    end
-
-    local sender, msg = rednet.receive(PROTOCOL, remaining)
-    if sender == contract_id and type(msg) == "table" and msg.success ~= nil then
+    if remaining <= 0 then return false, "No response from bank" end
+    local sender, msg = rednet.receive(BANK_PROTOCOL, remaining)
+    if sender == bank_id and type(msg) == "table" and msg.success ~= nil then
       return msg.success, msg.response
     end
   end
 end
 
--- =============================================================================
--- DATA
--- =============================================================================
-local function refreshContracts()
-  local ok, res = contractRequest({
-    type = "list_contracts",
-    status = filter,
-  })
 
-  if ok and type(res) == "table" then
-    contracts = res.contracts or {}
-    if selected > #contracts then selected = #contracts end
-    if selected < 1 then selected = 1 end
-    setMessage("Loaded " .. tostring(#contracts) .. " contracts.", C.ok)
-    return true
+local function bankAccounts()
+  local ok, res = bankReq({ type = "list_accounts" }, 6)
+  if ok and type(res) == "table" and type(res.accounts) == "table" then
+    return res.accounts
+  end
+  return nil, res
+end
+
+local function bankCompanyExists(company_id)
+  company_id = trim(company_id or "")
+  if company_id == "" then return false end
+  local accounts, err = bankAccounts()
+  if not accounts then return false, err or "Could not read bank accounts" end
+
+  for _, acc in ipairs(accounts) do
+    if acc.account_id == company_id and acc.type == "company" and (acc.status or "active") == "active" then
+      return true, acc
+    end
+  end
+  return false, "Company account not found: " .. tostring(company_id)
+end
+
+local function listClaimantCompanies(sender_id, req)
+  local accounts, err = bankAccounts()
+  if not accounts then return false, err or "Could not read bank accounts" end
+
+  local companies = {}
+  for _, acc in ipairs(accounts) do
+    if acc.type == "company" and (acc.status or "active") == "active" then
+      local id = tostring(acc.account_id or "")
+      local ticker = id:gsub("^company:", "")
+      companies[#companies+1] = {
+        company_id = id,
+        account_id = id,
+        ticker = string.upper(ticker),
+        display_name = acc.display_name or id,
+        balance = tonumber(acc.balance) or 0,
+        owner_id = acc.owner_id,
+        status = acc.status or "active",
+      }
+    end
   end
 
-  setMessage("Load failed: " .. tostring(res), C.err)
-  return false
+  table.sort(companies, function(a,b)
+    return tostring(a.ticker or a.company_id) < tostring(b.ticker or b.company_id)
+  end)
+
+  return true, { companies = companies, count = #companies }
 end
 
-local function currentContract()
-  return contracts[selected]
+local function drawStatus()
+  term.clear()
+  term.setCursorPos(1, 1)
+  local w = term.getSize()
+
+  local _, s = handlers["status"](os.getComputerID(), {})
+
+  term.setBackgroundColor(colors.black)
+  term.setTextColor(colors.yellow)
+  print(string.rep("=", w))
+  print("  QUID CONTRACT SERVER  v" .. VERSION)
+  print(string.rep("=", w))
+
+  term.setTextColor(colors.white)
+  print("  ID:       " .. os.getComputerID())
+  print("  Label:    " .. (os.getComputerLabel() or "unlabelled"))
+  print("  Protocol: " .. PROTOCOL)
+  print("  Uptime:   " .. string.format("%.0f", os.clock()) .. "s")
+  print("  Audits:   " .. tostring(audit_counter))
+
+  term.setTextColor(colors.yellow)
+  print(string.rep("-", w))
+  term.setTextColor(colors.lime)
+  print("  Open:      " .. tostring(s and s.open or "?"))
+  term.setTextColor(colors.orange)
+  print("  Claimed:   " .. tostring(s and s.claimed or "?"))
+  term.setTextColor(colors.cyan)
+  print("  Fulfilled: " .. tostring(s and s.fulfilled or "?"))
+  term.setTextColor(colors.red)
+  print("  Cancelled: " .. tostring(s and s.cancelled or "?"))
+  term.setTextColor(colors.yellow)
+  print("  Pending:   " .. tostring(s and s.pending or "?"))
+  term.setTextColor(colors.white)
+  print("  Total:     " .. tostring(s and s.total or countTable(contracts)))
+
+  term.setTextColor(colors.yellow)
+  print(string.rep("-", w))
+  term.setTextColor(colors.lightGray)
+  print("  [Running. Ctrl+T to terminate]")
+  term.setTextColor(colors.white)
 end
 
-local function loadCompanies()
-  local ok, res = contractRequest({ type = "list_claimant_companies" }, 8)
-  if ok and type(res) == "table" and type(res.companies) == "table" then
-    return res.companies
+local function handleRequest(sender_id, request)
+  if type(request) ~= "table" then return false, "Invalid request format" end
+
+  local req_type = request.type
+  if not req_type then return false, "Missing request type" end
+
+  local handler = handlers[req_type]
+  if not handler then
+    audit("UNKNOWN", "UNKNOWN", sender_id, tostring(req_type))
+    return false, "Unknown request type: " .. tostring(req_type)
   end
-  setMessage("Company list failed: " .. tostring(res), C.err)
-  return {}
+
+  local ok, success, response = pcall(handler, sender_id, request)
+  if not ok then
+    audit("ERROR", "SYSTEM", sender_id, tostring(success))
+    return false, "Internal contract server error"
+  end
+
+  return success, response
 end
 
-local function resetLiveContracts()
-  cls()
-  topBar()
-  card(2, 4, W - 2, H - 5)
-
-  at(4, 5, "Reset Current Live Requests", C.card_fg, C.card)
-  at(4, 7, "This cancels all active MineColonies live request contracts.", C.label, C.card)
-  at(4, 8, "The integrator will repost whatever requests still exist.", C.label, C.card)
-  at(4, 10, "Use this after bad claims, bad pricing, or request desync.", C.warn, C.card)
-
-  local bw = math.floor((W - 8) / 2)
-  local bBack = button(4, H - 2, bw, "Back", C.btn_sec, C.card_fg)
-  local bReset = button(5 + bw, H - 2, bw, "Reset Live", C.btn_dan, C.btn_fg)
-
-  statusBar()
+local function serverLoop()
+  local request_count = 0
 
   while true do
-    local ev, p1, p2, p3 = os.pullEvent()
-    if ev == "mouse_click" then
-      if hit(bBack, p2, p3) then return end
-      if hit(bReset, p2, p3) then
-        local ok, res = contractRequest({
-          type = "reset_live_contracts",
-          source_type = "minecolonies_request",
-          include_claimed = true,
-          reason = "Manual reset from ContractBoard",
-        }, 10)
+    local sender_id, message, protocol = rednet.receive(PROTOCOL, 5)
 
-        if ok and type(res) == "table" then
-          setMessage("Reset " .. tostring(res.reset or 0) .. " live contracts.", C.ok)
-        else
-          setMessage("Reset failed: " .. tostring(res), C.err)
-        end
-        refreshContracts()
-        return
-      end
-    end
-  end
-end
+    if sender_id then
+      request_count = request_count + 1
+      local success, response = handleRequest(sender_id, message)
+      rednet.send(sender_id, {
+        success = success,
+        response = response,
+        time = timestamp(),
+        server = os.getComputerID(),
+      }, PROTOCOL)
 
--- =============================================================================
--- DETAIL / CLAIM
--- =============================================================================
-local function detailScreen(c)
-  if not c then return end
-
-  local scroll = 0
-
-  while true do
-    cls()
-    topBar()
-
-    card(2, 3, W - 2, H - 4)
-
-    at(4, 4, c.contract_id .. " - " .. tostring(c.title or ""), C.card_fg, C.card)
-    at(4, 5, "Reward: " .. money(c.reward or 0) .. "    Status: " .. tostring(c.status or "?"), C.label, C.card)
-    at(4, 6, "Poster: " .. tostring(c.poster or "?"), C.label, C.card)
-
-    local y = 8
-    at(4, y, "Required Items", C.card_fg, C.card)
-    y = y + 1
-
-    local items = c.items or {}
-    local start = scroll + 1
-    local maxRows = H - 15
-
-    for i = start, math.min(#items, start + maxRows - 1) do
-      local item = items[i]
-      at(4, y, tostring(item.count or 0) .. "x " .. tostring(item.display or item.item), C.card_fg, C.card)
-      y = y + 1
-    end
-
-    if c.claimed_by then
-      at(4, H - 7, "Claimed by: " .. tostring(c.claimed_by), C.warn, C.card)
-    end
-    if c.pending_reason then
-      at(4, H - 6, "Pending: " .. tostring(c.pending_reason):sub(1, W - 10), C.warn, C.card)
-    elseif c.payout_status then
-      at(4, H - 6, "Payout: " .. tostring(c.payout_status), c.payout_status == "paid" and C.ok or C.warn, C.card)
-    end
-
-    local action = "Claim"
-    if c.status == "claimed" or c.status == "pending_completion" or c.status == "pending_payout" then
-      action = "Complete"
-    elseif c.status == "fulfilled" then
-      action = "Done"
-    elseif c.status == "cancelled" then
-      action = "Closed"
-    end
-
-    local third = math.floor((W - 10) / 3)
-    local bBack = button(4, H - 2, third, "Back", C.btn_sec, C.card_fg)
-    local bUp   = button(5 + third, H - 2, third, "Scroll", C.btn_sec, C.card_fg)
-    local bAction = button(10 + (third * 2), H - 2, third, action, C.btn_pri, C.btn_fg)
-
-    statusBar()
-
-    local ev, p1, p2, p3 = os.pullEvent()
-    if ev == "mouse_click" then
-      if hit(bBack, p2, p3) then return end
-      if hit(bUp, p2, p3) then
-        if #items > maxRows then
-          scroll = scroll + maxRows
-          if scroll >= #items then scroll = 0 end
-        end
-      end
-      if hit(bAction, p2, p3) then
-        if action == "Claim" then return "claim" end
-        if action == "Complete" then return "complete" end
-      end
-    end
-  end
-end
-
-local function completeContract(c)
-  if not c then return end
-  local ok, res = contractRequest({
-    type = "mark_fulfilled",
-    contract_id = c.contract_id,
-    note = "Completed from ContractBoard after in-game fulfilment.",
-  }, 8)
-
-  if ok then
-    setMessage("Completed and paid " .. tostring(c.contract_id), C.ok)
-    refreshContracts()
-  else
-    setMessage("Complete failed: " .. tostring(res), C.err)
-  end
-end
-
-local function claimScreen(c)
-  if not c then return end
-
-  local companies = loadCompanies()
-  local selectedCompany = 1
-  local scroll = 0
-
-  local function visibleRows()
-    return math.max(3, H - 14)
-  end
-
-  local function draw()
-    cls()
-    topBar()
-    card(2, 4, W - 2, H - 5)
-
-    at(4, 5, "Claim Contract", C.card_fg, C.card)
-    at(4, 7, c.contract_id .. " - " .. tostring(c.title or ""), C.label, C.card)
-    at(4, 8, "Reward: " .. money(c.reward or 0), C.label, C.card)
-    at(4, 10, "Choose claimant company", C.card_fg, C.card)
-
-    local rows = visibleRows()
-    if #companies == 0 then
-      at(4, 12, "No active companies found from bank.", C.err, C.card)
+      if request_count % 5 == 0 then drawStatus() end
     else
-      if selectedCompany < 1 then selectedCompany = 1 end
-      if selectedCompany > #companies then selectedCompany = #companies end
-      if selectedCompany <= scroll then scroll = selectedCompany - 1 end
-      if selectedCompany > scroll + rows then scroll = selectedCompany - rows end
-      if scroll < 0 then scroll = 0 end
+      drawStatus()
+      rednet.broadcast({
+        type = "contract_server_online",
+        version = VERSION,
+        id = os.getComputerID(),
+        time = timestamp(),
+      }, PROTOCOL)
 
-      for i = 1, rows do
-        local idx = scroll + i
-        local co = companies[idx]
-        if co then
-          local y = 11 + i
-          local selectedRow = idx == selectedCompany
-          local bg = selectedRow and C.input_bg or C.card
-          local fg = selectedRow and C.card_fg or C.card_fg
-          fill(4, y, W - 6, 1, bg)
-
-          local label = tostring(co.ticker or "?") .. " - " .. tostring(co.display_name or co.company_id)
-          local bal = money(co.balance or 0)
-          at(5, y, label, fg, bg)
-          at(W - #bal - 4, y, bal, C.ok, bg)
-        end
-      end
-    end
-
-    local preview = companies[selectedCompany] and companies[selectedCompany].company_id or "none"
-    at(4, H - 4, "Claim as: " .. tostring(preview), C.label, C.card)
-
-    local third = math.floor((W - 10) / 3)
-    local bBack = button(4, H - 2, third, "Back", C.btn_sec, C.card_fg)
-    local bScroll = button(5 + third, H - 2, third, "Scroll", C.btn_sec, C.card_fg)
-    local bClaim = button(10 + (third * 2), H - 2, third, "Claim", C.btn_pri, C.btn_fg)
-
-    statusBar()
-    term.setCursorBlink(false)
-    return bBack, bScroll, bClaim, rows
-  end
-
-  local bBack, bScroll, bClaim, rows = draw()
-
-  while true do
-    local ev, p1, p2, p3 = os.pullEvent()
-
-    if ev == "mouse_click" then
-      local mx, my = p2, p3
-
-      if hit(bBack, mx, my) then return end
-
-      -- Click rows to select.
-      local rowTop = 12
-      local row = my - rowTop + 1
-      local idx = scroll + row
-      if idx >= 1 and idx <= #companies and mx >= 4 and mx <= W - 2 then
-        selectedCompany = idx
-      elseif hit(bScroll, mx, my) then
-        if #companies > rows then
-          scroll = scroll + rows
-          if scroll >= #companies then scroll = 0 end
-          selectedCompany = math.min(#companies, scroll + 1)
-        end
-      elseif hit(bClaim, mx, my) then
-        local co = companies[selectedCompany]
-        if not co then
-          setMessage("Choose a company first.", C.err)
-        else
-          local ok, res = contractRequest({
-            type = "claim_contract",
-            contract_id = c.contract_id,
-            claimant = co.company_id,
-            claimant_type = "company",
-          })
-
-          if ok then
-            setMessage("Claimed " .. c.contract_id .. " as " .. tostring(co.company_id), C.ok)
-            refreshContracts()
-            return
-          else
-            setMessage("Claim failed: " .. tostring(res), C.err)
-          end
-        end
-      end
-
-      bBack, bScroll, bClaim, rows = draw()
-
-    elseif ev == "key" then
-      if p1 == keys.up and selectedCompany > 1 then
-        selectedCompany = selectedCompany - 1
-      elseif p1 == keys.down and selectedCompany < #companies then
-        selectedCompany = selectedCompany + 1
-      elseif p1 == keys.enter then
-        local co = companies[selectedCompany]
-        if co then
-          local ok, res = contractRequest({
-            type = "claim_contract",
-            contract_id = c.contract_id,
-            claimant = co.company_id,
-            claimant_type = "company",
-          })
-          if ok then
-            setMessage("Claimed " .. c.contract_id .. " as " .. tostring(co.company_id), C.ok)
-            refreshContracts()
-            return
-          else
-            setMessage("Claim failed: " .. tostring(res), C.err)
-          end
-        end
-      elseif p1 == keys.escape or p1 == keys.backspace then
-        return
-      end
-      bBack, bScroll, bClaim, rows = draw()
+      rednet.broadcast({
+        type = "contract_server_online",
+        version = VERSION,
+        id = os.getComputerID(),
+        time = timestamp(),
+      }, PROTOCOL_BROADCAST)
     end
   end
 end
 
--- =============================================================================
--- MAIN DRAW
--- =============================================================================
-local function drawTabs(y)
-  local tabs = { "Open", "Claimed", "Pending", "Fulfilled", "All" }
-  local values = { "open", "claimed", "pending_completion", "fulfilled", "all" }
-  local tw = math.floor((W - 2) / #tabs)
-  local buttons = {}
-
-  for i, label in ipairs(tabs) do
-    local x = 2 + ((i - 1) * tw)
-    local active = filter == values[i]
-    local bg = active and C.tab_act or C.tab_inact
-    local fg = active and C.tab_fg_a or C.tab_fg_i
-
-    fill(x, y, tw, 1, bg)
-    at(x + math.floor((tw - #label) / 2), y, label, fg, bg)
-    buttons[i] = { x1 = x, x2 = x + tw - 1, y1 = y, y2 = y, value = values[i] }
-  end
-
-  return buttons
-end
-
-local function drawMain()
-  cls()
-  topBar()
-
-  local tabs = drawTabs(3)
-
-  card(2, 5, W - 2, H - 6)
-
-  local listTop = 6
-  local listBottom = H - 5
-  local perPage = listBottom - listTop + 1
-  if perPage < 3 then perPage = 3 end
-
-  local totalPages = math.max(1, math.ceil(#contracts / perPage))
-  if page > totalPages then page = totalPages end
-
-  local start = ((page - 1) * perPage) + 1
-  local y = listTop
-
-  if #contracts == 0 then
-    at(4, y, "No contracts found.", C.label, C.card)
-  else
-    for i = start, math.min(#contracts, start + perPage - 1) do
-      local c = contracts[i]
-      local selectedRow = i == selected
-      local bg = selectedRow and C.input_bg or C.card
-      local fg = selectedRow and C.card_fg or C.card_fg
-      fill(3, y, W - 4, 1, bg)
-
-      local title = tostring(c.contract_id) .. "  " .. tostring(c.title or "Contract")
-      at(4, y, title, fg, bg)
-      local reward = money(c.reward or 0)
-      at(W - #reward - 2, y, reward, C.ok, bg)
-      y = y + 1
-    end
-  end
-
-  local third = math.floor((W - 10) / 3)
-  local bPrev = button(4, H - 3, third, "Prev", C.btn_sec, C.card_fg)
-  local bNext = button(5 + third, H - 3, third, "Next", C.btn_sec, C.card_fg)
-  local bOpen = button(10 + (third * 2), H - 3, third, "Open", C.btn_pri, C.btn_fg)
-
-  local half = math.floor((W - 8) / 2)
-  local bRefresh = button(4, H - 2, half, "Refresh", C.btn_pri, C.btn_fg)
-  local bReset = button(5 + half, H - 2, half, "Reset Live", C.btn_dan, C.btn_fg)
-
-  statusBar()
-  term.setCursorBlink(false)
-
-  return tabs, bPrev, bNext, bOpen, bRefresh, bReset, perPage
-end
-
--- =============================================================================
--- MAIN LOOP
--- =============================================================================
-local function screenMain()
-  refreshContracts()
-  local tabs, bPrev, bNext, bOpen, bRefresh, bReset, perPage = drawMain()
-
-  while true do
-    local ev, p1, p2, p3 = os.pullEvent()
-
-    if ev == "mouse_click" then
-      local mx, my = p2, p3
-
-      for _, tab in ipairs(tabs) do
-        if hit(tab, mx, my) then
-          filter = tab.value
-          selected = 1
-          page = 1
-          refreshContracts()
-          tabs, bPrev, bNext, bOpen, bRefresh, bReset, perPage = drawMain()
-          break
-        end
-      end
-
-      if hit(bPrev, mx, my) then
-        if selected > 1 then
-          selected = selected - 1
-        end
-        local minForPage = ((page - 1) * perPage) + 1
-        if selected < minForPage then page = math.max(1, page - 1) end
-      elseif hit(bNext, mx, my) then
-        if selected < #contracts then
-          selected = selected + 1
-        end
-        local maxForPage = page * perPage
-        if selected > maxForPage then page = page + 1 end
-      elseif hit(bOpen, mx, my) then
-        local c = currentContract()
-        local next = detailScreen(c)
-        if next == "claim" then
-          claimScreen(c)
-        elseif next == "complete" then
-          completeContract(c)
-        end
-      elseif hit(bRefresh, mx, my) then
-        refreshContracts()
-      elseif hit(bReset, mx, my) then
-        resetLiveContracts()
-      else
-        -- row click selection
-        local listTop = 6
-        local start = ((page - 1) * perPage) + 1
-        local row = my - listTop + 1
-        local idx = start + row - 1
-        if idx >= 1 and idx <= #contracts then
-          selected = idx
-        end
-      end
-
-      tabs, bPrev, bNext, bOpen, bRefresh, bReset, perPage = drawMain()
-
-    elseif ev == "key" then
-      -- Keyboard only edits text fields in sub-screens.
-      -- Main board navigation is mouse-only.
-    end
-  end
-end
-
--- =============================================================================
--- ENTRY
--- =============================================================================
 local function main()
+  term.clear()
+  term.setCursorPos(1, 1)
+
+  if os.getComputerLabel() ~= LABEL then
+    os.setComputerLabel(LABEL)
+  end
+
+  print("QUID CONTRACT SERVER v" .. VERSION)
+  print("Booting...")
+
+  initFiles()
+  print("  Contracts: " .. countTable(contracts))
+  print("  Next ID:   CON-" .. pad(contract_counter + 1, 6))
+
   if not openModem() then
-    cls()
-    print("ERROR: No modem found.")
-    print("Attach an Ender Modem and reboot.")
+    print("FATAL: No modem. Halting.")
     return
   end
 
-  while not connectServer() do
-    sleep(2)
-  end
+  discoverBank()
 
-  setMessage("Connected.", C.ok)
-  screenMain()
+  audit("BOOT", "SYSTEM", os.getComputerID(), "v" .. VERSION)
+
+  print("Boot complete.")
+  sleep(1)
+
+  drawStatus()
+  rednet.broadcast({ type = "contract_server_online", version = VERSION, id = os.getComputerID() }, PROTOCOL)
+  rednet.broadcast({ type = "contract_server_online", version = VERSION, id = os.getComputerID() }, PROTOCOL_BROADCAST)
+
+  serverLoop()
 end
 
 main()
