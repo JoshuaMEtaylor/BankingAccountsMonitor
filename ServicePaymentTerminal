@@ -1,10 +1,16 @@
 -- =============================================================================
 -- SERVICE PAYMENT TERMINAL
 -- ServicePaymentTerminal
--- Dining Hall service payments from bank service observations.
 --
--- The ColonyBusinessIntegrator observes MineColonies. This terminal does not
--- invent local colony/building variables; it consumes bank snapshots only.
+-- Dining Hall service payments.
+--
+-- Data source:
+--   ColonyBusinessIntegrator observes the real colony integrator.
+--   CBI resolves the Dining Hall company, asks the bank for that company's
+--   employee/payroll mappings, scans only those employees' citizen data, and
+--   pushes a service observation to the bank.
+--
+-- This terminal only consumes bank observations and creates payments.
 -- =============================================================================
 
 local args = {...}
@@ -16,203 +22,409 @@ if args[1] ~= "--updated" then
   local cb = tostring(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
   local url = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/ServicePaymentTerminal?cb=" .. cb
   shell.run("wget " .. url .. " startup.lua")
-  if not fs.exists("startup.lua") then print("Download failed. Expected GitHub file: ServicePaymentTerminal"); return end
+  if not fs.exists("startup.lua") then
+    print("Download failed. Expected GitHub file: ServicePaymentTerminal")
+    return
+  end
   print("Relaunching...")
   sleep(0.5)
   shell.run("startup.lua", "--updated")
   return
 end
 
-local VERSION = "1.1.2-SUPPLY-EVENT-POOL"
+local VERSION = "1.1.3-PAYROLL-EMPLOYEE-STOCK"
 local BANK_PROTOCOL = "quid_bank"
 local SERVICE_KEY = "dining_hall"
-local FILE_STATE = "data/service_payment_state.db"
 local SCAN_SECONDS = 2
+local EAT_DELAY_SECONDS = 2
+local MATCH_WINDOW_SECONDS = 6
 local SAT_DELTA_MIN = 0.50
 
-local db_id=nil
-local last_message="Booting..."
-local last_colour=colors.lightGray
-local auto_charge=true
-local obs=nil
-local prev_citizens=nil
-local state={ processed_supply={}, stock_pool={}, charged_sat={}, stats={matched=0,charged=0,unpaid=0,unattributed=0} }
-local stats={citizens_seen=0, citizen_inventory_sources=0, stock_kinds=0, stock_units=0, supply_events=0, pool_units=0, sat_events=0, matched=0, charged=0, unpaid=0, unattributed=0}
+local db_id = nil
+local auto_charge = true
+local last_message = "Booting..."
+local last_colour = colors.lightGray
 
-local function now() return os.epoch("utc") end
-local function lower(s) return string.lower(tostring(s or "")) end
-local function setMsg(m,c) last_message=tostring(m or ""); last_colour=c or colors.lightGray end
-local function ensureDir(path) local d=fs.getDir(path); if d and d~="" and not fs.exists(d) then fs.makeDir(d) end end
-local function readFile(path) if not fs.exists(path) then return nil end local f=fs.open(path,"r"); if not f then return nil end local t=f.readAll(); f.close(); if not t or t=="" then return nil end local ok,d=pcall(textutils.unserialize,t); if ok then return d end return nil end
-local function writeFile(path,data) ensureDir(path); local f=fs.open(path,"w"); if f then f.write(textutils.serialize(data)); f.close(); return true end return false end
-local function money(n) return tostring(math.floor((tonumber(n) or 0)+0.5)).." Q" end
+local obs = nil
+local prev_stock = nil
+local prev_citizens = nil
+local pending_food = {}
+local sat_events = {}
 
-local function loadState()
-  state=readFile(FILE_STATE) or state
-  state.processed_supply=state.processed_supply or {}
-  state.stock_pool=state.stock_pool or {}
-  state.charged_sat=state.charged_sat or {}
-  state.stats=state.stats or {matched=0,charged=0,unpaid=0,unattributed=0}
+local stats = {
+  citizens_seen = 0,
+  payroll_employee_count = 0,
+  employees_seen_live = 0,
+  employee_inventory_sources = 0,
+  stock_kinds = 0,
+  stock_units = 0,
+  last_loss = 0,
+  pending = 0,
+  sat_events = 0,
+  matched = 0,
+  charged = 0,
+  unpaid = 0,
+  unattributed = 0,
+}
+
+local function now()
+  return os.epoch("utc")
 end
-local function saveState() writeFile(FILE_STATE,state) end
+
+local function lower(s)
+  return string.lower(tostring(s or ""))
+end
+
+local function setMsg(msg, col)
+  last_message = tostring(msg or "")
+  last_colour = col or colors.lightGray
+end
+
+local function money(n)
+  n = tonumber(n) or 0
+  local sign = ""
+  if n < 0 then sign = "-"; n = math.abs(n) end
+  return sign .. tostring(math.floor(n + 0.5)) .. " Q"
+end
 
 local function openModem()
-  for _,n in ipairs(peripheral.getNames()) do if peripheral.getType(n)=="modem" then rednet.open(n); return true end end
-  return false
-end
-local function discoverBank()
-  for _=1,5 do
-    rednet.broadcast({type="ping"},BANK_PROTOCOL)
-    local sender,msg=rednet.receive(BANK_PROTOCOL,2)
-    if sender and type(msg)=="table" and (msg.type=="treasury_online" or msg.success==true) then db_id=sender; return true end
+  for _, n in ipairs(peripheral.getNames()) do
+    if peripheral.getType(n) == "modem" then
+      rednet.open(n)
+      return true
+    end
   end
   return false
 end
-local function bankReq(req,timeout)
-  timeout=timeout or 6
+
+local function discoverBank()
+  for _ = 1, 5 do
+    rednet.broadcast({ type = "ping" }, BANK_PROTOCOL)
+    local sender, msg = rednet.receive(BANK_PROTOCOL, 2)
+    if sender and type(msg) == "table" and (msg.type == "treasury_online" or msg.success == true) then
+      db_id = sender
+      return true
+    end
+  end
+  return false
+end
+
+local function bankReq(req, timeout)
+  timeout = timeout or 6
   if not db_id then discoverBank() end
-  if not db_id then return false,"No bank server connected" end
-  rednet.send(db_id,req,BANK_PROTOCOL)
-  local deadline=os.clock()+timeout
+  if not db_id then return false, "No bank server connected" end
+
+  rednet.send(db_id, req, BANK_PROTOCOL)
+  local deadline = os.clock() + timeout
+
   while true do
-    local rem=deadline-os.clock()
-    if rem<=0 then return false,"No response from bank" end
-    local sender,msg=rednet.receive(BANK_PROTOCOL,rem)
-    if sender==db_id and type(msg)=="table" and msg.success~=nil then return msg.success,msg.response end
+    local rem = deadline - os.clock()
+    if rem <= 0 then return false, "No response from bank" end
+    local sender, msg = rednet.receive(BANK_PROTOCOL, rem)
+    if sender == db_id and type(msg) == "table" and msg.success ~= nil then
+      return msg.success, msg.response
+    end
   end
 end
 
-local function unitPrice(item)
-  local id=lower(item)
-  if id:find("golden_carrot",1,true) or id:find("cake",1,true) or id:find("rabbit_stew",1,true) then return 4 end
-  if id:find("steak",1,true) or id:find("cooked_beef",1,true) or id:find("cooked_porkchop",1,true) or id:find("cooked_salmon",1,true) then return 3 end
-  if id:find("cooked_",1,true) or id:find("bread",1,true) or id:find("pie",1,true) or id:find("stew",1,true) or id:find("soup",1,true) then return 2 end
-  return 1
-end
-local function poolUnits()
-  local u=0; for _,q in pairs(state.stock_pool or {}) do u=u+(tonumber(q) or 0) end; return u
-end
-local function poolKinds()
-  local k=0; for _,q in pairs(state.stock_pool or {}) do if (tonumber(q) or 0)>0 then k=k+1 end end; return k
-end
-local function addSupplyEvents(events)
-  local added=0
-  for _,e in ipairs(events or {}) do
-    local id=tostring(e.event_id or "")
-    if id~="" and not state.processed_supply[id] then
-      local item=tostring(e.item or e.display or "meal")
-      local qty=math.max(1,math.floor(tonumber(e.qty) or 1))
-      state.stock_pool[item]=(state.stock_pool[item] or 0)+qty
-      state.processed_supply[id]=true
-      added=added+qty
-    end
-  end
-  if added>0 then setMsg("Added "..tostring(added).." dining stock from fulfilled food requests.",colors.lime) end
-end
-local function takeFoodFromPool()
-  local best=nil
-  for item,qty in pairs(state.stock_pool or {}) do
-    qty=tonumber(qty) or 0
-    if qty>0 and (not best or tostring(item)<tostring(best)) then best=item end
-  end
-  if not best then return nil end
-  state.stock_pool[best]=(tonumber(state.stock_pool[best]) or 0)-1
-  return best
-end
-local function citizenMap(rows)
-  local out={}
-  for _,z in ipairs(rows or {}) do
-    if z.citizen_id then out[z.citizen_id]={name=z.display_name or z.citizen_id,saturation=tonumber(z.saturation) or 0} end
+local function stockCopy(t)
+  local out = {}
+  for k, v in pairs(t or {}) do
+    out[tostring(k)] = tonumber(v) or 0
   end
   return out
 end
-local function chargeForSaturation(id,name,delta)
-  if not obs or not obs.company_id then setMsg("No dining company in observation.",colors.red); return end
-  local item=takeFoodFromPool()
-  if not item then stats.unattributed=stats.unattributed+1; state.stats.unattributed=(state.stats.unattributed or 0)+1; setMsg("Saturation rose but stock pool is empty.",colors.orange); return end
-  local amount=unitPrice(item)
-  local ok,res=bankReq({type="hospitality_meal_payment", citizen_id=id, company_id=obs.company_id, amount=amount, item=item, memo="Dining Hall meal: 1x "..item},6)
-  if ok and type(res)=="table" then
-    stats.matched=stats.matched+1; stats.charged=stats.charged+(tonumber(res.paid) or 0); stats.unpaid=stats.unpaid+(tonumber(res.shortfall) or 0)
-    state.stats.matched=(state.stats.matched or 0)+1; state.stats.charged=(state.stats.charged or 0)+(tonumber(res.paid) or 0); state.stats.unpaid=(state.stats.unpaid or 0)+(tonumber(res.shortfall) or 0)
-    setMsg("Charged "..tostring(name).." "..money(res.paid or 0).." for 1x "..item,colors.lime)
-  else
-    state.stock_pool[item]=(state.stock_pool[item] or 0)+1
-    setMsg("Meal payment failed: "..tostring(res),colors.red)
+
+local function stockStats(t)
+  local kinds, units = 0, 0
+  for _, q in pairs(t or {}) do
+    if (tonumber(q) or 0) > 0 then
+      kinds = kinds + 1
+      units = units + (tonumber(q) or 0)
+    end
+  end
+  return kinds, units
+end
+
+local function unitPrice(item)
+  local id = lower(item)
+  if id:find("golden_carrot", 1, true) or id:find("cake", 1, true) or id:find("rabbit_stew", 1, true) then return 4 end
+  if id:find("steak", 1, true) or id:find("cooked_beef", 1, true) or id:find("cooked_porkchop", 1, true) or id:find("cooked_salmon", 1, true) then return 3 end
+  if id:find("cooked_", 1, true) or id:find("bread", 1, true) or id:find("pie", 1, true) or id:find("stew", 1, true) or id:find("soup", 1, true) then return 2 end
+  return 1
+end
+
+local function stockLoss(old, new)
+  local losses, total_qty, total_value = {}, 0, 0
+
+  for item, oldQty in pairs(old or {}) do
+    local newQty = tonumber((new or {})[item]) or 0
+    oldQty = tonumber(oldQty) or 0
+
+    if newQty < oldQty then
+      local qty = oldQty - newQty
+      local unit = unitPrice(item)
+      losses[#losses + 1] = { item = item, qty = qty, unit = unit, value = qty * unit }
+      total_qty = total_qty + qty
+      total_value = total_value + (qty * unit)
+    end
+  end
+
+  return losses, total_qty, total_value
+end
+
+local function summary(losses)
+  local out = {}
+  for _, l in ipairs(losses or {}) do
+    out[#out + 1] = tostring(l.qty) .. "x " .. tostring(l.item)
+  end
+  if #out == 0 then return "meal" end
+  return table.concat(out, ", ")
+end
+
+local function citizenMap(rows)
+  local out = {}
+  for _, z in ipairs(rows or {}) do
+    if z.citizen_id then
+      out[z.citizen_id] = {
+        name = z.display_name or z.citizen_id,
+        saturation = tonumber(z.saturation) or 0,
+      }
+    end
+  end
+  return out
+end
+
+local function updateSaturationEvents(old, new)
+  local t = now()
+
+  for id, z in pairs(new or {}) do
+    local p = (old or {})[id]
+    if p then
+      local delta = (tonumber(z.saturation) or 0) - (tonumber(p.saturation) or 0)
+      if delta >= SAT_DELTA_MIN then
+        sat_events[#sat_events + 1] = {
+          time = t,
+          citizen_id = id,
+          name = z.name,
+          delta = delta,
+        }
+      end
+    end
+  end
+
+  local keep = {}
+  local max_age = (MATCH_WINDOW_SECONDS + EAT_DELAY_SECONDS + 4) * 1000
+  for _, ev in ipairs(sat_events) do
+    if t - ev.time <= max_age then keep[#keep + 1] = ev end
+  end
+  sat_events = keep
+  stats.sat_events = #sat_events
+end
+
+local function findLastSat(start_ms, end_ms)
+  local best = nil
+  for _, ev in ipairs(sat_events) do
+    if ev.time >= start_ms and ev.time <= end_ms then
+      if not best or ev.time > best.time then best = ev end
+    end
+  end
+  return best
+end
+
+local function processPending()
+  local t = now()
+  local keep = {}
+
+  for _, p in ipairs(pending_food) do
+    if t >= p.due then
+      local ev = findLastSat(p.detected_at, p.due + (MATCH_WINDOW_SECONDS * 1000))
+
+      if ev and obs and obs.company_id then
+        local amount = math.max(1, math.floor(p.value or 1))
+        local ok, res = bankReq({
+          type = "hospitality_meal_payment",
+          citizen_id = ev.citizen_id,
+          company_id = obs.company_id,
+          amount = amount,
+          item = p.summary,
+          memo = "Dining Hall meal: " .. p.summary,
+        }, 6)
+
+        if ok and type(res) == "table" then
+          stats.matched = stats.matched + 1
+          stats.charged = stats.charged + (tonumber(res.paid) or 0)
+          stats.unpaid = stats.unpaid + (tonumber(res.shortfall) or 0)
+          setMsg("Charged " .. tostring(ev.name) .. " " .. money(res.paid or 0) .. " for " .. p.summary, colors.lime)
+        else
+          setMsg("Meal payment failed: " .. tostring(res), colors.red)
+          keep[#keep + 1] = p
+        end
+      else
+        stats.unattributed = stats.unattributed + (tonumber(p.qty) or 0)
+        setMsg("Food decrease had no saturation match: " .. p.summary, colors.orange)
+      end
+    else
+      keep[#keep + 1] = p
+    end
+  end
+
+  pending_food = keep
+  stats.pending = #pending_food
+end
+
+local function poll()
+  local ok, res = bankReq({ type = "get_service_observations", service_key = SERVICE_KEY }, 6)
+  if not ok then
+    setMsg("No service observation: " .. tostring(res), colors.red)
+    return
+  end
+
+  obs = res.observation or res
+
+  stats.citizens_seen = tonumber(obs.citizens_seen) or 0
+  stats.payroll_employee_count = tonumber(obs.payroll_employee_count) or #(obs.payroll_employees or {})
+  stats.employees_seen_live = tonumber(obs.employees_seen_live) or #(obs.citizens or {})
+  stats.employee_inventory_sources = tonumber(obs.employee_inventory_sources or obs.citizen_inventory_sources) or 0
+
+  local st = stockCopy(obs.dining_stock or {})
+  local cits = citizenMap(obs.citizens or {})
+
+  updateSaturationEvents(prev_citizens, cits)
+
+  if prev_stock then
+    local losses, qty, value = stockLoss(prev_stock, st)
+    stats.last_loss = qty
+
+    if qty > 0 then
+      pending_food[#pending_food + 1] = {
+        detected_at = now(),
+        due = now() + (EAT_DELAY_SECONDS * 1000),
+        losses = losses,
+        qty = qty,
+        value = math.max(1, value),
+        summary = summary(losses),
+      }
+      setMsg("Employee stock decrease: " .. summary(losses), colors.yellow)
+    end
+  end
+
+  prev_stock = st
+  prev_citizens = cits
+  stats.stock_kinds, stats.stock_units = stockStats(st)
+
+  processPending()
+end
+
+local function cls()
+  term.setCursorBlink(false)
+  term.setBackgroundColor(colors.black)
+  term.setTextColor(colors.white)
+  term.clear()
+  term.setCursorPos(1, 1)
+end
+
+local function at(x, y, text, fg, bg)
+  local W, H = term.getSize()
+  if y < 1 or y > H then return end
+  term.setCursorPos(x, y)
+  term.setTextColor(fg or colors.white)
+  term.setBackgroundColor(bg or colors.black)
+  term.write(tostring(text or ""):sub(1, W - x + 1))
+end
+
+local function fill(x, y, w, h, bg)
+  term.setBackgroundColor(bg or colors.black)
+  local row = string.rep(" ", math.max(0, w))
+  for yy = y, y + h - 1 do
+    term.setCursorPos(x, yy)
+    term.write(row)
   end
 end
-local function handleSaturationChanges(old,new)
-  for id,z in pairs(new or {}) do
-    local p=(old or {})[id]
-    if p then
-      local delta=(tonumber(z.saturation) or 0)-(tonumber(p.saturation) or 0)
-      if delta>=SAT_DELTA_MIN then
-        local key=id..":"..tostring(os.day and os.day() or 0)..":"..tostring(math.floor(now()/1000))
-        if not state.charged_sat[key] then
-          state.charged_sat[key]=true
-          stats.sat_events=stats.sat_events+1
-          chargeForSaturation(id,z.name,delta)
-        end
+
+local function button(x, y, w, label, bg, fg)
+  fill(x, y, w, 1, bg or colors.gray)
+  at(x + math.floor((w - #label) / 2), y, label, fg or colors.white, bg or colors.gray)
+  return { x1 = x, x2 = x + w - 1, y1 = y, y2 = y }
+end
+
+local function hit(b, x, y)
+  return b and x >= b.x1 and x <= b.x2 and y >= b.y1 and y <= b.y2
+end
+
+local function draw()
+  local W, H = term.getSize()
+  cls()
+  fill(1, 1, W, 1, colors.purple)
+  at(2, 1, "SERVICE PAYMENT TERMINAL", colors.white, colors.purple)
+  at(math.max(2, W - #VERSION), 1, VERSION, colors.lightGray, colors.purple)
+
+  at(2, 3, "Source:       CBI payroll employees -> Bank", colors.white)
+  at(2, 4, "Bank:         " .. tostring(db_id or "not connected"), db_id and colors.lime or colors.red)
+  at(2, 5, "Company:      " .. tostring(obs and (obs.company_name or obs.company_id) or "unknown"), (obs and obs.company_id) and colors.lime or colors.red)
+  at(2, 6, "Company src:  " .. tostring(obs and obs.company_source or "none"), colors.lightGray)
+  at(2, 7, "Employee src: " .. tostring(obs and obs.employee_source or "none"), colors.lightGray)
+
+  at(2, 9,  "Citizens seen:       " .. tostring(stats.citizens_seen), stats.citizens_seen > 0 and colors.lime or colors.orange)
+  at(2, 10, "Payroll employees:   " .. tostring(stats.payroll_employee_count), stats.payroll_employee_count > 0 and colors.lime or colors.orange)
+  at(2, 11, "Employees live seen: " .. tostring(stats.employees_seen_live), stats.employees_seen_live > 0 and colors.lime or colors.orange)
+  at(2, 12, "Employee inv sources:" .. tostring(stats.employee_inventory_sources), stats.employee_inventory_sources > 0 and colors.lime or colors.orange)
+  at(2, 13, "Stock kinds/units:   " .. tostring(stats.stock_kinds) .. " / " .. tostring(stats.stock_units), stats.stock_units > 0 and colors.lime or colors.orange)
+  at(2, 14, "Last stock decrease: " .. tostring(stats.last_loss), stats.last_loss > 0 and colors.yellow or colors.gray)
+  at(2, 15, "Saturation events:   " .. tostring(stats.sat_events), colors.cyan)
+
+  at(2, 17, "Matched: " .. tostring(stats.matched) .. "  Charged: " .. money(stats.charged) .. "  Unpaid: " .. money(stats.unpaid), colors.lime)
+  at(2, 18, "Unattributed:        " .. tostring(stats.unattributed), stats.unattributed > 0 and colors.orange or colors.gray)
+
+  local third = math.floor((W - 8) / 3)
+  local bScan = button(2, H - 3, third, "Poll Now", colors.purple)
+  local bAuto = button(4 + third, H - 3, third, auto_charge and "Auto Off" or "Auto On", colors.gray)
+  local bRecon = button(6 + third * 2, H - 3, third, "Reconnect", colors.gray)
+
+  at(2, H - 1, last_message, last_colour)
+  return bScan, bAuto, bRecon
+end
+
+local function main()
+  if not openModem() then
+    print("No modem found.")
+    return
+  end
+
+  discoverBank()
+  poll()
+
+  local bScan, bAuto, bRecon = draw()
+  local timer = os.startTimer(SCAN_SECONDS)
+
+  while true do
+    local ev, p1, p2, p3 = os.pullEvent()
+
+    if ev == "timer" and p1 == timer then
+      if auto_charge then poll() end
+      bScan, bAuto, bRecon = draw()
+      timer = os.startTimer(SCAN_SECONDS)
+
+    elseif ev == "mouse_click" then
+      if hit(bScan, p2, p3) then
+        poll()
+      elseif hit(bAuto, p2, p3) then
+        auto_charge = not auto_charge
+        setMsg("Auto " .. (auto_charge and "on" or "off"), colors.yellow)
+      elseif hit(bRecon, p2, p3) then
+        discoverBank()
+        setMsg("Reconnected.", colors.lime)
       end
+      bScan, bAuto, bRecon = draw()
+
+    elseif ev == "terminate" then
+      break
     end
   end
 end
 
-local function poll()
-  local ok,res=bankReq({type="get_service_observations",service_key=SERVICE_KEY},6)
-  if not ok then setMsg("No service observation: "..tostring(res),colors.red); return end
-  obs=res.observation or res
-  stats.citizens_seen=tonumber(obs.citizens_seen) or #(obs.citizens or {})
-  stats.citizen_inventory_sources=tonumber(obs.citizen_inventory_sources) or 0
-  stats.supply_events=#(obs.supply_events or {})
-  addSupplyEvents(obs.supply_events or {})
-  local cits=citizenMap(obs.citizens or {})
-  handleSaturationChanges(prev_citizens,cits)
-  prev_citizens=cits
-  stats.stock_kinds=poolKinds(); stats.stock_units=poolUnits()
-  stats.matched=state.stats.matched or stats.matched
-  stats.charged=state.stats.charged or stats.charged
-  stats.unpaid=state.stats.unpaid or stats.unpaid
-  stats.unattributed=state.stats.unattributed or stats.unattributed
-  saveState()
+local ok, err = pcall(main)
+if not ok then
+  term.setTextColor(colors.red)
+  print("Runtime error: " .. tostring(err))
 end
-
-local function cls() term.setCursorBlink(false); term.setBackgroundColor(colors.black); term.setTextColor(colors.white); term.clear(); term.setCursorPos(1,1) end
-local function at(x,y,text,fg,bg) local W,H=term.getSize(); if y<1 or y>H then return end; term.setCursorPos(x,y); term.setTextColor(fg or colors.white); term.setBackgroundColor(bg or colors.black); term.write(tostring(text or ""):sub(1,W-x+1)) end
-local function fill(x,y,w,h,bg) term.setBackgroundColor(bg or colors.black); local row=string.rep(" ",w); for yy=y,y+h-1 do term.setCursorPos(x,yy); term.write(row) end end
-local function button(x,y,w,label,bg,fg) fill(x,y,w,1,bg or colors.gray); at(x+math.floor((w-#label)/2),y,label,fg or colors.white,bg or colors.gray); return {x1=x,x2=x+w-1,y1=y,y2=y} end
-local function hit(b,x,y) return b and x>=b.x1 and x<=b.x2 and y>=b.y1 and y<=b.y2 end
-local function draw()
-  local W,H=term.getSize(); cls(); fill(1,1,W,1,colors.purple)
-  at(2,1,"SERVICE PAYMENT TERMINAL",colors.white,colors.purple); at(math.max(2,W-#VERSION),1,VERSION,colors.lightGray,colors.purple)
-  at(2,3,"Source:       CBI -> Bank service observations",colors.white)
-  at(2,4,"Bank:         "..tostring(db_id or "not connected"),db_id and colors.lime or colors.red)
-  at(2,5,"Company:      "..tostring(obs and (obs.company_name or obs.company_id) or "unknown"),(obs and obs.company_id) and colors.lime or colors.red)
-  at(2,6,"Company src:  "..tostring(obs and obs.company_source or "none"),colors.lightGray)
-  at(2,8,"Citizens seen:       "..tostring(stats.citizens_seen),stats.citizens_seen>0 and colors.lime or colors.orange)
-  at(2,9,"Citizen inv sources: "..tostring(stats.citizen_inventory_sources),stats.citizen_inventory_sources>0 and colors.lime or colors.orange)
-  at(2,10,"Supply events:       "..tostring(stats.supply_events),stats.supply_events>0 and colors.lime or colors.orange)
-  at(2,11,"Local stock pool:    "..tostring(stats.stock_kinds).." / "..tostring(stats.stock_units),stats.stock_units>0 and colors.lime or colors.orange)
-  at(2,12,"Saturation events:   "..tostring(stats.sat_events),colors.cyan)
-  at(2,14,"Matched: "..tostring(stats.matched).."  Charged: "..money(stats.charged).."  Unpaid: "..money(stats.unpaid),colors.lime)
-  at(2,15,"Unattributed:        "..tostring(stats.unattributed),stats.unattributed>0 and colors.orange or colors.gray)
-  local third=math.floor((W-8)/3)
-  local bScan=button(2,H-3,third,"Poll Now",colors.purple)
-  local bAuto=button(4+third,H-3,third,auto_charge and "Auto Off" or "Auto On",colors.gray)
-  local bRecon=button(6+third*2,H-3,third,"Reconnect",colors.gray)
-  at(2,H-1,last_message,last_colour)
-  return bScan,bAuto,bRecon
-end
-local function main()
-  loadState()
-  if not openModem() then print("No modem found."); return end
-  discoverBank(); poll()
-  local bScan,bAuto,bRecon=draw(); local timer=os.startTimer(2)
-  while true do
-    local ev,p1,p2,p3=os.pullEvent()
-    if ev=="timer" and p1==timer then if auto_charge then poll() end; bScan,bAuto,bRecon=draw(); timer=os.startTimer(2)
-    elseif ev=="mouse_click" then if hit(bScan,p2,p3) then poll() elseif hit(bAuto,p2,p3) then auto_charge=not auto_charge; setMsg("Auto "..(auto_charge and "on" or "off"),colors.yellow) elseif hit(bRecon,p2,p3) then discoverBank(); setMsg("Reconnected.",colors.lime) end; bScan,bAuto,bRecon=draw()
-    elseif ev=="terminate" then saveState(); break end
-  end
-end
-local ok,err=pcall(main); if not ok then term.setTextColor(colors.red); print("Runtime error: "..tostring(err)) end
