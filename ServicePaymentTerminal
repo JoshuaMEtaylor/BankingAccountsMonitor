@@ -48,7 +48,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION = "1.0.5-FIX-GETBUILDINGS-SCOPE"
+local VERSION = "1.0.6-NO-GETBUILDINGS-HELPER"
 local BANK_PROTOCOL = "quid_bank"
 local DB_TIMEOUT = 5
 
@@ -347,13 +347,6 @@ local function hospitalityCompany()
   return "company:hrth", "Hospitality"
 end
 
-local function getBuildings()
-  if not colony or not colony.getBuildings then return {} end
-  local ok, b = pcall(colony.getBuildings)
-  if ok and type(b) == "table" then return b end
-  return {}
-end
-
 local function isHospitalityBuilding(b)
   local t = normalType(b and (b.type or b.name) or "")
   local n = normalType(b and b.name or "")
@@ -369,11 +362,22 @@ end
 
 local function hospitalityBuildings()
   local out = {}
-  for _, b in ipairs(getBuildings()) do
+
+  if not colony or not colony.getBuildings then
+    return out
+  end
+
+  local ok, buildings = pcall(colony.getBuildings)
+  if not ok or type(buildings) ~= "table" then
+    return out
+  end
+
+  for _, b in ipairs(buildings) do
     if isHospitalityBuilding(b) then
       out[#out + 1] = b
     end
   end
+
   return out
 end
 
