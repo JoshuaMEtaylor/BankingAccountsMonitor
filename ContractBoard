@@ -10,8 +10,7 @@
 --   * View contract details and required items
 --   * Claim contracts as a citizen or company
 --
--- This does NOT pay contracts yet.
--- Escrow/payment release comes after the posting/claim flow is proven.
+-- Can complete claimed/pending contracts. ContractServer handles payout.
 -- =============================================================================
 
 local args = {...}
@@ -50,7 +49,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION    = "1.0.3"
+local VERSION    = "1.0.4-COMPLETE-CONTRACTS"
 local PROTOCOL   = "quid_contracts"
 local DB_TIMEOUT = 5
 
@@ -338,7 +337,7 @@ local function detailScreen(c)
 
     local items = c.items or {}
     local start = scroll + 1
-    local maxRows = H - 14
+    local maxRows = H - 15
 
     for i = start, math.min(#items, start + maxRows - 1) do
       local item = items[i]
@@ -347,13 +346,27 @@ local function detailScreen(c)
     end
 
     if c.claimed_by then
-      at(4, H - 6, "Claimed by: " .. tostring(c.claimed_by), C.warn, C.card)
+      at(4, H - 7, "Claimed by: " .. tostring(c.claimed_by), C.warn, C.card)
+    end
+    if c.pending_reason then
+      at(4, H - 6, "Pending: " .. tostring(c.pending_reason):sub(1, W - 10), C.warn, C.card)
+    elseif c.payout_status then
+      at(4, H - 6, "Payout: " .. tostring(c.payout_status), c.payout_status == "paid" and C.ok or C.warn, C.card)
+    end
+
+    local action = "Claim"
+    if c.status == "claimed" or c.status == "pending_completion" or c.status == "pending_payout" then
+      action = "Complete"
+    elseif c.status == "fulfilled" then
+      action = "Done"
+    elseif c.status == "cancelled" then
+      action = "Closed"
     end
 
     local third = math.floor((W - 10) / 3)
     local bBack = button(4, H - 2, third, "Back", C.btn_sec, C.card_fg)
     local bUp   = button(5 + third, H - 2, third, "Scroll", C.btn_sec, C.card_fg)
-    local bClaim = button(10 + (third * 2), H - 2, third, "Claim", C.btn_pri, C.btn_fg)
+    local bAction = button(10 + (third * 2), H - 2, third, action, C.btn_pri, C.btn_fg)
 
     statusBar()
 
@@ -366,10 +379,27 @@ local function detailScreen(c)
           if scroll >= #items then scroll = 0 end
         end
       end
-      if hit(bClaim, p2, p3) then
-        return "claim"
+      if hit(bAction, p2, p3) then
+        if action == "Claim" then return "claim" end
+        if action == "Complete" then return "complete" end
       end
     end
+  end
+end
+
+local function completeContract(c)
+  if not c then return end
+  local ok, res = contractRequest({
+    type = "mark_fulfilled",
+    contract_id = c.contract_id,
+    note = "Completed from ContractBoard after in-game fulfilment.",
+  }, 8)
+
+  if ok then
+    setMessage("Completed and paid " .. tostring(c.contract_id), C.ok)
+    refreshContracts()
+  else
+    setMessage("Complete failed: " .. tostring(res), C.err)
   end
 end
 
@@ -458,8 +488,8 @@ end
 -- MAIN DRAW
 -- =============================================================================
 local function drawTabs(y)
-  local tabs = { "Open", "Claimed", "Fulfilled", "All" }
-  local values = { "open", "claimed", "fulfilled", "all" }
+  local tabs = { "Open", "Claimed", "Pending", "Fulfilled", "All" }
+  local values = { "open", "claimed", "pending_completion", "fulfilled", "all" }
   local tw = math.floor((W - 2) / #tabs)
   local buttons = {}
 
@@ -568,6 +598,8 @@ local function screenMain()
         local next = detailScreen(c)
         if next == "claim" then
           claimScreen(c)
+        elseif next == "complete" then
+          completeContract(c)
         end
       elseif hit(bRefresh, mx, my) then
         refreshContracts()
