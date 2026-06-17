@@ -44,7 +44,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION = "1.2.3-PRICE-SHOCK-FALLBACK"
+local VERSION = "1.2.4-ZERO-BASE-PRICE-FALLBACK"
 local BANK_PROTOCOL = "quid_bank"
 local TARGET_COMPANY = "company:grki"
 
@@ -62,10 +62,9 @@ local FULL_GAIN = 13.00
 local BASE_NORMAL_MEAL_PRICE = 2.00
 local MIN_CHARGE = 1
 
--- Immediate visible inflation fallback. The bank-side v1.4.4 oracle also uses
--- this as its default price-pressure floor. This terminal only uses it when the
--- bank oracle cannot be reached, so meals do not silently fall back to x1.000.
-local LOCAL_PRICE_PRESSURE_FLOOR = 0.26
+-- Local fallback has no built-in inflation. If the bank oracle is unreachable,
+-- use base meal prices rather than inventing a permanent starter shock.
+local LOCAL_PRICE_PRESSURE_FLOOR = 0.00
 local LOCAL_GENERAL_SENSITIVITY = 1.00
 local LOCAL_FOOD_SENSITIVITY = 1.40
 local LOCAL_FOOD_BIAS = 0.05
@@ -335,7 +334,7 @@ end
 local function refreshPricing()
   if not db_id then discoverBank() end
   if not db_id then
-    applyLocalPriceShock("no_bank_local_price_shock")
+    applyLocalPriceShock("no_bank_zero_base_fallback")
     return false
   end
 
@@ -357,7 +356,7 @@ local function refreshPricing()
   end
 
   if not gotOracle then
-    applyLocalPriceShock("oracle_unavailable_price_shock")
+    applyLocalPriceShock("oracle_unavailable_zero_base_fallback")
   end
 
   ok, res = bankReq({ type = "quote_service_price", service = "dining_meal", tier = "normal meal" }, 4)
