@@ -32,7 +32,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION = "1.0.15-DINING-SUPPLY-EVENTS"
+local VERSION = "1.0.16-SERVICE-FUNCTION-SCOPE-FIX"
 local BANK_PROTOCOL = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT = 5
@@ -1444,49 +1444,6 @@ local function syncStaleContracts(active_keys)
   end
 end
 
-local function scanRequests(requests, citizens)
-  local active_keys = {}
-  local active_dining_keys = {}
-
-  for _, req in ipairs(requests or {}) do
-    stats.requests_seen = stats.requests_seen + 1
-
-    local business = resolveBusiness(req, citizens)
-    if not business then
-      stats.skipped_unmapped = stats.skipped_unmapped + 1
-    else
-      local provisional_items = {}
-      local key = reqKey(req, provisional_items, business)
-      local fixed_quantity, min_q, max_q = chooseContractQuantity(req, key)
-      local items = extractItems(req, fixed_quantity)
-
-      if #items > 0 then
-        local reward, reason, bal = priceJob(business, items)
-        if reward then
-          local posted_ok, active_key = postContract(req, business, items, reward, fixed_quantity, min_q, max_q, key)
-          if posted_ok and active_key then
-            active_keys[active_key] = true
-            if serviceIsDiningRequest(req, business, items) then
-              active_dining_keys[active_key] = true
-              serviceRememberDiningRequest(active_key, req, business, items, fixed_quantity)
-            end
-          end
-        else
-          stats.skipped_unfunded = stats.skipped_unfunded + 1
-          setMsg("Skipped " .. reqTitle(req, fixed_quantity) .. ": " .. tostring(reason) .. " (" .. money(bal) .. ")", colors.orange)
-        end
-      else
-        stats.skipped_unmapped = stats.skipped_unmapped + 1
-        setMsg("Skipped " .. reqTitle(req, fixed_quantity) .. ": no valid item list", colors.orange)
-      end
-    end
-  end
-
-  serviceFinalizeDiningRequests(active_dining_keys)
-  syncStaleContracts(active_keys)
-end
-
-
 -- =============================================================================
 -- SERVICE OBSERVATIONS
 -- =============================================================================
@@ -1729,6 +1686,50 @@ local function pushDiningServiceObservation(citizens)
   }, 4)
 
   return ok, res
+end
+
+
+
+local function scanRequests(requests, citizens)
+  local active_keys = {}
+  local active_dining_keys = {}
+
+  for _, req in ipairs(requests or {}) do
+    stats.requests_seen = stats.requests_seen + 1
+
+    local business = resolveBusiness(req, citizens)
+    if not business then
+      stats.skipped_unmapped = stats.skipped_unmapped + 1
+    else
+      local provisional_items = {}
+      local key = reqKey(req, provisional_items, business)
+      local fixed_quantity, min_q, max_q = chooseContractQuantity(req, key)
+      local items = extractItems(req, fixed_quantity)
+
+      if #items > 0 then
+        local reward, reason, bal = priceJob(business, items)
+        if reward then
+          local posted_ok, active_key = postContract(req, business, items, reward, fixed_quantity, min_q, max_q, key)
+          if posted_ok and active_key then
+            active_keys[active_key] = true
+            if serviceIsDiningRequest(req, business, items) then
+              active_dining_keys[active_key] = true
+              serviceRememberDiningRequest(active_key, req, business, items, fixed_quantity)
+            end
+          end
+        else
+          stats.skipped_unfunded = stats.skipped_unfunded + 1
+          setMsg("Skipped " .. reqTitle(req, fixed_quantity) .. ": " .. tostring(reason) .. " (" .. money(bal) .. ")", colors.orange)
+        end
+      else
+        stats.skipped_unmapped = stats.skipped_unmapped + 1
+        setMsg("Skipped " .. reqTitle(req, fixed_quantity) .. ": no valid item list", colors.orange)
+      end
+    end
+  end
+
+  serviceFinalizeDiningRequests(active_dining_keys)
+  syncStaleContracts(active_keys)
 end
 
 
