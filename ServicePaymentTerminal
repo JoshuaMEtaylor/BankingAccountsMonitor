@@ -2,7 +2,7 @@
 -- SERVICE PAYMENT TERMINAL
 -- ServicePaymentTerminal
 --
--- v1.2.2-WIDE-SECTOR-PRICE-ORACLE
+-- v1.2.3-PRICE-SHOCK-FALLBACK
 --
 -- Dining Hall / Restaurant point-of-sale for MineColonies citizens.
 --
@@ -44,7 +44,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION = "1.2.2-WIDE-SECTOR-PRICE-ORACLE"
+local VERSION = "1.2.3-PRICE-SHOCK-FALLBACK"
 local BANK_PROTOCOL = "quid_bank"
 local TARGET_COMPANY = "company:grki"
 
@@ -61,6 +61,14 @@ local FULL_GAIN = 13.00
 
 local BASE_NORMAL_MEAL_PRICE = 2.00
 local MIN_CHARGE = 1
+
+-- Immediate visible inflation fallback. The bank-side v1.4.4 oracle also uses
+-- this as its default price-pressure floor. This terminal only uses it when the
+-- bank oracle cannot be reached, so meals do not silently fall back to x1.000.
+local LOCAL_PRICE_PRESSURE_FLOOR = 0.26
+local LOCAL_GENERAL_SENSITIVITY = 1.00
+local LOCAL_FOOD_SENSITIVITY = 1.40
+local LOCAL_FOOD_BIAS = 0.05
 
 local STATE_FILE = "data/service_payment_state.db"
 local CONFIG_FILE = "data/service_payment_config.db"
@@ -177,6 +185,18 @@ local function roundMoney(n)
   if n <= 0 then return 0 end
   return math.max(MIN_CHARGE, math.floor(n + 0.5))
 end
+
+local function applyLocalPriceShock(reason)
+  local pressure = tonumber(LOCAL_PRICE_PRESSURE_FLOOR) or 0
+  if pressure < 0 then pressure = 0 end
+  pricing.general_index = math.max(1, 1 + (pressure * LOCAL_GENERAL_SENSITIVITY))
+  pricing.food_index = math.max(1, 1 + (pressure * LOCAL_FOOD_SENSITIVITY) + LOCAL_FOOD_BIAS)
+  pricing.effective_index = pricing.food_index
+  pricing.normal_meal = BASE_NORMAL_MEAL_PRICE * pricing.food_index
+  pricing.monetary_pressure = pressure
+  pricing.source = reason or "local_price_shock_fallback"
+end
+
 
 local function countTable(t)
   local n = 0
@@ -315,20 +335,17 @@ end
 local function refreshPricing()
   if not db_id then discoverBank() end
   if not db_id then
-    pricing.general_index = 1
-    pricing.food_index = 1
-    pricing.effective_index = 1
-    pricing.normal_meal = BASE_NORMAL_MEAL_PRICE
-    pricing.monetary_pressure = 0
-    pricing.source = "no_bank_local_base"
+    applyLocalPriceShock("no_bank_local_price_shock")
     return false
   end
 
   -- Safe to call repeatedly; the bank only advances when the Minecraft day moves.
   bankReq({ type = "tick_inflation", day = currentMinecraftDay() }, 4)
 
+  local gotOracle = false
   local ok, res = bankReq({ type = "get_price_indices" }, 4)
   if ok and type(res) == "table" and type(res.sectors) == "table" then
+    gotOracle = true
     local general = res.sectors.general or {}
     local food = res.sectors.food or res.sectors.hospitality or {}
     pricing.general_index = tonumber(general.index) or 1
@@ -337,6 +354,10 @@ local function refreshPricing()
     pricing.monetary_pressure = tonumber(food.monetary_pressure or general.monetary_pressure) or 0
     pricing.source = tostring(res.model or "wide_sector_price_oracle")
     if type(res.inflation) == "table" then inflation_state = res.inflation end
+  end
+
+  if not gotOracle then
+    applyLocalPriceShock("oracle_unavailable_price_shock")
   end
 
   ok, res = bankReq({ type = "quote_service_price", service = "dining_meal", tier = "normal meal" }, 4)
