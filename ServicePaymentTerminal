@@ -2,16 +2,23 @@
 -- SERVICE PAYMENT TERMINAL
 -- ServicePaymentTerminal
 --
--- v1.1.4-DIRECT-COLONY-EMPLOYEE-INVENTORY
+-- v1.2.0-SATURATION-INFLATION-POS
 --
--- This version is for a terminal that has its OWN colonyIntegrator attached.
+-- Dining Hall / Restaurant point-of-sale for MineColonies citizens.
 --
--- It uses:
---   1. local colonyIntegrator.getCitizens()
---   2. bank list_company_payroll_payees for company:grki
---   3. direct recursive scan of those employees' live citizen tables
+-- This does NOT try to read waiter/cook inventories. MineColonies keeps food on
+-- the worker, and the Colony Integrator does not expose that inventory in a
+-- useful way. Instead this terminal watches citizen saturation changes:
 --
--- It does not use local company mapping files or industry fallback state.
+--   hungry citizen near Dining Hall + saturation gain = inferred meal served
+--
+-- Price is calculated from:
+--   1. saturation gain tier, as the quantity/meal-size proxy
+--   2. bank inflation price_index
+--   3. food-basket prices from the bank price table when available
+--
+-- Payment route:
+--   citizen account -> company:grki via bank hospitality_meal_payment endpoint
 -- =============================================================================
 
 local args = {...}
@@ -34,42 +41,91 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION = "1.1.4-DIRECT-COLONY-EMPLOYEE-INVENTORY"
+-- =============================================================================
+-- CONFIG
+-- =============================================================================
+local VERSION = "1.2.0-SATURATION-INFLATION-POS"
 local BANK_PROTOCOL = "quid_bank"
 local TARGET_COMPANY = "company:grki"
 
 local SCAN_SECONDS = 2
-local EAT_DELAY_SECONDS = 2
-local MATCH_WINDOW_SECONDS = 6
-local SAT_DELTA_MIN = 0.50
+local DINING_RADIUS = 28
+local NEAR_GRACE_SECONDS = 25
+local MEAL_COOLDOWN_SECONDS = 150
 
+local MIN_SAT_GAIN = 2.00
+local SMALL_GAIN = 2.00
+local NORMAL_GAIN = 5.00
+local LARGE_GAIN = 9.00
+local FULL_GAIN = 13.00
+
+local BASE_NORMAL_MEAL_PRICE = 2.00
+local MIN_CHARGE = 1
+
+local STATE_FILE = "data/service_payment_state.db"
+local CONFIG_FILE = "data/service_payment_config.db"
+
+-- Food-basket values are base-period Quid values. If the bank has a live price
+-- for one of these items, the live price is used. Otherwise the base price is
+-- inflated by the bank's general price_index.
+local FOOD_BASKET = {
+  { item = "bread",             base = 1.00, weight = 4 },
+  { item = "baked_potato",      base = 0.80, weight = 4 },
+  { item = "carrot",            base = 0.50, weight = 3 },
+  { item = "cooked_beef",       base = 2.50, weight = 2 },
+  { item = "steak",             base = 2.50, weight = 2 },
+  { item = "cooked_porkchop",   base = 2.30, weight = 2 },
+  { item = "cooked_chicken",    base = 2.00, weight = 2 },
+  { item = "cooked_mutton",     base = 2.00, weight = 2 },
+  { item = "cooked_cod",        base = 1.60, weight = 2 },
+  { item = "cooked_salmon",     base = 1.80, weight = 2 },
+}
+
+-- =============================================================================
+-- RUNTIME
+-- =============================================================================
 local db_id = nil
 local colony = nil
 local auto_charge = true
 local last_message = "Booting..."
 local last_colour = colors.lightGray
+local W, H = term.getSize()
 
-local prev_stock = nil
-local prev_citizens = nil
-local pending_food = {}
-local sat_events = {}
+local prices = {}
+local inflation_state = {}
+local pricing = {
+  general_index = 1.00,
+  food_index = 1.00,
+  effective_index = 1.00,
+  normal_meal = BASE_NORMAL_MEAL_PRICE,
+  live_food_prices = 0,
+}
+
+local state = {
+  citizens = {},       -- [citizen_id] = { name, sat, near_at, last_charge_at }
+  receivables = {},    -- local note only, bank does not enforce this yet
+  events = {},         -- recent local event history
+}
 
 local stats = {
   citizens_seen = 0,
-  payroll_employees = 0,
-  employees_live_seen = 0,
-  employee_inv_sources = 0,
-  stock_kinds = 0,
-  stock_units = 0,
-  last_loss = 0,
-  pending = 0,
-  sat_events = 0,
-  matched = 0,
+  dining_buildings = 0,
+  near_dining = 0,
+  saturation_rises = 0,
+  meals_charged = 0,
   charged = 0,
   unpaid = 0,
-  unattributed = 0,
+  skipped_cooldown = 0,
+  skipped_not_near = 0,
+  skipped_small_gain = 0,
+  pricing_refreshes = 0,
+  last_gain = 0,
+  last_charge = 0,
 }
 
+-- =============================================================================
+-- BASIC HELPERS
+-- =============================================================================
 local function now()
   return os.epoch("utc")
 end
@@ -78,9 +134,45 @@ local function lower(s)
   return string.lower(tostring(s or ""))
 end
 
+local function trim(s)
+  return tostring(s or ""):match("^%s*(.-)%s*$")
+end
+
 local function setMsg(msg, col)
   last_message = tostring(msg or "")
   last_colour = col or colors.lightGray
+end
+
+local function ensureDir(path)
+  local parts = {}
+  for p in string.gmatch(path, "[^/]+") do parts[#parts + 1] = p end
+  table.remove(parts)
+  local cur = ""
+  for _, p in ipairs(parts) do
+    cur = cur == "" and p or (cur .. "/" .. p)
+    if not fs.exists(cur) then fs.makeDir(cur) end
+  end
+end
+
+local function readFile(path)
+  if not fs.exists(path) then return nil end
+  local f = fs.open(path, "r")
+  if not f then return nil end
+  local text = f.readAll()
+  f.close()
+  if not text or text == "" then return nil end
+  local ok, data = pcall(textutils.unserialize, text)
+  if ok then return data end
+  return nil
+end
+
+local function writeFile(path, data)
+  ensureDir(path)
+  local f = fs.open(path, "w")
+  if not f then return false end
+  f.write(textutils.serialize(data))
+  f.close()
+  return true
 end
 
 local function money(n)
@@ -90,24 +182,98 @@ local function money(n)
   return sign .. tostring(math.floor(n + 0.5)) .. " Q"
 end
 
+local function roundMoney(n)
+  n = tonumber(n) or 0
+  if n <= 0 then return 0 end
+  return math.max(MIN_CHARGE, math.floor(n + 0.5))
+end
+
+local function countTable(t)
+  local n = 0
+  for _ in pairs(t or {}) do n = n + 1 end
+  return n
+end
+
 local function simpleItemName(name)
-  name = tostring(name or "")
+  name = lower(name)
   name = name:gsub("^minecraft:", "")
   name = name:gsub("^minecolonies:", "")
   name = name:gsub("^%w+:", "")
-  return lower(name)
+  return name
 end
 
-local function isCoalOrCharcoal(item)
-  local id = simpleItemName(item)
-  return id == "coal"
-    or id == "charcoal"
-    or id == "coal_block"
-    or id == "block_of_coal"
-    or id:find("coal_block", 1, true)
-    or id:find("charcoal", 1, true)
+local function normalType(t)
+  t = tostring(t or "")
+  t = t:gsub("com%.minecolonies%.building%.", "")
+  t = t:gsub("com%.minecolonies%.job%.", "")
+  t = t:gsub("[^%w_%-]", "")
+  return lower(t)
 end
 
+local function currentMinecraftDay()
+  if os.day then return math.floor(tonumber(os.day()) or 0) end
+  return math.floor(now() / 1200000)
+end
+
+local function getPos(v)
+  if type(v) ~= "table" then return nil end
+
+  local src = v.location or v.position or v.pos or v.loc or v.blockPos or v.homeLocation or nil
+  if type(src) == "table" then
+    local x = tonumber(src.x or src.X or src[1])
+    local y = tonumber(src.y or src.Y or src[2])
+    local z = tonumber(src.z or src.Z or src[3])
+    if x and y and z then return { x = x, y = y, z = z } end
+  end
+
+  local x = tonumber(v.x or v.X or v[1])
+  local y = tonumber(v.y or v.Y or v[2])
+  local z = tonumber(v.z or v.Z or v[3])
+  if x and y and z then return { x = x, y = y, z = z } end
+
+  return nil
+end
+
+local function dist(a, b)
+  if not a or not b then return 999999 end
+  local dx = (tonumber(a.x) or 0) - (tonumber(b.x) or 0)
+  local dy = (tonumber(a.y) or 0) - (tonumber(b.y) or 0)
+  local dz = (tonumber(a.z) or 0) - (tonumber(b.z) or 0)
+  return math.sqrt((dx * dx) + (dy * dy) + (dz * dz))
+end
+
+local function citizenStableId(z)
+  if type(z) ~= "table" then return nil end
+  local id = z.id or z.citizen_id or z.citizenId or z.uuid or z.name
+  if id == nil then return nil end
+  return tostring(id)
+end
+
+local function citizenUsername(z)
+  local id = citizenStableId(z)
+  if not id then return nil end
+  id = id:gsub("[^%w_%-]", "_")
+  if id:find("^mc_") then return id end
+  return "mc_" .. id
+end
+
+local function citizenAccountId(z)
+  local u = citizenUsername(z)
+  if not u then return nil end
+  return "citizen:" .. u
+end
+
+local function citizenName(z, fallback)
+  return tostring(z and (z.name or z.display_name or z.displayName) or fallback or "citizen")
+end
+
+local function citizenSaturation(z)
+  return tonumber(z and (z.saturation or z.food or z.foodLevel or z.food_level) or 0) or 0
+end
+
+-- =============================================================================
+-- NETWORK / PERIPHERALS
+-- =============================================================================
 local function openModem()
   for _, n in ipairs(peripheral.getNames()) do
     if peripheral.getType(n) == "modem" then
@@ -153,70 +319,114 @@ local function bankReq(req, timeout)
   end
 end
 
-local function citizenStableId(z)
-  if type(z) ~= "table" then return nil end
-  local id = z.id or z.citizen_id or z.citizenId or z.uuid or z.name
-  if id == nil then return nil end
-  return tostring(id)
-end
-
-local function citizenUsername(z)
-  local id = citizenStableId(z)
-  if not id then return nil end
-  id = id:gsub("[^%w_%-]", "_")
-  if id:find("^mc_") then return id end
-  return "mc_" .. id
-end
-
-local function citizenAccountId(z)
-  local u = citizenUsername(z)
-  if not u then return nil end
-  return "citizen:" .. u
-end
-
-local function serviceSaturation(z)
-  return tonumber(z and (z.saturation or z.food or z.foodLevel or z.food_level) or 0) or 0
-end
-
-local function scanValueForInventory(v, counts, depth, seen)
-  if type(v) ~= "table" then return end
-  depth = depth or 0
-  if depth > 7 then return end
-  seen = seen or {}
-  if seen[v] then return end
-  seen[v] = true
-
-  local item_name = v.name or v.item or v.id or v.item_id or v.itemName or v.displayName or v.display
-  local qty = v.count or v.qty or v.amount or v.size or v.quantity
-
-  if item_name ~= nil and qty ~= nil then
-    qty = tonumber(qty) or 0
-    if qty > 0 and not isCoalOrCharcoal(item_name) then
-      local id = simpleItemName(item_name)
-      counts[id] = (counts[id] or 0) + qty
-    end
-  end
-
-  local keys = {
-    "inventory", "items", "stacks", "contents", "mainInventory",
-    "main_inventory", "heldItems", "held_items", "food", "foods",
-    "slots", "backpack", "equipment", "armor", "offhand",
-    "hand", "mainHand", "mainhand", "heldItem", "held_item"
+-- =============================================================================
+-- PRICING
+-- =============================================================================
+local function priceLookup(item)
+  item = simpleItemName(item)
+  local candidates = {
+    item,
+    "minecraft:" .. item,
+    item:gsub("_", " "),
   }
 
-  for _, k in ipairs(keys) do
-    if type(v[k]) == "table" then
-      scanValueForInventory(v[k], counts, depth + 1, seen)
+  for _, key in ipairs(candidates) do
+    local rec = prices[key]
+    if type(rec) == "table" then
+      local p = tonumber(rec.unit_price or rec.price or rec.value)
+      if p and p > 0 then return p end
+    elseif tonumber(rec) and tonumber(rec) > 0 then
+      return tonumber(rec)
     end
   end
 
-  for k, child in pairs(v) do
-    if type(k) == "number" and type(child) == "table" then
-      scanValueForInventory(child, counts, depth + 1, seen)
-    end
-  end
+  return nil
 end
 
+local function computeFoodIndex(general_index)
+  general_index = tonumber(general_index) or 1
+  if general_index <= 0 then general_index = 1 end
+
+  local base_total = 0
+  local current_total = 0
+  local live = 0
+
+  for _, row in ipairs(FOOD_BASKET) do
+    local base = tonumber(row.base) or 1
+    local weight = tonumber(row.weight) or 1
+    local p = priceLookup(row.item)
+    base_total = base_total + (base * weight)
+
+    if p then
+      current_total = current_total + (p * weight)
+      live = live + 1
+    else
+      current_total = current_total + (base * general_index * weight)
+    end
+  end
+
+  if base_total <= 0 then return general_index, live end
+  return current_total / base_total, live
+end
+
+local function refreshPricing()
+  if not db_id then discoverBank() end
+  if not db_id then
+    pricing.general_index = 1
+    pricing.food_index = 1
+    pricing.effective_index = 1
+    pricing.normal_meal = BASE_NORMAL_MEAL_PRICE
+    return false
+  end
+
+  -- Safe to call repeatedly; the bank only advances when the Minecraft day moves.
+  bankReq({ type = "tick_inflation", day = currentMinecraftDay() }, 4)
+
+  local ok, res = bankReq({ type = "get_inflation_state" }, 4)
+  if ok and type(res) == "table" and type(res.state) == "table" then
+    inflation_state = res.state
+  end
+
+  ok, res = bankReq({ type = "get_prices" }, 4)
+  if ok and type(res) == "table" and type(res.prices) == "table" then
+    prices = res.prices
+  end
+
+  local general = tonumber(inflation_state.price_index) or 1
+  if general <= 0 then general = 1 end
+
+  local food_index, live = computeFoodIndex(general)
+  local effective = math.max(general, food_index)
+  if effective <= 0 then effective = 1 end
+
+  pricing.general_index = general
+  pricing.food_index = food_index
+  pricing.effective_index = effective
+  pricing.normal_meal = BASE_NORMAL_MEAL_PRICE * effective
+  pricing.live_food_prices = live
+  stats.pricing_refreshes = stats.pricing_refreshes + 1
+  return true
+end
+
+local function mealTierForGain(gain)
+  gain = tonumber(gain) or 0
+  if gain >= FULL_GAIN then return 2.00, "full refill" end
+  if gain >= LARGE_GAIN then return 1.50, "large meal" end
+  if gain >= NORMAL_GAIN then return 1.00, "normal meal" end
+  if gain >= SMALL_GAIN then return 0.50, "snack" end
+  return 0, "none"
+end
+
+local function priceMeal(gain)
+  local tier, label = mealTierForGain(gain)
+  if tier <= 0 then return 0, label, tier end
+  local raw = (tonumber(pricing.normal_meal) or BASE_NORMAL_MEAL_PRICE) * tier
+  return roundMoney(raw), label, tier
+end
+
+-- =============================================================================
+-- COLONY SCANNING
+-- =============================================================================
 local function getLiveCitizens()
   if not colony or type(colony.getCitizens) ~= "function" then return {} end
   local ok, citizens = pcall(colony.getCitizens)
@@ -224,248 +434,250 @@ local function getLiveCitizens()
   return {}
 end
 
-local function getPayrollEmployees()
-  local set = {}
-  local rows = {}
-
-  local ok, res = bankReq({
-    type = "list_company_payroll_payees",
-    company_id = TARGET_COMPANY,
-    limit = 3000,
-  }, 6)
-
-  if ok and type(res) == "table" and type(res.payees) == "table" then
-    for _, e in ipairs(res.payees) do
-      local cid = tostring(e.citizen_id or "")
-      if cid ~= "" then
-        set[cid] = e
-        rows[#rows + 1] = e
-      end
-    end
-    return set, rows, "ledger_company_payroll"
-  end
-
-  ok, res = bankReq({ type = "list_employee_mappings", include_inactive = false }, 6)
-  if ok and type(res) == "table" and type(res.employees) == "table" then
-    for _, e in ipairs(res.employees) do
-      if type(e) == "table" and e.active ~= false and tostring(e.company_id or "") == TARGET_COMPANY then
-        local cid = tostring(e.citizen_id or "")
-        if cid ~= "" then
-          set[cid] = e
-          rows[#rows + 1] = e
-        end
-      end
-    end
-    return set, rows, "fallback_employee_mappings"
-  end
-
-  return set, rows, "none"
+local function getLiveBuildings()
+  if not colony or type(colony.getBuildings) ~= "function" then return {} end
+  local ok, buildings = pcall(colony.getBuildings)
+  if ok and type(buildings) == "table" then return buildings end
+  return {}
 end
 
-local function stockStats(t)
-  local kinds, units = 0, 0
-  for _, q in pairs(t or {}) do
-    if (tonumber(q) or 0) > 0 then
-      kinds = kinds + 1
-      units = units + (tonumber(q) or 0)
-    end
-  end
-  return kinds, units
+local function isDiningBuilding(b)
+  if type(b) ~= "table" then return false end
+  local t = normalType(b.type or b.name or b.buildingType)
+  local n = lower((b.name or "") .. " " .. (b.type or "") .. " " .. (b.buildingType or ""))
+
+  local wanted = t:find("dining", 1, true)
+    or t:find("restaurant", 1, true)
+    or t == "cook"
+    or n:find("dining", 1, true)
+    or n:find("restaurant", 1, true)
+    or n:find("cook", 1, true)
+    or n:find("kitchen", 1, true)
+
+  local wrong = n:find("tavern", 1, true) or n:find("inn", 1, true) or n:find("bar", 1, true)
+  return wanted and not wrong
 end
 
-local function unitPrice(item)
-  local id = lower(item)
-  if id:find("golden_carrot", 1, true) or id:find("cake", 1, true) or id:find("rabbit_stew", 1, true) then return 4 end
-  if id:find("steak", 1, true) or id:find("cooked_beef", 1, true) or id:find("cooked_porkchop", 1, true) or id:find("cooked_salmon", 1, true) then return 3 end
-  if id:find("cooked_", 1, true) or id:find("bread", 1, true) or id:find("pie", 1, true) or id:find("stew", 1, true) or id:find("soup", 1, true) then return 2 end
-  return 1
-end
-
-local function stockLoss(old, new)
-  local losses, total_qty, total_value = {}, 0, 0
-
-  for item, oldQty in pairs(old or {}) do
-    local newQty = tonumber((new or {})[item]) or 0
-    oldQty = tonumber(oldQty) or 0
-
-    if newQty < oldQty then
-      local qty = oldQty - newQty
-      local unit = unitPrice(item)
-      losses[#losses + 1] = { item = item, qty = qty, unit = unit, value = qty * unit }
-      total_qty = total_qty + qty
-      total_value = total_value + (qty * unit)
-    end
-  end
-
-  return losses, total_qty, total_value
-end
-
-local function summary(losses)
+local function diningBuildings(buildings)
   local out = {}
-  for _, l in ipairs(losses or {}) do
-    out[#out + 1] = tostring(l.qty) .. "x " .. tostring(l.item)
-  end
-  if #out == 0 then return "meal" end
-  return table.concat(out, ", ")
-end
-
-local function citizenMap(citizens)
-  local out = {}
-  for _, z in ipairs(citizens or {}) do
-    local cid = citizenAccountId(z)
-    if cid then
-      out[cid] = {
-        name = tostring(z.name or z.display_name or cid),
-        saturation = serviceSaturation(z),
-      }
+  for _, b in ipairs(buildings or {}) do
+    if isDiningBuilding(b) then
+      local p = getPos(b)
+      if p then
+        out[#out + 1] = {
+          name = tostring(b.name or b.type or "Dining Hall"),
+          pos = p,
+          raw = b,
+        }
+      end
     end
   end
   return out
 end
 
-local function updateSaturationEvents(old, new)
-  local t = now()
-
-  for id, z in pairs(new or {}) do
-    local p = (old or {})[id]
-    if p then
-      local delta = (tonumber(z.saturation) or 0) - (tonumber(p.saturation) or 0)
-      if delta >= SAT_DELTA_MIN then
-        sat_events[#sat_events + 1] = {
-          time = t,
-          citizen_id = id,
-          name = z.name,
-          delta = delta,
-        }
-      end
-    end
+local function isNearDining(pos, dining)
+  if not pos then return false, nil end
+  local best, bestDist = nil, 999999
+  for _, d in ipairs(dining or {}) do
+    local dd = dist(pos, d.pos)
+    if dd < bestDist then bestDist = dd; best = d end
   end
-
-  local keep = {}
-  local max_age = (MATCH_WINDOW_SECONDS + EAT_DELAY_SECONDS + 4) * 1000
-  for _, ev in ipairs(sat_events) do
-    if t - ev.time <= max_age then keep[#keep + 1] = ev end
-  end
-  sat_events = keep
-  stats.sat_events = #sat_events
+  if best and bestDist <= DINING_RADIUS then return true, best, bestDist end
+  return false, best, bestDist
 end
 
-local function findLastSat(start_ms, end_ms)
-  local best = nil
-  for _, ev in ipairs(sat_events) do
-    if ev.time >= start_ms and ev.time <= end_ms then
-      if not best or ev.time > best.time then best = ev end
-    end
+-- =============================================================================
+-- PAYMENT
+-- =============================================================================
+local function addEvent(ev)
+  state.events = state.events or {}
+  ev.time = ev.time or now()
+  state.events[#state.events + 1] = ev
+  local keep = {}
+  local cutoff = now() - (30 * 60 * 1000)
+  for _, e in ipairs(state.events) do
+    if tonumber(e.time) and tonumber(e.time) >= cutoff then keep[#keep + 1] = e end
   end
-  return best
+  state.events = keep
 end
 
-local function processPending()
-  local t = now()
-  local keep = {}
+local function totalReceivables()
+  local total = 0
+  for _, n in pairs(state.receivables or {}) do total = total + (tonumber(n) or 0) end
+  return total
+end
 
-  for _, p in ipairs(pending_food) do
-    if t >= p.due then
-      local ev = findLastSat(p.detected_at, p.due + (MATCH_WINDOW_SECONDS * 1000))
+local function chargeCitizenMeal(citizen_id, name, amount, label, gain)
+  local ok, res = bankReq({
+    type = "hospitality_meal_payment",
+    citizen_id = citizen_id,
+    company_id = TARGET_COMPANY,
+    amount = amount,
+    item = label,
+    memo = "Dining Hall " .. label .. " (sat +" .. string.format("%.1f", gain) .. ", CPI x" .. string.format("%.3f", pricing.effective_index) .. ")",
+  }, 6)
 
-      if ev then
-        local amount = math.max(1, math.floor(p.value or 1))
-        local ok, res = bankReq({
-          type = "hospitality_meal_payment",
-          citizen_id = ev.citizen_id,
-          company_id = TARGET_COMPANY,
-          amount = amount,
-          item = p.summary,
-          memo = "Dining Hall meal: " .. p.summary,
-        }, 6)
+  if ok and type(res) == "table" then
+    local paid = tonumber(res.paid) or 0
+    local shortfall = tonumber(res.shortfall) or 0
 
-        if ok and type(res) == "table" then
-          stats.matched = stats.matched + 1
-          stats.charged = stats.charged + (tonumber(res.paid) or 0)
-          stats.unpaid = stats.unpaid + (tonumber(res.shortfall) or 0)
-          setMsg("Charged " .. tostring(ev.name) .. " " .. money(res.paid or 0) .. " for " .. p.summary, colors.lime)
-        else
-          setMsg("Meal payment failed: " .. tostring(res), colors.red)
-          keep[#keep + 1] = p
-        end
-      else
-        stats.unattributed = stats.unattributed + (tonumber(p.qty) or 0)
-        setMsg("Stock decrease had no saturation match: " .. p.summary, colors.orange)
-      end
+    stats.meals_charged = stats.meals_charged + 1
+    stats.charged = stats.charged + paid
+    stats.unpaid = stats.unpaid + shortfall
+    stats.last_charge = paid
+
+    if shortfall > 0 then
+      state.receivables = state.receivables or {}
+      state.receivables[citizen_id] = (tonumber(state.receivables[citizen_id]) or 0) + shortfall
+    end
+
+    addEvent({
+      type = "meal_charge",
+      citizen_id = citizen_id,
+      name = name,
+      label = label,
+      gain = gain,
+      amount = amount,
+      paid = paid,
+      shortfall = shortfall,
+      normal_meal = pricing.normal_meal,
+      food_index = pricing.food_index,
+      general_index = pricing.general_index,
+      effective_index = pricing.effective_index,
+    })
+
+    if paid > 0 then
+      setMsg("Charged " .. tostring(name) .. " " .. money(paid) .. " for " .. label, colors.lime)
     else
-      keep[#keep + 1] = p
+      setMsg(tostring(name) .. " could not pay " .. money(amount) .. " for " .. label, colors.orange)
+    end
+    return true
+  end
+
+  setMsg("Meal charge failed: " .. tostring(res), colors.red)
+  return false
+end
+
+local function processCitizen(z, dining)
+  local cid = citizenAccountId(z)
+  if not cid then return end
+
+  local name = citizenName(z, cid)
+  local sat = citizenSaturation(z)
+  local pos = getPos(z)
+  local near = false
+  local nearBuilding = nil
+  local nearDistance = nil
+
+  if #dining > 0 then
+    near, nearBuilding, nearDistance = isNearDining(pos, dining)
+  else
+    -- If the integrator/building data does not expose Dining Hall coordinates,
+    -- do not kill the system. Saturation gain still becomes the signal.
+    near = true
+  end
+
+  local t = now()
+  state.citizens = state.citizens or {}
+  local rec = state.citizens[cid] or {}
+  rec.name = name
+
+  if near then
+    rec.near_at = t
+    rec.near_building = nearBuilding and nearBuilding.name or "proximity disabled"
+    rec.near_distance = nearDistance
+    stats.near_dining = stats.near_dining + 1
+  end
+
+  local oldSat = tonumber(rec.sat)
+  if oldSat ~= nil then
+    local gain = sat - oldSat
+    if gain > 0 then
+      stats.saturation_rises = stats.saturation_rises + 1
+      stats.last_gain = gain
+    end
+
+    if gain >= MIN_SAT_GAIN then
+      local recentlyNear = false
+      if #dining == 0 then
+        recentlyNear = true
+      elseif tonumber(rec.near_at) and (t - tonumber(rec.near_at)) <= (NEAR_GRACE_SECONDS * 1000) then
+        recentlyNear = true
+      end
+
+      local cooldownOk = true
+      if tonumber(rec.last_charge_at) and (t - tonumber(rec.last_charge_at)) < (MEAL_COOLDOWN_SECONDS * 1000) then
+        cooldownOk = false
+      end
+
+      local amount, label = priceMeal(gain)
+
+      if not recentlyNear then
+        stats.skipped_not_near = stats.skipped_not_near + 1
+      elseif not cooldownOk then
+        stats.skipped_cooldown = stats.skipped_cooldown + 1
+      elseif amount <= 0 then
+        stats.skipped_small_gain = stats.skipped_small_gain + 1
+      else
+        if chargeCitizenMeal(cid, name, amount, label, gain) then
+          rec.last_charge_at = t
+          rec.last_charge_amount = amount
+          rec.last_charge_label = label
+          rec.last_gain = gain
+        end
+      end
+    elseif gain > 0 then
+      stats.skipped_small_gain = stats.skipped_small_gain + 1
     end
   end
 
-  pending_food = keep
-  stats.pending = #pending_food
+  rec.sat = sat
+  rec.last_seen = t
+  state.citizens[cid] = rec
+end
+
+local function pruneMissingCitizens(seen)
+  local cutoff = now() - (60 * 60 * 1000)
+  for cid, rec in pairs(state.citizens or {}) do
+    if not seen[cid] and tonumber(rec.last_seen or 0) < cutoff then
+      state.citizens[cid] = nil
+    end
+  end
 end
 
 local function poll()
   if not connectColony() then
     setMsg("No local colonyIntegrator on this terminal.", colors.red)
-    return
+    return false
   end
+  if not db_id then discoverBank() end
+  refreshPricing()
 
   local citizens = getLiveCitizens()
-  local employee_set, employees, source = getPayrollEmployees()
+  local buildings = getLiveBuildings()
+  local dining = diningBuildings(buildings)
 
   stats.citizens_seen = #citizens
-  stats.payroll_employees = #employees
-  stats.employees_live_seen = 0
-  stats.employee_inv_sources = 0
+  stats.dining_buildings = #dining
+  stats.near_dining = 0
 
-  local stock = {}
-
+  local seen = {}
   for _, z in ipairs(citizens) do
     local cid = citizenAccountId(z)
-    if cid and employee_set[cid] then
-      stats.employees_live_seen = stats.employees_live_seen + 1
-
-      local before_units = 0
-      for _, q in pairs(stock) do before_units = before_units + (tonumber(q) or 0) end
-
-      scanValueForInventory(z, stock, 0, {})
-
-      local after_units = 0
-      for _, q in pairs(stock) do after_units = after_units + (tonumber(q) or 0) end
-
-      if after_units > before_units then
-        stats.employee_inv_sources = stats.employee_inv_sources + 1
-      end
-    end
+    if cid then seen[cid] = true end
+    processCitizen(z, dining)
   end
 
-  local cits = citizenMap(citizens)
-  updateSaturationEvents(prev_citizens, cits)
-
-  if prev_stock then
-    local losses, qty, value = stockLoss(prev_stock, stock)
-    stats.last_loss = qty
-
-    if qty > 0 then
-      pending_food[#pending_food + 1] = {
-        detected_at = now(),
-        due = now() + (EAT_DELAY_SECONDS * 1000),
-        losses = losses,
-        qty = qty,
-        value = math.max(1, value),
-        summary = summary(losses),
-      }
-      setMsg("Employee inventory decrease: " .. summary(losses), colors.yellow)
-    end
-  else
-    setMsg("Baseline taken from direct colony employee scan.", colors.lime)
-  end
-
-  prev_stock = stock
-  prev_citizens = cits
-  stats.stock_kinds, stats.stock_units = stockStats(stock)
-
-  processPending()
+  pruneMissingCitizens(seen)
+  writeFile(STATE_FILE, state)
+  return true
 end
 
+-- =============================================================================
+-- DISPLAY
+-- =============================================================================
 local function cls()
+  W, H = term.getSize()
   term.setCursorBlink(false)
   term.setBackgroundColor(colors.black)
   term.setTextColor(colors.white)
@@ -474,26 +686,33 @@ local function cls()
 end
 
 local function at(x, y, text, fg, bg)
-  local W, H = term.getSize()
-  if y < 1 or y > H then return end
+  W, H = term.getSize()
+  if y < 1 or y > H or x > W then return end
+  if x < 1 then x = 1 end
   term.setCursorPos(x, y)
   term.setTextColor(fg or colors.white)
   term.setBackgroundColor(bg or colors.black)
-  term.write(tostring(text or ""):sub(1, W - x + 1))
+  local maxw = W - x + 1
+  if maxw > 0 then term.write(tostring(text or ""):sub(1, maxw)) end
 end
 
 local function fill(x, y, w, h, bg)
+  W, H = term.getSize()
+  if w <= 0 or h <= 0 then return end
   term.setBackgroundColor(bg or colors.black)
-  local row = string.rep(" ", math.max(0, w))
+  local row = string.rep(" ", w)
   for yy = y, y + h - 1 do
-    term.setCursorPos(x, yy)
-    term.write(row)
+    if yy >= 1 and yy <= H then
+      term.setCursorPos(math.max(1, x), yy)
+      term.write(row:sub(1, math.max(0, W - x + 1)))
+    end
   end
 end
 
 local function button(x, y, w, label, bg, fg)
   fill(x, y, w, 1, bg or colors.gray)
-  at(x + math.floor((w - #label) / 2), y, label, fg or colors.white, bg or colors.gray)
+  local tx = x + math.floor((w - #label) / 2)
+  at(tx, y, label, fg or colors.white, bg or colors.gray)
   return { x1 = x, x2 = x + w - 1, y1 = y, y2 = y }
 end
 
@@ -502,39 +721,58 @@ local function hit(b, x, y)
 end
 
 local function draw()
-  local W, H = term.getSize()
   cls()
   fill(1, 1, W, 1, colors.purple)
   at(2, 1, "SERVICE PAYMENT TERMINAL", colors.white, colors.purple)
   at(math.max(2, W - #VERSION), 1, VERSION, colors.lightGray, colors.purple)
 
-  at(2, 3, "Source:       local colonyIntegrator", colors.white)
+  at(2, 3, "Source:       saturation POS, no inventory scan", colors.white)
   at(2, 4, "Bank:         " .. tostring(db_id or "not connected"), db_id and colors.lime or colors.red)
   at(2, 5, "Colony:       " .. tostring(colony and "connected" or "missing"), colony and colors.lime or colors.red)
   at(2, 6, "Company:      " .. TARGET_COMPANY, colors.lime)
+  at(2, 7, "Auto:         " .. (auto_charge and "ON" or "OFF"), auto_charge and colors.lime or colors.orange)
 
-  at(2, 8,  "Citizens seen:       " .. tostring(stats.citizens_seen), stats.citizens_seen > 0 and colors.lime or colors.orange)
-  at(2, 9,  "Payroll employees:   " .. tostring(stats.payroll_employees), stats.payroll_employees > 0 and colors.lime or colors.orange)
-  at(2, 10, "Employees live seen: " .. tostring(stats.employees_live_seen), stats.employees_live_seen > 0 and colors.lime or colors.orange)
-  at(2, 11, "Employee inv sources:" .. tostring(stats.employee_inv_sources), stats.employee_inv_sources > 0 and colors.lime or colors.orange)
-  at(2, 12, "Stock kinds/units:   " .. tostring(stats.stock_kinds) .. " / " .. tostring(stats.stock_units), stats.stock_units > 0 and colors.lime or colors.orange)
-  at(2, 13, "Last stock decrease: " .. tostring(stats.last_loss), stats.last_loss > 0 and colors.yellow or colors.gray)
-  at(2, 14, "Pending meals:       " .. tostring(stats.pending), stats.pending > 0 and colors.yellow or colors.gray)
-  at(2, 15, "Saturation events:   " .. tostring(stats.sat_events), colors.cyan)
+  at(2, 9,  "Citizens:     " .. tostring(stats.citizens_seen) .. "   Near dining: " .. tostring(stats.near_dining), colors.lightGray)
+  at(2, 10, "Dining halls: " .. tostring(stats.dining_buildings) .. "   Radius: " .. tostring(DINING_RADIUS), stats.dining_buildings > 0 and colors.lime or colors.orange)
+  at(2, 11, "Inflation:    bank x" .. string.format("%.3f", pricing.general_index) .. "  food x" .. string.format("%.3f", pricing.food_index), colors.cyan)
+  at(2, 12, "Meal price:   normal " .. money(pricing.normal_meal) .. " raw, charge bands by sat gain", colors.cyan)
+  at(2, 13, "Food prices:  " .. tostring(pricing.live_food_prices) .. "/" .. tostring(#FOOD_BASKET) .. " live basket entries", colors.lightGray)
 
-  at(2, 17, "Matched: " .. tostring(stats.matched) .. "  Charged: " .. money(stats.charged) .. "  Unpaid: " .. money(stats.unpaid), colors.lime)
-  at(2, 18, "Unattributed:        " .. tostring(stats.unattributed), stats.unattributed > 0 and colors.orange or colors.gray)
+  at(2, 15, "Sat rises:    " .. tostring(stats.saturation_rises) .. "   Last gain: +" .. string.format("%.1f", stats.last_gain), colors.lightGray)
+  at(2, 16, "Meals:        " .. tostring(stats.meals_charged) .. "   Charged: " .. money(stats.charged) .. "   Unpaid: " .. money(stats.unpaid), colors.lime)
+  at(2, 17, "Skipped:      cooldown " .. tostring(stats.skipped_cooldown) .. " / not near " .. tostring(stats.skipped_not_near) .. " / tiny " .. tostring(stats.skipped_small_gain), colors.orange)
+  at(2, 18, "Receivables:  " .. money(totalReceivables()), totalReceivables() > 0 and colors.orange or colors.gray)
 
   local third = math.floor((W - 8) / 3)
   local bScan = button(2, H - 3, third, "Poll Now", colors.purple)
   local bAuto = button(4 + third, H - 3, third, auto_charge and "Auto Off" or "Auto On", colors.gray)
   local bRecon = button(6 + third * 2, H - 3, third, "Reconnect", colors.gray)
 
-  at(2, H - 1, last_message, last_colour)
+  at(2, H - 1, tostring(last_message):sub(1, W - 2), last_colour)
   return bScan, bAuto, bRecon
 end
 
+-- =============================================================================
+-- MAIN
+-- =============================================================================
+local function loadConfig()
+  local cfg = readFile(CONFIG_FILE)
+  if type(cfg) ~= "table" then return end
+
+  if tonumber(cfg.scan_seconds) then SCAN_SECONDS = math.max(1, tonumber(cfg.scan_seconds)) end
+  if tonumber(cfg.dining_radius) then DINING_RADIUS = math.max(4, tonumber(cfg.dining_radius)) end
+  if tonumber(cfg.near_grace_seconds) then NEAR_GRACE_SECONDS = math.max(1, tonumber(cfg.near_grace_seconds)) end
+  if tonumber(cfg.meal_cooldown_seconds) then MEAL_COOLDOWN_SECONDS = math.max(1, tonumber(cfg.meal_cooldown_seconds)) end
+  if tonumber(cfg.base_normal_meal_price) then BASE_NORMAL_MEAL_PRICE = math.max(0.1, tonumber(cfg.base_normal_meal_price)) end
+end
+
 local function main()
+  state = readFile(STATE_FILE) or state
+  state.citizens = state.citizens or {}
+  state.receivables = state.receivables or {}
+  state.events = state.events or {}
+  loadConfig()
+
   if not openModem() then
     print("No modem found.")
     return
@@ -564,11 +802,13 @@ local function main()
       elseif hit(bRecon, p2, p3) then
         discoverBank()
         connectColony()
+        refreshPricing()
         setMsg("Reconnected.", colors.lime)
       end
       bScan, bAuto, bRecon = draw()
 
     elseif ev == "terminate" then
+      writeFile(STATE_FILE, state)
       break
     end
   end
