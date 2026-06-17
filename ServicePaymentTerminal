@@ -2,7 +2,7 @@
 -- SERVICE PAYMENT TERMINAL
 -- ServicePaymentTerminal
 --
--- v1.2.1-SATURATION-INFLATION-POS-STAFF-SAFE
+-- v1.2.2-WIDE-SECTOR-PRICE-ORACLE
 --
 -- Dining Hall / Restaurant point-of-sale for MineColonies citizens.
 --
@@ -12,10 +12,10 @@
 --
 --   hungry citizen near Dining Hall + saturation gain = inferred meal served
 --
--- Price is calculated from:
+-- Price is calculated by the bank's wide sector price oracle:
 --   1. saturation gain tier, as the quantity/meal-size proxy
---   2. bank inflation price_index
---   3. food-basket prices from the bank price table when available
+--   2. Food CPI / Hospitality sector pressure
+--   3. current positive inflation_rate as an immediate price-pressure floor
 --
 -- Payment route:
 --   citizen account -> company:grki via bank hospitality_meal_payment endpoint
@@ -44,7 +44,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION = "1.2.1-SATURATION-INFLATION-POS-STAFF-SAFE"
+local VERSION = "1.2.2-WIDE-SECTOR-PRICE-ORACLE"
 local BANK_PROTOCOL = "quid_bank"
 local TARGET_COMPANY = "company:grki"
 
@@ -65,21 +65,8 @@ local MIN_CHARGE = 1
 local STATE_FILE = "data/service_payment_state.db"
 local CONFIG_FILE = "data/service_payment_config.db"
 
--- Food-basket values are base-period Quid values. If the bank has a live price
--- for one of these items, the live price is used. Otherwise the base price is
--- inflated by the bank's general price_index.
-local FOOD_BASKET = {
-  { item = "bread",             base = 1.00, weight = 4 },
-  { item = "baked_potato",      base = 0.80, weight = 4 },
-  { item = "carrot",            base = 0.50, weight = 3 },
-  { item = "cooked_beef",       base = 2.50, weight = 2 },
-  { item = "steak",             base = 2.50, weight = 2 },
-  { item = "cooked_porkchop",   base = 2.30, weight = 2 },
-  { item = "cooked_chicken",    base = 2.00, weight = 2 },
-  { item = "cooked_mutton",     base = 2.00, weight = 2 },
-  { item = "cooked_cod",        base = 1.60, weight = 2 },
-  { item = "cooked_salmon",     base = 1.80, weight = 2 },
-}
+-- Meal pricing is now quoted by the bank's wide sector price oracle.
+-- This terminal keeps only the POS detection logic; the bank owns the price system.
 
 -- =============================================================================
 -- RUNTIME
@@ -99,6 +86,8 @@ local pricing = {
   effective_index = 1.00,
   normal_meal = BASE_NORMAL_MEAL_PRICE,
   live_food_prices = 0,
+  monetary_pressure = 0,
+  source = "local_fallback",
 }
 
 local state = {
@@ -323,53 +312,6 @@ end
 -- =============================================================================
 -- PRICING
 -- =============================================================================
-local function priceLookup(item)
-  item = simpleItemName(item)
-  local candidates = {
-    item,
-    "minecraft:" .. item,
-    item:gsub("_", " "),
-  }
-
-  for _, key in ipairs(candidates) do
-    local rec = prices[key]
-    if type(rec) == "table" then
-      local p = tonumber(rec.unit_price or rec.price or rec.value)
-      if p and p > 0 then return p end
-    elseif tonumber(rec) and tonumber(rec) > 0 then
-      return tonumber(rec)
-    end
-  end
-
-  return nil
-end
-
-local function computeFoodIndex(general_index)
-  general_index = tonumber(general_index) or 1
-  if general_index <= 0 then general_index = 1 end
-
-  local base_total = 0
-  local current_total = 0
-  local live = 0
-
-  for _, row in ipairs(FOOD_BASKET) do
-    local base = tonumber(row.base) or 1
-    local weight = tonumber(row.weight) or 1
-    local p = priceLookup(row.item)
-    base_total = base_total + (base * weight)
-
-    if p then
-      current_total = current_total + (p * weight)
-      live = live + 1
-    else
-      current_total = current_total + (base * general_index * weight)
-    end
-  end
-
-  if base_total <= 0 then return general_index, live end
-  return current_total / base_total, live
-end
-
 local function refreshPricing()
   if not db_id then discoverBank() end
   if not db_id then
@@ -377,34 +319,39 @@ local function refreshPricing()
     pricing.food_index = 1
     pricing.effective_index = 1
     pricing.normal_meal = BASE_NORMAL_MEAL_PRICE
+    pricing.monetary_pressure = 0
+    pricing.source = "no_bank_local_base"
     return false
   end
 
   -- Safe to call repeatedly; the bank only advances when the Minecraft day moves.
   bankReq({ type = "tick_inflation", day = currentMinecraftDay() }, 4)
 
-  local ok, res = bankReq({ type = "get_inflation_state" }, 4)
-  if ok and type(res) == "table" and type(res.state) == "table" then
-    inflation_state = res.state
+  local ok, res = bankReq({ type = "get_price_indices" }, 4)
+  if ok and type(res) == "table" and type(res.sectors) == "table" then
+    local general = res.sectors.general or {}
+    local food = res.sectors.food or res.sectors.hospitality or {}
+    pricing.general_index = tonumber(general.index) or 1
+    pricing.food_index = tonumber(food.index) or pricing.general_index or 1
+    pricing.effective_index = pricing.food_index
+    pricing.monetary_pressure = tonumber(food.monetary_pressure or general.monetary_pressure) or 0
+    pricing.source = tostring(res.model or "wide_sector_price_oracle")
+    if type(res.inflation) == "table" then inflation_state = res.inflation end
   end
 
-  ok, res = bankReq({ type = "get_prices" }, 4)
-  if ok and type(res) == "table" and type(res.prices) == "table" then
-    prices = res.prices
+  ok, res = bankReq({ type = "quote_service_price", service = "dining_meal", tier = "normal meal" }, 4)
+  if ok and type(res) == "table" and tonumber(res.total) then
+    pricing.normal_meal = tonumber(res.total) or BASE_NORMAL_MEAL_PRICE
+    pricing.effective_index = tonumber(res.sector_index) or pricing.effective_index or 1
+    pricing.food_index = tonumber(res.sector_index) or pricing.food_index or 1
+    pricing.monetary_pressure = tonumber(res.monetary_pressure) or pricing.monetary_pressure or 0
+    pricing.source = tostring(res.source or pricing.source)
+  else
+    local idx = tonumber(pricing.food_index) or 1
+    if idx < 1 then idx = 1 end
+    pricing.normal_meal = BASE_NORMAL_MEAL_PRICE * idx
   end
 
-  local general = tonumber(inflation_state.price_index) or 1
-  if general <= 0 then general = 1 end
-
-  local food_index, live = computeFoodIndex(general)
-  local effective = math.max(general, food_index)
-  if effective <= 0 then effective = 1 end
-
-  pricing.general_index = general
-  pricing.food_index = food_index
-  pricing.effective_index = effective
-  pricing.normal_meal = BASE_NORMAL_MEAL_PRICE * effective
-  pricing.live_food_prices = live
   stats.pricing_refreshes = stats.pricing_refreshes + 1
   return true
 end
@@ -421,7 +368,26 @@ end
 local function priceMeal(gain)
   local tier, label = mealTierForGain(gain)
   if tier <= 0 then return 0, label, tier end
-  local raw = (tonumber(pricing.normal_meal) or BASE_NORMAL_MEAL_PRICE) * tier
+
+  if db_id then
+    local ok, res = bankReq({
+      type = "quote_service_price",
+      service = "dining_meal",
+      saturation_gain = gain,
+    }, 5)
+
+    if ok and type(res) == "table" and tonumber(res.total) then
+      pricing.effective_index = tonumber(res.sector_index) or pricing.effective_index or 1
+      pricing.food_index = tonumber(res.sector_index) or pricing.food_index or 1
+      pricing.monetary_pressure = tonumber(res.monetary_pressure) or pricing.monetary_pressure or 0
+      pricing.source = tostring(res.source or pricing.source)
+      return math.max(MIN_CHARGE, math.floor(tonumber(res.total) + 0.5)), tostring(res.tier or label), tonumber(res.tier_multiplier) or tier
+    end
+  end
+
+  local idx = tonumber(pricing.food_index) or 1
+  if idx < 1 then idx = 1 end
+  local raw = BASE_NORMAL_MEAL_PRICE * idx * tier
   return roundMoney(raw), label, tier
 end
 
@@ -801,9 +767,9 @@ local function draw()
 
   at(2, 9,  "Citizens:     " .. tostring(stats.citizens_seen) .. "   Near dining: " .. tostring(stats.near_dining), colors.lightGray)
   at(2, 10, "Dining halls: " .. tostring(stats.dining_buildings) .. "   Radius: " .. tostring(DINING_RADIUS), stats.dining_buildings > 0 and colors.lime or colors.orange)
-  at(2, 11, "Inflation:    bank x" .. string.format("%.3f", pricing.general_index) .. "  food x" .. string.format("%.3f", pricing.food_index), colors.cyan)
-  at(2, 12, "Meal price:   normal " .. money(pricing.normal_meal) .. " raw, charge bands by sat gain", colors.cyan)
-  at(2, 13, "Food prices:  " .. tostring(pricing.live_food_prices) .. "/" .. tostring(#FOOD_BASKET) .. " live basket entries", colors.lightGray)
+  at(2, 11, "Price CPI:    food x" .. string.format("%.3f", pricing.food_index) .. "  general x" .. string.format("%.3f", pricing.general_index), colors.cyan)
+  at(2, 12, "Meal price:   normal " .. money(pricing.normal_meal) .. " | pressure " .. string.format("%.1f%%", (pricing.monetary_pressure or 0) * 100), colors.cyan)
+  at(2, 13, "Oracle:       " .. tostring(pricing.source or "fallback"), colors.lightGray)
 
   at(2, 15, "Sat rises:    " .. tostring(stats.saturation_rises) .. "   Last gain: +" .. string.format("%.1f", stats.last_gain), colors.lightGray)
   at(2, 16, "Meals:        " .. tostring(stats.meals_charged) .. "   Charged: " .. money(stats.charged) .. "   Unpaid: " .. money(stats.unpaid), colors.lime)
