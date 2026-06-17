@@ -32,7 +32,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION = "1.0.13-INTEGER-CONTRACT-PRICES"
+local VERSION = "1.0.14-SERVICE-OBSERVATION-PUSH"
 local BANK_PROTOCOL = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT = 5
@@ -1476,6 +1476,147 @@ local function scanRequests(requests, citizens)
   syncStaleContracts(active_keys)
 end
 
+
+-- =============================================================================
+-- SERVICE OBSERVATIONS
+-- =============================================================================
+local function serviceSimpleItemName(name)
+  name = tostring(name or "")
+  name = name:gsub("^minecraft:", "")
+  name = name:gsub("^minecolonies:", "")
+  name = name:gsub("^%w+:", "")
+  return lower(name)
+end
+
+local function serviceIsExcludedFuel(item)
+  local id = serviceSimpleItemName(item)
+  return id == "coal" or id == "charcoal" or id == "coal_block" or id == "block_of_coal"
+    or id:find("coal_block", 1, true) or id:find("charcoal", 1, true)
+end
+
+local function serviceAddStock(counts, item, qty)
+  qty = tonumber(qty) or 0
+  if qty <= 0 then return end
+  if not item or tostring(item) == "" then return end
+  if serviceIsExcludedFuel(item) then return end
+  local id = serviceSimpleItemName(item)
+  counts[id] = (counts[id] or 0) + qty
+end
+
+local function serviceScanValueForInventory(v, counts, depth, seen)
+  if type(v) ~= "table" then return end
+  depth = depth or 0
+  if depth > 6 then return end
+  seen = seen or {}
+  if seen[v] then return end
+  seen[v] = true
+
+  local item_name = v.name or v.item or v.id or v.item_id or v.itemName or v.displayName
+  local qty = v.count or v.qty or v.amount or v.size or v.quantity
+  if item_name and qty then serviceAddStock(counts, item_name, qty) end
+
+  local keys = { "inventory", "items", "stacks", "contents", "mainInventory", "main_inventory", "heldItems", "held_items", "food", "foods", "slots", "backpack", "equipment", "armor", "offhand" }
+  for _, k in ipairs(keys) do
+    if type(v[k]) == "table" then serviceScanValueForInventory(v[k], counts, depth + 1, seen) end
+  end
+
+  for k, child in pairs(v) do
+    if type(k) == "number" and type(child) == "table" then serviceScanValueForInventory(child, counts, depth + 1, seen) end
+  end
+end
+
+local function serviceCitizenAccountId(z)
+  local username = citizenUsername(z)
+  if not username then return nil end
+  return "citizen:" .. username
+end
+
+local function serviceSaturation(z)
+  return tonumber(z and (z.saturation or z.food or z.foodLevel or z.food_level) or 0) or 0
+end
+
+local function serviceDiningText(s)
+  s = lower(s or "")
+  local wanted = s:find("waiter",1,true) or s:find("dining",1,true) or s:find("dininghall",1,true) or s:find("restaurant",1,true) or s:find("cook",1,true) or s:find("chef",1,true)
+  local wrong = s:find("tavern",1,true) or s:find("bar",1,true) or s:find("inn",1,true)
+  return wanted and not wrong
+end
+
+local function resolveDiningServiceCompany(citizens)
+  for _, z in ipairs(citizens or {}) do
+    local job = lower(citizenJobRaw(z) .. " " .. citizenTitle(z) .. " " .. tostring(z.name or ""))
+    if serviceDiningText(job) then
+      local e = resolveCitizenEmployment(z)
+      if e and e.company_id then return e.company_id, e.company_name or e.company_id, "employee:" .. tostring(e.citizen_id) end
+    end
+  end
+
+  for _, b in pairs(businesses or {}) do
+    local txt = lower(tostring(b.building_type or "") .. " " .. tostring(b.building_name or "") .. " " .. tostring(b.name or ""))
+    if serviceDiningText(txt) and b.company_id then return b.company_id, b.name or b.company_id, "building:" .. tostring(b.key or "") end
+  end
+
+  return nil, nil, "unresolved"
+end
+
+local function pushDiningServiceObservation(citizens)
+  if not bank_id then return false, "no bank" end
+
+  local company_id, company_name, source = resolveDiningServiceCompany(citizens)
+  local dining_stock = {}
+  local citizen_rows = {}
+  local citizen_inv_sources = 0
+  local chargeable_units = 0
+
+  for _, z in ipairs(citizens or {}) do
+    local cid = serviceCitizenAccountId(z)
+    if cid then
+      local inv = {}
+      serviceScanValueForInventory(z, inv, 0, {})
+      local units = 0
+      for item, qty in pairs(inv) do
+        dining_stock[item] = (dining_stock[item] or 0) + qty
+        units = units + qty
+        chargeable_units = chargeable_units + qty
+      end
+      if units > 0 then citizen_inv_sources = citizen_inv_sources + 1 end
+
+      citizen_rows[#citizen_rows+1] = {
+        citizen_id = cid,
+        display_name = tostring(z.name or z.display_name or cid),
+        saturation = serviceSaturation(z),
+        stock = inv,
+        stock_units = units,
+        job_raw = tostring(citizenJobRaw(z) or ""),
+        job_text = tostring(citizenTitle(z) or ""),
+        is_dining_worker = serviceDiningText(citizenJobRaw(z) .. " " .. citizenTitle(z) .. " " .. tostring(z.name or "")) and true or false,
+      }
+    end
+  end
+
+  local ok, res = bankReq({
+    type = "sync_service_observations",
+    service_key = "dining_hall",
+    observation = {
+      service_key = "dining_hall",
+      service = "Dining Hall",
+      company_id = company_id,
+      company_name = company_name,
+      company_source = source,
+      colony_name = colony_name,
+      day = os.day and os.day() or 0,
+      citizens_seen = #citizens,
+      citizen_inventory_sources = citizen_inv_sources,
+      chargeable_units = chargeable_units,
+      dining_stock = dining_stock,
+      citizens = citizen_rows,
+    },
+  }, 4)
+
+  return ok, res
+end
+
+
 -- =============================================================================
 -- SCAN LOOP
 -- =============================================================================
@@ -1501,6 +1642,7 @@ local function scanOnce()
   scanCitizens(citizens)
   scanBusinesses(buildings)
   syncEmployeeMappings(citizens)
+  pushDiningServiceObservation(citizens)
   scanRequests(requests, citizens)
 
   stats.last_scan = now()
