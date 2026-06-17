@@ -49,7 +49,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION    = "1.0.5-COMPANY-DROPDOWN-RESET"
+local VERSION    = "1.0.7-COMPANY-DROPDOWN-FIX"
 local PROTOCOL   = "quid_contracts"
 local DB_TIMEOUT = 5
 
@@ -314,52 +314,13 @@ local function currentContract()
 end
 
 local function loadCompanies()
-  local ok, res = contractRequest({ type = "list_claimant_companies" }, 8)
+  local ok, res = contractRequest({ type = "list_claimant_companies" }, 10)
   if ok and type(res) == "table" and type(res.companies) == "table" then
+    setMessage("Loaded " .. tostring(#res.companies) .. " companies.", C.ok)
     return res.companies
   end
   setMessage("Company list failed: " .. tostring(res), C.err)
   return {}
-end
-
-local function resetLiveContracts()
-  cls()
-  topBar()
-  card(2, 4, W - 2, H - 5)
-
-  at(4, 5, "Reset Current Live Requests", C.card_fg, C.card)
-  at(4, 7, "This cancels all active MineColonies live request contracts.", C.label, C.card)
-  at(4, 8, "The integrator will repost whatever requests still exist.", C.label, C.card)
-  at(4, 10, "Use this after bad claims, bad pricing, or request desync.", C.warn, C.card)
-
-  local bw = math.floor((W - 8) / 2)
-  local bBack = button(4, H - 2, bw, "Back", C.btn_sec, C.card_fg)
-  local bReset = button(5 + bw, H - 2, bw, "Reset Live", C.btn_dan, C.btn_fg)
-
-  statusBar()
-
-  while true do
-    local ev, p1, p2, p3 = os.pullEvent()
-    if ev == "mouse_click" then
-      if hit(bBack, p2, p3) then return end
-      if hit(bReset, p2, p3) then
-        local ok, res = contractRequest({
-          type = "reset_live_contracts",
-          source_type = "minecolonies_request",
-          include_claimed = true,
-          reason = "Manual reset from ContractBoard",
-        }, 10)
-
-        if ok and type(res) == "table" then
-          setMessage("Reset " .. tostring(res.reset or 0) .. " live contracts.", C.ok)
-        else
-          setMessage("Reset failed: " .. tostring(res), C.err)
-        end
-        refreshContracts()
-        return
-      end
-    end
-  end
 end
 
 -- =============================================================================
@@ -475,7 +436,8 @@ local function claimScreen(c)
 
     local rows = visibleRows()
     if #companies == 0 then
-      at(4, 12, "No active companies found from bank.", C.err, C.card)
+      at(4, 12, "No companies loaded from bank.", C.err, C.card)
+      at(4, 13, "ContractServer could not read company accounts.", C.label, C.card)
     else
       if selectedCompany < 1 then selectedCompany = 1 end
       if selectedCompany > #companies then selectedCompany = #companies end
@@ -594,8 +556,8 @@ end
 -- MAIN DRAW
 -- =============================================================================
 local function drawTabs(y)
-  local tabs = { "Open", "Claimed", "Pending", "Fulfilled", "All" }
-  local values = { "open", "claimed", "pending_completion", "fulfilled", "all" }
+  local tabs = { "Open", "Claimed", "Fulfilled", "All" }
+  local values = { "open", "claimed", "fulfilled", "all" }
   local tw = math.floor((W - 2) / #tabs)
   local buttons = {}
 
@@ -655,14 +617,12 @@ local function drawMain()
   local bNext = button(5 + third, H - 3, third, "Next", C.btn_sec, C.card_fg)
   local bOpen = button(10 + (third * 2), H - 3, third, "Open", C.btn_pri, C.btn_fg)
 
-  local half = math.floor((W - 8) / 2)
-  local bRefresh = button(4, H - 2, half, "Refresh", C.btn_pri, C.btn_fg)
-  local bReset = button(5 + half, H - 2, half, "Reset Live", C.btn_dan, C.btn_fg)
+  local bRefresh = button(4, H - 2, W - 6, "Refresh Contracts", C.btn_pri, C.btn_fg)
 
   statusBar()
   term.setCursorBlink(false)
 
-  return tabs, bPrev, bNext, bOpen, bRefresh, bReset, perPage
+  return tabs, bPrev, bNext, bOpen, bRefresh, perPage
 end
 
 -- =============================================================================
@@ -670,7 +630,7 @@ end
 -- =============================================================================
 local function screenMain()
   refreshContracts()
-  local tabs, bPrev, bNext, bOpen, bRefresh, bReset, perPage = drawMain()
+  local tabs, bPrev, bNext, bOpen, bRefresh, perPage = drawMain()
 
   while true do
     local ev, p1, p2, p3 = os.pullEvent()
@@ -684,7 +644,7 @@ local function screenMain()
           selected = 1
           page = 1
           refreshContracts()
-          tabs, bPrev, bNext, bOpen, bRefresh, bReset, perPage = drawMain()
+          tabs, bPrev, bNext, bOpen, bRefresh, perPage = drawMain()
           break
         end
       end
@@ -711,8 +671,6 @@ local function screenMain()
         end
       elseif hit(bRefresh, mx, my) then
         refreshContracts()
-      elseif hit(bReset, mx, my) then
-        resetLiveContracts()
       else
         -- row click selection
         local listTop = 6
@@ -724,7 +682,7 @@ local function screenMain()
         end
       end
 
-      tabs, bPrev, bNext, bOpen, bRefresh, bReset, perPage = drawMain()
+      tabs, bPrev, bNext, bOpen, bRefresh, perPage = drawMain()
 
     elseif ev == "key" then
       -- Keyboard only edits text fields in sub-screens.
