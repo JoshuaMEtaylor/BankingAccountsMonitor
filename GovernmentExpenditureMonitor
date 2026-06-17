@@ -3,7 +3,7 @@
 -- GovernmentExpenditureMonitor
 --
 -- Read-only public monitor for state expenditure.
--- Current first use: government payroll by sector with a pie chart.
+-- Current first use: annualised government payroll by sector with a pie chart.
 -- =============================================================================
 
 local args = {...}
@@ -42,13 +42,16 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION          = "1.0.0-PAYROLL-PIE"
+local VERSION          = "1.0.3-DATA-FALLBACK"
 local BANK_PROTOCOL    = "quid_bank"
 local TREASURY_ACCOUNT = "treasury:quid_bank"
-local DB_TIMEOUT       = 5
+local DB_TIMEOUT       = 3
 local REFRESH_SECONDS  = 10
 local HISTORY_LIMIT    = 900
+local FISCAL_YEAR_DAYS = 365
 
+local native_term = term.current()
+local display_term = native_term
 local bank_id = nil
 local modem_name = nil
 local monitor_name = nil
@@ -57,6 +60,8 @@ local last_message = "Booting..."
 local last_colour = colors.lightGray
 local last_data_source = "none"
 local last_refresh = 0
+local last_error = nil
+local last_diagnostics = {}
 
 local function nowMs()
   if os.epoch then return os.epoch("utc") end
@@ -88,8 +93,13 @@ local SECTORS = {
   { key = "other", label = "Other payroll", color = colors.lightGray },
 }
 
-local SECTOR_BY_KEY = {}
-for _, s in ipairs(SECTORS) do SECTOR_BY_KEY[s.key] = s end
+local function consoleLog(text)
+  local current = term.current()
+  term.redirect(native_term)
+  term.setTextColor(colors.lightGray)
+  print("[GovEx] " .. tostring(text))
+  term.redirect(current)
+end
 
 -- =============================================================================
 -- BASIC HELPERS
@@ -202,23 +212,23 @@ local function yearDays(year)
   return isLeapYear(year) and 366 or 365
 end
 
-local function mcDate()
-  local d = 0
-  if os.day then d = math.floor(tonumber(os.day()) or 0) end
-  if d < 0 then d = 0 end
+local function currentMcDay()
+  if os.day then return math.max(0, math.floor(tonumber(os.day()) or 0)) end
+  return 0
+end
 
+local function mcDate()
+  local d = currentMcDay()
   local year = 0
   while d >= yearDays(year) do
     d = d - yearDays(year)
     year = year + 1
   end
-
   local month = 0
   while d >= monthDays(year, month) do
     d = d - monthDays(year, month)
     month = month + 1
   end
-
   return string.format("%02d/%02d/%04d", d, month, year)
 end
 
@@ -233,23 +243,53 @@ local function mcTime()
 end
 
 -- =============================================================================
--- MODEM / BANK
+-- DISPLAY SELECTION / LOADING
 -- =============================================================================
 local function useMonitorIfPresent()
   local mon = peripheral.find("monitor")
   if mon then
-    monitor_name = peripheral.getName and peripheral.getName(mon) or "monitor"
+    local okName, name = pcall(peripheral.getName, mon)
+    monitor_name = okName and name or "monitor"
     if mon.setTextScale then mon.setTextScale(0.5) end
     term.redirect(mon)
+    display_term = mon
     using_monitor = true
     refreshSize()
+    consoleLog("Rendering output on monitor: " .. tostring(monitor_name))
     return true
   end
   using_monitor = false
+  display_term = native_term
   refreshSize()
+  consoleLog("No monitor found; rendering on terminal")
   return false
 end
 
+local function connectScreen(message, colour)
+  cls()
+  topBar()
+  at(2, 3, mcDate() .. "  " .. mcTime(), C.dim, C.bg)
+  at(2, 5, message or "Connecting...", colour or C.dim, C.bg)
+  at(2, 7, "Modem: " .. tostring(modem_name or "none"), C.dim, C.bg)
+  at(2, 8, "Monitor: " .. tostring(monitor_name or (using_monitor and "attached" or "terminal")), C.dim, C.bg)
+  if bank_id then at(2, 9, "Bank ID: " .. tostring(bank_id), C.dim, C.bg) end
+  statusBar()
+end
+
+local function loadingScreen(step, detail)
+  cls()
+  topBar()
+  at(2, 3, mcDate() .. "  " .. mcTime(), C.dim, C.bg)
+  at(2, 5, step or "Loading government expenditure...", C.label, C.bg)
+  if detail and detail ~= "" then at(2, 7, tostring(detail):sub(1, W - 4), C.dim, C.bg) end
+  at(2, 9, "Bank: " .. tostring(bank_id or "not connected"), C.dim, C.bg)
+  at(2, 10, "Data source: " .. tostring(last_data_source), C.dim, C.bg)
+  statusBar()
+end
+
+-- =============================================================================
+-- MODEM / BANK
+-- =============================================================================
 local function openModem()
   for _, name in ipairs(peripheral.getNames()) do
     if peripheral.getType(name) == "modem" then
@@ -257,6 +297,7 @@ local function openModem()
       if m and m.isWireless and m.isWireless() then
         rednet.open(name)
         modem_name = name
+        consoleLog("Modem open: " .. name .. " wireless")
         return true
       end
     end
@@ -266,6 +307,7 @@ local function openModem()
     if peripheral.getType(name) == "modem" then
       rednet.open(name)
       modem_name = name
+      consoleLog("Modem open: " .. name)
       return true
     end
   end
@@ -273,14 +315,53 @@ local function openModem()
   return false
 end
 
+local function waitForResponseFrom(target_id, protocol, timeout)
+  local deadline = os.clock() + (timeout or DB_TIMEOUT)
+  while true do
+    local remaining = deadline - os.clock()
+    if remaining <= 0 then return nil end
+    local sender, msg = rednet.receive(protocol, remaining)
+    if sender == target_id and type(msg) == "table" then
+      return msg
+    end
+  end
+end
+
+local function validateBankCandidate(sender)
+  rednet.send(sender, { type = "status" }, BANK_PROTOCOL)
+  local msg = waitForResponseFrom(sender, BANK_PROTOCOL, 2)
+  if type(msg) ~= "table" or msg.success == nil then
+    return false
+  end
+  if msg.success == true and type(msg.response) == "table" then
+    local r = msg.response
+    if r.supply or r.account_count or r.citizen_count or r.company_count or r.economy_status then
+      bank_id = sender
+      return true
+    end
+  end
+  return false
+end
+
 local function discoverBank()
-  for _ = 1, 6 do
+  last_data_source = "discover"
+  for attempt = 1, 8 do
+    connectScreen("Finding Quid bank server... attempt " .. tostring(attempt), C.dim)
     rednet.broadcast({ type = "ping" }, BANK_PROTOCOL)
-    local sender, msg = rednet.receive(BANK_PROTOCOL, 3)
-    if sender and type(msg) == "table" then
-      if msg.type == "treasury_online" or msg.success == true then
-        bank_id = sender
-        return true
+
+    local deadline = os.clock() + 2
+    while true do
+      local remaining = deadline - os.clock()
+      if remaining <= 0 then break end
+      local sender, msg = rednet.receive(BANK_PROTOCOL, remaining)
+      if sender and type(msg) == "table" then
+        if msg.type == "treasury_online" or msg.success == true then
+          if validateBankCandidate(sender) then
+            consoleLog("Bank connected: " .. tostring(sender))
+            last_data_source = "none"
+            return true
+          end
+        end
       end
     end
   end
@@ -296,7 +377,7 @@ local function dbRequest(req, timeout)
 
   while true do
     local remaining = deadline - os.clock()
-    if remaining <= 0 then return false, "No response from bank" end
+    if remaining <= 0 then return false, "No response from bank for " .. tostring(req and req.type) end
 
     local sender, msg = rednet.receive(BANK_PROTOCOL, remaining)
     if sender == bank_id and type(msg) == "table" and msg.success ~= nil then
@@ -305,35 +386,48 @@ local function dbRequest(req, timeout)
   end
 end
 
-local function requestTreasuryHistory()
-  local ok, res = dbRequest({
-    type = "fiscal_history",
-    account_id = TREASURY_ACCOUNT,
-    limit = HISTORY_LIMIT,
-  }, 8)
-
+local function endpointRequest(endpoint, request)
+  loadingScreen("Requesting bank data...", endpoint)
+  consoleLog("Requesting " .. endpoint)
+  local ok, res = dbRequest(request, DB_TIMEOUT)
+  last_diagnostics[endpoint] = ok and "ok" or tostring(res)
   if ok and type(res) == "table" then
-    last_data_source = "fiscal_history"
+    last_data_source = endpoint
     return true, res
   end
-
-  ok, res = dbRequest({
-    type = "treasury_history",
-    account_id = TREASURY_ACCOUNT,
-    limit = HISTORY_LIMIT,
-  }, 8)
-
-  if ok and type(res) == "table" then
-    last_data_source = "treasury_history"
-    return true, res
-  end
-
-  last_data_source = "none"
   return false, res
 end
 
+local function requestTreasuryHistory()
+  last_diagnostics = {}
+
+  local ok, res = endpointRequest("fiscal_history", {
+    type = "fiscal_history",
+    account_id = TREASURY_ACCOUNT,
+    limit = HISTORY_LIMIT,
+  })
+  if ok then return true, res end
+
+  ok, res = endpointRequest("treasury_history", {
+    type = "treasury_history",
+    account_id = TREASURY_ACCOUNT,
+    limit = HISTORY_LIMIT,
+  })
+  if ok then return true, res end
+
+  -- Final fallback: status at least proves the monitor is alive and connected.
+  ok, res = endpointRequest("status", { type = "status" })
+  if ok then
+    last_data_source = "status-only"
+    return true, { transactions = {}, summary = {}, status = res, status_only = true }
+  end
+
+  last_data_source = "none"
+  return false, "No usable bank data. fiscal_history=" .. tostring(last_diagnostics.fiscal_history) .. "; treasury_history=" .. tostring(last_diagnostics.treasury_history) .. "; status=" .. tostring(last_diagnostics.status)
+end
+
 -- =============================================================================
--- PAYROLL CLASSIFICATION
+-- PAYROLL CLASSIFICATION / ANNUALISATION
 -- =============================================================================
 local function txField(tx, ...)
   for i = 1, select("#", ...) do
@@ -347,6 +441,7 @@ local function txText(tx)
   local bits = {
     txField(tx, "type", "tx_type") or "",
     txField(tx, "memo", "description", "note") or "",
+    txField(tx, "sector", "payroll_sector") or "",
     txField(tx, "from", "from_id") or "",
     txField(tx, "to", "to_id") or "",
     txField(tx, "counterparty_id") or "",
@@ -378,8 +473,6 @@ local function isPayrollTx(tx)
   local text = txText(tx)
   local typ = lower(txField(tx, "type", "tx_type") or "")
 
-  -- Explicit payroll markers always count, even if the old terminal used a
-  -- generic GRANT/TRANSFER transaction type.
   if text:find("payroll", 1, true)
     or text:find("worker pay", 1, true)
     or text:find("wage", 1, true)
@@ -388,12 +481,13 @@ local function isPayrollTx(tx)
     return true
   end
 
-  -- Conservative fallback for the current early economy: if it is a treasury
-  -- outflow to a citizen and it is not an obvious grant/mint/burn/company move,
-  -- treat it as unlabelled payroll.
   if isTreasuryOutflow(tx) then
     local to_id = lower(txField(tx, "to", "to_id", "counterparty_id") or "")
-    if to_id:find("^citizen:") and not text:find("grant", 1, true) and not text:find("burn", 1, true) and not text:find("mint", 1, true) then
+    if to_id:find("^citizen:")
+      and not text:find("grant", 1, true)
+      and not text:find("burn", 1, true)
+      and not text:find("mint", 1, true)
+      and not text:find("stimulus", 1, true) then
       return true
     end
   end
@@ -402,6 +496,12 @@ local function isPayrollTx(tx)
 end
 
 local function classifySector(tx)
+  local explicit = lower(txField(tx, "sector", "payroll_sector", "department") or "")
+  if explicit == "defence" or explicit == "defense" then return "defence" end
+  if explicit == "research" then return "research" end
+  if explicit == "logistics" then return "logistics" end
+  if explicit == "administration" or explicit == "admin" then return "administration" end
+
   local text = txText(tx)
 
   if text:find("sector:defence", 1, true)
@@ -445,66 +545,113 @@ local function classifySector(tx)
   return "other"
 end
 
+local function txMcDay(tx)
+  local d = txField(tx, "mc_day", "mct_day", "minecraft_day", "day")
+  d = tonumber(d)
+  if d then return math.floor(d) end
+  return nil
+end
+
 local function analyse(res)
   local txs = {}
   if type(res) == "table" then
-    txs = res.transactions or res.history or {}
+    txs = res.transactions or res.history or res.txs or {}
   end
 
+  local current_day = currentMcDay()
+  local window_start = math.max(0, current_day - FISCAL_YEAR_DAYS + 1)
+  local world_period_days = math.min(FISCAL_YEAR_DAYS, current_day + 1)
+  if world_period_days < 1 then world_period_days = 1 end
+
+  local any_day_fields = false
+  for _, tx in ipairs(txs) do
+    if txMcDay(tx) ~= nil then any_day_fields = true; break end
+  end
+
+  local observed_days = world_period_days
   local by = {}
   for _, s in ipairs(SECTORS) do
-    by[s.key] = { key = s.key, label = s.label, color = s.color, amount = 0, count = 0 }
+    by[s.key] = { key = s.key, label = s.label, color = s.color, observed = 0, annual = 0, count = 0 }
   end
 
-  local total = 0
+  local observed_total = 0
   local count = 0
   local last = nil
+  local considered_rows = 0
 
   for _, tx in ipairs(txs) do
-    if isPayrollTx(tx) then
-      local amount = math.floor(tonumber(txField(tx, "amount", "value") or 0) or 0)
-      if amount > 0 then
-        local key = classifySector(tx)
-        by[key] = by[key] or { key = key, label = key, color = colors.lightGray, amount = 0, count = 0 }
-        by[key].amount = by[key].amount + amount
-        by[key].count = by[key].count + 1
-        total = total + amount
-        count = count + 1
-        last = tx
+    local include = true
+    local d = txMcDay(tx)
+    if any_day_fields then
+      include = d ~= nil and d >= window_start and d <= current_day
+    end
+
+    if include then
+      considered_rows = considered_rows + 1
+      if isPayrollTx(tx) then
+        local amount = math.floor(tonumber(txField(tx, "amount", "value") or 0) or 0)
+        if amount > 0 then
+          local key = classifySector(tx)
+          by[key] = by[key] or { key = key, label = key, color = colors.lightGray, observed = 0, annual = 0, count = 0 }
+          by[key].observed = by[key].observed + amount
+          by[key].count = by[key].count + 1
+          observed_total = observed_total + amount
+          count = count + 1
+          last = tx
+        end
       end
     end
   end
 
-  -- If the newer fiscal endpoint provides a payroll total but individual rows
-  -- could not be read/classified, still show the total as unclassified payroll.
-  if total <= 0 and type(res) == "table" and type(res.summary) == "table" then
-    local summary_total = tonumber(res.summary.payroll_total or res.summary.expenditure_total or 0) or 0
+  if observed_total <= 0 and type(res) == "table" and type(res.summary) == "table" then
+    local summary_total = tonumber(res.summary.payroll_total or 0) or 0
+    if summary_total <= 0 then
+      summary_total = tonumber(res.summary.gov_payroll_total or 0) or 0
+    end
     if summary_total > 0 then
-      by.other.amount = math.floor(summary_total)
+      by.other.observed = math.floor(summary_total)
       by.other.count = tonumber(res.summary.payroll_count or 0) or 0
-      total = by.other.amount
+      observed_total = by.other.observed
       count = by.other.count
     end
   end
 
+  local factor = FISCAL_YEAR_DAYS / observed_days
+  if current_day >= FISCAL_YEAR_DAYS then factor = 1 end
+
+  local annual_total = math.floor((observed_total * factor) + 0.5)
+
   local list = {}
   for _, s in ipairs(SECTORS) do
     local row = by[s.key]
-    if row and row.amount > 0 then list[#list + 1] = row end
+    if row and row.observed > 0 then
+      row.annual = math.floor((row.observed * factor) + 0.5)
+      row.amount = row.annual
+      list[#list + 1] = row
+    end
   end
   table.sort(list, function(a, b)
-    if a.amount ~= b.amount then return a.amount > b.amount end
+    if a.annual ~= b.annual then return a.annual > b.annual end
     return a.label < b.label
   end)
 
   return {
-    total = total,
+    observed_total = observed_total,
+    annual_total = annual_total,
+    total = annual_total,
+    factor = factor,
     count = count,
     sectors = list,
     by = by,
     last = last,
     raw_count = #txs,
+    considered_rows = considered_rows,
     source = last_data_source,
+    status_only = type(res) == "table" and res.status_only or false,
+    current_day = current_day,
+    window_start = window_start,
+    observed_days = observed_days,
+    any_day_fields = any_day_fields,
   }
 end
 
@@ -525,7 +672,7 @@ local function sectorForFraction(sectors, total, f)
   if total <= 0 or #sectors == 0 then return nil end
   local acc = 0
   for _, s in ipairs(sectors) do
-    acc = acc + ((tonumber(s.amount) or 0) / total)
+    acc = acc + ((tonumber(s.annual or s.amount) or 0) / total)
     if f <= acc then return s end
   end
   return sectors[#sectors]
@@ -566,7 +713,7 @@ local function drawLegend(x, y, sectors, total)
     if y >= H - 1 then break end
     fill(x, y, 2, 1, s.color or C.empty)
     at(x + 3, y, s.label:sub(1, 14), C.text, C.bg)
-    at(x + 19, y, pct(s.amount, total), C.dim, C.bg)
+    at(x + 19, y, pct(s.annual or s.amount, total), C.dim, C.bg)
     y = y + 1
   end
 end
@@ -585,30 +732,41 @@ local function drawScreen(data, err)
 
   if err then
     at(2, 4, "Unable to load government expenditure.", C.bad, C.bg)
-    at(2, 6, tostring(err), C.dim, C.bg)
+    at(2, 6, tostring(err):sub(1, W - 4), C.dim, C.bg)
+    at(2, 8, "The monitor will retry. Touch monitor or press R to retry now.", C.dim, C.bg)
+    last_message = "Waiting for valid bank data | " .. tostring(err):sub(1, math.max(1, W - 32))
+    last_colour = C.bad
     statusBar()
     return
   end
 
-  data = data or { total = 0, count = 0, sectors = {}, raw_count = 0 }
+  data = data or { total = 0, annual_total = 0, observed_total = 0, count = 0, sectors = {}, raw_count = 0, observed_days = 1 }
 
-  local leftW = math.max(32, math.floor(W * 0.46))
-  if leftW > W - 22 then leftW = W - 22 end
+  local leftW = math.max(36, math.floor(W * 0.50))
+  if leftW > W - 24 then leftW = W - 24 end
   local rightX = leftW + 3
 
-  drawBox(2, 4, leftW - 2, H - 5, "PAYROLL EXPENDITURE")
+  drawBox(2, 4, leftW - 2, H - 5, "ANNUALISED PAYROLL")
 
-  at(4, 6, "Current expense model:", C.label, C.bg)
-  at(4, 7, "Government payroll only", C.text, C.bg)
-  at(4, 9, "Total payroll: " .. money(data.total), C.good, C.bg)
-  at(4,10, "Payroll entries: " .. tostring(data.count), C.text, C.bg)
-  at(4,11, "Ledger rows read: " .. tostring(data.raw_count or 0), C.dim, C.bg)
+  if data.status_only then
+    at(4, 6, "Connected, but no history endpoint answered.", C.warn, C.bg)
+    at(4, 7, "Bank status works; payroll history endpoint does not.", C.dim, C.bg)
+  else
+    at(4, 6, "Expense model:", C.label, C.bg)
+    at(4, 7, "Government payroll only", C.text, C.bg)
+  end
 
-  at(4,13, "Sector", C.label, C.bg)
-  at(math.max(18, leftW - 20), 13, "Amount", C.label, C.bg)
-  at(math.max(27, leftW - 8), 13, "Share", C.label, C.bg)
+  at(4, 9,  "Annualised payroll: " .. money(data.annual_total or data.total), C.good, C.bg)
+  at(4, 10, "Observed payroll:   " .. money(data.observed_total or 0), C.text, C.bg)
+  at(4, 11, "Period basis:       " .. tostring(data.observed_days or 1) .. "/365 MCT days", C.dim, C.bg)
+  at(4, 12, "Payroll entries:    " .. tostring(data.count or 0), C.text, C.bg)
+  at(4, 13, "Rows read/window:   " .. tostring(data.raw_count or 0) .. "/" .. tostring(data.considered_rows or 0), C.dim, C.bg)
 
-  local y = 14
+  at(4, 15, "Sector", C.label, C.bg)
+  at(math.max(20, leftW - 22), 15, "Annual", C.label, C.bg)
+  at(math.max(30, leftW - 9), 15, "Share", C.label, C.bg)
+
+  local y = 16
   if #data.sectors == 0 then
     at(4, y, "No payroll expenditure found.", C.dim, C.bg)
     y = y + 1
@@ -617,8 +775,8 @@ local function drawScreen(data, err)
       if y >= H - 5 then break end
       fill(4, y, 2, 1, s.color or C.empty)
       at(7, y, s.label:sub(1, 16), C.text, C.bg)
-      at(math.max(18, leftW - 20), y, money(s.amount), C.good, C.bg)
-      at(math.max(27, leftW - 8), y, pct(s.amount, data.total), C.dim, C.bg)
+      at(math.max(20, leftW - 22), y, money(s.annual or s.amount), C.good, C.bg)
+      at(math.max(30, leftW - 9), y, pct(s.annual or s.amount, data.annual_total or data.total), C.dim, C.bg)
       y = y + 1
     end
   end
@@ -630,7 +788,7 @@ local function drawScreen(data, err)
     end
   end
 
-  drawBox(rightX, 4, W - rightX - 1, H - 5, "SPEND MIX")
+  drawBox(rightX, 4, W - rightX - 1, H - 5, "PAYROLL MIX")
 
   local pieW = W - rightX - 4
   local rx = math.floor(math.min(14, math.max(4, pieW / 3)))
@@ -638,19 +796,19 @@ local function drawScreen(data, err)
   local cx = rightX + math.floor((W - rightX) / 2)
   local cy = 7 + ry
 
-  drawPie(cx, cy, rx, ry, data.sectors, data.total)
-  at(rightX + 2, cy + ry + 2, "Total: " .. money(data.total), C.good, C.bg)
+  drawPie(cx, cy, rx, ry, data.sectors, data.annual_total or data.total)
+  at(rightX + 2, cy + ry + 2, "Annual: " .. money(data.annual_total or data.total), C.good, C.bg)
 
   local legendY = cy + ry + 4
   if legendY < H - 7 then
-    drawLegend(rightX + 2, legendY, data.sectors, data.total)
+    drawLegend(rightX + 2, legendY, data.sectors, data.annual_total or data.total)
   else
-    drawLegend(rightX + 2, 5, data.sectors, data.total)
+    drawLegend(rightX + 2, 5, data.sectors, data.annual_total or data.total)
   end
 
   local age = "never"
   if last_refresh > 0 then age = tostring(math.floor((nowMs() - last_refresh) / 1000)) .. "s ago" end
-  last_message = "Refresh " .. age .. " | Q quits | R refreshes"
+  last_message = "Refresh " .. age .. " | Q quit | R refresh | annualised 365 MCT days"
   last_colour = C.dim
   statusBar()
 end
@@ -658,16 +816,6 @@ end
 -- =============================================================================
 -- MAIN LOOP
 -- =============================================================================
-local function connectScreen(message, colour)
-  cls()
-  topBar()
-  at(2, 3, mcDate() .. "  " .. mcTime(), C.dim, C.bg)
-  at(2, 5, message or "Connecting...", colour or C.dim, C.bg)
-  at(2, 7, "Modem: " .. tostring(modem_name or "none"), C.dim, C.bg)
-  at(2, 8, "Monitor: " .. tostring(monitor_name or (using_monitor and "attached" or "terminal")), C.dim, C.bg)
-  statusBar()
-end
-
 local function main()
   useMonitorIfPresent()
 
@@ -676,7 +824,6 @@ local function main()
     return
   end
 
-  connectScreen("Finding Quid bank server...", C.dim)
   while not discoverBank() do
     last_message = "Bank server not found. Retrying..."
     last_colour = C.bad
@@ -688,26 +835,30 @@ local function main()
   local latest_err = nil
 
   local function refresh()
+    loadingScreen("Loading government payroll history...", "Trying fiscal_history, treasury_history, then status fallback.")
     local ok, res = requestTreasuryHistory()
     if ok then
       latest = analyse(res)
       latest_err = nil
       last_refresh = nowMs()
+      last_error = nil
     else
       latest_err = res
       latest = nil
+      last_error = res
     end
     drawScreen(latest, latest_err)
   end
 
   refresh()
 
+  local timer = os.startTimer(REFRESH_SECONDS)
   while true do
-    local timer = os.startTimer(REFRESH_SECONDS)
     local ev, p1 = os.pullEvent()
 
     if ev == "timer" and p1 == timer then
       refresh()
+      timer = os.startTimer(REFRESH_SECONDS)
     elseif ev == "key" then
       if p1 == keys.q then
         cls()
@@ -715,11 +866,22 @@ local function main()
         return
       elseif p1 == keys.r then
         refresh()
+        timer = os.startTimer(REFRESH_SECONDS)
       end
     elseif ev == "monitor_touch" then
       refresh()
+      timer = os.startTimer(REFRESH_SECONDS)
     end
   end
 end
 
-main()
+local ok, err = pcall(main)
+if not ok then
+  term.redirect(native_term)
+  term.setBackgroundColor(colors.black)
+  term.setTextColor(colors.red)
+  term.clear()
+  term.setCursorPos(1, 1)
+  print("GovernmentExpenditureMonitor crashed")
+  print(tostring(err))
+end
