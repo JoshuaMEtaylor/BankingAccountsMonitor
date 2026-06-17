@@ -51,7 +51,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION            = "1.0.8-COMPLETION-PAYOUT"
+local VERSION            = "1.0.9-DROPDOWN-CLAIM-RESET"
 local LABEL              = "Quid-Contracts"
 local PROTOCOL           = "quid_contracts"
 local PROTOCOL_BROADCAST = "quid_contracts_discovery"
@@ -495,6 +495,14 @@ local function claimContract(sender_id, req)
   if not c then return false, "Contract not found: " .. tostring(id) end
   if c.status ~= "open" then return false, "Contract is not open" end
 
+  if claimant_type == "company" then
+    if not claimant:find("^company:") then
+      claimant = "company:" .. string.lower(claimant):gsub("%s+", "_")
+    end
+    local exists, acc_or_err = bankCompanyExists(claimant)
+    if not exists then return false, acc_or_err end
+  end
+
   c.status = "claimed"
   c.claimed_by = claimant
   c.claimed_type = claimant_type
@@ -736,6 +744,43 @@ handlers["status"] = function(sender_id, req)
   }
 end
 
+
+local function resetLiveContracts(sender_id, req)
+  local source_type = req and req.source_type or "minecolonies_request"
+  local include_claimed = req and req.include_claimed ~= false
+
+  local reset = 0
+  local skipped_claimed = 0
+
+  for id, c in pairs(contracts) do
+    local is_live_source = (not source_type) or c.source_type == source_type
+    local is_active = c.status == "open"
+      or c.status == "claimed"
+      or c.status == "pending_completion"
+      or c.status == "pending_payout"
+
+    if is_live_source and is_active then
+      if c.status == "claimed" and not include_claimed then
+        skipped_claimed = skipped_claimed + 1
+      else
+        c.status = "cancelled"
+        c.cancelled_at = timestamp()
+        c.updated = timestamp()
+        c.cancel_reason = req and req.reason or "Manual live request reset"
+        c.reset_by = sender_id
+        c.claimed_by = nil
+        c.claimed_type = nil
+        c.claimed_at = nil
+        reset = reset + 1
+        audit("LIVE_RESET", c.poster or "unknown", sender_id, id)
+      end
+    end
+  end
+
+  writeFile(FILE.contracts, contracts)
+  return true, { reset = reset, skipped_claimed = skipped_claimed, message = "Live request contracts reset" }
+end
+
 handlers["post_contract"] = postContract
 handlers["list_contracts"] = listContracts
 handlers["get_contract"] = getContract
@@ -744,6 +789,8 @@ handlers["unclaim_contract"] = unclaimContract
 handlers["mark_fulfilled"] = markFulfilled
 handlers["cancel_contract"] = cancelContract
 handlers["sync_source_contracts"] = syncSourceContracts
+handlers["reset_live_contracts"] = resetLiveContracts
+handlers["list_claimant_companies"] = listClaimantCompanies
 
 -- =============================================================================
 -- BOOT
@@ -832,6 +879,57 @@ local function bankReq(req, timeout)
       return msg.success, msg.response
     end
   end
+end
+
+
+local function bankAccounts()
+  local ok, res = bankReq({ type = "list_accounts" }, 6)
+  if ok and type(res) == "table" and type(res.accounts) == "table" then
+    return res.accounts
+  end
+  return nil, res
+end
+
+local function bankCompanyExists(company_id)
+  company_id = trim(company_id or "")
+  if company_id == "" then return false end
+  local accounts, err = bankAccounts()
+  if not accounts then return false, err or "Could not read bank accounts" end
+
+  for _, acc in ipairs(accounts) do
+    if acc.account_id == company_id and acc.type == "company" and (acc.status or "active") == "active" then
+      return true, acc
+    end
+  end
+  return false, "Company account not found: " .. tostring(company_id)
+end
+
+local function listClaimantCompanies(sender_id, req)
+  local accounts, err = bankAccounts()
+  if not accounts then return false, err or "Could not read bank accounts" end
+
+  local companies = {}
+  for _, acc in ipairs(accounts) do
+    if acc.type == "company" and (acc.status or "active") == "active" then
+      local id = tostring(acc.account_id or "")
+      local ticker = id:gsub("^company:", "")
+      companies[#companies+1] = {
+        company_id = id,
+        account_id = id,
+        ticker = string.upper(ticker),
+        display_name = acc.display_name or id,
+        balance = tonumber(acc.balance) or 0,
+        owner_id = acc.owner_id,
+        status = acc.status or "active",
+      }
+    end
+  end
+
+  table.sort(companies, function(a,b)
+    return tostring(a.ticker or a.company_id) < tostring(b.ticker or b.company_id)
+  end)
+
+  return true, { companies = companies, count = #companies }
 end
 
 local function drawStatus()
