@@ -15,7 +15,7 @@
 -- Read-only. No banking controls. No trade panel. Contract GDP over 365 Minecraft days + in-view Minecraft clock + tapered money-supply inflation.
 -- =============================================================================
 
-local VERSION         = "0.5.4-MC365-CLOCK"
+local VERSION         = "0.5.5-MC-CALENDAR"
 local PROTOCOL        = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT      = 5
@@ -56,6 +56,25 @@ local function nowMs()
   return math.floor(os.time() * 1000)
 end
 
+local MONTH_NAMES = {
+  "January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December"
+}
+
+local function isLeapYear(year)
+  year = math.floor(tonumber(year) or 0)
+  if year % 400 == 0 then return true end
+  if year % 100 == 0 then return false end
+  return year % 4 == 0
+end
+
+local function monthLength(month_zero, year)
+  local base = {31,28,31,30,31,30,31,31,30,31,30,31}
+  local idx = (math.floor(tonumber(month_zero) or 0) % 12) + 1
+  if idx == 2 and isLeapYear(year) then return 29 end
+  return base[idx]
+end
+
 local function currentMinecraftDay()
   if os.day then
     local ok, day = pcall(os.day, "ingame")
@@ -66,7 +85,7 @@ local function currentMinecraftDay()
   return math.floor(nowMs() / MINECRAFT_DAY_MS)
 end
 
-local function currentMinecraftTime()
+local function currentMinecraftTimeHours()
   if os.time then
     local ok, t = pcall(os.time, "ingame")
     if ok and tonumber(t) then return tonumber(t) end
@@ -77,26 +96,70 @@ local function currentMinecraftTime()
   return (dayMs / MINECRAFT_DAY_MS) * 24
 end
 
-local function minecraftClock()
-  local day = currentMinecraftDay()
-  local t = currentMinecraftTime() % 24
-  local hour = math.floor(t)
-  local minute = math.floor(((t - hour) * 60) + 0.5)
-  if minute >= 60 then
-    minute = 0
-    hour = (hour + 1) % 24
+local function calendarFromMinecraftDay(day)
+  day = math.floor(tonumber(day) or 0)
+  if day < 0 then day = 0 end
+
+  local year = 0
+  local remaining = day
+  while true do
+    local year_len = isLeapYear(year) and 366 or 365
+    if remaining < year_len then break end
+    remaining = remaining - year_len
+    year = year + 1
   end
-  local year = math.floor(day / GDP_PERIOD_MC_DAYS) + 1
-  local dayOfYear = (day % GDP_PERIOD_MC_DAYS) + 1
+
+  local dayOfYear = remaining
+  local month = 0
+  while true do
+    local len = monthLength(month, year)
+    if remaining < len then break end
+    remaining = remaining - len
+    month = month + 1
+  end
+
   return {
-    day = day,
+    absolute_day = day,
     year = year,
+    month = month, -- zero-indexed so day 0 starts at 0/0/0000
+    month_name = MONTH_NAMES[(month % 12) + 1],
+    day_of_month = remaining,
     day_of_year = dayOfYear,
+    leap_year = isLeapYear(year),
+  }
+end
+
+local function minecraftClock()
+  local absolute_day = currentMinecraftDay()
+  local cal = calendarFromMinecraftDay(absolute_day)
+
+  local t = currentMinecraftTimeHours() % 24
+  local tick = math.floor(((t / 24) * 24000) + 0.5) % 24000
+  local total_seconds = math.floor((tick / 24000) * 86400)
+  local hour = math.floor(total_seconds / 3600) % 24
+  local minute = math.floor((total_seconds % 3600) / 60)
+  local second = total_seconds % 60
+
+  local date_text = string.format("%02d/%02d/%04d", cal.day_of_month, cal.month, cal.year)
+  local time_text = string.format("%02d:%02d:%02d", hour, minute, second)
+
+  return {
+    day = absolute_day,
+    absolute_day = absolute_day,
+    year = cal.year,
+    month = cal.month,
+    month_name = cal.month_name,
+    day_of_month = cal.day_of_month,
+    day_of_year = cal.day_of_year,
+    leap_year = cal.leap_year,
+    tick = tick,
     hour = hour,
     minute = minute,
-    time_text = string.format("%02d:%02d", hour, minute),
-    date_text = "Y" .. tostring(year) .. " D" .. tostring(dayOfYear) .. "/" .. tostring(GDP_PERIOD_MC_DAYS),
-    full_text = "Y" .. tostring(year) .. " D" .. tostring(dayOfYear) .. "/" .. tostring(GDP_PERIOD_MC_DAYS) .. " " .. string.format("%02d:%02d", hour, minute),
+    second = second,
+    date_text = date_text,
+    time_text = time_text,
+    tick_text = tostring(tick),
+    full_text = date_text .. " " .. time_text,
   }
 end
 
@@ -1093,16 +1156,17 @@ local function drawHeader(snap)
 
   local clock = (snap and snap.mc_clock) or minecraftClock()
   writeAt(2, 3, "MC Date: " .. tostring(clock.date_text), C.good, C.bg)
-  writeAt(28, 3, "MC Time: " .. tostring(clock.time_text), C.good, C.bg)
-  writeAt(54, 3, "GDP window: " .. tostring(GDP_PERIOD_MC_DAYS) .. " MC days", C.warn, C.bg)
-  writeAt(86, 3, "Clock: tick-accurate", C.dim, C.bg)
+  writeAt(29, 3, "MC Time: " .. tostring(clock.time_text), C.good, C.bg)
+  writeAt(56, 3, "Tick: " .. tostring(clock.tick_text), C.good, C.bg)
+  writeAt(72, 3, "GDP window: " .. tostring(GDP_PERIOD_MC_DAYS) .. " MC days", C.warn, C.bg)
+  writeAt(106, 3, "Calendar: 0/0/0000", C.dim, C.bg)
 end
 
 local function drawFooter()
   local w, h = getSize()
   fill(1, h - 1, w, 2, C.bg)
   writeAt(1, h - 1, string.rep("-", w), C.dim, C.bg)
-  local text = "Refresh: " .. REFRESH_SECONDS .. "s   MC365 CONTRACT GDP BUILD   Monitor: " .. (monitor and "attached" or "terminal") .. "   [Q] Quit"
+  local text = "Refresh: " .. REFRESH_SECONDS .. "s   MC CALENDAR CONTRACT GDP BUILD   Monitor: " .. (monitor and "attached" or "terminal") .. "   [Q] Quit"
   writeAt(2, h, text, C.dim, C.bg)
   if last_error ~= "" then writeAt(math.max(2, w - #last_error - 2), h, last_error, C.bad, C.bg) end
 end
