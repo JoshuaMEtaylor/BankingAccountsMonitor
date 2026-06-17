@@ -32,7 +32,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION = "1.0.12-PUSH-EMPLOYMENT-MAP"
+local VERSION = "1.0.13-INTEGER-CONTRACT-PRICES"
 local BANK_PROTOCOL = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT = 5
@@ -44,7 +44,7 @@ local DEFAULT_OWNER_ID = "treasury:quid_bank"
 
 local PRICE_INDEX = 1.00          -- central inflation price index from bank
 local INFLATION_RATE = 0.00       -- daily inflation/deflation rate from bank
-local BASE_CONTRACT_FEE = 1       -- deliberately low for early economy growth
+local BASE_CONTRACT_FEE = 0       -- contract price is unit base price * quantity, then inflation; no separate job fee
 local SPEND_LIMIT = 0.50          -- max % of business balance per job; bulk supply jobs need room to pay by quantity
 local MIN_FAIR_RATIO = 0.50       -- don't post if affordable price is under this share of fair value
 
@@ -1006,36 +1006,42 @@ end
 
 local function officialPrice(id)
   local p = prices[id]
-  if type(p) == "table" then return tonumber(p.unit_price) end
-  if type(p) == "number" then return p end
-  return nil
+  if type(p) == "table" then p = p.unit_price end
+  p = tonumber(p)
+  if not p then return nil end
+
+  -- Quid has no decimal sub-unit. Even if an old/manual price table contains a
+  -- decimal, contract pricing normalises it to a whole-number unit price.
+  p = math.floor(p + 0.5)
+  if p < 1 then p = 1 end
+  return p
 end
 
 local function fallbackPrice(id)
   id = lower(id)
 
-  -- Fallback prices are PER ITEM. The job value later multiplies this by the
-  -- requested quantity and then by the central price index.
-  -- Official state price table still overrides these values through get_prices/set_price.
+  -- Fallback prices are PER ITEM and are ALWAYS integer Quid.
+  -- Absolute minimum unit price is 1 Q. No item may be valued at 0.x Q.
+  -- Contract reward later multiplies this by requested quantity, then applies
+  -- positive inflation pressure.
   if id:find("netherite",1,true) then return 20 end
   if id:find("diamond",1,true) then return 8 end
   if id:find("emerald",1,true) then return 6 end
-  if id:find("gold",1,true) then return 2 end
-  if id:find("iron",1,true) then return 1 end
-  if id:find("redstone",1,true) then return 0.5 end
-  if id:find("lapis",1,true) then return 0.5 end
-  if id:find("copper",1,true) then return 0.3 end
-  if id:find("brick",1,true) or id:find("glass",1,true) then return 0.25 end
-  if id:find("coal",1,true) or id:find("charcoal",1,true) then return 0.2 end
+  if id:find("gold",1,true) then return 3 end
+  if id:find("iron",1,true) then return 2 end
+  if id:find("redstone",1,true) then return 1 end
+  if id:find("lapis",1,true) then return 1 end
+  if id:find("copper",1,true) then return 1 end
+  if id:find("brick",1,true) or id:find("glass",1,true) then return 1 end
+  if id:find("coal",1,true) or id:find("charcoal",1,true) then return 1 end
 
   if id:find("pickaxe",1,true) or id:find("shovel",1,true) or id:find("axe",1,true) or id:find("hoe",1,true) or id:find("tool",1,true) then return 3 end
   if id:find("sword",1,true) or id:find("bow",1,true) or id:find("armor",1,true) or id:find("helmet",1,true) or id:find("chestplate",1,true) then return 4 end
 
-  if id:find("log",1,true) then return 0.08 end
-  if id:find("plank",1,true) or id:find("stair",1,true) or id:find("slab",1,true) then return 0.05 end
-  if id:find("cobble",1,true) or id:find("stone",1,true) or id:find("dirt",1,true) or id:find("sand",1,true) or id:find("gravel",1,true) then return 0.03 end
+  if id:find("log",1,true) then return 1 end
+  if id:find("plank",1,true) or id:find("stair",1,true) or id:find("slab",1,true) then return 1 end
+  if id:find("cobble",1,true) or id:find("stone",1,true) or id:find("dirt",1,true) or id:find("sand",1,true) or id:find("gravel",1,true) then return 1 end
 
-  -- Food is now a real economic good: default 1 Q per item before inflation.
   if id:find("salmon",1,true) or id:find("cod",1,true) or id:find("fish",1,true)
     or id:find("bread",1,true) or id:find("wheat",1,true)
     or id:find("potato",1,true) or id:find("carrot",1,true)
@@ -1045,10 +1051,22 @@ local function fallbackPrice(id)
     return 1
   end
 
-  return 0.1
+  return 1
 end
+
 local function unitPrice(id)
-  return officialPrice(id) or fallbackPrice(id)
+  local p = officialPrice(id) or fallbackPrice(id)
+  p = math.floor(tonumber(p) or 1)
+  if p < 1 then p = 1 end
+  return p
+end
+
+local function positiveInflationIndex()
+  -- Inflation can raise contract prices. Deflation does not push contracts below
+  -- their integer base value because contracts are priced in whole Quid.
+  local idx = tonumber(PRICE_INDEX) or 1
+  if idx < 1 then idx = 1 end
+  return idx
 end
 
 local function companyBalance(company_id)
@@ -1138,31 +1156,46 @@ end
 local function requestItemValue(items)
   if #items <= 0 then return 0 end
   -- MineColonies request.items are usually alternatives; price by cheapest valid option.
+  -- Price is always integer: unit base price * exact quantity.
   local cheapest = nil
   for _, it in ipairs(items) do
-    local v = unitPrice(it.item) * (tonumber(it.count) or 1)
+    local qty = math.max(1, math.floor(tonumber(it.count) or 1))
+    local v = unitPrice(it.item) * qty
+    if v < 1 then v = 1 end
     if not cheapest or v < cheapest then cheapest = v end
   end
-  return cheapest or 0
+  return cheapest or 1
 end
 
 local function priceJob(business, items)
   local bal = companyBalance(business.company_id)
   if bal <= 0 then return nil, "no funds", bal, 0 end
 
-  -- Quantity pricing:
-  --   fair = (job fee + cheapest accepted item unit price * requested quantity)
-  --          * central price index * wealth multiplier
+  -- Integer quantity pricing:
+  --   base value = cheapest accepted integer unit price * requested quantity
+  --   fair value = base value + positive inflation adjustment
+  --
+  -- There are no decimal item prices. Absolute minimum unit price is 1 Q.
   --
   -- Example at price index x1:
-  --   64 cooked salmon = (1 + 1*64) = 65 Q before wealth multiplier.
+  --   3 birch planks at 1 Q each = 3 Q
+  --   10 dark oak planks at 1 Q each = 10 Q
+  --
+  -- Example at price index x1.25:
+  --   10 planks = ceil(10 * 1.25) = 13 Q
   local raw_item_value = requestItemValue(items)
-  local fair = (BASE_CONTRACT_FEE + raw_item_value) * PRICE_INDEX * wealthMult(bal)
+  if raw_item_value < 1 then raw_item_value = 1 end
+
+  local fair = math.ceil(raw_item_value * positiveInflationIndex())
+  if fair < raw_item_value then fair = raw_item_value end
+  if fair < 1 then fair = 1 end
 
   local max_pay = math.floor(bal * SPEND_LIMIT)
   if max_pay <= 0 then return nil, "unfunded", bal, fair end
   if max_pay < fair * MIN_FAIR_RATIO then return nil, "cannot afford fair price", bal, fair end
-  local reward = round1(math.min(fair, max_pay))
+
+  local reward = math.floor(math.min(fair, max_pay))
+  if reward < 1 then reward = 1 end
   if reward <= 0 or reward > bal then return nil, "cannot pay", bal, fair end
   return reward, nil, bal, fair
 end
