@@ -15,7 +15,7 @@
 -- Read-only. No banking controls. No trade panel. Contract GDP over 365 Minecraft days + in-view MCT clock + tapered money-supply inflation.
 -- =============================================================================
 
-local VERSION         = "0.5.9-PRICE-SHOCK"
+local VERSION         = "0.5.10-ZERO-BASE-STICKY-DEFLATION"
 local PROTOCOL        = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT      = 5
@@ -579,9 +579,9 @@ end
 
 -- =============================================================================
 -- PRICE / INFLATION ORACLE
--- ServerSideAccounts v1.4.4+ exposes a wide sector price oracle with an immediate price-pressure floor. The monitor
--- treats that as the live inflation source when available. The older adaptive
--- money-supply inflation remains as a fallback only.
+-- ServerSideAccounts v1.4.6+ exposes a zero-baseline wide sector price oracle.
+-- Prices rise easily under money-print/inflation pressure, but deflate slowly
+-- and cannot fall below the sticky ATH floor.
 -- =============================================================================
 local function sectorFromOracle(priceOracle, name)
   if type(priceOracle) ~= "table" or type(priceOracle.sectors) ~= "table" then return nil end
@@ -1292,7 +1292,7 @@ local function drawPriceOracleCard(x, y, w, h, snap)
     local m = snap and snap.monetary or {}
     metric(x + 2, y + 4, "Issued supply", fmtMoney(m.issued_supply), m.issued_supply and C.good or C.warn)
     metric(x + 2, y + 5, "Fallback inflation", fmtPct(snap and snap.inflation, 2), snap and snap.inflation and colors.white or C.warn)
-    writeAt(x + 2, y + h - 1, "ServerSideAccounts v1.4.4+ needed for sector CPI shock", C.warn, C.bg)
+    writeAt(x + 2, y + h - 1, "ServerSideAccounts v1.4.6+ needed for zero-base sticky CPI", C.warn, C.bg)
     return
   end
 
@@ -1306,15 +1306,18 @@ local function drawPriceOracleCard(x, y, w, h, snap)
 
   local floor = tonumber(food.price_pressure_floor or general.price_pressure_floor)
   local pressure = tonumber(food.monetary_pressure or general.monetary_pressure)
+  local shock = tonumber(food.shock_pressure or general.shock_pressure)
+  local sticky = tonumber(food.sticky_floor_from_ath or general.sticky_floor_from_ath)
+  local defCap = tonumber(food.max_daily_deflation or general.max_daily_deflation)
 
   metric(x + 2, y + 2, "Bank rate", fmtPct(po.inflation_percent, 2), po.inflation_percent and colors.white or C.warn, 16)
   metric(x + 2, y + 3, "Price pressure", fmtPct(pressure and (pressure * 100) or nil, 1), pressure and colors.white or C.warn, 16)
-  metric(x + 2, y + 4, "Shock floor", fmtPct(floor and (floor * 100) or nil, 1), floor and C.warn or C.dim, 16)
-  metric(x + 2, y + 5, "General CPI", fmtIndex(general.index, 3), general.index and colors.white or C.warn, 16)
-  metric(x + 2, y + 6, "Food CPI", fmtIndex(food.index, 3), food.index and colors.white or C.warn, 16)
-  metric(x + 2, y + 7, "Construction", fmtIndex(construction.index, 3), construction.index and colors.white or C.warn, 16)
-  metric(x + 2, y + 8, "Fuel/Logistics", fmtIndex(fuel.index, 2) .. " / " .. fmtIndex(logistics.index, 2), fuel.index and colors.white or C.warn, 16)
-  metric(x + 2, y + 9, "Tools/Hospital", fmtIndex(tools.index, 2) .. " / " .. fmtIndex(hospitality.index, 2), tools.index and colors.white or C.warn, 16)
+  metric(x + 2, y + 4, "Admin floor", fmtPct(floor and (floor * 100) or nil, 1), floor and floor > 0 and C.warn or C.dim, 16)
+  metric(x + 2, y + 5, "Print shock", fmtPct(shock and (shock * 100) or nil, 1), shock and shock > 0 and C.warn or C.dim, 16)
+  metric(x + 2, y + 6, "Deflation cap", fmtPct(defCap and (defCap * 100) or nil, 1), defCap and colors.white or C.warn, 16)
+  metric(x + 2, y + 7, "ATH floor", sticky and (fmtPct(sticky * 100, 0) .. " of ATH") or "Awaiting data", sticky and colors.white or C.warn, 16)
+  metric(x + 2, y + 8, "General/Food", fmtIndex(general.index, 2) .. " / " .. fmtIndex(food.index, 2), food.index and colors.white or C.warn, 16)
+  metric(x + 2, y + 9, "Construct/Fuel", fmtIndex(construction.index, 2) .. " / " .. fmtIndex(fuel.index, 2), construction.index and colors.white or C.warn, 16)
 
   local q = po.quotes or {}
   local lineY = y + 11
