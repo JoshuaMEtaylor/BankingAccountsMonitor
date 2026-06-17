@@ -1,0 +1,969 @@
+-- =============================================================================
+-- SERVICE PAYMENT TERMINAL
+-- ServicePaymentTerminal
+--
+-- Current service module: Hospitality / Dining Hall meals.
+--
+-- Flow:
+--   1. Watch Dining Hall / Restaurant / Cook food stock.
+--   2. Ignore coal, charcoal, fuel and non-food items.
+--   3. When food stock decreases, wait the configured eating delay.
+--   4. Find the citizen who last increased saturation after that stock decrease.
+--   5. Charge that citizen based on food tier * quantity.
+--   6. Pay the mapped hospitality company.
+--
+-- No flat fee.
+-- No treasury subsidy.
+-- No fake colonist-to-colonist market.
+-- =============================================================================
+
+local args = {...}
+
+-- =============================================================================
+-- SELF UPDATE
+-- =============================================================================
+if args[1] ~= "--updated" then
+  print("[ Service Payment Terminal ]")
+  print("Deleting old version...")
+  fs.delete("startup.lua")
+  print("Downloading latest from GitHub...")
+
+  local cb = tostring(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
+  local url = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/ServicePaymentTerminal?cb=" .. cb
+  shell.run("wget " .. url .. " startup.lua")
+
+  if not fs.exists("startup.lua") then
+    print("")
+    print("Download failed.")
+    print("Expected GitHub file: ServicePaymentTerminal")
+    return
+  end
+
+  print("Relaunching...")
+  sleep(0.5)
+  shell.run("startup.lua", "--updated")
+  return
+end
+
+-- =============================================================================
+-- CONFIG
+-- =============================================================================
+local VERSION = "1.0.0-DINING-HALL-STOCK-SATURATION"
+local BANK_PROTOCOL = "quid_bank"
+local DB_TIMEOUT = 5
+
+local FILE_CONFIG = "data/service_payment_config.db"
+local FILE_HISTORY = "data/service_payment_history.db"
+local FILE_INDUSTRY_COMPANIES = "data/industry_companies.db"
+
+local DEFAULT_SCAN_INTERVAL_TICKS = 20   -- 1 second
+local DEFAULT_EAT_DELAY_TICKS     = 40   -- 2 seconds, deliberately slightly after vanilla eating time
+local SATURATION_DELTA_MIN        = 0.50
+local MATCH_WINDOW_EXTRA_TICKS    = 80   -- extra window after eating delay for lag / scan timing
+
+local db_id = nil
+local modem_name = nil
+local colony = nil
+local colony_name = "Colony"
+
+local config = {}
+local history = { days = {}, events = {}, unpaid = {} }
+
+local prev_stock = nil
+local prev_citizens = nil
+local saturation_events = {}
+local pending_food_events = {}
+
+local auto_charge = true
+local last_message = "Booting..."
+local last_colour = colors.lightGray
+
+local stats = {
+  stock_sources = 0,
+  food_kinds = 0,
+  food_units = 0,
+  last_food_loss = 0,
+  pending_events = 0,
+  saturation_events = 0,
+  matched_today = 0,
+  charged_today = 0,
+  unpaid_today = 0,
+  unattributed_today = 0,
+}
+
+-- =============================================================================
+-- BASICS
+-- =============================================================================
+local function now()
+  return os.epoch("utc")
+end
+
+local function mcDay()
+  if os.day then return math.floor(tonumber(os.day()) or 0) end
+  return math.floor(now() / 1200000)
+end
+
+local function tickSeconds(ticks)
+  return (tonumber(ticks) or 0) / 20
+end
+
+local function msFromTicks(ticks)
+  return math.floor(tickSeconds(ticks) * 1000)
+end
+
+local function lower(s)
+  return string.lower(tostring(s or ""))
+end
+
+local function trim(s)
+  return tostring(s or ""):match("^%s*(.-)%s*$")
+end
+
+local function setMsg(msg, col)
+  last_message = tostring(msg or "")
+  last_colour = col or colors.lightGray
+end
+
+local function ensureDir(path)
+  local dir = fs.getDir(path)
+  if dir and dir ~= "" and not fs.exists(dir) then fs.makeDir(dir) end
+end
+
+local function readFile(path)
+  if not fs.exists(path) then return nil end
+  local f = fs.open(path, "r")
+  if not f then return nil end
+  local text = f.readAll()
+  f.close()
+  if not text or text == "" then return nil end
+  local ok, data = pcall(textutils.unserialize, text)
+  if ok then return data end
+  return nil
+end
+
+local function writeFile(path, data)
+  ensureDir(path)
+  local f = fs.open(path, "w")
+  if not f then return false end
+  f.write(textutils.serialize(data))
+  f.close()
+  return true
+end
+
+local function money(n)
+  n = tonumber(n) or 0
+  local sign = ""
+  if n < 0 then sign = "-"; n = math.abs(n) end
+  local s = tostring(math.floor(n + 0.5))
+  local out = ""
+  while #s > 3 do
+    out = "," .. s:sub(-3) .. out
+    s = s:sub(1, -4)
+  end
+  return sign .. s .. out .. " Q"
+end
+
+local function locString(loc)
+  if type(loc) ~= "table" then return "0,0,0" end
+  local x = loc.x or loc[1] or 0
+  local y = loc.y or loc[2] or 0
+  local z = loc.z or loc[3] or 0
+  return tostring(x) .. "," .. tostring(y) .. "," .. tostring(z)
+end
+
+local function normalType(s)
+  s = tostring(s or "")
+  s = s:gsub("com%.minecolonies%.building%.", "")
+  s = s:gsub("com%.minecolonies%.job%.", "")
+  return lower(s)
+end
+
+local function simpleItemName(name)
+  name = tostring(name or "")
+  name = name:gsub("^minecraft:", "")
+  name = name:gsub("^minecolonies:", "")
+  name = name:gsub("^%w+:", "")
+  return lower(name)
+end
+
+-- =============================================================================
+-- FOOD RULES
+-- =============================================================================
+local function isExcludedFuel(item)
+  local id = simpleItemName(item)
+  return id == "coal"
+    or id == "charcoal"
+    or id:find("coal_block", 1, true)
+    or id:find("charcoal", 1, true)
+end
+
+local FOOD_KEYWORDS = {
+  "apple", "bread", "potato", "carrot", "beetroot", "soup", "stew",
+  "cookie", "pie", "melon", "berries", "kelp", "cod", "salmon",
+  "beef", "steak", "porkchop", "chicken", "mutton", "rabbit",
+  "honey", "cake", "pumpkin_pie", "golden_carrot", "food"
+}
+
+local function isFoodItem(item)
+  if isExcludedFuel(item) then return false end
+  local id = simpleItemName(item)
+  for _, k in ipairs(FOOD_KEYWORDS) do
+    if id:find(k, 1, true) then return true end
+  end
+  return false
+end
+
+local function foodTier(item)
+  local id = simpleItemName(item)
+
+  -- Tier 4: premium / very high value foods
+  if id:find("golden_carrot", 1, true)
+    or id:find("cake", 1, true)
+    or id:find("rabbit_stew", 1, true) then
+    return 4
+  end
+
+  -- Tier 3: strong cooked meats / premium cooked meals
+  if id:find("steak", 1, true)
+    or id:find("cooked_beef", 1, true)
+    or id:find("cooked_porkchop", 1, true)
+    or id:find("cooked_salmon", 1, true) then
+    return 3
+  end
+
+  -- Tier 2: ordinary cooked meals / decent food
+  if id:find("cooked_", 1, true)
+    or id:find("bread", 1, true)
+    or id:find("pumpkin_pie", 1, true)
+    or id:find("mushroom_stew", 1, true)
+    or id:find("beetroot_soup", 1, true) then
+    return 2
+  end
+
+  -- Tier 1: raw/basic food. Minimum unit price is always 1 Q.
+  return 1
+end
+
+local function foodUnitPrice(item)
+  local t = foodTier(item)
+  if t < 1 then t = 1 end
+  return t
+end
+
+-- =============================================================================
+-- NETWORK
+-- =============================================================================
+local function openModem()
+  for _, n in ipairs(peripheral.getNames()) do
+    if peripheral.getType(n) == "modem" then
+      local m = peripheral.wrap(n)
+      if m and m.isWireless and m.isWireless() then
+        rednet.open(n)
+        modem_name = n
+        return true
+      end
+    end
+  end
+  for _, n in ipairs(peripheral.getNames()) do
+    if peripheral.getType(n) == "modem" then
+      rednet.open(n)
+      modem_name = n
+      return true
+    end
+  end
+  return false
+end
+
+local function discoverBank()
+  for _ = 1, 5 do
+    rednet.broadcast({ type = "ping" }, BANK_PROTOCOL)
+    local sender, msg = rednet.receive(BANK_PROTOCOL, 2)
+    if sender and type(msg) == "table" then
+      if msg.type == "treasury_online" or msg.success == true then
+        db_id = sender
+        return true
+      end
+    end
+  end
+  return false
+end
+
+local function bankReq(req, timeout)
+  timeout = timeout or DB_TIMEOUT
+  if not db_id then discoverBank() end
+  if not db_id then return false, "No bank server connected" end
+
+  rednet.send(db_id, req, BANK_PROTOCOL)
+  local deadline = os.clock() + timeout
+
+  while true do
+    local rem = deadline - os.clock()
+    if rem <= 0 then return false, "No response from bank" end
+    local sender, msg = rednet.receive(BANK_PROTOCOL, rem)
+    if sender == db_id and type(msg) == "table" and msg.success ~= nil then
+      return msg.success, msg.response
+    end
+  end
+end
+
+-- =============================================================================
+-- COLONY / COMPANY DISCOVERY
+-- =============================================================================
+local function findColony()
+  colony = peripheral.find("colonyIntegrator") or peripheral.find("colony_integrator")
+  if colony and colony.getColonyName then
+    local ok, name = pcall(colony.getColonyName)
+    if ok and name then colony_name = tostring(name) end
+  end
+  return colony ~= nil
+end
+
+local function loadConfig()
+  config = readFile(FILE_CONFIG) or {}
+
+  if not config.scan_interval_ticks then config.scan_interval_ticks = DEFAULT_SCAN_INTERVAL_TICKS end
+  if not config.eat_delay_ticks then config.eat_delay_ticks = DEFAULT_EAT_DELAY_TICKS end
+  if not config.match_window_extra_ticks then config.match_window_extra_ticks = MATCH_WINDOW_EXTRA_TICKS end
+  if config.auto_charge == nil then config.auto_charge = true end
+
+  auto_charge = config.auto_charge ~= false
+  return config
+end
+
+local function saveConfig()
+  config.auto_charge = auto_charge
+  writeFile(FILE_CONFIG, config)
+end
+
+local function hospitalityCompany()
+  if config.company_id and config.company_id ~= "" then
+    return config.company_id, config.company_name or config.company_id
+  end
+
+  local industries = readFile(FILE_INDUSTRY_COMPANIES) or {}
+  local h = industries.hospitality
+
+  if type(h) == "table" and h.company_id then
+    return h.company_id, h.name or h.company_id
+  end
+
+  -- Current expected fallback for the hospitality company if mappings are not
+  -- present on this terminal yet.
+  return "company:hrth", "Hospitality"
+end
+
+local function isHospitalityBuilding(b)
+  local t = normalType(b and (b.type or b.name) or "")
+  local n = normalType(b and b.name or "")
+  return t:find("dining",1,true)
+    or t:find("restaurant",1,true)
+    or t:find("cook",1,true)
+    or t:find("tavern",1,true)
+    or n:find("dining",1,true)
+    or n:find("restaurant",1,true)
+    or n:find("cook",1,true)
+    or n:find("tavern",1,true)
+end
+
+local function getBuildings()
+  if not colony or not colony.getBuildings then return {} end
+  local ok, b = pcall(colony.getBuildings)
+  if ok and type(b) == "table" then return b end
+  return {}
+end
+
+local function hospitalityBuildings()
+  local out = {}
+  for _, b in ipairs(getBuildings()) do
+    if isHospitalityBuilding(b) then out[#out+1] = b end
+  end
+  return out
+end
+
+-- =============================================================================
+-- STOCK READING
+-- =============================================================================
+local function addFood(counts, item, qty)
+  qty = tonumber(qty) or 0
+  if qty <= 0 then return end
+  if not isFoodItem(item) then return end
+
+  local id = simpleItemName(item)
+  counts[id] = (counts[id] or 0) + qty
+end
+
+local function countFromInventory(inv, counts)
+  if not inv or type(inv.list) ~= "function" then return false end
+
+  local ok, items = pcall(inv.list)
+  if not ok or type(items) ~= "table" then return false end
+
+  local before = 0
+  for _ in pairs(counts) do before = before + 1 end
+
+  for _, st in pairs(items) do
+    if type(st) == "table" then
+      addFood(counts, st.name or st.displayName or st.item, st.count or st.qty or st.amount or 0)
+    end
+  end
+
+  local after = 0
+  for _ in pairs(counts) do after = after + 1 end
+  return after > before
+end
+
+local function countFromStorageTable(tbl, counts)
+  if type(tbl) ~= "table" then return false end
+
+  local before_units = 0
+  for _, q in pairs(counts) do before_units = before_units + q end
+
+  local lists = { "items", "contents", "inventory", "stacks" }
+  for _, k in ipairs(lists) do
+    if type(tbl[k]) == "table" then
+      for _, st in pairs(tbl[k]) do
+        if type(st) == "table" then
+          addFood(counts, st.name or st.displayName or st.item or st.id, st.count or st.qty or st.amount or 0)
+        end
+      end
+    end
+  end
+
+  if tbl.name and (tbl.count or tbl.qty or tbl.amount) then
+    addFood(counts, tbl.name, tbl.count or tbl.qty or tbl.amount)
+  end
+
+  local possible = { tbl.peripheral, tbl.peripheral_name, tbl.name }
+  for _, pname in ipairs(possible) do
+    if type(pname) == "string" and peripheral.isPresent(pname) then
+      countFromInventory(peripheral.wrap(pname), counts)
+    end
+  end
+
+  local after_units = 0
+  for _, q in pairs(counts) do after_units = after_units + q end
+  return after_units > before_units
+end
+
+local function readFoodStock()
+  local counts = {}
+  local sources = 0
+
+  -- MineColonies building storage fields, if AP exposes contents.
+  for _, b in ipairs(hospitalityBuildings()) do
+    if type(b.storageBlocks) == "table" then
+      for _, sb in pairs(b.storageBlocks) do
+        if countFromStorageTable(sb, counts) then sources = sources + 1 end
+      end
+    end
+    if countFromStorageTable(b, counts) then sources = sources + 1 end
+  end
+
+  -- Configured inventory peripheral names.
+  local invs = config.inventories or config.inventory_names or {}
+  if type(invs) == "table" then
+    for _, pname in ipairs(invs) do
+      if type(pname) == "string" and peripheral.isPresent(pname) then
+        if countFromInventory(peripheral.wrap(pname), counts) then sources = sources + 1 end
+      end
+    end
+  end
+
+  -- Fallback: attached inventories with useful names.
+  for _, pname in ipairs(peripheral.getNames()) do
+    local n = lower(pname)
+    if n:find("dining",1,true)
+      or n:find("restaurant",1,true)
+      or n:find("cook",1,true)
+      or n:find("kitchen",1,true)
+      or n:find("hospitality",1,true) then
+      if countFromInventory(peripheral.wrap(pname), counts) then sources = sources + 1 end
+    end
+  end
+
+  local kinds = 0
+  local units = 0
+  for _, q in pairs(counts) do
+    kinds = kinds + 1
+    units = units + (tonumber(q) or 0)
+  end
+
+  stats.stock_sources = sources
+  stats.food_kinds = kinds
+  stats.food_units = units
+
+  return counts
+end
+
+local function stockLosses(old, new)
+  old = old or {}
+  new = new or {}
+
+  local losses = {}
+  local total_qty = 0
+  local total_value = 0
+
+  for item, oldQty in pairs(old) do
+    local newQty = tonumber(new[item]) or 0
+    oldQty = tonumber(oldQty) or 0
+    if newQty < oldQty then
+      local qty = oldQty - newQty
+      local unit = foodUnitPrice(item)
+      local value = unit * qty
+
+      losses[#losses+1] = {
+        item = item,
+        qty = qty,
+        unit = unit,
+        value = value,
+        tier = foodTier(item),
+      }
+
+      total_qty = total_qty + qty
+      total_value = total_value + value
+    end
+  end
+
+  table.sort(losses, function(a,b)
+    if a.value ~= b.value then return a.value > b.value end
+    return tostring(a.item) < tostring(b.item)
+  end)
+
+  return losses, total_qty, total_value
+end
+
+-- =============================================================================
+-- CITIZEN SATURATION
+-- =============================================================================
+local function getCitizens()
+  if not colony or not colony.getCitizens then return {} end
+  local ok, z = pcall(colony.getCitizens)
+  if ok and type(z) == "table" then return z end
+  return {}
+end
+
+local function citizenStableId(z)
+  if type(z) ~= "table" then return nil end
+  return z.id or z.citizen_id or z.citizenId or z.citizenID or z.uuid
+end
+
+local function citizenAccountId(z)
+  local id = citizenStableId(z)
+  if not id then return nil end
+  local sid = tostring(id)
+  if sid:find("^citizen:") then return sid end
+  if sid:find("^mc_") then return "citizen:" .. sid end
+  return "citizen:mc_" .. sid
+end
+
+local function citizenName(z)
+  return tostring(z and (z.name or z.display_name or citizenAccountId(z)) or "Citizen")
+end
+
+local function snapshotCitizens()
+  local snap = {}
+  for _, z in ipairs(getCitizens()) do
+    local id = citizenAccountId(z)
+    if id then
+      snap[id] = {
+        id = id,
+        name = citizenName(z),
+        saturation = tonumber(z.saturation or z.food or 0) or 0,
+        betterFood = z.betterFood,
+        state = tostring(z.state or ""),
+        location = z.location,
+      }
+    end
+  end
+  return snap
+end
+
+local function updateSaturationEvents(prev, cur)
+  local t = now()
+  prev = prev or {}
+
+  for id, c in pairs(cur or {}) do
+    local p = prev[id]
+    if p then
+      local delta = (tonumber(c.saturation) or 0) - (tonumber(p.saturation) or 0)
+      if delta >= SATURATION_DELTA_MIN then
+        saturation_events[#saturation_events+1] = {
+          time = t,
+          citizen_id = id,
+          name = c.name,
+          delta = delta,
+          state = c.state,
+        }
+      end
+    end
+  end
+
+  local keep = {}
+  local max_age = msFromTicks((config.eat_delay_ticks or DEFAULT_EAT_DELAY_TICKS) + (config.match_window_extra_ticks or MATCH_WINDOW_EXTRA_TICKS) + 200)
+  for _, ev in ipairs(saturation_events) do
+    if t - ev.time <= max_age then keep[#keep+1] = ev end
+  end
+  saturation_events = keep
+  stats.saturation_events = #saturation_events
+end
+
+local function lastSaturationIncreaseBetween(start_time, end_time)
+  local best = nil
+  for _, ev in ipairs(saturation_events) do
+    if ev.time >= start_time and ev.time <= end_time then
+      if not best or ev.time > best.time then best = ev end
+    end
+  end
+  return best
+end
+
+-- =============================================================================
+-- HISTORY / PAYMENT
+-- =============================================================================
+local function loadHistory()
+  history = readFile(FILE_HISTORY) or { days = {}, events = {}, unpaid = {} }
+  history.days = history.days or {}
+  history.events = history.events or {}
+  history.unpaid = history.unpaid or {}
+end
+
+local function saveHistory()
+  while #history.events > 500 do table.remove(history.events, 1) end
+  while #history.unpaid > 500 do table.remove(history.unpaid, 1) end
+  writeFile(FILE_HISTORY, history)
+end
+
+local function dayRec()
+  local key = tostring(mcDay())
+  history.days[key] = history.days[key] or {
+    day = mcDay(),
+    events = 0,
+    matched = 0,
+    charged = 0,
+    unpaid = 0,
+    unattributed = 0,
+    created = now(),
+  }
+  return history.days[key]
+end
+
+local function chargeCitizenMeal(ev, pending)
+  local company_id, company_name = hospitalityCompany()
+  local amount = math.floor(tonumber(pending.total_value) or 0)
+  if amount < 1 then amount = 1 end
+
+  local ok, res = bankReq({
+    type = "hospitality_meal_payment",
+    citizen_id = ev.citizen_id,
+    company_id = company_id,
+    amount = amount,
+    item = pending.summary,
+    memo = "Dining Hall meal: " .. pending.summary,
+  }, 6)
+
+  local rec = dayRec()
+  rec.events = (rec.events or 0) + 1
+  rec.matched = (rec.matched or 0) + 1
+
+  local paid = 0
+  local shortfall = amount
+
+  if ok and type(res) == "table" then
+    paid = tonumber(res.paid) or 0
+    shortfall = tonumber(res.shortfall) or 0
+
+    rec.charged = (rec.charged or 0) + paid
+    rec.unpaid = (rec.unpaid or 0) + shortfall
+
+    history.events[#history.events+1] = {
+      time = now(),
+      day = mcDay(),
+      type = "dining_hall_service",
+      citizen_id = ev.citizen_id,
+      citizen_name = ev.name,
+      company_id = company_id,
+      company_name = company_name,
+      amount = amount,
+      paid = paid,
+      shortfall = shortfall,
+      losses = pending.losses,
+      summary = pending.summary,
+      saturation_delta = ev.delta,
+      tx_id = res.tx_id,
+    }
+
+    if shortfall > 0 then
+      history.unpaid[#history.unpaid+1] = {
+        time = now(),
+        day = mcDay(),
+        citizen_id = ev.citizen_id,
+        citizen_name = ev.name,
+        company_id = company_id,
+        amount = shortfall,
+        summary = pending.summary,
+      }
+    end
+
+    stats.matched_today = rec.matched
+    stats.charged_today = rec.charged
+    stats.unpaid_today = rec.unpaid
+
+    setMsg(ev.name .. " charged " .. money(paid) .. " for " .. pending.summary .. (shortfall > 0 and (" / unpaid " .. money(shortfall)) or ""), shortfall > 0 and colors.orange or colors.lime)
+    return true
+  end
+
+  history.events[#history.events+1] = {
+    time = now(),
+    day = mcDay(),
+    type = "dining_hall_payment_failed",
+    citizen_id = ev.citizen_id,
+    citizen_name = ev.name,
+    company_id = company_id,
+    amount = amount,
+    error = tostring(res),
+    losses = pending.losses,
+    summary = pending.summary,
+  }
+
+  setMsg("Payment failed: " .. tostring(res), colors.red)
+  return false
+end
+
+local function recordUnattributed(pending)
+  local rec = dayRec()
+  rec.events = (rec.events or 0) + 1
+  rec.unattributed = (rec.unattributed or 0) + (tonumber(pending.total_qty) or 0)
+
+  history.events[#history.events+1] = {
+    time = now(),
+    day = mcDay(),
+    type = "unattributed_dining_hall_consumption",
+    total_qty = pending.total_qty,
+    total_value = pending.total_value,
+    losses = pending.losses,
+    summary = pending.summary,
+  }
+
+  stats.unattributed_today = rec.unattributed
+  setMsg("Food consumed but no saturation match: " .. pending.summary, colors.orange)
+end
+
+local function summarizeLosses(losses)
+  if #losses == 0 then return "food" end
+  local parts = {}
+  for _, l in ipairs(losses) do
+    parts[#parts+1] = tostring(l.qty) .. "x " .. tostring(l.item)
+  end
+  return table.concat(parts, ", ")
+end
+
+-- =============================================================================
+-- SCANNING
+-- =============================================================================
+local function processDueFoodEvents()
+  local t = now()
+  local keep = {}
+
+  local eat_delay = msFromTicks(config.eat_delay_ticks or DEFAULT_EAT_DELAY_TICKS)
+  local extra = msFromTicks(config.match_window_extra_ticks or MATCH_WINDOW_EXTRA_TICKS)
+
+  for _, pending in ipairs(pending_food_events) do
+    if t >= pending.due_time then
+      local match = lastSaturationIncreaseBetween(pending.detected_at, pending.due_time + extra)
+
+      if match then
+        chargeCitizenMeal(match, pending)
+      else
+        recordUnattributed(pending)
+      end
+    else
+      keep[#keep+1] = pending
+    end
+  end
+
+  pending_food_events = keep
+  stats.pending_events = #pending_food_events
+end
+
+local function scanOnce()
+  if not colony then findColony() end
+  if not db_id then discoverBank() end
+
+  local current_stock = readFoodStock()
+  local current_citizens = snapshotCitizens()
+
+  updateSaturationEvents(prev_citizens, current_citizens)
+
+  if prev_stock then
+    local losses, total_qty, total_value = stockLosses(prev_stock, current_stock)
+    stats.last_food_loss = total_qty
+
+    if total_qty > 0 then
+      local t = now()
+      local delay_ms = msFromTicks(config.eat_delay_ticks or DEFAULT_EAT_DELAY_TICKS)
+
+      pending_food_events[#pending_food_events+1] = {
+        detected_at = t,
+        due_time = t + delay_ms,
+        losses = losses,
+        total_qty = total_qty,
+        total_value = math.max(1, math.floor(total_value)),
+        summary = summarizeLosses(losses),
+      }
+
+      stats.pending_events = #pending_food_events
+      setMsg("Food decrease detected: " .. summarizeLosses(losses) .. ". Waiting for saturation increase.", colors.yellow)
+    end
+  end
+
+  prev_stock = current_stock
+  prev_citizens = current_citizens
+
+  processDueFoodEvents()
+  saveHistory()
+end
+
+-- =============================================================================
+-- DISPLAY
+-- =============================================================================
+local function cls()
+  term.setCursorBlink(false)
+  term.setBackgroundColor(colors.black)
+  term.setTextColor(colors.white)
+  term.clear()
+  term.setCursorPos(1, 1)
+end
+
+local function at(x, y, text, fg, bg)
+  local W, H = term.getSize()
+  if y < 1 or y > H or x > W then return end
+  term.setCursorPos(x, y)
+  term.setTextColor(fg or colors.white)
+  term.setBackgroundColor(bg or colors.black)
+  local maxw = W - x + 1
+  if maxw > 0 then term.write(tostring(text or ""):sub(1, maxw)) end
+end
+
+local function fill(x, y, w, h, bg)
+  term.setBackgroundColor(bg or colors.black)
+  local W, H = term.getSize()
+  local row = string.rep(" ", math.max(0, w))
+  for yy = y, y + h - 1 do
+    if yy >= 1 and yy <= H then
+      term.setCursorPos(x, yy)
+      term.write(row:sub(1, math.max(0, W - x + 1)))
+    end
+  end
+end
+
+local function button(x, y, w, label, bg, fg)
+  fill(x, y, w, 1, bg or colors.gray)
+  local tx = x + math.floor((w - #label) / 2)
+  at(tx, y, label, fg or colors.white, bg or colors.gray)
+  return { x1 = x, x2 = x + w - 1, y1 = y, y2 = y }
+end
+
+local function hit(b, mx, my)
+  return b and mx >= b.x1 and mx <= b.x2 and my >= b.y1 and my <= b.y2
+end
+
+local function draw()
+  local W, H = term.getSize()
+  cls()
+
+  fill(1, 1, W, 1, colors.purple)
+  at(2, 1, "SERVICE PAYMENT TERMINAL", colors.white, colors.purple)
+  at(math.max(2, W - #VERSION), 1, VERSION, colors.lightGray, colors.purple)
+
+  local company_id, company_name = hospitalityCompany()
+  local rec = dayRec()
+
+  at(2, 3, "Service:      Dining Hall / Hospitality", colors.white)
+  at(2, 4, "Colony:       " .. tostring(colony_name), colors.lightGray)
+  at(2, 5, "Bank:         " .. tostring(db_id or "not connected"), db_id and colors.lime or colors.red)
+  at(2, 6, "Company:      " .. tostring(company_name) .. " (" .. tostring(company_id) .. ")", colors.lime)
+  at(2, 7, "Auto charge:  " .. (auto_charge and "ON" or "OFF"), auto_charge and colors.lime or colors.orange)
+
+  at(2, 9,  "Stock sources:        " .. tostring(stats.stock_sources), stats.stock_sources > 0 and colors.lime or colors.orange)
+  at(2, 10, "Food kinds / units:   " .. tostring(stats.food_kinds) .. " / " .. tostring(stats.food_units), colors.white)
+  at(2, 11, "Last food decrease:   " .. tostring(stats.last_food_loss), stats.last_food_loss > 0 and colors.yellow or colors.gray)
+  at(2, 12, "Pending food events:  " .. tostring(#pending_food_events), #pending_food_events > 0 and colors.yellow or colors.gray)
+  at(2, 13, "Saturation events:    " .. tostring(#saturation_events), colors.cyan)
+
+  at(2, 15, "Matched meals today:  " .. tostring(rec.matched or 0), colors.white)
+  at(2, 16, "Charged today:        " .. money(rec.charged or 0), colors.lime)
+  at(2, 17, "Unpaid receivable:    " .. money(rec.unpaid or 0), (rec.unpaid or 0) > 0 and colors.orange or colors.gray)
+  at(2, 18, "Unattributed food:    " .. tostring(rec.unattributed or 0) .. " units", (rec.unattributed or 0) > 0 and colors.orange or colors.gray)
+
+  at(2, 20, "Eating delay: " .. tostring(config.eat_delay_ticks or DEFAULT_EAT_DELAY_TICKS) .. " ticks. Coal/charcoal excluded.", colors.gray)
+
+  local third = math.floor((W - 8) / 3)
+  local bScan = button(2, H - 3, third, "Scan Now", colors.purple)
+  local bAuto = button(4 + third, H - 3, third, auto_charge and "Auto Off" or "Auto On", colors.gray)
+  local bRecon = button(6 + (third * 2), H - 3, third, "Reconnect", colors.gray)
+
+  at(2, H - 1, tostring(last_message), last_colour)
+  return bScan, bAuto, bRecon
+end
+
+-- =============================================================================
+-- MAIN
+-- =============================================================================
+local function main()
+  loadConfig()
+  loadHistory()
+
+  if not openModem() then
+    cls()
+    print("No modem found.")
+    print("Attach a modem and reboot.")
+    return
+  end
+
+  findColony()
+  discoverBank()
+
+  -- Initial baseline scan. Do not charge on first read.
+  prev_stock = readFoodStock()
+  prev_citizens = snapshotCitizens()
+
+  local bScan, bAuto, bRecon = draw()
+  local timer = os.startTimer(tickSeconds(config.scan_interval_ticks or DEFAULT_SCAN_INTERVAL_TICKS))
+
+  while true do
+    local ev, p1, p2, p3 = os.pullEvent()
+
+    if ev == "timer" and p1 == timer then
+      if auto_charge then scanOnce() end
+      bScan, bAuto, bRecon = draw()
+      timer = os.startTimer(tickSeconds(config.scan_interval_ticks or DEFAULT_SCAN_INTERVAL_TICKS))
+
+    elseif ev == "mouse_click" then
+      local mx, my = p2, p3
+      if hit(bScan, mx, my) then
+        scanOnce()
+      elseif hit(bAuto, mx, my) then
+        auto_charge = not auto_charge
+        saveConfig()
+        setMsg("Auto charge " .. (auto_charge and "enabled" or "disabled"), auto_charge and colors.lime or colors.orange)
+      elseif hit(bRecon, mx, my) then
+        findColony()
+        discoverBank()
+        setMsg("Reconnected.", colors.lime)
+      end
+      bScan, bAuto, bRecon = draw()
+
+    elseif ev == "terminate" then
+      saveHistory()
+      saveConfig()
+      break
+    end
+  end
+end
+
+local ok, err = pcall(main)
+if not ok then
+  term.setCursorBlink(false)
+  term.setTextColor(colors.red)
+  print("Runtime error: " .. tostring(err))
+end
