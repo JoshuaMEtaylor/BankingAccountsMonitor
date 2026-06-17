@@ -44,9 +44,9 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION = "1.2.5-HALLOWAY-DINING-TARGET"
+local VERSION = "1.2.6-HOSPITALITY-MAPPING-TARGET"
 local BANK_PROTOCOL = "quid_bank"
-local TARGET_COMPANY = "company:halloway_dining" -- fallback / manual override; auto-detects from Dining Hall name when possible
+local TARGET_COMPANY = "company:hospitality" -- fallback only; the real target is resolved from bank employment mappings
 
 local SCAN_SECONDS = 2
 local DINING_RADIUS = 28
@@ -81,6 +81,7 @@ local CONFIG_FILE = "data/service_payment_config.db"
 local db_id = nil
 local colony = nil
 local active_company_id = TARGET_COMPANY
+local active_company_source = "fallback"
 local active_dining_name = "fallback target"
 local auto_charge = true
 local last_message = "Booting..."
@@ -290,25 +291,28 @@ local function companyIdFromName(name)
   return "company:" .. slug
 end
 
-local function diningCompanyIdForBuilding(b)
-  if type(b) ~= "table" then return TARGET_COMPANY end
+local function isSafeCompanyId(id)
+  id = tostring(id or "")
+  if id == "" then return false end
+  if not id:find("^company:") then return false end
+  -- Never accept raw Java/MineColonies class names as bank company accounts.
+  -- The bug was: com.minecolonies.building.cook -> company:com_minecolonies_building_cook
+  if id:find("minecolonies", 1, true) or id:find("building", 1, true) or id:find("%.") then return false end
+  return true
+end
 
-  -- Prefer explicit company-like fields if a future integrator exposes them.
+local function diningCompanyIdForBuilding(b)
+  if type(b) ~= "table" then return nil end
+
+  -- Only accept explicit company IDs if a future integrator exposes a real bank
+  -- account. Do NOT derive a company account from building name/type.
   local explicit = b.company_id or b.companyId or b.account_id or b.accountId or b.business_id or b.businessId
   if explicit and tostring(explicit) ~= "" then
     explicit = tostring(explicit)
-    if explicit:find("^company:") then return explicit end
-    return companyIdFromName(explicit) or TARGET_COMPANY
+    if explicit:find("^company:") and isSafeCompanyId(explicit) then return explicit end
   end
 
-  -- Current MineColonies building data normally gives us name/type/location,
-  -- not a bank account. Use the building name as the company account slug.
-  -- Example: "Halloway dining" -> "company:halloway_dining".
-  local name = b.name or b.display_name or b.displayName
-  local id = companyIdFromName(name)
-  if id then return id end
-
-  return TARGET_COMPANY
+  return nil
 end
 
 local function citizenName(z, fallback)
@@ -365,6 +369,101 @@ local function bankReq(req, timeout)
       return msg.success, msg.response
     end
   end
+end
+
+
+-- =============================================================================
+-- COMPANY TARGET RESOLUTION
+-- =============================================================================
+local function textHasHospitality(text)
+  text = lower(text or "")
+  return text:find("hospitality", 1, true)
+    or text:find("dining", 1, true)
+    or text:find("restaurant", 1, true)
+    or text:find("catering", 1, true)
+    or text:find("cook", 1, true)
+    or text:find("kitchen", 1, true)
+    or text:find("waiter", 1, true)
+end
+
+local function resolveHospitalityCompanyFromMappings()
+  local ok, res = bankReq({ type = "list_employee_mappings", include_inactive = false }, 4)
+  if not ok or type(res) ~= "table" or type(res.employees) ~= "table" then return nil, nil end
+
+  local score = {}
+  local label = {}
+  for _, e in ipairs(res.employees or {}) do
+    if type(e) == "table" then
+      local cid = tostring(e.company_id or "")
+      local industry = lower(e.industry or "")
+      local text = table.concat({
+        tostring(e.company_name or ""),
+        tostring(e.job_text or ""),
+        tostring(e.work_type or ""),
+        tostring(e.work_name or ""),
+        tostring(e.building_key or ""),
+      }, " ")
+
+      if isSafeCompanyId(cid) and (industry == "hospitality" or textHasHospitality(text)) then
+        score[cid] = (score[cid] or 0) + (industry == "hospitality" and 5 or 1)
+        label[cid] = tostring(e.company_name or cid)
+      end
+    end
+  end
+
+  local best, bestScore = nil, 0
+  for cid, sc in pairs(score) do
+    if sc > bestScore then best, bestScore = cid, sc end
+  end
+
+  if best then return best, "employee_mappings" end
+  return nil, nil
+end
+
+local function resolveHospitalityCompanyFromAccounts()
+  local ok, res = bankReq({ type = "list_accounts" }, 4)
+  if not ok or type(res) ~= "table" or type(res.accounts) ~= "table" then return nil, nil end
+
+  local best, bestScore = nil, 0
+  for _, acc in ipairs(res.accounts or {}) do
+    if type(acc) == "table" and acc.type == "company" and acc.status ~= "suspended" then
+      local cid = tostring(acc.account_id or "")
+      local name = lower((acc.display_name or "") .. " " .. cid)
+      local sc = 0
+      if name:find("hospitality", 1, true) then sc = sc + 100 end
+      if name:find("dining", 1, true) then sc = sc + 80 end
+      if name:find("catering", 1, true) then sc = sc + 75 end
+      if name:find("restaurant", 1, true) then sc = sc + 70 end
+      if name:find("cook", 1, true) then sc = sc + 60 end
+      if name:find("halloway", 1, true) then sc = sc + 50 end
+
+      if isSafeCompanyId(cid) and sc > bestScore then
+        best, bestScore = cid, sc
+      end
+    end
+  end
+
+  if best then return best, "account_search" end
+  return nil, nil
+end
+
+local function resolveHospitalityCompany(dining)
+  -- If the building data ever provides a real bank company id, accept it.
+  for _, d in ipairs(dining or {}) do
+    if d and isSafeCompanyId(d.company_id) then return d.company_id, "building_company_id" end
+  end
+
+  -- Normal route: ColonyBusinessIntegrator syncs workers to the bank, and the
+  -- bank knows their industry/company mapping. This gives the exact random
+  -- ticker company id instead of inventing company:com_minecolonies_building_cook.
+  local cid, source = resolveHospitalityCompanyFromMappings()
+  if cid then return cid, source end
+
+  cid, source = resolveHospitalityCompanyFromAccounts()
+  if cid then return cid, source end
+
+  if isSafeCompanyId(TARGET_COMPANY) then return TARGET_COMPANY, "fallback" end
+  return nil, "unresolved"
 end
 
 -- =============================================================================
@@ -754,12 +853,18 @@ local function poll()
   local buildings = getLiveBuildings()
   local dining = diningBuildings(buildings)
 
+  local resolved_company, resolved_source = resolveHospitalityCompany(dining)
+  active_company_id = resolved_company or TARGET_COMPANY
+  active_company_source = resolved_source or "fallback"
+
   if #dining > 0 then
-    active_company_id = dining[1].company_id or TARGET_COMPANY
     active_dining_name = dining[1].name or "Dining Hall"
   else
-    active_company_id = TARGET_COMPANY
     active_dining_name = "fallback target"
+  end
+
+  for _, d in ipairs(dining or {}) do
+    d.company_id = active_company_id
   end
 
   stats.citizens_seen = #citizens
@@ -836,18 +941,19 @@ local function draw()
   at(2, 5, "Colony:       " .. tostring(colony and "connected" or "missing"), colony and colors.lime or colors.red)
   at(2, 6, "Company:      " .. tostring(active_company_id or TARGET_COMPANY), colors.lime)
   at(2, 7, "Dining area:  " .. tostring(active_dining_name or "unknown"), colors.lightGray)
-  at(2, 8, "Auto:         " .. (auto_charge and "ON" or "OFF"), auto_charge and colors.lime or colors.orange)
+  at(2, 8, "Target via:   " .. tostring(active_company_source or "fallback"), colors.gray)
+  at(2, 9, "Auto:         " .. (auto_charge and "ON" or "OFF"), auto_charge and colors.lime or colors.orange)
 
-  at(2, 10,  "Citizens:     " .. tostring(stats.citizens_seen) .. "   Near dining: " .. tostring(stats.near_dining), colors.lightGray)
-  at(2, 11, "Dining halls: " .. tostring(stats.dining_buildings) .. "   Radius: " .. tostring(DINING_RADIUS), stats.dining_buildings > 0 and colors.lime or colors.orange)
-  at(2, 12, "Price CPI:    food x" .. string.format("%.3f", pricing.food_index) .. "  general x" .. string.format("%.3f", pricing.general_index), colors.cyan)
-  at(2, 13, "Meal price:   normal " .. money(pricing.normal_meal) .. " | pressure " .. string.format("%.1f%%", (pricing.monetary_pressure or 0) * 100), colors.cyan)
-  at(2, 14, "Oracle:       " .. tostring(pricing.source or "fallback"), colors.lightGray)
+  at(2, 11,  "Citizens:     " .. tostring(stats.citizens_seen) .. "   Near dining: " .. tostring(stats.near_dining), colors.lightGray)
+  at(2, 12, "Dining halls: " .. tostring(stats.dining_buildings) .. "   Radius: " .. tostring(DINING_RADIUS), stats.dining_buildings > 0 and colors.lime or colors.orange)
+  at(2, 13, "Price CPI:    food x" .. string.format("%.3f", pricing.food_index) .. "  general x" .. string.format("%.3f", pricing.general_index), colors.cyan)
+  at(2, 14, "Meal price:   normal " .. money(pricing.normal_meal) .. " | pressure " .. string.format("%.1f%%", (pricing.monetary_pressure or 0) * 100), colors.cyan)
+  at(2, 15, "Oracle:       " .. tostring(pricing.source or "fallback"), colors.lightGray)
 
-  at(2, 16, "Sat rises:    " .. tostring(stats.saturation_rises) .. "   Last gain: +" .. string.format("%.1f", stats.last_gain), colors.lightGray)
-  at(2, 17, "Meals:        " .. tostring(stats.meals_charged) .. "   Charged: " .. money(stats.charged) .. "   Unpaid: " .. money(stats.unpaid), colors.lime)
-  at(2, 18, "Skipped:      staff " .. tostring(stats.skipped_staff) .. " / cooldown " .. tostring(stats.skipped_cooldown) .. " / not near " .. tostring(stats.skipped_not_near) .. " / tiny " .. tostring(stats.skipped_small_gain), colors.orange)
-  at(2, 19, "Receivables:  " .. money(totalReceivables()), totalReceivables() > 0 and colors.orange or colors.gray)
+  at(2, 17, "Sat rises:    " .. tostring(stats.saturation_rises) .. "   Last gain: +" .. string.format("%.1f", stats.last_gain), colors.lightGray)
+  at(2, 18, "Meals:        " .. tostring(stats.meals_charged) .. "   Charged: " .. money(stats.charged) .. "   Unpaid: " .. money(stats.unpaid), colors.lime)
+  at(2, 19, "Skipped:      staff " .. tostring(stats.skipped_staff) .. " / cooldown " .. tostring(stats.skipped_cooldown) .. " / not near " .. tostring(stats.skipped_not_near) .. " / tiny " .. tostring(stats.skipped_small_gain), colors.orange)
+  at(2, 20, "Receivables:  " .. money(totalReceivables()), totalReceivables() > 0 and colors.orange or colors.gray)
 
   local third = math.floor((W - 8) / 3)
   local bScan = button(2, H - 3, third, "Poll Now", colors.purple)
