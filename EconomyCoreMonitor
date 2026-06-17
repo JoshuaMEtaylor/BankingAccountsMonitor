@@ -15,7 +15,7 @@
 -- Read-only. No banking controls. No trade panel. Contract GDP over 365 Minecraft days + in-view MCT clock + tapered money-supply inflation.
 -- =============================================================================
 
-local VERSION         = "0.5.7-SECTOR-CPI"
+local VERSION         = "0.5.8-ROBUST-CPI"
 local PROTOCOL        = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT      = 5
@@ -909,65 +909,147 @@ local function normaliseNationalStats(raw)
 end
 
 local function fallbackSnapshot()
-  local okStatus, status = dbRequest({ type = "status" }, 3)
+  -- v0.5.8: do not let one broken/old endpoint blank the entire monitor.
+  -- The v1.4.3 bank does not expose national_statistics, and in some worlds the
+  -- status handler may fail while supply/list_accounts/price-oracle still work.
+  -- So this snapshot is assembled from separate narrow endpoints.
+  local endpointErrors = {}
+
+  local okStatus, status = dbRequest({ type = "status" }, 2)
   if not okStatus or type(status) ~= "table" then
-    return nil, "Status unavailable: " .. tostring(status)
+    endpointErrors[#endpointErrors + 1] = "status=" .. shortText(tostring(status), 36)
+    status = {}
+  end
+
+  local okSupply, supplyRes = dbRequest({ type = "supply" }, 2)
+  local supply = {}
+  if okSupply and type(supplyRes) == "table" then
+    supply = supplyRes
+  else
+    endpointErrors[#endpointErrors + 1] = "supply=" .. shortText(tostring(supplyRes), 36)
+    if type(status.supply) == "table" then supply = status.supply end
   end
 
   local okAccounts, accRes = dbRequest({ type = "list_accounts" }, 3)
   local accounts = nil
-  if okAccounts and type(accRes) == "table" then accounts = accRes.accounts or {} end
+  if okAccounts and type(accRes) == "table" then
+    accounts = accRes.accounts or {}
+  else
+    endpointErrors[#endpointErrors + 1] = "accounts=" .. shortText(tostring(accRes), 36)
+  end
 
-  local supply = status.supply or {}
-  local issued = num(supply.in_circulation or ((num(supply.total_minted) or 0) - (num(supply.total_burned) or 0)))
-  local treasury = num(supply.treasury_balance)
-  local private = nil
-  if issued and treasury then private = issued - treasury end
+  local issued = num(supply.in_circulation or supply.total_supply)
+  if not issued then
+    local minted = num(supply.total_minted) or 0
+    local burned = num(supply.total_burned) or 0
+    if minted > 0 or burned > 0 then issued = minted - burned end
+  end
+
+  local treasury = num(supply.treasury_balance or supply.treasury_reserve)
+  local private = num(supply.private_supply)
+
+  local derivedPopulation = 0
+  local derivedCompanies = 0
+  local derivedCitizenWealth = 0
+  local derivedTreasury = nil
+  if type(accounts) == "table" then
+    for _, acc in ipairs(accounts) do
+      if type(acc) == "table" and acc.status ~= "suspended" then
+        if acc.account_id == "treasury:quid_bank" then derivedTreasury = num(acc.balance) end
+        if acc.type == "citizen" then
+          derivedPopulation = derivedPopulation + 1
+          derivedCitizenWealth = derivedCitizenWealth + (num(acc.balance) or 0)
+        elseif acc.type == "company" then
+          derivedCompanies = derivedCompanies + 1
+        end
+      end
+    end
+  end
+
+  if not treasury then treasury = derivedTreasury end
+  if not private and issued and treasury then private = issued - treasury end
   local reserveShare = nil
   if issued and issued > 0 and treasury then reserveShare = (treasury / issued) * 100 end
 
-  local txDay, txStatus = estimateTxPerDay(status.tx_count)
-  local inflation, inflationStatus = calculateMonetaryInflation(issued)
-  local contractEco = fetchContractEconomy()
+  local population = num(status.citizen_count)
+  if not population and derivedPopulation > 0 then population = derivedPopulation end
 
+  local companyCount = num(status.company_count)
+  if not companyCount and derivedCompanies > 0 then companyCount = derivedCompanies end
+
+  local txTotal = num(status.tx_count)
+  local txDay, txStatus = nil, "Status tx counter unavailable"
+  if txTotal then txDay, txStatus = estimateTxPerDay(txTotal) end
+
+  -- Prefer the bank's actual inflation state. The older adaptive monetary
+  -- calculation remains only as a fallback if that endpoint is unavailable.
+  local inflation, inflationStatus = nil, nil
+  local okInf, infRes = dbRequest({ type = "get_inflation_state" }, 2)
+  if okInf and type(infRes) == "table" then
+    local st = infRes.state or infRes
+    local rate = num(st.inflation_rate)
+    inflation = num(st.inflation_percent)
+    if not inflation and rate then inflation = rate * 100 end
+    inflationStatus = "Bank inflation state"
+  else
+    endpointErrors[#endpointErrors + 1] = "inflation=" .. shortText(tostring(infRes), 36)
+    inflation, inflationStatus = calculateMonetaryInflation(issued)
+  end
+
+  local contractEco = fetchContractEconomy()
   local gdp = nil
   local outputStatus = "Waiting for ContractServer / fulfilled contracts"
   if contractEco and contractEco.connected then
     gdp = tonumber(contractEco.gdp_365d or contractEco.gdp_24h) or 0
     outputStatus = contractEco.status or "GDP from fulfilled contracts"
+  else
+    local okGdp, gdpRes = dbRequest({ type = "economic_gdp", days = 30 }, 2)
+    if okGdp and type(gdpRes) == "table" then
+      gdp = num(gdpRes.total or gdpRes.gdp or gdpRes.private_gdp)
+      outputStatus = "Private GDP fallback from bank ledger"
+    else
+      endpointErrors[#endpointErrors + 1] = "gdp=" .. shortText(tostring(gdpRes), 36)
+    end
   end
 
-  local population = num(status.citizen_count)
   local gdpCap = nil
   if gdp and population and population > 0 then gdpCap = gdp / population end
 
+  local quality = "LIVE"
+  if #endpointErrors > 0 then quality = "PARTIAL" end
+
+  local sourceText = "direct endpoints"
+  if #endpointErrors > 0 then
+    sourceText = "direct endpoints; degraded: " .. table.concat(endpointErrors, "; ")
+  end
+
   return {
-    mode = "FALLBACK + CONTRACTS",
-    quality = contractEco and contractEco.connected and "LIVE" or "PARTIAL",
-    time = status.time or nowMs(),
+    mode = "DIRECT ENDPOINTS",
+    quality = quality,
+    time = num(status.time) or nowMs(),
     mc_clock = minecraftClock(),
     gdp_period_mc_days = GDP_PERIOD_MC_DAYS,
     gdp = gdp,
     gdp_per_capita = gdpCap,
     inflation = inflation,
     output_status = outputStatus,
-    inflation_status = inflationStatus,
+    inflation_status = inflationStatus or "Awaiting inflation state",
     inequality = inequalityFromAccounts(accounts),
     monetary = {
       issued_supply = issued,
       private_supply = private,
       treasury_reserve = treasury,
       reserve_share = reserveShare,
-      status = "Live from ledger supply",
+      status = (okSupply and "Live from supply endpoint") or "Supply degraded",
     },
     scale = {
       population = population,
-      companies = num(status.company_count),
-      transactions_total = num(status.tx_count),
+      companies = companyCount,
+      transactions_total = txTotal,
       transactions_per_day = txDay,
       tx_day_status = txStatus,
       top_companies = topCompaniesFromAccounts(accounts),
-      source = "bank status + accounts + contract server",
+      source = sourceText,
     },
     contracts = contractEco,
   }
@@ -976,30 +1058,14 @@ end
 local function refreshSnapshot()
   if not db_id then return false, "No server connected" end
 
-  local okNational, national = dbRequest({ type = "national_statistics" }, 3)
-  local snap = nil
-  if okNational and type(national) == "table" then
-    snap = normaliseNationalStats(national)
+  -- Advance the bank-side inflation clock if the server supports it. This only
+  -- updates the inflation/index state; it does not move money or control accounts.
+  pcall(function()
+    dbRequest({ type = "tick_inflation", day = currentMinecraftDay() }, 2)
+  end)
 
-    local contractEco = fetchContractEconomy()
-    snap.contracts = contractEco
-    if (not snap.gdp) and contractEco and contractEco.connected then
-      snap.gdp = tonumber(contractEco.gdp_365d or contractEco.gdp_24h) or 0
-      snap.output_status = contractEco.status or "GDP from fulfilled contracts"
-      local pop = snap.scale and tonumber(snap.scale.population)
-      if pop and pop > 0 then snap.gdp_per_capita = snap.gdp / pop end
-    end
-
-    if snap.inflation == nil then
-      local inf, infStatus = calculateMonetaryInflation(snap.monetary and snap.monetary.issued_supply)
-      snap.inflation = inf
-      snap.inflation_status = infStatus
-    end
-  else
-    local fallback, err = fallbackSnapshot()
-    if not fallback then return false, err end
-    snap = fallback
-  end
+  local snap, err = fallbackSnapshot()
+  if not snap then return false, err or "Could not build snapshot" end
 
   local priceOracle = fetchPriceOracle()
   snap.price_oracle = priceOracle
@@ -1007,6 +1073,9 @@ local function refreshSnapshot()
     if priceOracle.inflation_percent ~= nil then
       snap.inflation = priceOracle.inflation_percent
       snap.inflation_status = "Live bank inflation rate driving sector CPI"
+    end
+    if snap.quality == "PARTIAL" then
+      snap.quality = "PARTIAL + CPI"
     end
   end
 
@@ -1328,7 +1397,7 @@ local function drawFooter()
   local w, h = getSize()
   fill(1, h - 1, w, 2, C.bg)
   writeAt(1, h - 1, string.rep("-", w), C.dim, C.bg)
-  local text = "Refresh: " .. REFRESH_SECONDS .. "s   SECTOR CPI / CONTRACT GDP BUILD   Monitor: " .. (monitor and "attached" or "terminal") .. "   [Q] Quit"
+  local text = "Refresh: " .. REFRESH_SECONDS .. "s   ROBUST SECTOR CPI / CONTRACT GDP   Monitor: " .. (monitor and "attached" or "terminal") .. "   [Q] Quit"
   writeAt(2, h, text, C.dim, C.bg)
   if last_error ~= "" then writeAt(math.max(2, w - #last_error - 2), h, last_error, C.bad, C.bg) end
 end
