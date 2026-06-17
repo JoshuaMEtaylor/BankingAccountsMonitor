@@ -1,6 +1,7 @@
 -- =============================================================================
 -- EMPLOYEE INVENTORY PROBE
 -- EmployeeInventoryProbe
+-- Version: 1.0.1-STRICT-ITEM-STACKS
 --
 -- Run this ON THE COLONY BUSINESS INTEGRATOR TERMINAL.
 --
@@ -137,7 +138,7 @@ local function scanForItemLikeTables(v, path, out, depth, seen)
   local item_name = v.name or v.item or v.id or v.item_id or v.itemName or v.displayName or v.display
   local qty = v.count or v.qty or v.amount or v.size or v.quantity
 
-  if item_name ~= nil or qty ~= nil then
+  if item_name ~= nil and qty ~= nil then
     out[#out + 1] = {
       path = path,
       name = item_name,
