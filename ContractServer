@@ -51,7 +51,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION            = "1.0.12-DROPDOWN-HANDLER-FIX"
+local VERSION            = "1.0.13-CLAIM-SCOPE-FIX"
 local LABEL              = "Quid-Contracts"
 local PROTOCOL           = "quid_contracts"
 local PROTOCOL_BROADCAST = "quid_contracts_discovery"
@@ -311,6 +311,117 @@ local function publicContract(c)
   end
   return copy
 end
+
+local function discoverBank()
+  for _ = 1, 5 do
+    rednet.broadcast({ type = "ping" }, BANK_PROTOCOL)
+    local sender, msg = rednet.receive(BANK_PROTOCOL, 2)
+    if sender and type(msg) == "table" then
+      if msg.type == "treasury_online" or msg.success == true then
+        bank_id = sender
+        print("  Bank: " .. tostring(bank_id))
+        return true
+      end
+    end
+  end
+  print("  WARN: Quid bank not found. Payouts will fail until bank is online.")
+  return false
+end
+
+local function bankReq(req, timeout)
+  timeout = timeout or 5
+  if not bank_id then discoverBank() end
+  if not bank_id then return false, "No bank server connected" end
+
+  rednet.send(bank_id, req, BANK_PROTOCOL)
+  local deadline = os.clock() + timeout
+
+  while true do
+    local remaining = deadline - os.clock()
+    if remaining <= 0 then return false, "No response from bank" end
+    local sender, msg = rednet.receive(BANK_PROTOCOL, remaining)
+    if sender == bank_id and type(msg) == "table" and msg.success ~= nil then
+      return msg.success, msg.response
+    end
+  end
+end
+
+
+local function bankAccounts()
+  -- Use the bank's list_accounts endpoint. This is intentionally tolerant:
+  -- older account records/scripts may not have the type field perfectly set,
+  -- so company:<ticker> account IDs are treated as companies too.
+  local ok, res = bankReq({ type = "list_accounts" }, 8)
+  if ok and type(res) == "table" and type(res.accounts) == "table" then
+    return res.accounts
+  end
+  return nil, res
+end
+
+local function isCompanyAccount(acc)
+  if type(acc) ~= "table" then return false end
+  local id = tostring(acc.account_id or acc.id or "")
+  local typ = string.lower(tostring(acc.type or acc.account_type or ""))
+  local status = string.lower(tostring(acc.status or "active"))
+
+  if status ~= "active" and status ~= "" then return false end
+  if typ == "company" or typ == "business" then return true end
+  if id:find("^company:") then return true end
+  return false
+end
+
+local function bankCompanyExists(company_id)
+  company_id = trim(company_id or "")
+  if company_id == "" then return false end
+  local accounts, err = bankAccounts()
+  if not accounts then return false, err or "Could not read bank accounts" end
+
+  for _, acc in ipairs(accounts) do
+    local id = tostring(acc.account_id or acc.id or "")
+    if id == company_id and isCompanyAccount(acc) then
+      return true, acc
+    end
+  end
+  return false, "Company account not found: " .. tostring(company_id)
+end
+
+local function listClaimantCompanies(sender_id, req)
+  local accounts, err = bankAccounts()
+  if not accounts then
+    return false, err or "Could not read bank accounts"
+  end
+
+  local companies = {}
+  for _, acc in ipairs(accounts) do
+    if isCompanyAccount(acc) then
+      local id = tostring(acc.account_id or acc.id or "")
+      local ticker = id:gsub("^company:", "")
+      companies[#companies+1] = {
+        company_id = id,
+        account_id = id,
+        ticker = string.upper(ticker),
+        display_name = acc.display_name or acc.name or id,
+        balance = tonumber(acc.balance) or 0,
+        owner_id = acc.owner_id,
+        status = acc.status or "active",
+        type = acc.type or "company",
+      }
+    end
+  end
+
+  table.sort(companies, function(a,b)
+    return tostring(a.ticker or a.company_id) < tostring(b.ticker or b.company_id)
+  end)
+
+  if #companies == 0 then
+    return false, "Bank responded, but no company accounts were found. Check ServerSideAccounts list_accounts/company records."
+  end
+
+  return true, { companies = companies, count = #companies, bank_id = bank_id }
+end
+
+handlers["list_claimant_companies"] = listClaimantCompanies
+
 
 -- =============================================================================
 -- CONTRACT OPERATIONS
@@ -871,116 +982,6 @@ local function openModem()
 end
 
 
-local function discoverBank()
-  for _ = 1, 5 do
-    rednet.broadcast({ type = "ping" }, BANK_PROTOCOL)
-    local sender, msg = rednet.receive(BANK_PROTOCOL, 2)
-    if sender and type(msg) == "table" then
-      if msg.type == "treasury_online" or msg.success == true then
-        bank_id = sender
-        print("  Bank: " .. tostring(bank_id))
-        return true
-      end
-    end
-  end
-  print("  WARN: Quid bank not found. Payouts will fail until bank is online.")
-  return false
-end
-
-local function bankReq(req, timeout)
-  timeout = timeout or 5
-  if not bank_id then discoverBank() end
-  if not bank_id then return false, "No bank server connected" end
-
-  rednet.send(bank_id, req, BANK_PROTOCOL)
-  local deadline = os.clock() + timeout
-
-  while true do
-    local remaining = deadline - os.clock()
-    if remaining <= 0 then return false, "No response from bank" end
-    local sender, msg = rednet.receive(BANK_PROTOCOL, remaining)
-    if sender == bank_id and type(msg) == "table" and msg.success ~= nil then
-      return msg.success, msg.response
-    end
-  end
-end
-
-
-local function bankAccounts()
-  -- Use the bank's list_accounts endpoint. This is intentionally tolerant:
-  -- older account records/scripts may not have the type field perfectly set,
-  -- so company:<ticker> account IDs are treated as companies too.
-  local ok, res = bankReq({ type = "list_accounts" }, 8)
-  if ok and type(res) == "table" and type(res.accounts) == "table" then
-    return res.accounts
-  end
-  return nil, res
-end
-
-local function isCompanyAccount(acc)
-  if type(acc) ~= "table" then return false end
-  local id = tostring(acc.account_id or acc.id or "")
-  local typ = string.lower(tostring(acc.type or acc.account_type or ""))
-  local status = string.lower(tostring(acc.status or "active"))
-
-  if status ~= "active" and status ~= "" then return false end
-  if typ == "company" or typ == "business" then return true end
-  if id:find("^company:") then return true end
-  return false
-end
-
-local function bankCompanyExists(company_id)
-  company_id = trim(company_id or "")
-  if company_id == "" then return false end
-  local accounts, err = bankAccounts()
-  if not accounts then return false, err or "Could not read bank accounts" end
-
-  for _, acc in ipairs(accounts) do
-    local id = tostring(acc.account_id or acc.id or "")
-    if id == company_id and isCompanyAccount(acc) then
-      return true, acc
-    end
-  end
-  return false, "Company account not found: " .. tostring(company_id)
-end
-
-local function listClaimantCompanies(sender_id, req)
-  local accounts, err = bankAccounts()
-  if not accounts then
-    return false, err or "Could not read bank accounts"
-  end
-
-  local companies = {}
-  for _, acc in ipairs(accounts) do
-    if isCompanyAccount(acc) then
-      local id = tostring(acc.account_id or acc.id or "")
-      local ticker = id:gsub("^company:", "")
-      companies[#companies+1] = {
-        company_id = id,
-        account_id = id,
-        ticker = string.upper(ticker),
-        display_name = acc.display_name or acc.name or id,
-        balance = tonumber(acc.balance) or 0,
-        owner_id = acc.owner_id,
-        status = acc.status or "active",
-        type = acc.type or "company",
-      }
-    end
-  end
-
-  table.sort(companies, function(a,b)
-    return tostring(a.ticker or a.company_id) < tostring(b.ticker or b.company_id)
-  end)
-
-  if #companies == 0 then
-    return false, "Bank responded, but no company accounts were found. Check ServerSideAccounts list_accounts/company records."
-  end
-
-  return true, { companies = companies, count = #companies, bank_id = bank_id }
-end
-
-handlers["list_claimant_companies"] = listClaimantCompanies
-
 local function drawStatus()
   term.clear()
   term.setCursorPos(1, 1)
@@ -1039,7 +1040,7 @@ local function handleRequest(sender_id, request)
   local ok, success, response = pcall(handler, sender_id, request)
   if not ok then
     audit("ERROR", "SYSTEM", sender_id, tostring(success))
-    return false, "Internal contract server error"
+    return false, "Internal contract server error: " .. tostring(success)
   end
 
   return success, response
