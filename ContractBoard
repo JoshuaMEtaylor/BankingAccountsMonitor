@@ -49,7 +49,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION    = "1.0.7-COMPANY-DROPDOWN-FIX"
+local VERSION    = "1.0.8-DROPDOWN-SERVER-FIXED"
 local PROTOCOL   = "quid_contracts"
 local DB_TIMEOUT = 5
 
@@ -319,7 +319,12 @@ local function loadCompanies()
     setMessage("Loaded " .. tostring(#res.companies) .. " companies.", C.ok)
     return res.companies
   end
-  setMessage("Company list failed: " .. tostring(res), C.err)
+  local msg = tostring(res)
+  if msg:find("Unknown request type", 1, true) then
+    setMessage("Company list failed: ContractServer is missing dropdown endpoint.", C.err)
+  else
+    setMessage("Company list failed: " .. msg, C.err)
+  end
   return {}
 end
 
