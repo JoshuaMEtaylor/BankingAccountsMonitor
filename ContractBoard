@@ -49,7 +49,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION    = "1.0.15-BUNDLE-SCROLL"
+local VERSION    = "1.0.17-MANUAL-COMPLETE"
 local PROTOCOL   = "quid_contracts"
 local DB_TIMEOUT = 5
 
@@ -418,16 +418,16 @@ local function detailScreen(c)
       at(4, H - 5, "Error: " .. tostring(c.payout_error or "unknown"):sub(1, W - 12), C.err, C.card)
     elseif c.claimed_by then
       at(4, H - 6, "Claimed by: " .. tostring(c.claimed_by), C.warn, C.card)
-      at(4, H - 5, "Auto-completes after MineColonies accepts the items.", C.label, C.card)
+      at(4, H - 5, "Auto-completes after scan, or press Complete after delivery.", C.label, C.card)
     elseif c.payout_status then
       at(4, H - 5, "Payout: " .. tostring(c.payout_status), c.payout_status == "paid" and C.ok or C.warn, C.card)
     end
 
     local action = "Claim"
     if c.status == "pending_payout" then
-      action = "Retrying"
+      action = "Retry Pay"
     elseif c.status == "claimed" or c.status == "pending_completion" then
-      action = "Waiting"
+      action = "Complete"
     elseif c.status == "fulfilled" then
       action = "Done"
     elseif c.status == "cancelled" then
@@ -456,8 +456,34 @@ local function detailScreen(c)
         local maxScroll = math.max(0, #items - maxRows)
         scroll = clampScroll(math.floor((rel / denom) * maxScroll + 0.5), #items, maxRows)
       elseif hit(bAction, p2, p3) then
-        if action == "Claim" then return "claim" end
-        -- Waiting/Done/Closed are informational states.
+        if action == "Claim" then
+          return "claim"
+        elseif action == "Complete" then
+          local ok, res = contractRequest({
+            type = "mark_fulfilled",
+            contract_id = c.contract_id,
+            force_confirmed = true,
+            fulfilled_items = c.items or {},
+            note = "Manual completion from ContractBoard after MineColonies accepted delivery",
+          }, 10)
+          if ok and type(res) == "table" then
+            c = res.contract or c
+            setMessage("Completed " .. tostring(c.contract_id or "contract") .. ".", C.ok)
+            return
+          else
+            setMessage("Complete failed: " .. tostring(res), C.err)
+          end
+        elseif action == "Retry Pay" then
+          local ok, res = contractRequest({ type = "retry_company_payment", contract_id = c.contract_id }, 10)
+          if ok and type(res) == "table" then
+            c = res.contract or c
+            setMessage("Payout retried for " .. tostring(c.contract_id or "contract") .. ".", C.ok)
+            return
+          else
+            setMessage("Retry failed: " .. tostring(res), C.err)
+          end
+        end
+        -- Done/Closed are informational states.
       end
     elseif ev == "mouse_scroll" then
       if p1 < 0 then
