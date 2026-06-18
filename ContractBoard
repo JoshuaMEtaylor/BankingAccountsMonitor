@@ -49,7 +49,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION    = "1.0.14-PAYOUT-RETRYING-LABEL"
+local VERSION    = "1.0.15-BUNDLE-SCROLL"
 local PROTOCOL   = "quid_contracts"
 local DB_TIMEOUT = 5
 
@@ -331,6 +331,37 @@ end
 -- =============================================================================
 -- DETAIL / CLAIM
 -- =============================================================================
+local function clampScroll(scroll, total, visible)
+  total = tonumber(total) or 0
+  visible = tonumber(visible) or 1
+  local maxScroll = math.max(0, total - visible)
+  scroll = tonumber(scroll) or 0
+  if scroll < 0 then scroll = 0 end
+  if scroll > maxScroll then scroll = maxScroll end
+  return scroll
+end
+
+local function drawVerticalScrollbar(x, y, h, total, visible, scroll)
+  if h <= 0 then return nil end
+  fill(x, y, 1, h, C.input_bg)
+
+  if total <= visible then
+    fill(x, y, 1, h, C.btn_sec)
+    return { x1 = x, x2 = x, y1 = y, y2 = y + h - 1 }
+  end
+
+  local knobH = math.max(1, math.floor((visible / total) * h + 0.5))
+  if knobH > h then knobH = h end
+
+  local maxScroll = math.max(1, total - visible)
+  local knobY = y + math.floor(((h - knobH) * scroll) / maxScroll + 0.5)
+  if knobY < y then knobY = y end
+  if knobY + knobH - 1 > y + h - 1 then knobY = y + h - knobH end
+
+  fill(x, knobY, 1, knobH, C.accent)
+  return { x1 = x, x2 = x, y1 = y, y2 = y + h - 1 }
+end
+
 local function detailScreen(c)
   if not c then return end
 
@@ -342,33 +373,54 @@ local function detailScreen(c)
 
     card(2, 3, W - 2, H - 4)
 
-    at(4, 4, c.contract_id .. " - " .. tostring(c.title or ""), C.card_fg, C.card)
+    local title = tostring(c.contract_id or "?") .. " - " .. tostring(c.title or "")
+    at(4, 4, title, C.card_fg, C.card)
     at(4, 5, "Reward: " .. money(c.reward or 0) .. "    Status: " .. tostring(c.status or "?"), C.label, C.card)
     at(4, 6, "Poster: " .. tostring(c.poster or "?"), C.label, C.card)
 
-    local y = 8
-    at(4, y, "Required Items", C.card_fg, C.card)
-    y = y + 1
-
     local items = c.items or {}
-    local start = scroll + 1
-    local maxRows = H - 15
+    local listTop = 9
+    local listBottom = H - 8
+    local maxRows = math.max(1, listBottom - listTop + 1)
+    scroll = clampScroll(scroll, #items, maxRows)
 
-    for i = start, math.min(#items, start + maxRows - 1) do
-      local item = items[i]
-      at(4, y, tostring(item.count or 0) .. "x " .. tostring(item.display or item.item), C.card_fg, C.card)
-      y = y + 1
+    local first = #items == 0 and 0 or (scroll + 1)
+    local last = math.min(#items, scroll + maxRows)
+    local header = "Required Items"
+    if #items > 0 then
+      header = header .. "  " .. tostring(first) .. "-" .. tostring(last) .. " / " .. tostring(#items)
+    end
+    if c.bundle_contract or c.bundle_child_count then
+      header = header .. "  bundle"
+      if c.bundle_child_count then header = header .. " " .. tostring(c.bundle_child_count) end
+    end
+    at(4, 8, header, C.card_fg, C.card)
+
+    local barX = W - 3
+    local textWidth = math.max(8, barX - 5)
+    local y = listTop
+    if #items == 0 then
+      at(4, y, "No item requirements recorded.", C.label, C.card)
+    else
+      for i = first, last do
+        local item = items[i]
+        local line = tostring(i) .. ". " .. tostring(item.count or 0) .. "x " .. tostring(item.display or item.item)
+        at(4, y, line:sub(1, textWidth), C.card_fg, C.card)
+        y = y + 1
+      end
     end
 
+    local scrollBar = drawVerticalScrollbar(barX, listTop, maxRows, #items, maxRows, scroll)
+
     if c.status == "pending_payout" then
-      at(4, H - 8, "Claimed by: " .. tostring(c.claimed_by or "?"), C.warn, C.card)
-      at(4, H - 7, "Fulfilment detected. Server is retrying payout.", C.warn, C.card)
-      at(4, H - 6, "Error: " .. tostring(c.payout_error or "unknown"):sub(1, W - 12), C.err, C.card)
+      at(4, H - 7, "Claimed by: " .. tostring(c.claimed_by or "?"), C.warn, C.card)
+      at(4, H - 6, "Fulfilment detected. Server is retrying payout.", C.warn, C.card)
+      at(4, H - 5, "Error: " .. tostring(c.payout_error or "unknown"):sub(1, W - 12), C.err, C.card)
     elseif c.claimed_by then
-      at(4, H - 7, "Claimed by: " .. tostring(c.claimed_by), C.warn, C.card)
-      at(4, H - 6, "Auto-completes after MineColonies accepts the items.", C.label, C.card)
+      at(4, H - 6, "Claimed by: " .. tostring(c.claimed_by), C.warn, C.card)
+      at(4, H - 5, "Auto-completes after MineColonies accepts the items.", C.label, C.card)
     elseif c.payout_status then
-      at(4, H - 6, "Payout: " .. tostring(c.payout_status), c.payout_status == "paid" and C.ok or C.warn, C.card)
+      at(4, H - 5, "Payout: " .. tostring(c.payout_status), c.payout_status == "paid" and C.ok or C.warn, C.card)
     end
 
     local action = "Claim"
@@ -382,10 +434,12 @@ local function detailScreen(c)
       action = "Closed"
     end
 
-    local third = math.floor((W - 10) / 3)
-    local bBack = button(4, H - 2, third, "Back", C.btn_sec, C.card_fg)
-    local bUp   = button(5 + third, H - 2, third, "Scroll", C.btn_sec, C.card_fg)
-    local bAction = button(10 + (third * 2), H - 2, third, action, C.btn_pri, C.btn_fg)
+    local bw = math.floor((W - 12) / 4)
+    if bw < 7 then bw = 7 end
+    local bBack = button(4, H - 2, bw, "Back", C.btn_sec, C.card_fg)
+    local bUp   = button(5 + bw, H - 2, bw, "Up", C.btn_sec, C.card_fg)
+    local bDown = button(6 + (bw * 2), H - 2, bw, "Down", C.btn_sec, C.card_fg)
+    local bAction = button(7 + (bw * 3), H - 2, bw, action, C.btn_pri, C.btn_fg)
 
     statusBar()
 
@@ -393,14 +447,23 @@ local function detailScreen(c)
     if ev == "mouse_click" then
       if hit(bBack, p2, p3) then return end
       if hit(bUp, p2, p3) then
-        if #items > maxRows then
-          scroll = scroll + maxRows
-          if scroll >= #items then scroll = 0 end
-        end
-      end
-      if hit(bAction, p2, p3) then
+        scroll = clampScroll(scroll - maxRows, #items, maxRows)
+      elseif hit(bDown, p2, p3) then
+        scroll = clampScroll(scroll + maxRows, #items, maxRows)
+      elseif scrollBar and hit(scrollBar, p2, p3) and #items > maxRows then
+        local rel = p3 - listTop
+        local denom = math.max(1, maxRows - 1)
+        local maxScroll = math.max(0, #items - maxRows)
+        scroll = clampScroll(math.floor((rel / denom) * maxScroll + 0.5), #items, maxRows)
+      elseif hit(bAction, p2, p3) then
         if action == "Claim" then return "claim" end
         -- Waiting/Done/Closed are informational states.
+      end
+    elseif ev == "mouse_scroll" then
+      if p1 < 0 then
+        scroll = clampScroll(scroll - 3, #items, maxRows)
+      else
+        scroll = clampScroll(scroll + 3, #items, maxRows)
       end
     end
   end
