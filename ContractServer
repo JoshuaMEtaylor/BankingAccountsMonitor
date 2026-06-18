@@ -51,7 +51,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION            = "1.0.21-BOOT-RESCAN"
+local VERSION            = "1.0.22-DELIVERY-SHRINK-COMPLETE"
 local LABEL              = "Quid-Contracts"
 local PROTOCOL           = "quid_contracts"
 local PROTOCOL_BROADCAST = "quid_contracts_discovery"
@@ -490,14 +490,38 @@ local function postContract(sender_id, req)
       )
 
       local changed = request_changed or reward_changed
+      local preserve_claim = existing.status == "claimed" and (not req.keep_claim_on_refresh) and request_changed
+
+      -- Claimed MineColonies jobs are an accepted bargain. Do not reopen/clear
+      -- the claimant just because the live request range changed after items
+      -- were delivered. The sync step below can now detect ranged-request
+      -- shrinkage and mark the accepted contract fulfilled instead.
+      if preserve_claim then
+        existing.last_live_title = title
+        existing.last_live_description = new_description
+        existing.last_live_reward = reward
+        existing.last_live_item_signature = sig
+        existing.last_live_quantity_min = req.quantity_min
+        existing.last_live_quantity_max = req.quantity_max
+        existing.last_live_updated = timestamp()
+        existing.updated = timestamp()
+        writeFile(FILE.contracts, contracts)
+        audit("CLAIM_REFRESH_HELD", poster, sender_id, existing_id)
+        return true, {
+          contract = publicContract(existing),
+          message = "Claimed contract preserved; waiting for delivery reconciliation",
+          updated = false,
+          claim_preserved = true
+        }
+      end
 
       existing.title = title
       existing.description = new_description
       existing.poster = poster
 
       -- Open jobs float with live inflation. Claimed jobs keep the price that
-      -- the player accepted unless the underlying request itself changed.
-      if existing.status == "open" or request_changed then
+      -- the player accepted unless a special bundle explicitly refreshes while claimed.
+      if existing.status == "open" or (request_changed and req.keep_claim_on_refresh) then
         existing.reward = reward
       else
         existing.reward_locked = true
@@ -526,7 +550,7 @@ local function postContract(sender_id, req)
       existing.source_key = src_key
       existing.item_signature = sig
 
-      if request_changed and existing.status == "claimed" then
+      if request_changed and existing.status == "claimed" and not req.keep_claim_on_refresh then
         existing.status = "open"
         existing.claimed_by = nil
         existing.claimed_type = nil
@@ -759,7 +783,7 @@ local function markFulfilled(sender_id, req)
 
   -- Manual/admin fulfilment path. Normal MineColonies claimed-request completion
   -- is handled automatically during source sync when the live request disappears.
-  local source_disappeared = c.status == "pending_completion"
+  local source_disappeared = c.status == "pending_completion" or req.force_confirmed == true or req.manual_confirmed == true
 
   if (c.exact_fulfillment or c.source_type == "minecolonies_request") and not source_disappeared then
     local ok, err = fulfilmentMatchesContract(c, req.fulfilled_items or req.items or {})
@@ -849,11 +873,24 @@ local function syncSourceContracts(sender_id, req)
   local source_company = req.source_company
   local source_terminal = req.source_terminal or sender_id
   local active = {}
+  local active_meta = {}
 
   if type(req.active_source_keys) == "table" then
     for _, key in pairs(req.active_source_keys) do
       key = trim(key)
       if key ~= "" then active[key] = true end
+    end
+  end
+
+  if type(req.active_source_details) == "table" then
+    for _, meta in pairs(req.active_source_details) do
+      if type(meta) == "table" then
+        local key = trim(meta.source_key or meta.key or "")
+        if key ~= "" then
+          active[key] = true
+          active_meta[key] = meta
+        end
+      end
     end
   end
 
@@ -976,6 +1013,41 @@ local function syncSourceContracts(sender_id, req)
           audit("STALE_CANCEL", c.poster or "unknown", sender_id, id)
         end
       else
+        -- Some MineColonies requests, especially Dining Hall ranged food
+        -- requests like "1-46 Raw Salmon", do not disappear after a partial
+        -- fulfilment. They shrink instead. If a claimed contract accepted 15
+        -- items and the live request maximum drops by at least 15, conclude the
+        -- contract even though the request is still present.
+        local meta = key and active_meta[key] or nil
+        local auto_shrink_done = false
+        if c.status == "claimed" and type(meta) == "table" then
+          local old_max = tonumber(c.quantity_max or 0) or 0
+          local new_max = tonumber(meta.quantity_max or meta.max_count or old_max) or old_max
+          local fixed = tonumber(c.fixed_quantity or meta.fixed_quantity or 0) or 0
+          if old_max > 0 and new_max > 0 and fixed > 0 and new_max <= (old_max - fixed) then
+            local paid_ok, paid_res = payContract(c)
+            if paid_ok then
+              c.status = "fulfilled"
+              c.fulfilled_at = timestamp()
+              c.updated = timestamp()
+              c.fulfillment_note = "Auto-completed: live MineColonies request quantity decreased from " .. tostring(old_max) .. " to " .. tostring(new_max) .. " after claimed delivery."
+              c.completion_confirmed_by = "shrink-sync:" .. tostring(sender_id)
+              auto_completed = auto_completed + 1
+              audit("AUTO_SHRINK_FULFILLED", c.claimed_by or "unknown", sender_id, id)
+            else
+              c.status = "pending_payout"
+              c.updated = timestamp()
+              c.fulfillment_note = "Quantity-shrink completion detected, but payout failed"
+              c.payout_status = "failed"
+              c.payout_error = tostring(paid_res)
+              c.payout_failed_at = timestamp()
+              payout_failed = payout_failed + 1
+              audit("AUTO_SHRINK_PAYOUT_FAILED", c.claimed_by or "unknown", sender_id, id .. " " .. tostring(paid_res))
+            end
+            auto_shrink_done = true
+          end
+        end
+
         kept = kept + 1
       end
     end
