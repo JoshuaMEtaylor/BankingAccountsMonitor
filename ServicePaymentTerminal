@@ -44,22 +44,23 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION = "1.2.6-HOSPITALITY-MAPPING-TARGET"
+local VERSION = "1.2.7-SALMON-SAT-CHARGE"
 local BANK_PROTOCOL = "quid_bank"
 local TARGET_COMPANY = "company:hospitality" -- fallback only; the real target is resolved from bank employment mappings
 
 local SCAN_SECONDS = 2
 local DINING_RADIUS = 28
 local NEAR_GRACE_SECONDS = 25
-local MEAL_COOLDOWN_SECONDS = 150
+local MEAL_COOLDOWN_SECONDS = 0
 
-local MIN_SAT_GAIN = 2.00
+local MIN_SAT_GAIN = 0.01
 local SMALL_GAIN = 2.00
 local NORMAL_GAIN = 5.00
 local LARGE_GAIN = 9.00
 local FULL_GAIN = 13.00
 
-local BASE_NORMAL_MEAL_PRICE = 2.00
+local SALMON_BASE_PRICE = 2.00
+local BASE_NORMAL_MEAL_PRICE = SALMON_BASE_PRICE
 local MIN_CHARGE = 1
 
 -- Local fallback has no built-in inflation. If the bank oracle is unreachable,
@@ -72,8 +73,9 @@ local LOCAL_FOOD_BIAS = 0.05
 local STATE_FILE = "data/service_payment_state.db"
 local CONFIG_FILE = "data/service_payment_config.db"
 
--- Meal pricing is now quoted by the bank's wide sector price oracle.
--- This terminal keeps only the POS detection logic; the bank owns the price system.
+-- Temporary simple POS mode:
+-- any positive saturation increase is treated as one salmon meal.
+-- Charge the fixed base salmon price; do not tier by saturation/CPI yet.
 
 -- =============================================================================
 -- RUNTIME
@@ -470,56 +472,21 @@ end
 -- PRICING
 -- =============================================================================
 local function refreshPricing()
-  if not db_id then discoverBank() end
-  if not db_id then
-    applyLocalPriceShock("no_bank_zero_base_fallback")
-    return false
-  end
-
-  -- Safe to call repeatedly; the bank only advances when the Minecraft day moves.
-  bankReq({ type = "tick_inflation", day = currentMinecraftDay() }, 4)
-
-  local gotOracle = false
-  local ok, res = bankReq({ type = "get_price_indices" }, 4)
-  if ok and type(res) == "table" and type(res.sectors) == "table" then
-    gotOracle = true
-    local general = res.sectors.general or {}
-    local food = res.sectors.food or res.sectors.hospitality or {}
-    pricing.general_index = tonumber(general.index) or 1
-    pricing.food_index = tonumber(food.index) or pricing.general_index or 1
-    pricing.effective_index = pricing.food_index
-    pricing.monetary_pressure = tonumber(food.monetary_pressure or general.monetary_pressure) or 0
-    pricing.source = tostring(res.model or "wide_sector_price_oracle")
-    if type(res.inflation) == "table" then inflation_state = res.inflation end
-  end
-
-  if not gotOracle then
-    applyLocalPriceShock("oracle_unavailable_zero_base_fallback")
-  end
-
-  ok, res = bankReq({ type = "quote_service_price", service = "dining_meal", tier = "normal meal" }, 4)
-  if ok and type(res) == "table" and tonumber(res.total) then
-    pricing.normal_meal = tonumber(res.total) or BASE_NORMAL_MEAL_PRICE
-    pricing.effective_index = tonumber(res.sector_index) or pricing.effective_index or 1
-    pricing.food_index = tonumber(res.sector_index) or pricing.food_index or 1
-    pricing.monetary_pressure = tonumber(res.monetary_pressure) or pricing.monetary_pressure or 0
-    pricing.source = tostring(res.source or pricing.source)
-  else
-    local idx = tonumber(pricing.food_index) or 1
-    if idx < 1 then idx = 1 end
-    pricing.normal_meal = BASE_NORMAL_MEAL_PRICE * idx
-  end
-
+  -- For now the dining hall only serves salmon. Do not ask the bank oracle for
+  -- CPI/tiered prices here; just display and charge the fixed salmon base price.
+  pricing.general_index = 1.00
+  pricing.food_index = 1.00
+  pricing.effective_index = 1.00
+  pricing.normal_meal = SALMON_BASE_PRICE
+  pricing.monetary_pressure = 0
+  pricing.source = "salmon_base_price"
   stats.pricing_refreshes = stats.pricing_refreshes + 1
   return true
 end
 
 local function mealTierForGain(gain)
   gain = tonumber(gain) or 0
-  if gain >= FULL_GAIN then return 2.00, "full refill" end
-  if gain >= LARGE_GAIN then return 1.50, "large meal" end
-  if gain >= NORMAL_GAIN then return 1.00, "normal meal" end
-  if gain >= SMALL_GAIN then return 0.50, "snack" end
+  if gain > 0 then return 1.00, "salmon" end
   return 0, "none"
 end
 
@@ -527,26 +494,9 @@ local function priceMeal(gain)
   local tier, label = mealTierForGain(gain)
   if tier <= 0 then return 0, label, tier end
 
-  if db_id then
-    local ok, res = bankReq({
-      type = "quote_service_price",
-      service = "dining_meal",
-      saturation_gain = gain,
-    }, 5)
-
-    if ok and type(res) == "table" and tonumber(res.total) then
-      pricing.effective_index = tonumber(res.sector_index) or pricing.effective_index or 1
-      pricing.food_index = tonumber(res.sector_index) or pricing.food_index or 1
-      pricing.monetary_pressure = tonumber(res.monetary_pressure) or pricing.monetary_pressure or 0
-      pricing.source = tostring(res.source or pricing.source)
-      return math.max(MIN_CHARGE, math.floor(tonumber(res.total) + 0.5)), tostring(res.tier or label), tonumber(res.tier_multiplier) or tier
-    end
-  end
-
-  local idx = tonumber(pricing.food_index) or 1
-  if idx < 1 then idx = 1 end
-  local raw = BASE_NORMAL_MEAL_PRICE * idx * tier
-  return roundMoney(raw), label, tier
+  -- Current debug/bring-up rule:
+  -- any positive sat gain = one salmon served = fixed base salmon price.
+  return roundMoney(SALMON_BASE_PRICE), "salmon", 1.00
 end
 
 -- =============================================================================
@@ -752,8 +702,6 @@ local function processCitizen(z, dining)
   if #dining > 0 then
     near, nearBuilding, nearDistance = isNearDining(pos, dining)
   else
-    -- If the integrator/building data does not expose Dining Hall coordinates,
-    -- do not kill the system. Saturation gain still becomes the signal.
     near = true
   end
 
@@ -761,8 +709,7 @@ local function processCitizen(z, dining)
   state.citizens = state.citizens or {}
   local rec = state.citizens[cid] or {}
   rec.name = name
-  local diningStaff = isDiningStaffCitizen(z)
-  rec.dining_staff = diningStaff and true or false
+  rec.dining_staff = isDiningStaffCitizen(z) and true or false
 
   if near then
     rec.near_at = t
@@ -778,52 +725,21 @@ local function processCitizen(z, dining)
     if gain > 0 then
       stats.saturation_rises = stats.saturation_rises + 1
       stats.last_gain = gain
-    end
 
-    if gain >= MIN_SAT_GAIN then
-      local recentlyNear = false
-      if #dining == 0 then
-        recentlyNear = true
-      elseif tonumber(rec.near_at) and (t - tonumber(rec.near_at)) <= (NEAR_GRACE_SECONDS * 1000) then
-        recentlyNear = true
-      end
-
-      local cooldownOk = true
-      if tonumber(rec.last_charge_at) and (t - tonumber(rec.last_charge_at)) < (MEAL_COOLDOWN_SECONDS * 1000) then
-        cooldownOk = false
-      end
-
+      -- Current bring-up rule requested:
+      -- ANY positive saturation increase means the last citizen who changed ate
+      -- the current food item. Charge them the fixed base salmon price.
+      -- No staff exemption, no near-dining gate, no tiering, no CPI pricing.
       local amount, label = priceMeal(gain)
-
-      if diningStaff then
-        stats.skipped_staff = stats.skipped_staff + 1
-        rec.last_staff_exempt_at = t
-        rec.last_staff_exempt_gain = gain
-        addEvent({
-          type = "staff_meal_exempt",
-          citizen_id = cid,
-          name = name,
-          label = label,
-          gain = gain,
-          reason = "Dining Hall staff are not charged by their own workplace POS.",
-        })
-        setMsg("Ignored staff meal event for " .. tostring(name) .. " (+" .. string.format("%.1f", gain) .. " sat)", colors.lightGray)
-      elseif not recentlyNear then
-        stats.skipped_not_near = stats.skipped_not_near + 1
-      elseif not cooldownOk then
-        stats.skipped_cooldown = stats.skipped_cooldown + 1
-      elseif amount <= 0 then
-        stats.skipped_small_gain = stats.skipped_small_gain + 1
-      else
-        if chargeCitizenMeal(cid, name, amount, label, gain, rec.near_company_id or active_company_id or TARGET_COMPANY) then
+      if amount > 0 then
+        local company_id = rec.near_company_id or active_company_id or TARGET_COMPANY
+        if chargeCitizenMeal(cid, name, amount, label, gain, company_id) then
           rec.last_charge_at = t
           rec.last_charge_amount = amount
           rec.last_charge_label = label
           rec.last_gain = gain
         end
       end
-    elseif gain > 0 then
-      stats.skipped_small_gain = stats.skipped_small_gain + 1
     end
   end
 
@@ -936,7 +852,7 @@ local function draw()
   at(2, 1, "SERVICE PAYMENT TERMINAL", colors.white, colors.purple)
   at(math.max(2, W - #VERSION), 1, VERSION, colors.lightGray, colors.purple)
 
-  at(2, 3, "Source:       saturation POS, no inventory scan", colors.white)
+  at(2, 3, "Source:       any sat change = salmon charge", colors.white)
   at(2, 4, "Bank:         " .. tostring(db_id or "not connected"), db_id and colors.lime or colors.red)
   at(2, 5, "Colony:       " .. tostring(colony and "connected" or "missing"), colony and colors.lime or colors.red)
   at(2, 6, "Company:      " .. tostring(active_company_id or TARGET_COMPANY), colors.lime)
@@ -946,13 +862,13 @@ local function draw()
 
   at(2, 11,  "Citizens:     " .. tostring(stats.citizens_seen) .. "   Near dining: " .. tostring(stats.near_dining), colors.lightGray)
   at(2, 12, "Dining halls: " .. tostring(stats.dining_buildings) .. "   Radius: " .. tostring(DINING_RADIUS), stats.dining_buildings > 0 and colors.lime or colors.orange)
-  at(2, 13, "Price CPI:    food x" .. string.format("%.3f", pricing.food_index) .. "  general x" .. string.format("%.3f", pricing.general_index), colors.cyan)
-  at(2, 14, "Meal price:   normal " .. money(pricing.normal_meal) .. " | pressure " .. string.format("%.1f%%", (pricing.monetary_pressure or 0) * 100), colors.cyan)
-  at(2, 15, "Oracle:       " .. tostring(pricing.source or "fallback"), colors.lightGray)
+  at(2, 13, "Food item:    salmon", colors.cyan)
+  at(2, 14, "Charge price: " .. money(SALMON_BASE_PRICE) .. " per sat-rise event", colors.cyan)
+  at(2, 15, "Pricing:      fixed base food price", colors.lightGray)
 
   at(2, 17, "Sat rises:    " .. tostring(stats.saturation_rises) .. "   Last gain: +" .. string.format("%.1f", stats.last_gain), colors.lightGray)
   at(2, 18, "Meals:        " .. tostring(stats.meals_charged) .. "   Charged: " .. money(stats.charged) .. "   Unpaid: " .. money(stats.unpaid), colors.lime)
-  at(2, 19, "Skipped:      staff " .. tostring(stats.skipped_staff) .. " / cooldown " .. tostring(stats.skipped_cooldown) .. " / not near " .. tostring(stats.skipped_not_near) .. " / tiny " .. tostring(stats.skipped_small_gain), colors.orange)
+  at(2, 19, "Mode:         charge any positive sat change; no staff/near/tier filter", colors.orange)
   at(2, 20, "Receivables:  " .. money(totalReceivables()), totalReceivables() > 0 and colors.orange or colors.gray)
 
   local third = math.floor((W - 8) / 3)
