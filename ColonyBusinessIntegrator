@@ -32,7 +32,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION = "1.0.14-BUILDER-BUNDLES"
+local VERSION = "1.0.18-CITIZEN-LIFECYCLE"
 local BANK_PROTOCOL = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT = 5
@@ -47,6 +47,7 @@ local INFLATION_RATE = 0.00       -- daily inflation/deflation rate from bank
 local BASE_CONTRACT_FEE = 0       -- contract price is unit base price * quantity, then inflation; no separate job fee
 local SPEND_LIMIT = 0.50          -- max % of business balance per job; bulk supply jobs need room to pay by quantity
 local MIN_FAIR_RATIO = 0.50       -- don't post if affordable price is under this share of fair value
+local POST_LIVE_REQUESTS_WITH_OVERDRAFT = true -- live MineColonies requests should post even if the payer company is broke; payout already allows overdraft
 
 local FILE_BUSINESSES = "data/building_companies.db"
 local FILE_POSTED = "data/posted_requests.db"
@@ -78,6 +79,7 @@ local stats = {
   citizens_seen = 0,
   citizen_accounts = 0,
   citizens_registered = 0,
+  citizens_retired = 0,
   employment_synced = 0,
   requests_seen = 0,
   contracts_posted = 0,
@@ -230,7 +232,7 @@ local function draw()
 
   at(2, 8,  "Buildings: " .. tostring(stats.buildings_seen) .. "   Industries: " .. tostring(countTable(industry_companies)) .. " (new " .. tostring(stats.businesses_registered) .. ")", colors.lightGray)
   at(2, 9,  "Locations: " .. tostring(countTable(businesses)) .. "   Model: industry company + locations", colors.lightGray)
-  at(2, 10, "Citizens:  " .. tostring(stats.citizens_seen) .. "   Accounts: " .. tostring(countTable(citizens_map)) .. " (new " .. tostring(stats.citizens_registered) .. ")", colors.lightGray)
+  at(2, 10, "Citizens:  " .. tostring(stats.citizens_seen) .. "   Accounts: " .. tostring(countTable(citizens_map)) .. " (new " .. tostring(stats.citizens_registered) .. ", dead " .. tostring(stats.citizens_retired or 0) .. ")", colors.lightGray)
   at(2, 11, "Requests:  " .. tostring(stats.requests_seen) .. "   Contracts: " .. tostring(stats.contracts_posted), colors.lime)
   at(2, 12, "Skipped:   unmapped " .. tostring(stats.skipped_unmapped) .. " / unfunded " .. tostring(stats.skipped_unfunded), colors.orange)
   at(2, 13, "Pricing:   base " .. tostring(BASE_CONTRACT_FEE) .. " Q, index x" .. string.format("%.3f", PRICE_INDEX) .. ", rate " .. string.format("%.2f%%", INFLATION_RATE * 100), colors.lightGray)
@@ -832,6 +834,9 @@ local function registerCitizen(z)
 
   local ok, res = bankReq({
     type = "register_citizen",
+    citizen_id = citizen_id,
+    mc_id = stable,
+    colony_managed = true,
     display_name = display_name,
     username = username,
     password = "mc" .. tostring(stable),
@@ -880,6 +885,57 @@ local function scanCitizens(citizens)
 
   stats.citizen_accounts = countTable(citizens_map)
   writeFile(FILE_CITIZENS, citizens_map)
+end
+
+
+local function syncColonyCitizenLifecycle(citizens)
+  local roster = {}
+  for _, z in ipairs(citizens or {}) do
+    local stable = citizenStableId(z)
+    if stable then
+      local username = citizenUsername(z)
+      local citizen_id = "citizen:" .. username
+      local work = type(z.work) == "table" and z.work or {}
+      roster[#roster+1] = {
+        mc_id = stable,
+        citizen_id = citizen_id,
+        username = username,
+        display_name = tostring(z.name or z.display_name or ("Citizen " .. stable)),
+        title = citizenTitle(z),
+        job = citizenJobRaw(z),
+        job_text = citizenTitle(z),
+        work_type = normalType(work.type or work.name or ""),
+        work_name = tostring(work.name or ""),
+        workplace = tostring(work.name or ""),
+        active = true,
+      }
+    end
+  end
+
+  if #roster <= 0 then
+    stats.citizens_retired = 0
+    setMsg("Citizen lifecycle sync skipped: empty colony roster", colors.orange)
+    return false, "empty roster"
+  end
+
+  local ok, res = bankReq({
+    type = "sync_colony_citizens",
+    citizens = roster,
+    return_balance_to = "treasury:quid_bank",
+  }, 10)
+
+  if ok and type(res) == "table" then
+    stats.citizens_retired = tonumber(res.retired or 0) or 0
+    stats.citizen_accounts = tonumber(res.active_citizens or res.live or #roster) or #roster
+    if (res.created or 0) > 0 or (res.retired or 0) > 0 then
+      setMsg("Citizen lifecycle: +" .. tostring(res.created or 0) .. " / dead " .. tostring(res.retired or 0), colors.lime)
+    end
+    return true, res
+  end
+
+  stats.citizens_retired = 0
+  setMsg("Citizen lifecycle sync failed: " .. tostring(res), colors.orange)
+  return false, res
 end
 
 local function resolveCitizenEmployment(z)
@@ -1169,7 +1225,6 @@ end
 
 local function priceJob(business, items)
   local bal = companyBalance(business.company_id)
-  if bal <= 0 then return nil, "no funds", bal, 0 end
 
   -- Integer quantity pricing:
   --   base value = cheapest accepted integer unit price * requested quantity
@@ -1189,6 +1244,16 @@ local function priceJob(business, items)
   local fair = math.ceil(raw_item_value * positiveInflationIndex())
   if fair < raw_item_value then fair = raw_item_value end
   if fair < 1 then fair = 1 end
+
+  -- v1.0.16: do not suppress live MineColonies contracts just because the
+  -- mapped company has low or negative cash. The ContractServer payout path
+  -- already uses company_payment with allow_overdraft=true. Blocking the post
+  -- here is what left real live requests stuck with no board contracts after
+  -- inflation or bad legacy mappings pushed the payer below the affordability
+  -- threshold.
+  if POST_LIVE_REQUESTS_WITH_OVERDRAFT then
+    return fair, nil, bal, fair
+  end
 
   local max_pay = math.floor(bal * SPEND_LIMIT)
   if max_pay <= 0 then return nil, "unfunded", bal, fair end
@@ -1302,13 +1367,14 @@ local function requestFamily(req)
   --
   -- IMPORTANT: Do not include itemSignature here. If the accepted alternatives
   -- change, the existing contract should update, not spawn a new contract.
-  local name = trim(req and (req.name or "") or "")
-  local desc = trim(req and (req.desc or "") or "")
+  local name = stripRangePrefix(trim(req and (req.name or "") or ""))
+  local desc = stripRangePrefix(trim(req and (req.desc or "") or ""))
   local target = trim(req and (req.target or "") or "")
 
-  -- Prefer name+target. Raw Salmon and Cooked Salmon naturally split because
-  -- their request names differ, while changing accepted alternatives for Fuel
-  -- keeps the same family.
+  -- Prefer name+target, but strip MineColonies ranged quantity prefixes like
+  -- "1-46 Raw Salmon". Dining Hall requests often shrink instead of
+  -- disappearing after delivery, and the contract source key must stay stable
+  -- so the server can detect that shrink and conclude the claimed job.
   return lower(name) .. "|" .. lower(desc) .. "|" .. lower(target)
 end
 
@@ -1336,6 +1402,19 @@ end
 local function shouldUpsertContract(key, reward, item_sig, title)
   local p = posted and posted[key] or nil
   if not p then return true end
+
+  -- If the ContractServer was rebooted in fresh-rescan mode, our local posted
+  -- cache can point at a contract ID that no longer exists. Verify the remote
+  -- record before deciding to skip; if missing, forget the cache and repost.
+  local cached_id = tostring(p.contract_id or "")
+  if cached_id ~= "" and cached_id ~= "unknown" then
+    local ok_remote, remote_res = contractReq({ type = "get_contract", contract_id = cached_id }, 2)
+    if not ok_remote and tostring(remote_res or ""):find("Contract not found", 1, true) then
+      posted[key] = nil
+      writeFile(FILE_POSTED, posted)
+      return true
+    end
+  end
 
   -- Always refresh occasionally so stale source metadata stays alive, but do not
   -- rewrite a contract every scan for tiny changes.
@@ -1573,15 +1652,18 @@ local function postBuilderBundleContract(bundle)
   return false, nil
 end
 
-local function syncStaleContracts(active_keys)
+local function syncStaleContracts(active_keys, active_details)
   local active_list = {}
+  local detail_list = {}
   for key, _ in pairs(active_keys or {}) do active_list[#active_list+1] = key end
+  for _, meta in pairs(active_details or {}) do detail_list[#detail_list+1] = meta end
 
   local ok, res = contractReq({
     type = "sync_source_contracts",
     source_type = "minecolonies_request",
     source_terminal = os.getComputerID(),
     active_source_keys = active_list,
+    active_source_details = detail_list,
     reason = "MineColonies request no longer exists or is no longer affordable"
   }, 8)
 
@@ -1599,6 +1681,7 @@ end
 
 local function scanRequests(requests, citizens)
   local active_keys = {}
+  local active_details = {}
   local builder_bundles = {}
 
   for _, req in ipairs(requests or {}) do
@@ -1623,11 +1706,34 @@ local function scanRequests(requests, citizens)
           builder_bundles[bundle_key] = builder_bundles[bundle_key] or newBuilderBundle(business, bundle_key)
           addBuilderRequest(builder_bundles[bundle_key], req, items, fixed_quantity, min_q, max_q, child_key)
           active_keys[bundle_key] = true
+          active_details[bundle_key] = {
+            source_key = bundle_key,
+            source_family = "builder_material_bundle",
+            title = "Builder material bundle",
+            quantity_min = 0,
+            quantity_max = 0,
+            fixed_quantity = 0,
+            item_signature = itemSignature(builder_bundles[bundle_key].items),
+            business = business.company_id,
+            bundle_contract = true,
+          }
         else
           local reward, reason, bal = priceJob(business, items)
           if reward then
             local posted_ok, active_key = postContract(req, business, items, reward, fixed_quantity, min_q, max_q, child_key)
-            if posted_ok and active_key then active_keys[active_key] = true end
+            if posted_ok and active_key then
+              active_keys[active_key] = true
+              active_details[active_key] = {
+                source_key = active_key,
+                source_family = requestFamily(req),
+                title = reqTitle(req, fixed_quantity),
+                quantity_min = min_q,
+                quantity_max = max_q,
+                fixed_quantity = fixed_quantity,
+                item_signature = itemSignature(items),
+                business = business.company_id,
+              }
+            end
           else
             stats.skipped_unfunded = stats.skipped_unfunded + 1
             setMsg("Skipped " .. reqTitle(req, fixed_quantity) .. ": " .. tostring(reason) .. " (" .. money(bal) .. ")", colors.orange)
@@ -1642,15 +1748,47 @@ local function scanRequests(requests, citizens)
 
   for key, bundle in pairs(builder_bundles) do
     local ok, active_key = postBuilderBundleContract(bundle)
-    if ok and active_key then active_keys[active_key] = true end
+    if ok and active_key then
+      active_keys[active_key] = true
+      active_details[active_key] = {
+        source_key = active_key,
+        source_family = "builder_material_bundle",
+        title = builderBundleTitle(bundle),
+        quantity_min = 0,
+        quantity_max = 0,
+        fixed_quantity = 0,
+        item_signature = itemSignature(bundle.items),
+        business = bundle.business and bundle.business.company_id or nil,
+        bundle_contract = true,
+        bundle_child_count = #(bundle.children or {}),
+      }
+    end
   end
 
-  syncStaleContracts(active_keys)
+  syncStaleContracts(active_keys, active_details)
 end
 
 -- =============================================================================
 -- SCAN LOOP
 -- =============================================================================
+local function refreshPostedCacheAgainstServer()
+  local ok, res = contractReq({ type = "status" }, 3)
+  if not ok or type(res) ~= "table" then return false end
+
+  -- If the server has been boot-cleared for a fresh rescan, the local integrator
+  -- cache must not be allowed to suppress posting. Clearing posted_requests.db
+  -- here forces this scan to reacquire every currently live MineColonies request.
+  if tonumber(res.total or 0) == 0 and countTable(posted or {}) > 0 then
+    local old_count = countTable(posted or {})
+    posted = {}
+    writeFile(FILE_POSTED, posted)
+    setMsg("Contract server empty; cleared " .. tostring(old_count) .. " cached posts for reacquire.", colors.orange)
+    return true
+  end
+
+  return false
+end
+
 local function scanOnce()
   if not colony then setMsg("No Colony Integrator found.", colors.red); return false end
   if not bank_id or not contract_id then reconnect() end
@@ -1658,6 +1796,7 @@ local function scanOnce()
 
   refreshPrices()
   refreshInflation()
+  refreshPostedCacheAgainstServer()
   local okB, buildings = safeCall(colony, "getBuildings")
   local okC, citizens = safeCall(colony, "getCitizens")
   local okR, requests = safeCall(colony, "getRequests")
@@ -1669,8 +1808,10 @@ local function scanOnce()
   stats.requests_seen = 0
   stats.skipped_unmapped = 0
   stats.skipped_unfunded = 0
+  stats.citizens_retired = 0
 
   scanCitizens(citizens)
+  syncColonyCitizenLifecycle(citizens)
   scanBusinesses(buildings)
   syncEmployeeMappings(citizens)
   scanRequests(requests, citizens)
