@@ -22,7 +22,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.4.13-COLONY-CITIZEN-LIFECYCLE"
+local VERSION  = "1.4.14-COLONY-RECONCILE"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -663,6 +663,15 @@ local function isColonyCitizenId(id)
   return id:find("^" .. COLONY_CITIZEN_PREFIX) ~= nil
 end
 
+local function isManagedColonyCitizen(id)
+  id = tostring(id or "")
+  local c = citizens and citizens[id] or nil
+  local a = accounts and accounts[id] or nil
+  return isColonyCitizenId(id)
+    or (type(c) == "table" and (c.colony_managed == true or c.mc_id ~= nil))
+    or (type(a) == "table" and (a.colony_managed == true or a.mc_id ~= nil))
+end
+
 local function isActiveCitizenAccount(citizen_id)
   if not citizen_id or citizen_id == "" then return false end
   local c = citizens[citizen_id]
@@ -752,7 +761,7 @@ local function retireCitizenAccount(citizen_id, reason, sender_id, return_to)
   return_to = trim(return_to or "treasury:quid_bank")
 
   if citizen_id == "" then return false, "Missing citizen_id" end
-  if not isColonyCitizenId(citizen_id) then
+  if not isManagedColonyCitizen(citizen_id) then
     return false, "Refusing to retire non-colony citizen account: " .. tostring(citizen_id)
   end
   if not citizens[citizen_id] and not accounts[citizen_id] then
@@ -2900,6 +2909,31 @@ handlers["list_my_companies"] = listOwnedCompanies
 handlers["my_companies"] = listOwnedCompanies
 
 
+-- COLONY_LIFECYCLE_STATUS
+-- Diagnostic endpoint for checking whether the last citizen sync actually reached
+-- the bank and what the bank currently considers active/dead.
+handlers["colony_lifecycle_status"] = function(sender_id, req)
+  local active = {}
+  local dead = {}
+  for id, c in pairs(citizens or {}) do
+    if isManagedColonyCitizen(id) then
+      local row = {
+        citizen_id = id,
+        display_name = type(c) == "table" and c.display_name or id,
+        status = type(c) == "table" and c.status or "unknown",
+        balance = deriveBalance(id),
+        mc_id = type(c) == "table" and c.mc_id or nil,
+        last_seen = type(c) == "table" and c.last_seen or nil,
+        job = type(c) == "table" and c.job or nil,
+      }
+      if type(c) == "table" and isDeadStatus(c.status) then dead[#dead+1] = row else active[#active+1] = row end
+    end
+  end
+  table.sort(active, function(a,b) return tostring(a.citizen_id) < tostring(b.citizen_id) end)
+  table.sort(dead, function(a,b) return tostring(a.citizen_id) < tostring(b.citizen_id) end)
+  return true, { active = active, dead = dead, active_count = #active, dead_count = #dead }
+end
+
 -- RETIRE_CITIZEN
 -- Trusted colony lifecycle/admin endpoint. Used when MineColonies reports that
 -- a colony-managed citizen no longer exists. Positive estate balance is returned
@@ -2986,7 +3020,7 @@ handlers["sync_colony_citizens"] = function(sender_id, req)
   end
 
   for id, c in pairs(citizens or {}) do
-    if isColonyCitizenId(id) and type(c) == "table" and not isDeadStatus(c.status) and not live[id] then
+    if isManagedColonyCitizen(id) and type(c) == "table" and not isDeadStatus(c.status) and not live[id] then
       local ok, res = retireCitizenAccount(id, "missing_from_colony_roster", sender_id, req and req.return_balance_to or "treasury:quid_bank")
       if ok then
         retired = retired + 1
