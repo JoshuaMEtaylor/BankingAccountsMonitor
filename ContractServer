@@ -51,7 +51,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION            = "1.0.24-NO-MANUAL-PAYOUT"
+local VERSION            = "1.0.25-AUTO-PRUNE-CLOSED"
 local LABEL              = "Quid-Contracts"
 local PROTOCOL           = "quid_contracts"
 local PROTOCOL_BROADCAST = "quid_contracts_discovery"
@@ -70,6 +70,16 @@ local FILE = {
 -- start empty, so ColonyBusinessIntegrator can reacquire the current live
 -- MineColonies requests and repost only what is actually valid/affordable now.
 local CLEAR_CONTRACTS_ON_BOOT = true
+
+-- Closed contracts are useful for a short audit/debug window, but they should
+-- not live forever in contracts.db. This prevents fulfilled/cancelled history
+-- from filling the ContractServer disk and crashing saves.
+local MINECRAFT_DAY_MS = 20 * 60 * 1000
+local CLOSED_CONTRACT_TTL_MS = MINECRAFT_DAY_MS
+local PRUNE_CHECK_INTERVAL_MS = 60 * 1000
+local AUDIT_KEEP_RECENT_LINES = 300
+local MAX_CONTRACT_ARCHIVES = 3
+local LOW_SPACE_THRESHOLD = 4096
 
 local contracts = {}
 local config = {}
@@ -116,21 +126,126 @@ local function readFile(path)
   return nil
 end
 
+local function trimAuditLog()
+  if not fs.exists(FILE.audit) then return 0 end
+
+  local lines = {}
+  local f = fs.open(FILE.audit, "r")
+  if f then
+    local line = f.readLine()
+    while line do
+      lines[#lines + 1] = line
+      line = f.readLine()
+    end
+    f.close()
+  end
+
+  if #lines <= AUDIT_KEEP_RECENT_LINES then return 0 end
+
+  local keep = {}
+  local start = math.max(1, #lines - AUDIT_KEEP_RECENT_LINES + 1)
+  for i = start, #lines do keep[#keep + 1] = lines[i] end
+
+  local out = fs.open(FILE.audit, "w")
+  if not out then return 0 end
+  local ok = pcall(function()
+    for _, line in ipairs(keep) do out.writeLine(line) end
+  end)
+  out.close()
+
+  if not ok then return 0 end
+  return #lines - #keep
+end
+
+local function pruneContractArchives()
+  if not fs.exists(FILE.archive_dir) or not fs.isDir(FILE.archive_dir) then return 0 end
+
+  local entries = {}
+  for _, name in ipairs(fs.list(FILE.archive_dir)) do
+    local path = FILE.archive_dir .. "/" .. name
+    if not fs.isDir(path) then
+      local ts = tonumber(tostring(name):match("(%d+)")) or 0
+      entries[#entries + 1] = { name = name, path = path, ts = ts }
+    end
+  end
+
+  table.sort(entries, function(a, b)
+    if a.ts == b.ts then return a.name < b.name end
+    return a.ts > b.ts
+  end)
+
+  local removed = 0
+  for i = MAX_CONTRACT_ARCHIVES + 1, #entries do
+    fs.delete(entries[i].path)
+    removed = removed + 1
+  end
+  return removed
+end
+
+local function storageCleanup()
+  trimAuditLog()
+  pruneContractArchives()
+end
+
 local function writeFile(path, data)
   ensureDir(path)
-  local f = fs.open(path, "w")
-  if not f then return false end
-  f.write(textutils.serialize(data))
+
+  local okSer, payload = pcall(textutils.serialize, data)
+  if not okSer or payload == nil then return false end
+
+  if fs.getFreeSpace then
+    local dir = fs.getDir(path)
+    local check_path = (dir and dir ~= "") and dir or "/"
+    local free = tonumber(fs.getFreeSpace(check_path)) or 0
+    if free < LOW_SPACE_THRESHOLD then storageCleanup() end
+  end
+
+  -- Atomic-ish save: write a temporary file first so a failed save does not
+  -- destroy the previous database.
+  local tmp = path .. ".tmp"
+  if fs.exists(tmp) then fs.delete(tmp) end
+
+  local f = fs.open(tmp, "w")
+  if not f then
+    storageCleanup()
+    f = fs.open(tmp, "w")
+    if not f then return false end
+  end
+
+  local okWrite = pcall(function() f.write(payload) end)
   f.close()
+
+  if not okWrite then
+    fs.delete(tmp)
+    storageCleanup()
+    return false
+  end
+
+  fs.delete(path)
+  fs.move(tmp, path)
   return true
 end
 
 local function appendLine(path, line)
   ensureDir(path)
+
+  if path == FILE.audit then trimAuditLog() end
+
   local f = fs.open(path, "a")
-  if not f then return false end
-  f.writeLine(line)
+  if not f then
+    storageCleanup()
+    f = fs.open(path, "a")
+    if not f then return false end
+  end
+
+  local ok = pcall(function() f.writeLine(line) end)
   f.close()
+
+  if not ok then
+    storageCleanup()
+    return false
+  end
+
   return true
 end
 
@@ -156,6 +271,66 @@ local function audit(action, actor, terminal, result)
   local line = string.format("%s | %d | %-20s | %-20s | %-10s | %s",
     id, timestamp(), tostring(actor), tostring(action), tostring(terminal), tostring(result))
   appendLine(FILE.audit, line)
+end
+
+local CLOSED_CONTRACT_STATUSES = {
+  fulfilled = true,
+  cancelled = true,
+  closed = true,
+  expired = true,
+  paid = true,
+}
+
+local last_prune_check = 0
+
+local function contractClosedAt(c)
+  if type(c) ~= "table" then return nil end
+  return tonumber(
+    c.fulfilled_at
+    or c.cancelled_at
+    or c.closed_at
+    or c.expired_at
+    or c.paid_at
+    or c.updated
+    or c.created
+  )
+end
+
+local function pruneClosedContracts(reason)
+  local ts = timestamp()
+  local removed = 0
+
+  for id, c in pairs(contracts or {}) do
+    if type(c) == "table" and CLOSED_CONTRACT_STATUSES[tostring(c.status or "")] then
+      local closed_at = contractClosedAt(c) or ts
+      if (ts - closed_at) >= CLOSED_CONTRACT_TTL_MS then
+        contracts[id] = nil
+        removed = removed + 1
+      end
+    end
+  end
+
+  if removed > 0 then
+    config.last_prune_at = ts
+    config.last_prune_reason = tostring(reason or "auto")
+    config.last_prune_removed = removed
+    config.closed_contract_ttl_ms = CLOSED_CONTRACT_TTL_MS
+    writeFile(FILE.contracts, contracts)
+    writeFile(FILE.config, config)
+    audit("AUTO_PRUNE_CLOSED", "SYSTEM", tostring(reason or "auto"), tostring(removed) .. " removed")
+  end
+
+  return removed
+end
+
+local function pruneClosedContractsIfDue(reason, force)
+  local ts = timestamp()
+  if not force and (ts - last_prune_check) < PRUNE_CHECK_INTERVAL_MS then
+    return 0
+  end
+
+  last_prune_check = ts
+  return pruneClosedContracts(reason)
 end
 
 local function normaliseItems(items)
@@ -1146,6 +1321,9 @@ handlers["status"] = function(sender_id, req)
     boot_contract_refresh_archive = config.boot_contract_refresh_archive,
     pending_retry_paid = config.pending_retry_paid or 0,
     pending_retry_failed = config.pending_retry_failed or 0,
+    last_prune_removed = config.last_prune_removed or 0,
+    last_prune_at = config.last_prune_at or 0,
+    closed_contract_ttl_ms = CLOSED_CONTRACT_TTL_MS,
     audit_count = audit_counter,
   }
 end
@@ -1305,6 +1483,11 @@ local function initFiles()
   contracts = readFile(FILE.contracts) or {}
   config = readFile(FILE.config) or {}
   loadAuditCounter()
+  storageCleanup()
+
+  -- Remove old fulfilled/cancelled/closed records before any boot archive/write.
+  -- This keeps the main database and the boot archive small.
+  pruneClosedContractsIfDue("boot-pre-archive", true)
 
   if CLEAR_CONTRACTS_ON_BOOT then
     local ts = timestamp()
@@ -1323,6 +1506,7 @@ local function initFiles()
     writeFile(FILE.config, config)
 
     audit("BOOT_REFRESH_CLEAR", "SYSTEM", os.getComputerID(), "archived=" .. tostring(archived_count))
+    pruneContractArchives()
     return
   end
 
@@ -1401,6 +1585,7 @@ local function drawStatus()
   print("  Boot reset:" .. tostring(s and s.boot_reopened or 0) .. " reopened / " .. tostring(s and s.boot_repaired_cancelled or 0) .. " repaired")
   print("  Boot clear:" .. tostring(s and s.boot_contract_refresh_archived or 0) .. " archived for rescan")
   print("  Retry paid:" .. tostring(s and s.pending_retry_paid or 0) .. " / failed " .. tostring(s and s.pending_retry_failed or 0))
+  print("  Pruned:    " .. tostring(s and s.last_prune_removed or 0) .. " old closed contracts")
   term.setTextColor(colors.white)
   print("  Total:     " .. tostring(s and s.total or countTable(contracts)))
 
@@ -1447,7 +1632,10 @@ local function serverLoop()
         time = timestamp(),
       }, PROTOCOL)
 
-      if request_count % 5 == 0 then drawStatus() end
+      if request_count % 5 == 0 then
+        pruneClosedContractsIfDue("request-loop", false)
+        drawStatus()
+      end
     else
       local pr_retried, pr_paid, pr_failed = retryAllPendingPayouts("server-loop")
       if pr_retried > 0 then
@@ -1456,6 +1644,7 @@ local function serverLoop()
         writeFile(FILE.config, config)
       end
 
+      pruneClosedContractsIfDue("idle-loop", false)
       drawStatus()
       rednet.broadcast({
         type = "contract_server_online",
