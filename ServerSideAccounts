@@ -22,7 +22,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.4.14-COLONY-RECONCILE"
+local VERSION  = "1.4.15-COLONY-HARD-REPLACE"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -829,6 +829,84 @@ local function retireCitizenAccount(citizen_id, reason, sender_id, return_to)
     estate_tx_id = estate_tx,
     negative_balance_archived = bal < 0 and bal or nil,
   }
+end
+
+
+local function hardDeleteColonyCitizenAccount(citizen_id, reason, sender_id, return_to)
+  citizen_id = trim(citizen_id or "")
+  reason = trim(reason or "missing_from_colony_roster")
+  return_to = trim(return_to or "treasury:quid_bank")
+
+  if citizen_id == "" then return false, "Missing citizen_id" end
+  if not isManagedColonyCitizen(citizen_id) then
+    return false, "Refusing to delete non-colony citizen account: " .. tostring(citizen_id)
+  end
+  if return_to ~= "SYSTEM" and not accountExists(return_to) then
+    return false, "Estate destination account not found: " .. tostring(return_to)
+  end
+
+  local bal = deriveBalance(citizen_id)
+  local estate_tx = nil
+
+  -- Hard-replace behaviour: old missing colonists actually disappear from
+  -- accounts.db/citizens.db/balances.db after their positive estate is returned.
+  if bal > 0 and accountExists(citizen_id) then
+    local ok, res = transfer(citizen_id, return_to, bal, "ESTATE_RECOVERY", "Estate recovery before deletion: " .. reason, "COLONY_LIFECYCLE:" .. tostring(sender_id), false)
+    if ok and type(res) == "table" then
+      estate_tx = res.tx_id
+    else
+      return false, "Estate transfer failed for " .. citizen_id .. ": " .. tostring(res)
+    end
+  end
+
+  citizens[citizen_id] = nil
+  accounts[citizen_id] = nil
+  balances[citizen_id] = nil
+  employment_mappings[citizen_id] = nil
+
+  saveCitizens()
+  saveAccounts()
+  saveBalances()
+  saveEmployment()
+
+  audit("ACTION", "STATE", sender_id, "DELETE_COLONY_CITIZEN", citizen_id .. " estate=" .. tostring(bal > 0 and bal or 0))
+  return true, {
+    citizen_id = citizen_id,
+    status = "deleted",
+    reason = reason,
+    estate_amount = bal > 0 and bal or 0,
+    estate_tx_id = estate_tx,
+    negative_balance_written_off = bal < 0 and bal or nil,
+  }
+end
+
+local function managedColonyCitizenCandidates()
+  local candidates = {}
+  for id, _ in pairs(accounts or {}) do
+    if isManagedColonyCitizen(id) then candidates[id] = true end
+  end
+  for id, _ in pairs(citizens or {}) do
+    if isManagedColonyCitizen(id) then candidates[id] = true end
+  end
+  for id, _ in pairs(balances or {}) do
+    if isColonyCitizenId(id) then candidates[id] = true end
+  end
+  for id, _ in pairs(employment_mappings or {}) do
+    if isColonyCitizenId(id) then candidates[id] = true end
+  end
+  return candidates
+end
+
+local function rosterEntries(incoming)
+  local out = {}
+  if type(incoming) ~= "table" then return out end
+  for _, raw in pairs(incoming) do
+    if type(raw) == "table" then out[#out+1] = raw end
+  end
+  table.sort(out, function(a,b)
+    return tostring(a.citizen_id or a.mc_id or a.id or a.name or "") < tostring(b.citizen_id or b.mc_id or b.id or b.name or "")
+  end)
+  return out
 end
 
 
@@ -2931,7 +3009,7 @@ handlers["colony_lifecycle_status"] = function(sender_id, req)
   end
   table.sort(active, function(a,b) return tostring(a.citizen_id) < tostring(b.citizen_id) end)
   table.sort(dead, function(a,b) return tostring(a.citizen_id) < tostring(b.citizen_id) end)
-  return true, { active = active, dead = dead, active_count = #active, dead_count = #dead }
+  return true, { active = active, dead = dead, active_count = #active, dead_count = #dead, last_sync = config.last_colony_citizen_sync }
 end
 
 -- RETIRE_CITIZEN
@@ -2946,13 +3024,17 @@ handlers["retire_citizen"] = function(sender_id, req)
 end
 
 -- SYNC_COLONY_CITIZENS
--- ColonyBusinessIntegrator sends the live MineColonies roster here. This is the
--- source of truth for citizen:mc_* accounts.
+-- ColonyBusinessIntegrator sends the live MineColonies roster here. In hard
+-- replace mode, the live roster is the complete truth for citizen:mc_* accounts:
+-- missing old colonists are physically removed from accounts.db/citizens.db and
+-- new live colonists are created immediately.
 handlers["sync_colony_citizens"] = function(sender_id, req)
   local incoming = req and (req.citizens or req.roster or req.live_citizens) or {}
   if type(incoming) ~= "table" then return false, "Missing citizens table" end
-  if #incoming <= 0 and not (req and req.allow_empty == true) then
-    return false, "Empty colony citizen roster ignored; pass allow_empty=true to retire everyone deliberately"
+
+  local entries = rosterEntries(incoming)
+  if #entries <= 0 and not (req and req.allow_empty == true) then
+    return false, "Empty colony citizen roster ignored; pass allow_empty=true to delete all colony citizens deliberately"
   end
 
   local ts = timestamp()
@@ -2961,18 +3043,27 @@ handlers["sync_colony_citizens"] = function(sender_id, req)
   local updated = 0
   local reactivated = 0
   local retired = 0
+  local deleted = 0
   local estate_total = 0
   local errors = {}
+  local created_ids = {}
+  local updated_ids = {}
+  local deleted_ids = {}
 
-  for _, raw in ipairs(incoming) do
+  local hard_delete_missing = true
+  if req and req.hard_delete_missing == false then hard_delete_missing = false end
+  if req and req.archive_missing == true then hard_delete_missing = false end
+  if req and req.delete_missing == true then hard_delete_missing = true end
+
+  for _, raw in ipairs(entries) do
     local rec = normaliseSyncedCitizen(raw)
     if rec and isColonyCitizenId(rec.citizen_id) then
       local id = rec.citizen_id
       live[id] = true
-      local existed = type(citizens[id]) == "table"
-      local was_dead = existed and isDeadStatus(citizens[id].status)
+      local existed = type(citizens[id]) == "table" or type(accounts[id]) == "table" or balances[id] ~= nil
+      local was_dead = (type(citizens[id]) == "table" and isDeadStatus(citizens[id].status)) or (type(accounts[id]) == "table" and isDeadStatus(accounts[id].status))
 
-      if not existed then
+      if type(citizens[id]) ~= "table" then
         citizens[id] = {
           display_name = rec.display_name,
           username = rec.username,
@@ -2984,14 +3075,13 @@ handlers["sync_colony_citizens"] = function(sender_id, req)
           mc_id = rec.mc_id,
           first_seen = ts,
         }
-        created = created + 1
-      else
-        updated = updated + 1
       end
 
       local c = citizens[id]
       c.display_name = rec.display_name or c.display_name or id
       c.username = c.username or rec.username
+      c.password_hash = c.password_hash or simpleHash("mc" .. tostring(rec.mc_id or rec.username))
+      c.joined = c.joined or ts
       c.title = rec.title ~= "" and rec.title or c.title or "Colonist"
       c.status = "active"
       c.colony_managed = true
@@ -3005,6 +3095,7 @@ handlers["sync_colony_citizens"] = function(sender_id, req)
 
       local ok, res = ensureAccountRecord(id, "citizen", c.display_name, id)
       if ok and type(accounts[id]) == "table" then
+        accounts[id].type = "citizen"
         accounts[id].status = "active"
         accounts[id].display_name = c.display_name
         accounts[id].owner_id = id
@@ -3013,43 +3104,88 @@ handlers["sync_colony_citizens"] = function(sender_id, req)
         accounts[id].last_seen = ts
         accounts[id].dead_at = nil
         accounts[id].death_reason = nil
+        accounts[id].recovered = nil
+        accounts[id].recovered_at = nil
       end
+      if balances[id] == nil then balances[id] = 0 end
 
+      if not existed then
+        created = created + 1
+        created_ids[#created_ids+1] = id
+      else
+        updated = updated + 1
+        updated_ids[#updated_ids+1] = id
+      end
       if was_dead then reactivated = reactivated + 1 end
     end
   end
 
-  for id, c in pairs(citizens or {}) do
-    if isManagedColonyCitizen(id) and type(c) == "table" and not isDeadStatus(c.status) and not live[id] then
-      local ok, res = retireCitizenAccount(id, "missing_from_colony_roster", sender_id, req and req.return_balance_to or "treasury:quid_bank")
-      if ok then
-        retired = retired + 1
-        if type(res) == "table" then estate_total = estate_total + (tonumber(res.estate_amount) or 0) end
+  -- Important: check accounts.db as well as citizens.db. Older bank versions
+  -- could have citizen:mc_* rows in accounts.db only, so looping citizens alone
+  -- left stale rows behind.
+  local candidates = managedColonyCitizenCandidates()
+  for id, _ in pairs(candidates) do
+    if not live[id] then
+      local ok, res
+      if hard_delete_missing then
+        ok, res = hardDeleteColonyCitizenAccount(id, "missing_from_colony_roster", sender_id, req and req.return_balance_to or "treasury:quid_bank")
+        if ok then
+          deleted = deleted + 1
+          deleted_ids[#deleted_ids+1] = id
+        end
       else
+        local already_dead = (type(citizens[id]) == "table" and isDeadStatus(citizens[id].status)) or (type(accounts[id]) == "table" and isDeadStatus(accounts[id].status))
+        if already_dead then ok, res = true, { estate_amount = 0 } else ok, res = retireCitizenAccount(id, "missing_from_colony_roster", sender_id, req and req.return_balance_to or "treasury:quid_bank") end
+        if ok then retired = retired + 1 end
+      end
+      if ok and type(res) == "table" then
+        estate_total = estate_total + (tonumber(res.estate_amount) or 0)
+      elseif not ok then
         errors[#errors+1] = tostring(res)
       end
     end
   end
 
-  saveCitizens()
-  saveAccounts()
-  saveBalances()
-  saveEmployment()
-
-  audit("ACTION", "STATE", sender_id, "SYNC_COLONY_CITIZENS", "live=" .. tostring(countTable(live)) .. " retired=" .. tostring(retired))
-  return true, {
+  config.last_colony_citizen_sync = {
+    time = ts,
+    sender_id = sender_id,
     live = countTable(live),
+    incoming = #entries,
     created = created,
     updated = updated,
     reactivated = reactivated,
     retired = retired,
+    deleted = deleted,
+    hard_delete_missing = hard_delete_missing,
     estate_total = estate_total,
     errors = errors,
+  }
+
+  saveCitizens()
+  saveAccounts()
+  saveBalances()
+  saveEmployment()
+  saveConfig()
+
+  audit("ACTION", "STATE", sender_id, "SYNC_COLONY_CITIZENS", "live=" .. tostring(countTable(live)) .. " created=" .. tostring(created) .. " deleted=" .. tostring(deleted) .. " retired=" .. tostring(retired))
+  return true, {
+    live = countTable(live),
+    incoming = #entries,
+    created = created,
+    updated = updated,
+    reactivated = reactivated,
+    retired = retired,
+    deleted = deleted,
+    estate_total = estate_total,
+    errors = errors,
+    hard_delete_missing = hard_delete_missing,
     active_citizens = countActiveCitizens(),
     dead_citizens = countDeadCitizens(),
+    created_ids = created_ids,
+    deleted_ids = deleted_ids,
+    last_sync = config.last_colony_citizen_sync,
   }
 end
-
 
 -- LIST_CITIZENS
 handlers["list_citizens"] = function(sender_id, req)
