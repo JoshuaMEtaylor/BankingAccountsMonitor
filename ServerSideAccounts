@@ -22,7 +22,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.4.15-COLONY-HARD-REPLACE"
+local VERSION  = "1.4.16-HARD-FILE-ESTATE"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -66,6 +66,7 @@ local FILE = {
   inflation    = "data/inflation_state.db",
   config       = "data/config.db",
   employment   = "data/employment_mappings.db",
+  colony_deleted = "data/colony_deleted_citizens.db",
 }
 
 local LEDGER_KEEP_RECENT_TX = 500
@@ -91,6 +92,7 @@ local prices    = {}
 local price_oracle = {}
 local inflation_state = {}
 local config    = {}
+local colony_deleted_citizens = {} -- [citizen:mc_*] = tombstone record blocking boot repair/recovery
 
 local tx_counter    = 0
 local sh_counter    = 0
@@ -180,6 +182,13 @@ end
 
 local function lower(s)
   return string.lower(tostring(s or ""))
+end
+
+local function countTable(t)
+  local n = 0
+  if type(t) ~= "table" then return 0 end
+  for _ in pairs(t) do n = n + 1 end
+  return n
 end
 
 local function readLines(path)
@@ -377,6 +386,42 @@ local function savePrices()    return writeFile(FILE.prices,    prices)    end
 local function savePriceOracle() return writeFile(FILE.price_oracle, price_oracle) end
 local function saveInflation() return writeFile(FILE.inflation, inflation_state) end
 local function saveConfig()    return writeFile(FILE.config,    config)    end
+local function saveEmployment() return writeFile(FILE.employment, employment_mappings) end
+local function saveColonyDeleted() return writeFile(FILE.colony_deleted, colony_deleted_citizens) end
+
+local function saveCoreBankFiles()
+  local results = {
+    accounts = saveAccounts(),
+    citizens = saveCitizens(),
+    balances = saveBalances(),
+    employment = saveEmployment(),
+    config = saveConfig(),
+    colony_deleted = saveColonyDeleted(),
+  }
+  for name, ok in pairs(results) do
+    if not ok then
+      return false, "Failed to write data/" .. tostring(name) .. " file", results
+    end
+  end
+
+  -- Re-open the important hard files immediately. This catches cases where a
+  -- write appears to succeed but the file is not readable/serialised afterwards.
+  local checks = {
+    accounts = { path = FILE.accounts, data = accounts },
+    citizens = { path = FILE.citizens, data = citizens },
+    balances = { path = FILE.balances, data = balances },
+    employment = { path = FILE.employment, data = employment_mappings },
+    colony_deleted = { path = FILE.colony_deleted, data = colony_deleted_citizens },
+  }
+  for name, spec in pairs(checks) do
+    local loaded = readFile(spec.path)
+    if type(loaded) ~= "table" then
+      return false, "Hard file verify failed: " .. tostring(spec.path), results
+    end
+  end
+
+  return true, "hard files written", results
+end
 
 -- =============================================================================
 -- AUTH  — username + password, works from any terminal
@@ -398,10 +443,6 @@ local function authenticateUser(username, password)
     return false, "Incorrect password"
   end
   return true, citizen_id, citizen
-end
-
-local function saveEmployment()
-  return writeFile(FILE.employment, employment_mappings)
 end
 
 -- Compatibility helper for older admin/state terminals.
@@ -440,6 +481,9 @@ end
 -- =============================================================================
 local function ensureAccountRecord(account_id, acc_type, display_name, owner_id)
   if not account_id or account_id == "" then return false, "missing account_id" end
+  if tostring(account_id):find("^citizen:mc_") and type(colony_deleted_citizens) == "table" and colony_deleted_citizens[account_id] then
+    return false, "Refusing to recover deleted colony citizen account: " .. tostring(account_id)
+  end
   local changedAccounts = false
   local changedBalances = false
 
@@ -488,7 +532,7 @@ local function repairRegistryAccounts()
   ensureAccountRecord("contract:escrow", "escrow", "Contract Escrow", "SYSTEM")
 
   for citizen_id, citizen in pairs(citizens or {}) do
-    if type(citizen) == "table" then
+    if type(citizen) == "table" and not (tostring(citizen_id):find("^citizen:mc_") and type(colony_deleted_citizens) == "table" and colony_deleted_citizens[citizen_id]) then
       local name = citizen.display_name or citizen.name or citizen_id
       local ok2, res2 = ensureAccountRecord(citizen_id, "citizen", name, citizen_id)
       if ok2 then repaired.citizens = repaired.citizens + 1; bump(res2) end
@@ -815,10 +859,18 @@ local function retireCitizenAccount(citizen_id, reason, sender_id, return_to)
 
   employment_mappings[citizen_id] = nil
 
-  saveCitizens()
-  saveAccounts()
-  saveEmployment()
-  saveBalances()
+  colony_deleted_citizens[citizen_id] = colony_deleted_citizens[citizen_id] or {
+    citizen_id = citizen_id,
+    display_name = citizens[citizen_id] and citizens[citizen_id].display_name or (accounts[citizen_id] and accounts[citizen_id].display_name) or citizen_id,
+    deleted_at = ts,
+    reason = reason,
+    mode = "archived",
+    estate_amount = bal > 0 and bal or 0,
+    estate_tx_id = estate_tx,
+  }
+
+  local okSave, saveMsg = saveCoreBankFiles()
+  if not okSave then return false, saveMsg end
 
   audit("ACTION", "STATE", sender_id, "RETIRE_CITIZEN", citizen_id .. " estate=" .. tostring(bal > 0 and bal or 0))
   return true, {
@@ -850,6 +902,22 @@ local function hardDeleteColonyCitizenAccount(citizen_id, reason, sender_id, ret
 
   -- Hard-replace behaviour: old missing colonists actually disappear from
   -- accounts.db/citizens.db/balances.db after their positive estate is returned.
+  -- If an older bug left only a balance row with no account row, recreate a
+  -- temporary active account first so transfer() can move the estate cleanly
+  -- through the normal ledger instead of silently burning the citizen's money.
+  if bal > 0 and not accountExists(citizen_id) then
+    accounts[citizen_id] = {
+      type = "citizen",
+      display_name = (citizens[citizen_id] and citizens[citizen_id].display_name) or citizen_id,
+      owner_id = citizen_id,
+      created = timestamp(),
+      status = "active",
+      colony_managed = true,
+      recovered_for_estate = true,
+    }
+    saveAccounts()
+  end
+
   if bal > 0 and accountExists(citizen_id) then
     local ok, res = transfer(citizen_id, return_to, bal, "ESTATE_RECOVERY", "Estate recovery before deletion: " .. reason, "COLONY_LIFECYCLE:" .. tostring(sender_id), false)
     if ok and type(res) == "table" then
@@ -859,15 +927,26 @@ local function hardDeleteColonyCitizenAccount(citizen_id, reason, sender_id, ret
     end
   end
 
+  local old_display = (citizens[citizen_id] and citizens[citizen_id].display_name) or (accounts[citizen_id] and accounts[citizen_id].display_name) or citizen_id
+  colony_deleted_citizens[citizen_id] = {
+    citizen_id = citizen_id,
+    display_name = old_display,
+    deleted_at = timestamp(),
+    reason = reason,
+    mode = "hard_deleted",
+    return_to = return_to,
+    estate_amount = bal > 0 and bal or 0,
+    estate_tx_id = estate_tx,
+    negative_balance_written_off = bal < 0 and bal or nil,
+  }
+
   citizens[citizen_id] = nil
   accounts[citizen_id] = nil
   balances[citizen_id] = nil
   employment_mappings[citizen_id] = nil
 
-  saveCitizens()
-  saveAccounts()
-  saveBalances()
-  saveEmployment()
+  local okSave, saveMsg = saveCoreBankFiles()
+  if not okSave then return false, saveMsg end
 
   audit("ACTION", "STATE", sender_id, "DELETE_COLONY_CITIZEN", citizen_id .. " estate=" .. tostring(bal > 0 and bal or 0))
   return true, {
@@ -2748,6 +2827,8 @@ handlers["status"] = function(sender_id, req)
     citizen_count    = countActiveCitizens(),
     citizen_total    = count(citizens),
     dead_citizen_count = countDeadCitizens(),
+    colony_deleted_count = count(colony_deleted_citizens),
+    last_colony_citizen_sync = config.last_colony_citizen_sync,
     company_count    = count(companies),
     tx_count         = tx_counter,
     audit_count      = audit_counter,
@@ -2766,6 +2847,60 @@ handlers["repair_registry_accounts"] = function(sender_id, req)
   local repaired = repairRegistryAccounts()
   audit("ACTION", "STATE", sender_id, "REPAIR_REGISTRY_ACCOUNTS", textutils.serialize(repaired))
   return true, repaired
+end
+
+handlers["force_save_core_files"] = function(sender_id, req)
+  local ok, msg, results = saveCoreBankFiles()
+  audit(ok and "ACTION" or "ERROR", "STATE", sender_id, "FORCE_SAVE_CORE_FILES", tostring(msg))
+  return ok, {
+    message = msg,
+    results = results,
+    paths = {
+      accounts = FILE.accounts,
+      citizens = FILE.citizens,
+      balances = FILE.balances,
+      employment = FILE.employment,
+      colony_deleted = FILE.colony_deleted,
+    }
+  }
+end
+
+handlers["colony_lifecycle_status"] = function(sender_id, req)
+  local live = {}
+  local deleted = {}
+  for id, acc in pairs(accounts or {}) do
+    if isManagedColonyCitizen(id) then
+      live[#live+1] = {
+        citizen_id = id,
+        display_name = acc.display_name,
+        status = acc.status,
+        balance = deriveBalance(id),
+        in_accounts = accounts[id] ~= nil,
+        in_citizens = citizens[id] ~= nil,
+        in_balances = balances[id] ~= nil,
+        in_employment = employment_mappings[id] ~= nil,
+      }
+    end
+  end
+  for id, rec in pairs(colony_deleted_citizens or {}) do
+    deleted[#deleted+1] = rec
+  end
+  table.sort(live, function(a,b) return tostring(a.display_name or a.citizen_id) < tostring(b.display_name or b.citizen_id) end)
+  table.sort(deleted, function(a,b) return tostring(a.deleted_at or 0) > tostring(b.deleted_at or 0) end)
+  return true, {
+    live = live,
+    deleted = deleted,
+    live_count = #live,
+    deleted_count = #deleted,
+    last_sync = config.last_colony_citizen_sync,
+    files = {
+      accounts = FILE.accounts,
+      citizens = FILE.citizens,
+      balances = FILE.balances,
+      employment = FILE.employment,
+      colony_deleted = FILE.colony_deleted,
+    }
+  }
 end
 
 
@@ -3060,6 +3195,9 @@ handlers["sync_colony_citizens"] = function(sender_id, req)
     if rec and isColonyCitizenId(rec.citizen_id) then
       local id = rec.citizen_id
       live[id] = true
+      if type(colony_deleted_citizens) == "table" and colony_deleted_citizens[id] then
+        colony_deleted_citizens[id] = nil
+      end
       local existed = type(citizens[id]) == "table" or type(accounts[id]) == "table" or balances[id] ~= nil
       local was_dead = (type(citizens[id]) == "table" and isDeadStatus(citizens[id].status)) or (type(accounts[id]) == "table" and isDeadStatus(accounts[id].status))
 
@@ -3161,11 +3299,23 @@ handlers["sync_colony_citizens"] = function(sender_id, req)
     errors = errors,
   }
 
-  saveCitizens()
-  saveAccounts()
-  saveBalances()
-  saveEmployment()
-  saveConfig()
+  local okSave, saveMsg, saveResults = saveCoreBankFiles()
+  if not okSave then
+    errors[#errors+1] = tostring(saveMsg)
+    audit("ERROR", "STATE", sender_id, "SYNC_COLONY_CITIZENS_SAVE", tostring(saveMsg))
+    return false, {
+      message = tostring(saveMsg),
+      live = countTable(live),
+      incoming = #entries,
+      created = created,
+      updated = updated,
+      deleted = deleted,
+      retired = retired,
+      estate_total = estate_total,
+      errors = errors,
+      save_results = saveResults,
+    }
+  end
 
   audit("ACTION", "STATE", sender_id, "SYNC_COLONY_CITIZENS", "live=" .. tostring(countTable(live)) .. " created=" .. tostring(created) .. " deleted=" .. tostring(deleted) .. " retired=" .. tostring(retired))
   return true, {
@@ -3350,6 +3500,7 @@ local function initFiles()
   prices    = readFile(FILE.prices)    or {}
   price_oracle = readFile(FILE.price_oracle) or {}
   employment_mappings = readFile(FILE.employment) or {}
+  colony_deleted_citizens = readFile(FILE.colony_deleted) or {}
   inflation_state = readFile(FILE.inflation) or {}
   ensureInflationState()
   ensurePriceOracle()
@@ -3376,6 +3527,7 @@ local function initFiles()
   print("  Citizens:  " .. count(citizens))
   print("  Companies: " .. count(companies))
   print("  Employment mappings: " .. count(employment_mappings))
+  print("  Deleted colony citizens: " .. count(colony_deleted_citizens))
   print("  Price oracle sectors: " .. count(price_oracle.sectors or {}))
 end
 
@@ -3490,6 +3642,7 @@ local function drawStatus()
   print("  Citizens:  " .. count(citizens))
   print("  Companies: " .. count(companies))
   print("  Employment mappings: " .. count(employment_mappings))
+  print("  Deleted colony citizens: " .. count(colony_deleted_citizens))
   print("  Price oracle sectors: " .. count(price_oracle.sectors or {}))
   term.setTextColor(colors.lime)
   print("  Treasury:  " .. deriveBalance("treasury:quid_bank") .. " Quid")
