@@ -22,7 +22,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.4.12-RECOVERY-SAFE"
+local VERSION  = "1.4.13-COLONY-CITIZEN-LIFECYCLE"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -640,6 +640,185 @@ local function transfer(from_id, to_id, amount, tx_type, memo, actor, allow_over
     memo   = memo,
     status = "settled",
     ledger = ledger_ok and "written" or "deferred"
+  }
+end
+
+
+-- =============================================================================
+-- COLONY CITIZEN LIFECYCLE
+-- MineColonies citizen accounts are managed by ColonyBusinessIntegrator.
+-- The integrator sends the live roster; the bank retires missing citizen:mc_*
+-- accounts, returns positive estate balances to treasury, and removes payroll
+-- mappings for dead citizens.
+-- =============================================================================
+local COLONY_CITIZEN_PREFIX = "citizen:mc_"
+
+local function isDeadStatus(status)
+  status = lower(status or "")
+  return status == "dead" or status == "retired" or status == "archived"
+end
+
+local function isColonyCitizenId(id)
+  id = tostring(id or "")
+  return id:find("^" .. COLONY_CITIZEN_PREFIX) ~= nil
+end
+
+local function isActiveCitizenAccount(citizen_id)
+  if not citizen_id or citizen_id == "" then return false end
+  local c = citizens[citizen_id]
+  local a = accounts[citizen_id]
+  if type(c) ~= "table" or type(a) ~= "table" then return false end
+  if isDeadStatus(c.status) or isDeadStatus(a.status) then return false end
+  if c.status and c.status ~= "active" then return false end
+  if a.status and a.status ~= "active" then return false end
+  return true
+end
+
+local function countActiveCitizens()
+  local n = 0
+  for citizen_id, citizen in pairs(citizens or {}) do
+    local acc = accounts[citizen_id]
+    if type(citizen) == "table" and type(acc) == "table"
+      and not isDeadStatus(citizen.status)
+      and not isDeadStatus(acc.status)
+      and (citizen.status == nil or citizen.status == "active")
+      and (acc.status == nil or acc.status == "active") then
+      n = n + 1
+    end
+  end
+  return n
+end
+
+local function countDeadCitizens()
+  local n = 0
+  for citizen_id, citizen in pairs(citizens or {}) do
+    local acc = accounts[citizen_id]
+    if (type(citizen) == "table" and isDeadStatus(citizen.status))
+      or (type(acc) == "table" and isDeadStatus(acc.status)) then
+      n = n + 1
+    end
+  end
+  return n
+end
+
+local function safeUsernameFromCitizenId(citizen_id)
+  citizen_id = tostring(citizen_id or "")
+  local key = citizen_id:gsub("^citizen:", "")
+  key = key:gsub("[^%w_%-]", "_")
+  if key == "" then key = "unknown" end
+  return key
+end
+
+local function normaliseSyncedCitizen(e)
+  if type(e) ~= "table" then return nil end
+  local mc_id = trim(e.mc_id or e.id or e.citizen_mc_id or e.stable_id or "")
+  local citizen_id = trim(e.citizen_id or "")
+
+  if citizen_id == "" and mc_id ~= "" then
+    local safe = tostring(mc_id):gsub("[^%w_%-]", "_")
+    citizen_id = COLONY_CITIZEN_PREFIX .. safe
+  end
+
+  if citizen_id ~= "" and not citizen_id:find(":") then
+    citizen_id = "citizen:" .. lower(citizen_id):gsub("%s+", "_")
+  end
+
+  if citizen_id == "" then return nil end
+
+  local username = trim(e.username or safeUsernameFromCitizenId(citizen_id))
+  username = username:gsub("^citizen:", "")
+  username = username:gsub("[^%w_%-]", "_")
+  if username == "" then username = safeUsernameFromCitizenId(citizen_id) end
+
+  local display_name = trim(e.display_name or e.name or e.label or citizen_id)
+  if display_name == "" then display_name = citizen_id end
+
+  return {
+    citizen_id = citizen_id,
+    username = username,
+    mc_id = mc_id ~= "" and mc_id or username:gsub("^mc_", ""),
+    display_name = display_name,
+    title = trim(e.title or e.job_text or e.job or "Colonist"),
+    job = trim(e.job or e.job_raw or e.job_text or ""),
+    workplace = trim(e.workplace or e.work_name or ""),
+    industry = trim(e.industry or ""),
+    raw = e,
+  }
+end
+
+local function retireCitizenAccount(citizen_id, reason, sender_id, return_to)
+  citizen_id = trim(citizen_id or "")
+  reason = trim(reason or "missing_from_colony_roster")
+  return_to = trim(return_to or "treasury:quid_bank")
+
+  if citizen_id == "" then return false, "Missing citizen_id" end
+  if not isColonyCitizenId(citizen_id) then
+    return false, "Refusing to retire non-colony citizen account: " .. tostring(citizen_id)
+  end
+  if not citizens[citizen_id] and not accounts[citizen_id] then
+    return false, "Citizen account not found: " .. tostring(citizen_id)
+  end
+  if return_to ~= "SYSTEM" and not accountExists(return_to) then
+    return false, "Estate destination account not found: " .. tostring(return_to)
+  end
+
+  local ts = timestamp()
+  local bal = deriveBalance(citizen_id)
+  local estate_tx = nil
+  local estate_error = nil
+
+  if bal > 0 then
+    local ok, res = transfer(citizen_id, return_to, bal, "ESTATE_RECOVERY", "Estate recovery: " .. reason, "COLONY_LIFECYCLE:" .. tostring(sender_id), false)
+    if ok and type(res) == "table" then
+      estate_tx = res.tx_id
+    elseif not ok then
+      estate_error = tostring(res)
+      -- Do not mark the account dead if the estate transfer failed. That would
+      -- trap active money in a hidden account.
+      return false, "Estate transfer failed for " .. citizen_id .. ": " .. estate_error
+    end
+  end
+
+  if type(citizens[citizen_id]) ~= "table" then
+    citizens[citizen_id] = {
+      display_name = accounts[citizen_id] and accounts[citizen_id].display_name or citizen_id,
+      username = safeUsernameFromCitizenId(citizen_id),
+      joined = ts,
+      title = "Colonist",
+    }
+  end
+
+  citizens[citizen_id].status = "dead"
+  citizens[citizen_id].dead_at = ts
+  citizens[citizen_id].death_reason = reason
+  citizens[citizen_id].colony_managed = true
+  citizens[citizen_id].estate_returned_to = return_to
+  citizens[citizen_id].estate_amount = bal > 0 and bal or 0
+  citizens[citizen_id].estate_tx_id = estate_tx
+
+  if type(accounts[citizen_id]) == "table" then
+    accounts[citizen_id].status = "dead"
+    accounts[citizen_id].dead_at = ts
+    accounts[citizen_id].death_reason = reason
+    accounts[citizen_id].estate_returned_to = return_to
+    accounts[citizen_id].estate_tx_id = estate_tx
+  end
+
+  employment_mappings[citizen_id] = nil
+
+  saveCitizens()
+  saveAccounts()
+  saveEmployment()
+  saveBalances()
+
+  audit("ACTION", "STATE", sender_id, "RETIRE_CITIZEN", citizen_id .. " estate=" .. tostring(bal > 0 and bal or 0))
+  return true, {
+    citizen_id = citizen_id,
+    status = "dead",
+    reason = reason,
+    estate_amount = bal > 0 and bal or 0,
+    estate_tx_id = estate_tx,
+    negative_balance_archived = bal < 0 and bal or nil,
   }
 end
 
@@ -1770,15 +1949,19 @@ end
 -- LIST_ACCOUNTS
 handlers["list_accounts"] = function(sender_id, req)
   local result = {}
+  local include_dead = req and req.include_dead == true
   for id, acc in pairs(accounts) do
-    result[#result+1] = {
-      account_id   = id,
-      type         = acc.type,
-      display_name = acc.display_name,
-      owner_id     = acc.owner_id,
-      status       = acc.status,
-      balance      = deriveBalance(id)
-    }
+    local status = acc and acc.status or "active"
+    if include_dead or not isDeadStatus(status) then
+      result[#result+1] = {
+        account_id   = id,
+        type         = acc.type,
+        display_name = acc.display_name,
+        owner_id     = acc.owner_id,
+        status       = acc.status,
+        balance      = deriveBalance(id)
+      }
+    end
   end
   table.sort(result, function(a,b) return (a.balance or 0) > (b.balance or 0) end)
   audit("ACTION", "STATE", sender_id, "LIST_ACCOUNTS", tostring(#result))
@@ -1880,7 +2063,7 @@ handlers["sync_employee_mappings"] = function(sender_id, req)
     if type(e) == "table" and e.citizen_id and e.company_id then
       local citizen_id = tostring(e.citizen_id)
       local company_id = tostring(e.company_id)
-      if accountExists(citizen_id) and accountExists(company_id) and companies[company_id] then
+      if isActiveCitizenAccount(citizen_id) and accountExists(company_id) and companies[company_id] then
         local rec = employment_mappings[citizen_id] or {}
         rec.citizen_id = citizen_id
         rec.display_name = e.display_name or e.name or rec.display_name or citizen_id
@@ -2475,7 +2658,9 @@ handlers["status"] = function(sender_id, req)
     uptime           = os.clock(),
     economy_status   = (type(config) == "table" and config.economy_status) or "active",
     account_count    = count(accounts),
-    citizen_count    = count(citizens),
+    citizen_count    = countActiveCitizens(),
+    citizen_total    = count(citizens),
+    dead_citizen_count = countDeadCitizens(),
     company_count    = count(companies),
     tx_count         = tx_counter,
     audit_count      = audit_counter,
@@ -2519,6 +2704,8 @@ handlers["register_citizen"] = function(sender_id, req)
       joined        = timestamp(),
       status        = "active",
       title         = title,
+      mc_id         = req.mc_id,
+      colony_managed = req.colony_managed == true or req.mc_id ~= nil or tostring(citizen_id):find("^citizen:mc_") ~= nil,
       recovered     = req.recovered == true or nil,
     }
   else
@@ -2529,6 +2716,14 @@ handlers["register_citizen"] = function(sender_id, req)
     c.joined = c.joined or timestamp()
     c.status = c.status or "active"
     c.title = c.title or title
+    if req.mc_id then c.mc_id = req.mc_id end
+    if req.colony_managed == true or tostring(citizen_id):find("^citizen:mc_") then c.colony_managed = true end
+    if isDeadStatus(c.status) and req.reactivate_dead == true then
+      c.status = "active"
+      c.reactivated_at = timestamp()
+      c.dead_at = nil
+      c.death_reason = nil
+    end
     c.recovered_at = c.recovered_at or (req.recovered == true and timestamp() or nil)
   end
   saveCitizens()
@@ -2704,19 +2899,140 @@ end
 handlers["list_my_companies"] = listOwnedCompanies
 handlers["my_companies"] = listOwnedCompanies
 
+
+-- RETIRE_CITIZEN
+-- Trusted colony lifecycle/admin endpoint. Used when MineColonies reports that
+-- a colony-managed citizen no longer exists. Positive estate balance is returned
+-- to treasury; payroll mapping is removed; the account is hidden from active lists.
+handlers["retire_citizen"] = function(sender_id, req)
+  local citizen_id = req and req.citizen_id
+  local reason = req and req.reason or "manual_retirement"
+  local return_to = req and req.return_balance_to or "treasury:quid_bank"
+  return retireCitizenAccount(citizen_id, reason, sender_id, return_to)
+end
+
+-- SYNC_COLONY_CITIZENS
+-- ColonyBusinessIntegrator sends the live MineColonies roster here. This is the
+-- source of truth for citizen:mc_* accounts.
+handlers["sync_colony_citizens"] = function(sender_id, req)
+  local incoming = req and (req.citizens or req.roster or req.live_citizens) or {}
+  if type(incoming) ~= "table" then return false, "Missing citizens table" end
+  if #incoming <= 0 and not (req and req.allow_empty == true) then
+    return false, "Empty colony citizen roster ignored; pass allow_empty=true to retire everyone deliberately"
+  end
+
+  local ts = timestamp()
+  local live = {}
+  local created = 0
+  local updated = 0
+  local reactivated = 0
+  local retired = 0
+  local estate_total = 0
+  local errors = {}
+
+  for _, raw in ipairs(incoming) do
+    local rec = normaliseSyncedCitizen(raw)
+    if rec and isColonyCitizenId(rec.citizen_id) then
+      local id = rec.citizen_id
+      live[id] = true
+      local existed = type(citizens[id]) == "table"
+      local was_dead = existed and isDeadStatus(citizens[id].status)
+
+      if not existed then
+        citizens[id] = {
+          display_name = rec.display_name,
+          username = rec.username,
+          password_hash = simpleHash("mc" .. tostring(rec.mc_id or rec.username)),
+          joined = ts,
+          status = "active",
+          title = rec.title ~= "" and rec.title or "Colonist",
+          colony_managed = true,
+          mc_id = rec.mc_id,
+          first_seen = ts,
+        }
+        created = created + 1
+      else
+        updated = updated + 1
+      end
+
+      local c = citizens[id]
+      c.display_name = rec.display_name or c.display_name or id
+      c.username = c.username or rec.username
+      c.title = rec.title ~= "" and rec.title or c.title or "Colonist"
+      c.status = "active"
+      c.colony_managed = true
+      c.mc_id = rec.mc_id or c.mc_id
+      c.last_seen = ts
+      c.job = rec.job ~= "" and rec.job or c.job
+      c.workplace = rec.workplace ~= "" and rec.workplace or c.workplace
+      c.industry = rec.industry ~= "" and rec.industry or c.industry
+      c.dead_at = nil
+      c.death_reason = nil
+
+      local ok, res = ensureAccountRecord(id, "citizen", c.display_name, id)
+      if ok and type(accounts[id]) == "table" then
+        accounts[id].status = "active"
+        accounts[id].display_name = c.display_name
+        accounts[id].owner_id = id
+        accounts[id].colony_managed = true
+        accounts[id].mc_id = c.mc_id
+        accounts[id].last_seen = ts
+        accounts[id].dead_at = nil
+        accounts[id].death_reason = nil
+      end
+
+      if was_dead then reactivated = reactivated + 1 end
+    end
+  end
+
+  for id, c in pairs(citizens or {}) do
+    if isColonyCitizenId(id) and type(c) == "table" and not isDeadStatus(c.status) and not live[id] then
+      local ok, res = retireCitizenAccount(id, "missing_from_colony_roster", sender_id, req and req.return_balance_to or "treasury:quid_bank")
+      if ok then
+        retired = retired + 1
+        if type(res) == "table" then estate_total = estate_total + (tonumber(res.estate_amount) or 0) end
+      else
+        errors[#errors+1] = tostring(res)
+      end
+    end
+  end
+
+  saveCitizens()
+  saveAccounts()
+  saveBalances()
+  saveEmployment()
+
+  audit("ACTION", "STATE", sender_id, "SYNC_COLONY_CITIZENS", "live=" .. tostring(countTable(live)) .. " retired=" .. tostring(retired))
+  return true, {
+    live = countTable(live),
+    created = created,
+    updated = updated,
+    reactivated = reactivated,
+    retired = retired,
+    estate_total = estate_total,
+    errors = errors,
+    active_citizens = countActiveCitizens(),
+    dead_citizens = countDeadCitizens(),
+  }
+end
+
+
 -- LIST_CITIZENS
 handlers["list_citizens"] = function(sender_id, req)
   local result = {}
+  local include_dead = req and req.include_dead == true
   for citizen_id, citizen in pairs(citizens) do
-    result[#result+1] = {
-      citizen_id   = citizen_id,
-      display_name = citizen.display_name,
-      username     = citizen.username,
-      title        = citizen.title,
-      status       = citizen.status,
-      joined       = citizen.joined,
-      balance      = deriveBalance(citizen_id)
-    }
+    if include_dead or not isDeadStatus(citizen.status) then
+      result[#result+1] = {
+        citizen_id   = citizen_id,
+        display_name = citizen.display_name,
+        username     = citizen.username,
+        title        = citizen.title,
+        status       = citizen.status,
+        joined       = citizen.joined,
+        balance      = deriveBalance(citizen_id)
+      }
+    end
   end
   table.sort(result, function(a,b) return (a.display_name or "") < (b.display_name or "") end)
   return true, { citizens = result, count = #result }
