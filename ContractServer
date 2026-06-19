@@ -51,7 +51,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION            = "1.0.23-SOURCEKEY-AUTH"
+local VERSION            = "1.0.24-NO-MANUAL-PAYOUT"
 local LABEL              = "Quid-Contracts"
 local PROTOCOL           = "quid_contracts"
 local PROTOCOL_BROADCAST = "quid_contracts_discovery"
@@ -781,9 +781,22 @@ local function markFulfilled(sender_id, req)
     return false, "Contract is not active"
   end
 
-  -- Manual/admin fulfilment path. Normal MineColonies claimed-request completion
-  -- is handled automatically during source sync when the live request disappears.
-  local source_disappeared = c.status == "pending_completion" or req.force_confirmed == true or req.manual_confirmed == true
+  -- MineColonies contracts must NOT be manually completed from the public board.
+  -- The only valid completion signal is the ColonyBusinessIntegrator sync showing
+  -- that the claimed source request disappeared from MineColonies after delivery.
+  -- This prevents a claimant pressing Complete immediately after claiming and
+  -- receiving payment without actually delivering the items.
+  local source_disappeared = c.status == "pending_completion"
+  local is_minecolonies_contract = (
+    c.source_type == "minecolonies_request"
+    or tostring(c.source_key or ""):find("^mc_live:") ~= nil
+    or tostring(c.source_family or "") ~= ""
+    or tostring(c.minecolonies_request_id or "") ~= ""
+  )
+
+  if is_minecolonies_contract and c.status == "claimed" then
+    return false, "MineColonies contracts cannot be manually completed. Deliver the items, then run/await ColonyBusinessIntegrator sync."
+  end
 
   if (c.exact_fulfillment or c.source_type == "minecolonies_request") and not source_disappeared then
     local ok, err = fulfilmentMatchesContract(c, req.fulfilled_items or req.items or {})
@@ -804,7 +817,7 @@ local function markFulfilled(sender_id, req)
   c.status = "fulfilled"
   c.fulfilled_at = timestamp()
   c.updated = timestamp()
-  c.fulfillment_note = req.note or (source_disappeared and "MineColonies request disappeared after claim; manually confirmed." or "")
+  c.fulfillment_note = req.note or (source_disappeared and "MineColonies request disappeared after claim; completion confirmed by sync." or "")
   c.completion_confirmed_by = sender_id
 
   writeFile(FILE.contracts, contracts)
