@@ -32,7 +32,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION = "1.0.19-ROSTER-FALLBACK"
+local VERSION = "1.0.20-LIFECYCLE-HARD-REPLACE"
 local BANK_PROTOCOL = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT = 5
@@ -232,7 +232,7 @@ local function draw()
 
   at(2, 8,  "Buildings: " .. tostring(stats.buildings_seen) .. "   Industries: " .. tostring(countTable(industry_companies)) .. " (new " .. tostring(stats.businesses_registered) .. ")", colors.lightGray)
   at(2, 9,  "Locations: " .. tostring(countTable(businesses)) .. "   Model: industry company + locations", colors.lightGray)
-  at(2, 10, "Citizens:  " .. tostring(stats.citizens_seen) .. "   Accounts: " .. tostring(countTable(citizens_map)) .. " (new " .. tostring(stats.citizens_registered) .. ", dead " .. tostring(stats.citizens_retired or 0) .. ")", colors.lightGray)
+  at(2, 10, "Citizens:  " .. tostring(stats.citizens_seen) .. "   Accounts: " .. tostring(countTable(citizens_map)) .. " (new " .. tostring(stats.citizens_registered) .. ", removed " .. tostring(stats.citizens_retired or 0) .. ")", colors.lightGray)
   at(2, 11, "Roster:    " .. tostring(stats.citizen_source or "none") .. "   Sent: " .. tostring(stats.citizen_roster_sent or 0), colors.lightGray)
   at(2, 11, "Requests:  " .. tostring(stats.requests_seen) .. "   Contracts: " .. tostring(stats.contracts_posted), colors.lime)
   at(2, 12, "Skipped:   unmapped " .. tostring(stats.skipped_unmapped) .. " / unfunded " .. tostring(stats.skipped_unfunded), colors.orange)
@@ -1028,14 +1028,15 @@ local function syncColonyCitizenLifecycle(citizens)
     type = "sync_colony_citizens",
     citizens = roster,
     return_balance_to = "treasury:quid_bank",
+    delete_missing = true,
+    hard_delete_missing = true,
   }, 10)
 
   if ok and type(res) == "table" then
-    stats.citizens_retired = tonumber(res.retired or 0) or 0
+    stats.citizens_retired = tonumber(res.deleted or res.retired or 0) or 0
     stats.citizen_accounts = tonumber(res.active_citizens or res.live or #roster) or #roster
-    if (res.created or 0) > 0 or (res.retired or 0) > 0 then
-      setMsg("Citizen lifecycle: +" .. tostring(res.created or 0) .. " / dead " .. tostring(res.retired or 0), colors.lime)
-    end
+    stats.citizens_registered = tonumber(res.created or 0) or stats.citizens_registered or 0
+    setMsg("Citizen hard-sync: live " .. tostring(res.live or #roster) .. " +" .. tostring(res.created or 0) .. " del " .. tostring(res.deleted or 0), colors.lime)
     return true, res
   end
 
