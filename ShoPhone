@@ -49,7 +49,7 @@ end
 -- =============================================================================
 -- CONFIG / STATE
 -- =============================================================================
-local VERSION = "0.5.3"
+local VERSION = "0.5.4"
 
 local BANK_PROTOCOL = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
@@ -2327,18 +2327,6 @@ local function dLoadSuggestions(query)
   end
 
   local suggestions = {}
-  local seen = {}
-
-  local function add(account_id, label, kind)
-    account_id = tostring(account_id or "")
-    if account_id == "" or seen[account_id] then return end
-    seen[account_id] = true
-    suggestions[#suggestions + 1] = {
-      account_id = account_id,
-      label = tostring(label or account_id),
-      kind = tostring(kind or "local"),
-    }
-  end
 
   if dConnect() then
     local ok, res = dReq({
@@ -2347,24 +2335,22 @@ local function dLoadSuggestions(query)
       password = bank.password,
       citizen_id = bank.citizen_id,
       query = query,
-      limit = 5,
+      limit = 6,
     }, 4)
 
     if ok and type(res) == "table" and type(res.suggestions) == "table" then
-      for _, s in ipairs(res.suggestions) do
-        add(s.account_id or s.id or s.citizen_id, s.label or s.display_name or s.account_id, s.kind)
-      end
+      suggestions = res.suggestions
     end
   end
 
-  -- Local fallback so the dropdown still appears while typing, even before
-  -- the server has enough known names from previous deals.
-  local clean = query:lower():gsub("%s+", "_")
-  add("citizen:" .. clean, "citizen:" .. clean, "typed")
-  add(query, query .. " (raw account/name)", "typed")
-
   deals.suggestions = suggestions
   deals.suggest_selected = 1
+
+  if #suggestions == 0 then
+    dSet("No matching bank accounts.", QB.warn)
+  else
+    dSet("Matching accounts: " .. tostring(#suggestions), QB.ok)
+  end
 end
 
 local function dFrequencyPicker(current)
@@ -2704,8 +2690,6 @@ local function dNewDeal()
     local freqLabel = tostring(deals.form.frequency or "monthly")
     freqLabel = freqLabel:sub(1,1):upper() .. freqLabel:sub(2)
     local bFreq = qBtn(15, 16, math.max(10, W - 17), freqLabel, focus == 4 and QB.btn_pri or QB.btn_sec, focus == 4 and QB.btn_fg or QB.card_fg)
-
-    qAt(4, 17, "Start: " .. currentDateLabel, QB.label, QB.card)
 
     local half = math.floor((W - 8) / 2)
     local bSend = qBtn(4, H - 2, half, "Propose", QB.btn_pri, QB.btn_fg)
