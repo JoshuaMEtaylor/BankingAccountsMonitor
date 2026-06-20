@@ -55,7 +55,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION       = "1.0.4"
+local VERSION       = "1.0.5"
 local DEAL_PROTOCOL = "quid_deals"
 local BANK_PROTOCOL = "quid_bank"
 local DB_TIMEOUT    = 5
@@ -328,6 +328,64 @@ local function auth(username, password)
   return false, tostring(res or "Authentication failed")
 end
 
+
+local function notifyAccount(account_id, event_type, title, body, deal_id)
+  account_id = tostring(account_id or "")
+  if account_id == "" then return false end
+
+  notifications[account_id] = notifications[account_id] or {
+    unread = 0,
+    items = {},
+  }
+
+  local box = notifications[account_id]
+  box.unread = (tonumber(box.unread) or 0) + 1
+
+  box.items[#box.items + 1] = {
+    id = "NOTIF-" .. tostring(os.epoch("utc")) .. "-" .. tostring(#box.items + 1),
+    event_type = tostring(event_type or "message"),
+    title = tostring(title or "ShoMail"),
+    body = tostring(body or ""),
+    deal_id = deal_id,
+    read = false,
+    created_at = os.epoch("utc"),
+  }
+
+  while #box.items > 50 do table.remove(box.items, 1) end
+
+  saveNotifications()
+  appendAudit("NOTIFY " .. account_id .. " " .. tostring(event_type) .. " " .. tostring(deal_id or ""))
+  return true
+end
+
+local function unreadFor(account_id)
+  local box = notifications[tostring(account_id or "")]
+  if type(box) ~= "table" then return 0 end
+  return tonumber(box.unread) or 0
+end
+
+local function markSeen(account_id)
+  local box = notifications[tostring(account_id or "")]
+  if type(box) ~= "table" then return 0 end
+
+  local previous = tonumber(box.unread) or 0
+  box.unread = 0
+
+  for _, item in ipairs(box.items or {}) do
+    item.read = true
+  end
+
+  saveNotifications()
+  return previous
+end
+
+local function otherParty(deal, user_id)
+  if not deal then return nil end
+  if deal.from_id == user_id then return deal.to_id end
+  return deal.from_id
+end
+
+
 local function executePayment(deal)
   local amount = tonumber(deal.amount) or 0
   if amount <= 0 then return false, "Invalid deal amount" end
@@ -417,63 +475,6 @@ local function addSuggestion(out, seen, account_id, label, kind)
     label = tostring(label or account_id),
     kind = tostring(kind or "account"),
   }
-end
-
-
-local function notifyAccount(account_id, event_type, title, body, deal_id)
-  account_id = tostring(account_id or "")
-  if account_id == "" then return false end
-
-  notifications[account_id] = notifications[account_id] or {
-    unread = 0,
-    items = {},
-  }
-
-  local box = notifications[account_id]
-  box.unread = (tonumber(box.unread) or 0) + 1
-
-  box.items[#box.items + 1] = {
-    id = "NOTIF-" .. tostring(os.epoch("utc")) .. "-" .. tostring(#box.items + 1),
-    event_type = tostring(event_type or "message"),
-    title = tostring(title or "ShoMail"),
-    body = tostring(body or ""),
-    deal_id = deal_id,
-    read = false,
-    created_at = os.epoch("utc"),
-  }
-
-  while #box.items > 50 do table.remove(box.items, 1) end
-
-  saveNotifications()
-  appendAudit("NOTIFY " .. account_id .. " " .. tostring(event_type) .. " " .. tostring(deal_id or ""))
-  return true
-end
-
-local function unreadFor(account_id)
-  local box = notifications[tostring(account_id or "")]
-  if type(box) ~= "table" then return 0 end
-  return tonumber(box.unread) or 0
-end
-
-local function markSeen(account_id)
-  local box = notifications[tostring(account_id or "")]
-  if type(box) ~= "table" then return 0 end
-
-  local previous = tonumber(box.unread) or 0
-  box.unread = 0
-
-  for _, item in ipairs(box.items or {}) do
-    item.read = true
-  end
-
-  saveNotifications()
-  return previous
-end
-
-local function otherParty(deal, user_id)
-  if not deal then return nil end
-  if deal.from_id == user_id then return deal.to_id end
-  return deal.from_id
 end
 
 
