@@ -55,7 +55,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION       = "1.0.6"
+local VERSION       = "1.0.8"
 local DEAL_PROTOCOL = "quid_deals"
 local BANK_PROTOCOL = "quid_bank"
 local DB_TIMEOUT    = 5
@@ -478,6 +478,43 @@ local function addSuggestion(out, seen, account_id, label, kind)
 end
 
 
+
+local function pruneOldDeals()
+  -- Keep active arrangements indefinitely.
+  -- Keep only the newest 10 non-active/non-pending sent/closed records per proposer.
+  local byProposer = {}
+
+  for id, deal in pairs(deals) do
+    if type(deal) == "table" then
+      local status = tostring(deal.status or "")
+      if status ~= "active" and status ~= "pending" and status ~= "countered" then
+        local proposer = tostring(deal.proposer_id or deal.from_id or "unknown")
+        byProposer[proposer] = byProposer[proposer] or {}
+        byProposer[proposer][#byProposer[proposer] + 1] = deal
+      end
+    end
+  end
+
+  local changed = false
+
+  for proposer, list in pairs(byProposer) do
+    table.sort(list, function(a, b)
+      return tonumber(a.updated_at or a.created_at or 0) > tonumber(b.updated_at or b.created_at or 0)
+    end)
+
+    for i = 11, #list do
+      local d = list[i]
+      if d and d.deal_id and deals[d.deal_id] then
+        deals[d.deal_id] = nil
+        changed = true
+      end
+    end
+  end
+
+  if changed then saveDeals() end
+  return changed
+end
+
 local function handleSuggest(req)
   local ok, user = auth(req.username, req.password)
   if not ok then return false, user end
@@ -690,6 +727,7 @@ local function handlePropose(req)
 
   deals[deal_id] = deal
   saveDeals()
+  pruneOldDeals()
 
   notifyAccount(deal.to_id, "deal_proposed", "New deal proposed", tostring(deal.title) .. " from " .. tostring(deal.from_id), deal_id)
 
@@ -828,6 +866,19 @@ local function handleCounter(req)
   return true, { deal = publicDeal(deal) }
 end
 
+
+local function arrangementEndMessage(deal, ended_by)
+  local other = otherParty(deal, ended_by)
+  local amount = tonumber(deal.amount) or 0
+  local freq = tostring(deal.frequency or "period")
+  local title = tostring(deal.title or deal.deal_id or "arrangement")
+
+  return "Your contract with " .. tostring(ended_by) ..
+    " for " .. tostring(amount) .. " Q every " .. freq ..
+    " has been ended by " .. tostring(ended_by) ..
+    ". Title: " .. title .. "."
+end
+
 local function handleCancel(req)
   local ok, user = auth(req.username, req.password)
   if not ok then return false, user end
@@ -839,7 +890,7 @@ local function handleCancel(req)
     return false, "You are not part of this deal"
   end
 
-  local was_active = deal.status == "active"
+  local was_active = deal.status == "active" or req.type == "end_arrangement"
   local other = otherParty(deal, user.citizen_id)
 
   if was_active then
@@ -847,10 +898,14 @@ local function handleCancel(req)
     deal.ended_by = user.citizen_id
     deal.ended_at = os.epoch("utc")
     deal.notify_to = other
+    deal.message = arrangementEndMessage(deal, user.citizen_id)
+    deal.body = deal.message
   else
     deal.status = "cancelled"
     deal.cancelled_by = user.citizen_id
     deal.notify_to = other
+    deal.message = "Your deal '" .. tostring(deal.title or deal.deal_id) .. "' was cancelled by " .. tostring(user.citizen_id) .. "."
+    deal.body = deal.message
   end
 
   deal.updated_at = os.epoch("utc")
@@ -859,15 +914,17 @@ local function handleCancel(req)
     action = was_active and "ended" or "cancelled",
     actor = user.citizen_id,
     at = os.epoch("utc"),
+    message = deal.message,
   }
 
   saveDeals()
+  pruneOldDeals()
 
   if was_active then
-    notifyAccount(other, "arrangement_ended", "Arrangement ended", tostring(deal.title or deal.deal_id) .. " was ended by " .. tostring(user.citizen_id), deal.deal_id)
+    notifyAccount(other, "arrangement_ended", "Arrangement ended", deal.message, deal.deal_id)
     appendAudit("END " .. deal.deal_id .. " by " .. user.citizen_id)
   else
-    notifyAccount(other, "deal_cancelled", "Deal cancelled", tostring(deal.title or deal.deal_id) .. " was cancelled", deal.deal_id)
+    notifyAccount(other, "deal_cancelled", "Deal cancelled", deal.message, deal.deal_id)
     appendAudit("CANCEL " .. deal.deal_id .. " by " .. user.citizen_id)
   end
 
@@ -971,6 +1028,7 @@ local function load()
   if type(state.world_date) ~= "table" then
     state.world_date = { year = 1, month = 1, day = 1 }
   end
+  pruneOldDeals()
 end
 
 local function main()
@@ -1004,7 +1062,7 @@ local function main()
 
     if sender then
       local ok, res = handleRequest(req, sender)
-      rednet.send(sender, { success = ok, response = res }, DEAL_PROTOCOL)
+      rednet.send(sender, { success = ok, response = res, request_id = type(req) == "table" and req.request_id or nil }, DEAL_PROTOCOL)
     end
 
     -- Passive safety check every 10 seconds in case a world-clock updater has
