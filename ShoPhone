@@ -49,7 +49,7 @@ end
 -- =============================================================================
 -- CONFIG / STATE
 -- =============================================================================
-local VERSION = "0.5.4"
+local VERSION = "0.5.5"
 
 local BANK_PROTOCOL = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
@@ -99,6 +99,8 @@ local apps = {
 
 local selected = nil
 local message = "Ready"
+local shomail_unread = 0
+local shomail_last_poll = 0
 
 local bank = {
   server = nil,
@@ -262,6 +264,51 @@ local function request(server, protocol, payload, timeout)
   end
 end
 
+local function pollShoMailNotifications(force)
+  if not bank or not bank.logged or not bank.username or bank.username == "" then
+    shomail_unread = 0
+    return 0
+  end
+
+  if not force and os.clock() - shomail_last_poll < 8 then
+    return shomail_unread
+  end
+
+  shomail_last_poll = os.clock()
+
+  if not openModem() then return shomail_unread end
+
+  local server_id = nil
+
+  if deals and deals.server then
+    server_id = deals.server
+  else
+    rednet.broadcast({ type = "ping" }, DEAL_PROTOCOL)
+    local sender, msg = rednet.receive(DEAL_PROTOCOL, 1)
+    if sender and type(msg) == "table" then
+      if msg.type == "deal_server_online" or msg.type == "deals_server_online" or (msg.success == true and type(msg.response) == "table") then
+        server_id = sender
+      end
+    end
+  end
+
+  if not server_id then return shomail_unread end
+
+  local ok, res = request(server_id, DEAL_PROTOCOL, {
+    type = "notification_count",
+    username = bank.username,
+    password = bank.password,
+    citizen_id = bank.citizen_id,
+  }, 2)
+
+  if ok and type(res) == "table" then
+    shomail_unread = tonumber(res.unread or res.count or 0) or 0
+  end
+
+  return shomail_unread
+end
+
+
 local function findServer(protocol, title, accept)
   if not openModem() then return nil, "No modem" end
 
@@ -306,6 +353,15 @@ local function drawIcon(x, y, app, active)
   fill(x, y, 7, 3, bg)
   at(x + 3, y + 1, app.icon, fg, bg)
 
+  if app.id == "messages" and tonumber(shomail_unread or 0) > 0 then
+    local n = tonumber(shomail_unread) or 0
+    local label = n > 9 and "9+" or tostring(n)
+    local bw = #label + 2
+    local bx = x + 7 - bw
+    fill(bx, y, bw, 1, colors.red)
+    at(bx + 1, y, label, colors.white, colors.red)
+  end
+
   local label = app.name
   local lx = x + math.floor((7 - math.min(#label, 7)) / 2)
   at(lx, y + 3, label:sub(1, 7), colors.white, C.wall)
@@ -314,6 +370,7 @@ local function drawIcon(x, y, app, active)
 end
 
 local function drawHome()
+  pollShoMailNotifications(false)
   clear(C.wall)
   topBar("ShoPhone")
   center(3, "Home", C.title, C.wall)
@@ -2309,6 +2366,24 @@ local function dReq(payload, timeout)
   return request(deals.server, DEAL_PROTOCOL, payload, timeout or TIMEOUT)
 end
 
+local function dMarkNotificationsSeen()
+  if not bank.logged then return end
+  if not dConnect() then return end
+
+  local ok, res = dReq({
+    type = "mark_notifications_seen",
+    username = bank.username,
+    password = bank.password,
+    citizen_id = bank.citizen_id,
+  }, 4)
+
+  if ok then
+    shomail_unread = 0
+    shomail_last_poll = os.clock()
+  end
+end
+
+
 local function dCurrentDateLabel()
   local ok, res = dReq({ type = "get_world_date" }, 3)
   if ok and type(res) == "table" and type(res.world_date) == "table" then
@@ -2850,6 +2925,7 @@ local function messagesApp()
   end
 
   dConnect()
+  dMarkNotificationsSeen()
   dList()
 
   while true do
