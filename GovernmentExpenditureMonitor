@@ -43,7 +43,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION          = "1.1.7-SIDE-LABELS"
+local VERSION          = "1.1.8-SPACED-SIDES"
 local BANK_PROTOCOL    = "quid_bank"
 local TREASURY_ACCOUNT = "treasury:quid_bank"
 local DB_TIMEOUT       = 4
@@ -926,8 +926,8 @@ local function drawPieLabels(cx, cy, rx, ry, slices, total, chartX, chartY, char
   resolveLabelColumn(right, minY, maxY)
 
   -- Fixed far-side columns. No pointers, no leader lines, just lots of room.
-  local leftTextX  = chartX + 4
-  local rightTextX = chartRight - labelW - 4
+  local leftTextX  = chartX + 5
+  local rightTextX = chartRight - labelW - 2
 
   local function drawOne(r)
     local s = r.sector
@@ -1206,16 +1206,16 @@ local function drawWatchDashboard(data, startY)
 
   -- Keep the chart dominant, but leave breathing room for sector labels
   -- and leader lines around the ring.
-  local rx = math.max(8, math.min(15, math.floor(chartW * 0.15)))
-  local ry = math.max(4, math.min(7, math.floor((chartH - 8) / 2)))
-  local cx = math.floor(W / 2)
+  local rx = math.max(9, math.min(17, math.floor(chartW * 0.17)))
+  local ry = math.max(5, math.min(8, math.floor((chartH - 7) / 2)))
+  local cx = math.floor(W * 0.44)
   local cy = chartY + math.floor(chartH / 2) + 1
   if cy - ry < chartY + 4 then cy = chartY + 4 + ry end
   if cy + ry > chartBottom - 1 then cy = chartBottom - 1 - ry end
 
   drawPie(cx, cy, rx, ry, slices, data.chart_total)
 
-  -- Sector labels are now outside the donut and connected back to their slice.
+  -- Sector labels are kept in roomy side columns.
   -- Nothing is written in the middle of the chart.
   if slices and #slices > 0 then
     drawPieLabels(cx, cy, rx, ry, slices, data.chart_total, chartX, chartY, chartW, chartH)
