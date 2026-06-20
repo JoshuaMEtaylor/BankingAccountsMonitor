@@ -49,7 +49,7 @@ end
 -- =============================================================================
 -- CONFIG / STATE
 -- =============================================================================
-local VERSION = "0.5.2"
+local VERSION = "0.5.3"
 
 local BANK_PROTOCOL = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
@@ -2326,24 +2326,45 @@ local function dLoadSuggestions(query)
     return
   end
 
-  if not dConnect() then return end
+  local suggestions = {}
+  local seen = {}
 
-  local ok, res = dReq({
-    type = "suggest_recipients",
-    username = bank.username,
-    password = bank.password,
-    citizen_id = bank.citizen_id,
-    query = query,
-    limit = 5,
-  }, 4)
-
-  if ok and type(res) == "table" and type(res.suggestions) == "table" then
-    deals.suggestions = res.suggestions
-    deals.suggest_selected = 1
-  else
-    deals.suggestions = {}
-    deals.suggest_selected = 1
+  local function add(account_id, label, kind)
+    account_id = tostring(account_id or "")
+    if account_id == "" or seen[account_id] then return end
+    seen[account_id] = true
+    suggestions[#suggestions + 1] = {
+      account_id = account_id,
+      label = tostring(label or account_id),
+      kind = tostring(kind or "local"),
+    }
   end
+
+  if dConnect() then
+    local ok, res = dReq({
+      type = "suggest_recipients",
+      username = bank.username,
+      password = bank.password,
+      citizen_id = bank.citizen_id,
+      query = query,
+      limit = 5,
+    }, 4)
+
+    if ok and type(res) == "table" and type(res.suggestions) == "table" then
+      for _, s in ipairs(res.suggestions) do
+        add(s.account_id or s.id or s.citizen_id, s.label or s.display_name or s.account_id, s.kind)
+      end
+    end
+  end
+
+  -- Local fallback so the dropdown still appears while typing, even before
+  -- the server has enough known names from previous deals.
+  local clean = query:lower():gsub("%s+", "_")
+  add("citizen:" .. clean, "citizen:" .. clean, "typed")
+  add(query, query .. " (raw account/name)", "typed")
+
+  deals.suggestions = suggestions
+  deals.suggest_selected = 1
 end
 
 local function dFrequencyPicker(current)
@@ -2471,7 +2492,7 @@ local function dDealAmount(deal)
 end
 
 local function dDrawList()
-  dTop("Messages")
+  dTop("ShoMail")
   local tabs = dTabs()
 
   qCard(2, 7, W - 2, H - 10)
@@ -2501,12 +2522,14 @@ local function dDrawList()
   local bPrev = qBtn(4, H - 3, third, "Prev", QB.btn_sec, QB.card_fg)
   local bNext = qBtn(5 + third, H - 3, third, "Next", QB.btn_sec, QB.card_fg)
   local bOpen = qBtn(6 + (third * 2), H - 3, third, "Open", QB.btn_pri, QB.btn_fg)
-  local bRefresh = qBtn(4, H - 2, W - 6, "Refresh", QB.btn_pri, QB.btn_fg)
+
+  local half = math.floor((W - 8) / 2)
+  local bHome = qBtn(4, H - 2, half, "Home", QB.btn_sec, QB.card_fg)
+  local bRefresh = qBtn(5 + half, H - 2, half, "Refresh", QB.btn_pri, QB.btn_fg)
 
   dStatus()
-  return tabs, bPrev, bNext, bOpen, bRefresh
+  return tabs, bPrev, bNext, bOpen, bRefresh, bHome
 end
-
 local function dAction(deal, action, extra)
   if not deal then return false end
   if not dConnect() then return false end
@@ -2666,42 +2689,46 @@ local function dNewDeal()
 
   local function draw()
     dTop("New Deal")
-    qCard(2, 6, W - 2, H - 9)
+    qCard(2, 6, W - 2, H - 8)
 
     qAt(4, 7, "Recipient", QB.label, QB.card)
     qInput(4, 8, W - 6, deals.form.to_id, false, focus == 1)
 
+    qAt(4, 10, "Title", QB.label, QB.card)
+    qInput(4, 11, W - 6, deals.form.title, false, focus == 2)
+
+    qAt(4, 13, "Amount", QB.label, QB.card)
+    qInput(4, 14, W - 6, deals.form.amount, false, focus == 3)
+
+    qAt(4, 16, "Frequency", QB.label, QB.card)
+    local freqLabel = tostring(deals.form.frequency or "monthly")
+    freqLabel = freqLabel:sub(1,1):upper() .. freqLabel:sub(2)
+    local bFreq = qBtn(15, 16, math.max(10, W - 17), freqLabel, focus == 4 and QB.btn_pri or QB.btn_sec, focus == 4 and QB.btn_fg or QB.card_fg)
+
+    qAt(4, 17, "Start: " .. currentDateLabel, QB.label, QB.card)
+
+    local half = math.floor((W - 8) / 2)
+    local bSend = qBtn(4, H - 2, half, "Propose", QB.btn_pri, QB.btn_fg)
+    local bBack = qBtn(5 + half, H - 2, half, "Back", QB.btn_sec, QB.card_fg)
+
     local suggestionButtons = {}
+
+    -- Draw suggestions last so they can overlap the form like a proper dropdown.
     if focus == 1 and #deals.suggestions > 0 then
-      local y = 9
-      local maxRows = math.min(3, #deals.suggestions)
-      qFill(4, y, W - 6, maxRows, QB.tab_bg)
+      local maxRows = math.min(4, #deals.suggestions)
+      local ddX, ddY, ddW = 4, 9, W - 6
+      qFill(ddX, ddY, ddW, maxRows, QB.tab_bg)
 
       for i = 1, maxRows do
         local s = deals.suggestions[i]
         local bg = i == deals.suggest_selected and QB.btn_pri or QB.tab_bg
         local fg = i == deals.suggest_selected and QB.btn_fg or QB.tab_fg_i
         local label = tostring(s.label or s.display_name or s.account_id or s.id or "?")
-        qFill(4, y + i - 1, W - 6, 1, bg)
-        qAt(5, y + i - 1, label:sub(1, W - 8), fg, bg)
-        suggestionButtons[i] = { x1 = 4, x2 = W - 3, y1 = y + i - 1, y2 = y + i - 1, suggestion = s }
+        qFill(ddX, ddY + i - 1, ddW, 1, bg)
+        qAt(ddX + 1, ddY + i - 1, label:sub(1, ddW - 2), fg, bg)
+        suggestionButtons[i] = { x1 = ddX, x2 = ddX + ddW - 1, y1 = ddY + i - 1, y2 = ddY + i - 1, suggestion = s }
       end
     end
-
-    qAt(4, 12, "Title", QB.label, QB.card)
-    qInput(4, 13, W - 6, deals.form.title, false, focus == 2)
-
-    qAt(4, 15, "Amount", QB.label, QB.card)
-    qInput(4, 16, W - 6, deals.form.amount, false, focus == 3)
-
-    qAt(4, 18, "Frequency", QB.label, QB.card)
-    local bFreq = qBtn(4, 19, W - 6, tostring(deals.form.frequency or "monthly"):sub(1,1):upper() .. tostring(deals.form.frequency or "monthly"):sub(2), focus == 4 and QB.btn_pri or QB.btn_sec, focus == 4 and QB.btn_fg or QB.card_fg)
-
-    qAt(4, 21, "Start: " .. currentDateLabel, QB.label, QB.card)
-
-    local half = math.floor((W - 8) / 2)
-    local bSend = qBtn(4, H - 2, half, "Propose", QB.btn_pri, QB.btn_fg)
-    local bBack = qBtn(5 + half, H - 2, half, "Back", QB.btn_sec, QB.card_fg)
 
     dStatus()
     return bSend, bBack, bFreq, suggestionButtons
@@ -2784,11 +2811,11 @@ local function dNewDeal()
 
       elseif a == keys.up and focus == 1 and #deals.suggestions > 0 then
         deals.suggest_selected = deals.suggest_selected - 1
-        if deals.suggest_selected < 1 then deals.suggest_selected = math.min(3, #deals.suggestions) end
+        if deals.suggest_selected < 1 then deals.suggest_selected = math.min(4, #deals.suggestions) end
 
       elseif a == keys.down and focus == 1 and #deals.suggestions > 0 then
         deals.suggest_selected = deals.suggest_selected + 1
-        if deals.suggest_selected > math.min(3, #deals.suggestions) then deals.suggest_selected = 1 end
+        if deals.suggest_selected > math.min(4, #deals.suggestions) then deals.suggest_selected = 1 end
 
       elseif a == keys.enter then
         if focus == 1 and #deals.suggestions > 0 then
@@ -2821,11 +2848,11 @@ local function dNewDeal()
       if y == 8 then
         focus = 1
         dLoadSuggestions(deals.form.to_id)
-      elseif y == 13 then
+      elseif y == 11 then
         focus = 2
-      elseif y == 16 then
+      elseif y == 14 then
         focus = 3
-      elseif y == 19 then
+      elseif y == 16 then
         focus = 4
       end
     end
@@ -2848,7 +2875,7 @@ local function messagesApp()
       dList()
     end
 
-    local tabs, bPrev, bNext, bOpen, bRefresh = dDrawList()
+    local tabs, bPrev, bNext, bOpen, bRefresh, bHome = dDrawList()
 
     local ev, a, x, y = os.pullEvent()
 
@@ -2865,7 +2892,9 @@ local function messagesApp()
       end
 
       if not tabbed then
-        if bPrev and hit(bPrev, x, y) then
+        if bHome and hit(bHome, x, y) then
+          return
+        elseif bPrev and hit(bPrev, x, y) then
           if deals.selected > 1 then deals.selected = deals.selected - 1 end
         elseif bNext and hit(bNext, x, y) then
           if deals.selected < #deals.list then deals.selected = deals.selected + 1 end
