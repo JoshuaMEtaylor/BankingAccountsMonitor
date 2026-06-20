@@ -61,7 +61,7 @@ for i = 2, #args do
   runtime_args[#runtime_args + 1] = args[i]
 end
 
-local VERSION         = "0.5.23-MONETARY-CLEANUP"
+local VERSION         = "0.5.24-PRICE-LED-WAGES"
 local PROTOCOL        = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT      = 5
@@ -1534,20 +1534,22 @@ local function drawMonetaryCard(x, y, w, h, snap)
   local priceIdx = tonumber(wp.national_price_index or po.national_price_index)
   local wageIdx = tonumber(wp.wage_index or po.wage_index)
   local moneyPressure = tonumber(wp.money_pressure)
-  local wagePressure = tonumber(wp.wage_cost_pressure)
+  local businessPressure = tonumber(wp.business_margin_pressure)
+  local workerPressure = tonumber(wp.wage_demand_pressure)
+  local wageCostPressure = tonumber(wp.wage_cost_pressure)
   local totalPressure = tonumber(wp.total_inflation_pressure)
   local realWage = tonumber(wp.real_wage_ratio)
-  local wageTarget = tonumber(wp.wage_target_index)
   local bankRate = tonumber(po.inflation_percent)
 
   metric(x + 2, y + 7, "Inflation rate", bankRate and fmtPct(bankRate, 2) or "Awaiting data", bankRate and colors.white or C.warn, 18)
   metric(x + 2, y + 8, "Price index", fmtIndex(priceIdx, 3), priceIdx and colors.white or C.warn, 18)
   metric(x + 2, y + 9, "Wage index", fmtIndex(wageIdx, 3), wageIdx and colors.white or C.warn, 18)
-  metric(x + 2, y + 10, "Wage target", fmtIndex(wageTarget, 3), wageTarget and colors.white or C.warn, 18)
-  metric(x + 2, y + 11, "Real wage", realWage and fmtPct(realWage * 100, 1) or "Awaiting data", realWage and (realWage < 1 and C.warn or C.good) or C.warn, 18)
-  metric(x + 2, y + 12, "Money pressure", moneyPressure and fmtPct(moneyPressure * 100, 2) or "Awaiting data", moneyPressure and colors.white or C.warn, 18)
-  metric(x + 2, y + 13, "Wage pressure", wagePressure and fmtPct(wagePressure * 100, 2) or "Awaiting data", wagePressure and wagePressure > 0 and C.warn or C.dim, 18)
-  metric(x + 2, y + 14, "Total pressure", totalPressure and fmtPct(totalPressure * 100, 2) or "Awaiting data", totalPressure and colors.white or C.warn, 18)
+  metric(x + 2, y + 10, "Real wage", realWage and fmtPct(realWage * 100, 1) or "Awaiting data", realWage and (realWage < 1 and C.warn or C.good) or C.warn, 18)
+  metric(x + 2, y + 11, "Money pressure", moneyPressure and fmtPct(moneyPressure * 100, 2) or "Awaiting data", moneyPressure and colors.white or C.warn, 18)
+  metric(x + 2, y + 12, "Business drift", businessPressure and fmtPct(businessPressure * 100, 3) or "Awaiting data", businessPressure and colors.white or C.warn, 18)
+  metric(x + 2, y + 13, "Worker pressure", workerPressure and fmtPct(workerPressure * 100, 2) or "Awaiting data", workerPressure and workerPressure > 0 and C.warn or C.dim, 18)
+  metric(x + 2, y + 14, "Wage-cost", wageCostPressure and fmtPct(wageCostPressure * 100, 2) or "Awaiting data", wageCostPressure and wageCostPressure > 0 and C.warn or C.dim, 18)
+  metric(x + 2, y + 15, "Total pressure", totalPressure and fmtPct(totalPressure * 100, 2) or "Awaiting data", totalPressure and colors.white or C.warn, 18)
 
   writeAt(x + 2, y + h - 1, shortText(po.status or "Live monetary + wage pressure", w - 4), C.good, C.bg)
 end
