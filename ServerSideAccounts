@@ -22,7 +22,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.4.25-REAL-TX-STATS"
+local VERSION  = "1.4.27-PRICE-LED-WAGE-SPIRAL"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -1329,16 +1329,16 @@ end
 --
 --   final price = base price * national_price_index
 --
--- Inflation pressure comes from money supply / printing / imported money and
--- from a small wage-cost pressure once wages catch up enough to squeeze margins.
--- Prices rise quickly, fall slowly, and cannot fall below a sticky share of ATH.
--- Wages rise more slowly than prices, keep catching up after inflation cools,
--- and only add small pressure so the system does not spiral without governance.
+-- Price pressure has several sources: money/trade shocks, ordinary business
+-- margin drift, and wage-cost pressure once wages recover enough to squeeze
+-- company margins. Wages are a lagging response: when prices outrun wages the
+-- affordability gap creates wage demand pressure, which raises wages faster but
+-- never instantly. This creates a slow, governable wage-price spiral.
 -- =============================================================================
 local DEFAULT_PRICE_ORACLE = {
-  model = "national_wage_price_pressure_v1",
+  model = "national_wage_price_pressure_v3",
   min_index = 1.00,
-  max_index = 8.00,
+  max_index = 1000.00,
   immediate_pass_through = 1.00,
   -- No built-in starter inflation. Prices begin at x1.00 unless money-print
   -- shock, bank inflation, or a deliberate admin floor moves them.
@@ -1351,8 +1351,8 @@ local DEFAULT_PRICE_ORACLE = {
   -- Minecraft day. Sellers cut prices slowly, even if conditions improve.
   max_daily_deflation = 0.03,
   shock_pressure = 0.00,
-  money_print_sensitivity = 0.45,
-  max_shock_pressure = 3.00,
+  money_print_sensitivity = 0.85,
+  max_shock_pressure = 10.00,
   shock_decay_per_mc_day = 0.82,
   default_markup = 1.00,
   wage_price = {
@@ -1361,28 +1361,58 @@ local DEFAULT_PRICE_ORACLE = {
     sticky_price_floor = 1.00,
     wage_index = 1.00,
     wage_ath_index = 1.00,
+    wage_aspiration_index = 1.00,
+    wage_floor_index = 1.00,
     money_pressure = 0.00,
     wage_cost_pressure = 0.00,
     total_inflation_pressure = 0.00,
     real_wage_ratio = 1.00,
     policy = {
-      -- Small numbers by design. Governance should matter; the economy should
-      -- not spiral on its own just because wages and prices exist.
+      -- Small numbers by design. Governance should matter. Left alone,
+      -- wages should very slowly push upward, eventually creating business
+      -- margin pressure and a slow wage/price spiral. Fiscal policy then
+      -- pushes that spiral faster, slower, or into temporary deflation.
       sticky_floor_from_ath = 0.75,
+      wage_floor_from_ath = 0.92,
       max_daily_price_deflation = 0.03,
       max_daily_price_inflation = 0.08,
-      max_total_pressure = 3.00,
-      wage_policy_version = 2,
-      wage_catchup_rate = 0.025,       -- move 2.5% of the remaining wage gap/day
-      max_daily_wage_gain = 0.0015,    -- hard cap: +0.15% wage index/day before damping
-      max_daily_wage_decline = 0.0002, -- wages barely fall
-      wage_target_cushion = 1.03,      -- wages may drift slightly above prices, but slowly
-      wage_target_ath_cap = 1.00,      -- but not above the price shock ATH
-      wage_pressure_start_ratio = 0.95,
-      wage_pressure_sensitivity = 0.012,
-      max_wage_cost_pressure = 0.008,
+      emergency_max_daily_price_inflation = 0.60,
+      price_pressure_cap_multiplier = 0.18,
+      max_total_pressure = 10.00,
+      wage_policy_version = 4,
+
+      -- Businesses can lift prices even without fresh money pressure. This is
+      -- intentionally tiny: it is the background profit/margin incentive that
+      -- starts the long-run spiral.
+      base_business_margin_pressure = 0.00006, -- +0.006% price pressure per MC day
+
+      -- Workers always want better wages, but the independent drift is tiny.
+      -- Most wage movement comes from affordability pressure when prices move
+      -- ahead of wages.
+      baseline_wage_aspiration_growth = 0.00008, -- +0.008% target drift per MC day before damping
+      wage_catchup_rate = 0.012,       -- base: move 1.2% of remaining wage gap/day
+      max_daily_wage_gain = 0.0012,    -- quiet-economy cap: +0.12% wage index/day before damping
+      emergency_max_daily_wage_gain = 0.050, -- crisis cap: +5%/day before damping
+      max_daily_wage_decline = 0.0001, -- wages barely fall
+      wage_target_cushion = 1.00,      -- fair wage aims at current cost of living; aspiration can go higher
+      wage_target_ath_cap = 999.00,    -- no practical cap; damping controls high nominal wages
+
+      -- Affordability pressure controls how quickly wages chase prices. If
+      -- prices triple while wages stay flat, this gets large and wages speed up.
+      wage_affordability_sensitivity = 0.20,
+      max_wage_demand_pressure = 1.00,
+      wage_demand_catchup_multiplier = 0.20,
+      wage_demand_gain_multiplier = 0.12,
+
+      -- Wage-cost pressure controls how wages feed back into prices. Once real
+      -- wages are close enough to the current price level, businesses raise
+      -- prices to protect margins.
+      wage_pressure_start_ratio = 0.99,
+      wage_pressure_sensitivity = 0.004,
+      max_wage_cost_pressure = 0.006,
+
       wage_damping_start_index = 2.00, -- once wages are meaningfully higher, growth slows further
-      wage_damping_exponent = 0.70,
+      wage_damping_exponent = 0.85,
     },
   },
   sectors = {
@@ -1472,6 +1502,19 @@ local function ensurePriceOracle()
   if price_oracle.shock_decay_per_mc_day > 1 then price_oracle.shock_decay_per_mc_day = 1 end
   price_oracle.default_markup = tonumber(price_oracle.default_markup) or DEFAULT_PRICE_ORACLE.default_markup
 
+  -- v1.4.27 migration: allow the national price level to move well beyond
+  -- x8 over a very long economy, and make huge mints produce stronger pressure.
+  -- This does not force prices up by itself; it only removes the old low ceiling
+  -- and updates future mint-shock sensitivity.
+  if price_oracle.price_led_spiral_migrated_v4 ~= true then
+    if (tonumber(price_oracle.max_index) or 0) < DEFAULT_PRICE_ORACLE.max_index then
+      price_oracle.max_index = DEFAULT_PRICE_ORACLE.max_index
+    end
+    price_oracle.money_print_sensitivity = DEFAULT_PRICE_ORACLE.money_print_sensitivity
+    price_oracle.max_shock_pressure = DEFAULT_PRICE_ORACLE.max_shock_pressure
+    price_oracle.price_led_spiral_migrated_v4 = true
+  end
+
   price_oracle.sectors = type(price_oracle.sectors) == "table" and price_oracle.sectors or {}
   for key, def in pairs(DEFAULT_PRICE_ORACLE.sectors) do
     price_oracle.sectors[key] = type(price_oracle.sectors[key]) == "table" and price_oracle.sectors[key] or {}
@@ -1538,10 +1581,12 @@ local function wagePricePolicy()
   local defaults = DEFAULT_PRICE_ORACLE.wage_price.policy
   local currentVersion = tonumber(wp.policy.wage_policy_version or 0) or 0
 
-  -- v2 deliberately slows wage catch-up. With integer wages, a +1 Q rise on a
-  -- 5 Q worker is a 20% raise, so the wage index must not compound like a
-  -- normal percentage investment. Existing old policies are migrated once.
-  if currentVersion < 2 then
+  -- v4 changes the wage-price model to be price-led and pressure-scaled:
+  -- businesses can slowly raise prices without monetary pressure; workers chase
+  -- unaffordable prices at a speed proportional to the affordability gap; once
+  -- wages recover enough, wage costs feed back into prices. Existing old
+  -- policies are migrated once.
+  if currentVersion < 4 then
     for k, v in pairs(defaults) do
       wp.policy[k] = v
     end
@@ -1551,7 +1596,7 @@ local function wagePricePolicy()
     end
   end
 
-  wp.policy.wage_policy_version = tonumber(wp.policy.wage_policy_version) or 2
+  wp.policy.wage_policy_version = tonumber(wp.policy.wage_policy_version) or 4
   return wp.policy
 end
 
@@ -1571,6 +1616,8 @@ local function ensureWagePriceState()
   wp.sticky_price_floor = math.max(1, tonumber(wp.sticky_price_floor) or (wp.price_ath_index * (policy.sticky_floor_from_ath or 0.75)))
   wp.wage_index = math.max(1, tonumber(wp.wage_index) or 1)
   wp.wage_ath_index = math.max(1, tonumber(wp.wage_ath_index) or wp.wage_index)
+  wp.wage_aspiration_index = math.max(1, tonumber(wp.wage_aspiration_index) or wp.wage_index)
+  wp.wage_floor_index = math.max(1, tonumber(wp.wage_floor_index) or (wp.wage_ath_index * (tonumber(policy.wage_floor_from_ath) or 0.92)))
   wp.last_day = tonumber(wp.last_day) or currentMinecraftDay()
   wp.updated = wp.updated or timestamp()
   return wp
@@ -1590,29 +1637,68 @@ local function updateWagePriceState(force)
   local priceIndex = math.max(1, tonumber(wp.national_price_index) or 1)
   local priceAth = math.max(1, tonumber(wp.price_ath_index) or priceIndex)
   local wageIndex = math.max(1, tonumber(wp.wage_index) or 1)
+  local wageAspiration = math.max(1, tonumber(wp.wage_aspiration_index) or wageIndex)
 
-  local ratio = wageIndex / math.max(0.01, priceIndex)
-  local wageStart = tonumber(policy.wage_pressure_start_ratio) or 0.85
-  local wagePressure = 0
-  if ratio > wageStart then
-    wagePressure = (ratio - wageStart) * (tonumber(policy.wage_pressure_sensitivity) or 0.025)
+  local realWageRatio = wageIndex / math.max(0.01, priceIndex)
+
+  -- Wage demand pressure is the worker-side affordability signal. It does not
+  -- directly raise prices; it controls how quickly wages chase a higher cost of
+  -- living. A small price gap creates slow pressure. A crisis gap creates fast
+  -- pressure, but wages still move over days and remain capped.
+  local affordabilityGap = (priceIndex / math.max(0.01, wageIndex)) - 1
+  if affordabilityGap < 0 then affordabilityGap = 0 end
+  local wageDemandPressure = affordabilityGap * (tonumber(policy.wage_affordability_sensitivity) or 0.20)
+  wageDemandPressure = clamp(wageDemandPressure, 0, tonumber(policy.max_wage_demand_pressure) or 1.00)
+
+  -- Wage-cost pressure is the business-side feedback loop. Once wages are close
+  -- enough to current prices, payroll starts squeezing company margins and firms
+  -- raise prices to protect profit. This is deliberately a smaller factor than
+  -- monetary shocks.
+  local wageStart = tonumber(policy.wage_pressure_start_ratio) or 0.99
+  local wageCostPressure = 0
+  if realWageRatio > wageStart then
+    wageCostPressure = (realWageRatio - wageStart) * (tonumber(policy.wage_pressure_sensitivity) or 0.004)
   end
-  wagePressure = clamp(wagePressure, 0, tonumber(policy.max_wage_cost_pressure) or 0.015)
+  wageCostPressure = clamp(wageCostPressure, 0, tonumber(policy.max_wage_cost_pressure) or 0.006)
 
-  local totalPressure = clamp(moneyPressure + wagePressure, 0, tonumber(policy.max_total_pressure) or 3)
-  local targetPrice = 1 + totalPressure
-  targetPrice = clamp(targetPrice, tonumber(price_oracle.min_index) or 1, tonumber(price_oracle.max_index) or 8)
+  -- Businesses also have a tiny ordinary margin/profit drift. This lets prices
+  -- begin rising slowly even when money and wages are quiet, creating the first
+  -- pressure for wages to follow later.
+  local businessMarginPressure = tonumber(policy.base_business_margin_pressure) or 0.00006
+  if businessMarginPressure < 0 then businessMarginPressure = 0 end
 
-  -- Prices rise immediately when pressure jumps, but fall slowly and never below
-  -- the sticky ATH floor. This is the core one-national-CPI rule.
+  local ongoingPricePressure = businessMarginPressure + wageCostPressure
+  local totalPressure = clamp(moneyPressure + ongoingPricePressure, 0, tonumber(policy.max_total_pressure) or 10)
+
+  -- Money/printing/trade pressure sets a structural price target above base.
+  -- Business margin and wage-cost pressure are ongoing drifts, so they compound
+  -- from the current price level while active. This means prices can rise even
+  -- without monetary pressure, but money shocks still dominate when present.
+  local structuralTarget = 1 + moneyPressure
+  local targetPrice = structuralTarget
+  if elapsed > 0 and ongoingPricePressure > 0 then
+    local driftTarget = priceIndex * pow(1 + ongoingPricePressure, elapsed)
+    if driftTarget > targetPrice then targetPrice = driftTarget end
+  end
+  targetPrice = clamp(targetPrice, tonumber(price_oracle.min_index) or 1, tonumber(price_oracle.max_index) or 1000)
+
+  -- Prices rise faster under severe pressure, but not infinitely in one day.
+  -- A huge mint can create a major price spike; it still moves through a daily
+  -- adjustment cap rather than teleporting every price to the final target.
   if targetPrice >= priceIndex then
     if elapsed > 0 then
-      local maxRise = tonumber(policy.max_daily_price_inflation) or 0.08
+      local baseMaxRise = tonumber(policy.max_daily_price_inflation) or 0.08
+      local emergencyMaxRise = tonumber(policy.emergency_max_daily_price_inflation) or 0.60
+      if emergencyMaxRise < baseMaxRise then emergencyMaxRise = baseMaxRise end
+      local capBoost = totalPressure * (tonumber(policy.price_pressure_cap_multiplier) or 0.18)
+      local maxRise = clamp(baseMaxRise + capBoost, baseMaxRise, emergencyMaxRise)
       local allowedCeilingToday = priceIndex * pow(1 + maxRise, elapsed)
       priceIndex = math.min(targetPrice, allowedCeilingToday)
+      wp.dynamic_price_rise_cap = maxRise
     else
       -- Same-day repeated monitor/terminal polling must not ratchet prices.
       priceIndex = priceIndex
+      wp.dynamic_price_rise_cap = tonumber(policy.max_daily_price_inflation) or 0.08
     end
   else
     local allowedFloorToday = priceIndex
@@ -1620,68 +1706,111 @@ local function updateWagePriceState(force)
       allowedFloorToday = priceIndex * pow(1 - (tonumber(policy.max_daily_price_deflation) or 0.03), elapsed)
     end
     priceIndex = math.max(targetPrice, allowedFloorToday)
+    wp.dynamic_price_rise_cap = tonumber(policy.max_daily_price_inflation) or 0.08
   end
 
   priceAth = math.max(priceAth, priceIndex)
   local stickyFloor = math.max(tonumber(price_oracle.min_index) or 1, priceAth * (tonumber(policy.sticky_floor_from_ath) or 0.75))
   if priceIndex < stickyFloor then priceIndex = stickyFloor end
-  priceIndex = clamp(priceIndex, tonumber(price_oracle.min_index) or 1, tonumber(price_oracle.max_index) or 8)
+  priceIndex = clamp(priceIndex, tonumber(price_oracle.min_index) or 1, tonumber(price_oracle.max_index) or 1000)
 
-  -- Wages catch up slowly. They can drift slightly above current prices, but do
-  -- not exceed the previous price-shock ceiling. Wages barely decline.
-  local wageTarget = math.max(1, priceIndex * (tonumber(policy.wage_target_cushion) or 1.08))
-  wageTarget = math.min(wageTarget, priceAth * (tonumber(policy.wage_target_ath_cap) or 1.0))
+  -- Wages are a lagging response to prices. The target is the current cost of
+  -- living plus tiny worker aspiration, but the movement speed is scaled by
+  -- affordability pressure. If prices triple overnight, wage demand pressure
+  -- becomes large and wages rise much faster than normal, but still not
+  -- instantly.
+  local wageTarget = math.max(1, priceIndex * (tonumber(policy.wage_target_cushion) or 1.00), wageAspiration)
+  local targetCap = priceAth * (tonumber(policy.wage_target_ath_cap) or 999)
+  if targetCap > 0 then wageTarget = math.min(wageTarget, targetCap) end
   if wageTarget < 1 then wageTarget = 1 end
 
   if elapsed > 0 then
     for _ = 1, elapsed do
-      -- Wage damping is intentionally based on the wage index itself. Early
-      -- catch-up is slow but noticeable; once wages are several times their
-      -- base level, growth slows heavily so integer +1 Q raises cannot turn
-      -- into yearly doubling at high nominal pay levels.
       local dampingStart = tonumber(policy.wage_damping_start_index) or 2.0
-      local dampingExp = tonumber(policy.wage_damping_exponent) or 0.70
+      local dampingExp = tonumber(policy.wage_damping_exponent) or 0.85
       local wageDamping = 1
       if wageIndex > dampingStart and dampingStart > 0 then
         wageDamping = pow(wageIndex / dampingStart, dampingExp)
         if wageDamping < 1 then wageDamping = 1 end
       end
 
+      -- Recalculate wage pressure during the daily catch-up loop so a large gap
+      -- stays urgent while wages are far behind, then naturally cools as wages
+      -- recover.
+      local loopAffordabilityGap = (priceIndex / math.max(0.01, wageIndex)) - 1
+      if loopAffordabilityGap < 0 then loopAffordabilityGap = 0 end
+      local loopWageDemandPressure = loopAffordabilityGap * (tonumber(policy.wage_affordability_sensitivity) or 0.20)
+      loopWageDemandPressure = clamp(loopWageDemandPressure, 0, tonumber(policy.max_wage_demand_pressure) or 1.00)
+
+      local aspirationGrowth = (tonumber(policy.baseline_wage_aspiration_growth) or 0.00008) / wageDamping
+      if aspirationGrowth < 0 then aspirationGrowth = 0 end
+      wageAspiration = math.max(wageAspiration, wageIndex) * (1 + aspirationGrowth)
+
+      wageTarget = math.max(1, priceIndex * (tonumber(policy.wage_target_cushion) or 1.00), wageAspiration)
+      local cap = priceAth * (tonumber(policy.wage_target_ath_cap) or 999)
+      if cap > 0 then wageTarget = math.min(wageTarget, cap) end
+
+      local wageFloor = math.max(1, (tonumber(wp.wage_ath_index) or wageIndex) * (tonumber(policy.wage_floor_from_ath) or 0.92))
       if wageIndex < wageTarget then
         local gap = wageTarget - wageIndex
-        local catchupRate = (tonumber(policy.wage_catchup_rate) or 0.025) / wageDamping
-        local maxGainRate = (tonumber(policy.max_daily_wage_gain) or 0.0015) / wageDamping
+        local catchupRate = ((tonumber(policy.wage_catchup_rate) or 0.012) + (loopWageDemandPressure * (tonumber(policy.wage_demand_catchup_multiplier) or 0.20))) / wageDamping
+        local baseGainRate = tonumber(policy.max_daily_wage_gain) or 0.0012
+        local emergencyGainRate = tonumber(policy.emergency_max_daily_wage_gain) or 0.05
+        if emergencyGainRate < baseGainRate then emergencyGainRate = baseGainRate end
+        local maxGainRate = clamp(baseGainRate + (loopWageDemandPressure * (tonumber(policy.wage_demand_gain_multiplier) or 0.12)), baseGainRate, emergencyGainRate) / wageDamping
         local step = math.min(gap * catchupRate, wageIndex * maxGainRate)
         if step < 0 then step = 0 end
         wageIndex = wageIndex + step
+        wp.dynamic_wage_gain_cap = maxGainRate
       elseif wageIndex > wageTarget then
-        local decline = wageIndex * (tonumber(policy.max_daily_wage_decline) or 0.0002)
-        wageIndex = math.max(wageTarget, wageIndex - decline)
+        local decline = wageIndex * (tonumber(policy.max_daily_wage_decline) or 0.0001)
+        wageIndex = math.max(wageTarget, wageFloor, wageIndex - decline)
+        wp.dynamic_wage_gain_cap = 0
       end
     end
   end
 
-  wageIndex = math.max(1, wageIndex)
+  local wageFloorFinal = math.max(1, (tonumber(wp.wage_ath_index) or wageIndex) * (tonumber(policy.wage_floor_from_ath) or 0.92))
+  wageIndex = math.max(1, wageFloorFinal, wageIndex)
   local wageAth = math.max(tonumber(wp.wage_ath_index) or 1, wageIndex)
+
+  local finalRealWageRatio = wageIndex / math.max(0.01, priceIndex)
+  local finalAffordabilityGap = (priceIndex / math.max(0.01, wageIndex)) - 1
+  if finalAffordabilityGap < 0 then finalAffordabilityGap = 0 end
+  local finalWageDemandPressure = finalAffordabilityGap * (tonumber(policy.wage_affordability_sensitivity) or 0.20)
+  finalWageDemandPressure = clamp(finalWageDemandPressure, 0, tonumber(policy.max_wage_demand_pressure) or 1.00)
+
+  local finalWageCostPressure = 0
+  if finalRealWageRatio > wageStart then
+    finalWageCostPressure = (finalRealWageRatio - wageStart) * (tonumber(policy.wage_pressure_sensitivity) or 0.004)
+  end
+  finalWageCostPressure = clamp(finalWageCostPressure, 0, tonumber(policy.max_wage_cost_pressure) or 0.006)
+  local finalOngoingPricePressure = businessMarginPressure + finalWageCostPressure
+  local finalTotalPressure = clamp(moneyPressure + finalOngoingPricePressure, 0, tonumber(policy.max_total_pressure) or 10)
 
   wp.national_price_index = priceIndex
   wp.price_ath_index = priceAth
   wp.sticky_price_floor = stickyFloor
   wp.wage_index = wageIndex
   wp.wage_ath_index = wageAth
+  wp.wage_aspiration_index = wageAspiration
+  wp.wage_floor_index = wageFloorFinal
   wp.wage_target_index = wageTarget
-  wp.real_wage_ratio = wageIndex / math.max(0.01, priceIndex)
+  wp.real_wage_ratio = finalRealWageRatio
   wp.money_pressure = moneyPressure
-  wp.wage_cost_pressure = wagePressure
-  wp.total_inflation_pressure = totalPressure
+  wp.wage_demand_pressure = finalWageDemandPressure
+  wp.affordability_gap = finalAffordabilityGap
+  wp.business_margin_pressure = businessMarginPressure
+  wp.wage_cost_pressure = finalWageCostPressure
+  wp.total_inflation_pressure = finalTotalPressure
   wp.bank_inflation_rate = bankRate
   wp.bank_price_index = bankIndex
   wp.admin_floor_pressure = adminFloor
   wp.print_shock_pressure = printShock
   wp.last_day = today
   wp.updated = timestamp()
-  wp.model = "national_wage_price_pressure_v1"
-  wp.note = "One national price index. Wages catch up slowly with damping; wage cost pressure is deliberately small."
+  wp.model = "national_wage_price_pressure_v3"
+  wp.note = "Price-led wage spiral: prices can rise from money, margin drift, or wage costs; wages chase prices at a pressure-scaled lag."
 
   price_oracle.wage_price = wp
   savePriceOracle()
@@ -1715,6 +1844,9 @@ local function sectorIndex(sector)
     sector = sector,
     label = rec.label or "National CPI",
     monetary_pressure = tonumber(wp.money_pressure) or 0,
+    wage_demand_pressure = tonumber(wp.wage_demand_pressure) or 0,
+    affordability_gap = tonumber(wp.affordability_gap) or 0,
+    business_margin_pressure = tonumber(wp.business_margin_pressure) or 0,
     wage_cost_pressure = tonumber(wp.wage_cost_pressure) or 0,
     total_inflation_pressure = tonumber(wp.total_inflation_pressure) or 0,
     bank_inflation_rate = tonumber(wp.bank_inflation_rate) or 0,
@@ -3289,7 +3421,7 @@ handlers["get_price_indices"] = function(sender_id, req)
     imported_mint_shocks = imported or 0,
     skipped_mint_shocks = skipped or 0,
     time = timestamp(),
-    note = "National CPI model. Prices rise fast from money/wage pressure, fall slowly to sticky ATH floor; wages catch up slowly and add only small pressure."
+    note = "National price/wage model. Prices respond to money and wage-cost pressure; wages drift upward slowly and create business margin pressure once they overtake prices."
   }
 end
 
