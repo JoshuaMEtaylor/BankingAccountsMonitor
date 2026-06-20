@@ -43,7 +43,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION          = "1.2.1-CENTER-PIE-SPACED"
+local VERSION          = "1.2.2-BIGGER-CENTRAL-PIE"
 local BANK_PROTOCOL    = "quid_bank"
 local TREASURY_ACCOUNT = "treasury:quid_bank"
 local DB_TIMEOUT       = 4
@@ -826,8 +826,8 @@ local function drawPie(cx, cy, rx, ry, slices, total)
   end
 
   -- small hollow centre, makes the chart look cleaner on monitors
-  local irx = math.max(1, math.floor(rx * 0.30))
-  local iry = math.max(1, math.floor(ry * 0.30))
+  local irx = math.max(1, math.floor(rx * 0.24))
+  local iry = math.max(1, math.floor(ry * 0.24))
   for yy = cy - iry, cy + iry do
     for xx = cx - irx, cx + irx do
       local dx = (xx - cx) / math.max(1, irx)
@@ -1211,12 +1211,11 @@ local function drawWatchDashboard(data, startY)
   at(chartX + 3, chartY + 2, totalLine, C.good, C.bg)
   at(W - #recentLine - 3, chartY + 2, recentLine, C.warn, C.bg)
 
-  -- Keep the chart dominant, but leave breathing room for sector labels
-  -- and leader lines around the ring.
-  -- Big chart, but deliberately centre-left so the right labels do not touch it.
-  local rx = math.max(10, math.min(18, math.floor(chartW * 0.18)))
-  local ry = math.max(5, math.min(8, math.floor((chartH - 7) / 2)))
-  local cx = math.floor(W * 0.42)
+  -- Bigger main chart, placed more centrally on the screen.
+  -- The monitor is large enough to give the donut more presence.
+  local rx = math.max(12, math.min(21, math.floor(chartW * 0.21)))
+  local ry = math.max(6, math.min(10, math.floor((chartH - 6) / 2)))
+  local cx = math.floor(W * 0.46)
   local cy = chartY + math.floor(chartH / 2) + 1
   if cy - ry < chartY + 4 then cy = chartY + 4 + ry end
   if cy + ry > chartBottom - 1 then cy = chartBottom - 1 - ry end
