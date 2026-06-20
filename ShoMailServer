@@ -55,7 +55,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION       = "1.0.0"
+local VERSION       = "1.0.1"
 local DEAL_PROTOCOL = "quid_deals"
 local BANK_PROTOCOL = "quid_bank"
 local DB_TIMEOUT    = 5
@@ -396,6 +396,64 @@ local function processDueDeals()
   return paid, failed
 end
 
+
+local function addSuggestion(out, seen, account_id, label, kind)
+  account_id = tostring(account_id or "")
+  if account_id == "" or seen[account_id] then return end
+  seen[account_id] = true
+  out[#out + 1] = {
+    account_id = account_id,
+    label = tostring(label or account_id),
+    kind = tostring(kind or "account"),
+  }
+end
+
+local function handleSuggest(req)
+  local ok, user = auth(req.username, req.password)
+  if not ok then return false, user end
+
+  local q = lower(trim(req.query or ""))
+  local limit = tonumber(req.limit) or 5
+  if limit < 1 then limit = 5 end
+  if limit > 10 then limit = 10 end
+
+  local out = {}
+  local seen = {}
+
+  local function maybe(account_id, label, kind)
+    account_id = tostring(account_id or "")
+    label = tostring(label or account_id)
+
+    if q == "" then return end
+
+    local hay = lower(account_id .. " " .. label)
+    if hay:find(q, 1, true) then
+      addSuggestion(out, seen, account_id, label, kind)
+    end
+  end
+
+  -- Known people/accounts from previous deals.
+  for _, deal in pairs(deals) do
+    if type(deal) == "table" then
+      maybe(deal.from_id, deal.from_id, "deal_party")
+      maybe(deal.to_id, deal.to_id, "deal_party")
+      if #out >= limit then break end
+    end
+  end
+
+  -- Always allow direct citizen:<typed> fallback.
+  if #out < limit and q ~= "" then
+    local clean = q:gsub("%s+", "_")
+    addSuggestion(out, seen, "citizen:" .. clean, "citizen:" .. clean, "typed")
+  end
+
+  return true, {
+    suggestions = out,
+    count = #out,
+  }
+end
+
+
 -- =============================================================================
 -- REQUEST HANDLERS
 -- =============================================================================
@@ -676,6 +734,10 @@ local function handleRequest(req, sender)
       version = VERSION,
       world_date = copyTable(state.world_date),
     }
+  elseif req.type == "get_world_date" then
+    return true, { world_date = copyTable(state.world_date), label = dateLabel(state.world_date) }
+  elseif req.type == "suggest_recipients" then
+    return handleSuggest(req)
   elseif req.type == "list_deals" then
     return handleList(req)
   elseif req.type == "propose_deal" then
