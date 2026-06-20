@@ -43,7 +43,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION          = "1.1.6-SPACED-LABELS"
+local VERSION          = "1.1.7-SIDE-LABELS"
 local BANK_PROTOCOL    = "quid_bank"
 local TREASURY_ACCOUNT = "treasury:quid_bank"
 local DB_TIMEOUT       = 4
@@ -903,13 +903,7 @@ local function drawPieLabels(cx, cy, rx, ry, slices, total, chartX, chartY, char
   local maxY = chartY + chartH - 4
   if maxY < minY then maxY = minY end
 
-  -- Keep obvious blank space between the donut, leader lines and label text.
-  local radial_gap_x = 8
-  local radial_gap_y = 3
-  local text_gap = 4
-  local line_gap = 2
-  local labelW = 24
-
+  local labelW = 26
   local left, right = {}, {}
   local acc = 0
   for _, s in ipairs(slices or {}) do
@@ -920,13 +914,8 @@ local function drawPieLabels(cx, cy, rx, ry, slices, total, chartX, chartY, char
       local sn = math.sin(mid)
       local row = {
         sector = s,
-        angle = mid,
         side = c >= 0 and "right" or "left",
-        -- Anchor the leader line well OUTSIDE the donut.
-        edge_x = round(cx + c * (rx + radial_gap_x)),
-        edge_y = round(cy + sn * (ry + radial_gap_y)),
-        natural_y = round(cy + sn * (ry + radial_gap_y)),
-        colour = s.color or C.grid,
+        natural_y = round(cy + sn * (ry + 4)),
       }
       if row.side == "right" then right[#right + 1] = row else left[#left + 1] = row end
     end
@@ -936,37 +925,23 @@ local function drawPieLabels(cx, cy, rx, ry, slices, total, chartX, chartY, char
   resolveLabelColumn(left, minY, maxY)
   resolveLabelColumn(right, minY, maxY)
 
-  local leftTextX  = math.max(chartX + 3, cx - rx - radial_gap_x - labelW - 10)
-  local rightTextX = math.min(chartRight - labelW - 2, cx + rx + radial_gap_x + 10)
+  -- Fixed far-side columns. No pointers, no leader lines, just lots of room.
+  local leftTextX  = chartX + 4
+  local rightTextX = chartRight - labelW - 4
 
   local function drawOne(r)
     local s = r.sector
-    local name = shortText(s.label or "Sector", 14)
+    local name = shortText(s.label or "Sector", 15)
     local share = pct(s.value, total)
-    local value = shortText(money(s.value), 14)
-    local y = r.label_y or r.edge_y
-    local fg = r.colour or C.grid
+    local value = shortText(money(s.value), 16)
+    local y = r.label_y or r.natural_y
 
     if r.side == "right" then
-      local labelX = rightTextX
-      local textLineX = labelX
-      local labelLeadX = labelX - text_gap
-      local jointX = math.min(r.edge_x + line_gap + 4, labelLeadX - 2)
-      drawHLine(r.edge_x, jointX, r.edge_y, fg)
-      if y ~= r.edge_y then drawVLine(jointX, r.edge_y, y, fg) end
-      drawHLine(jointX, labelLeadX, y, fg)
-      at(textLineX, y, shortText(name .. " " .. share, labelW), C.text, C.bg)
-      at(textLineX, y + 1, value, C.good, C.bg)
+      at(rightTextX, y, shortText(name .. " " .. share, labelW), C.text, C.bg)
+      at(rightTextX, y + 1, value, C.good, C.bg)
     else
-      local labelX = leftTextX
-      local labelEnd = labelX + labelW - 1
-      local labelLeadX = labelEnd + text_gap
-      local jointX = math.max(r.edge_x - line_gap - 4, labelLeadX + 2)
-      drawHLine(labelLeadX, jointX, y, fg)
-      if y ~= r.edge_y then drawVLine(jointX, y, r.edge_y, fg) end
-      drawHLine(jointX, r.edge_x, r.edge_y, fg)
-      at(labelX, y, shortText(name .. " " .. share, labelW), C.text, C.bg)
-      at(labelX, y + 1, value, C.good, C.bg)
+      at(leftTextX, y, shortText(name .. " " .. share, labelW), C.text, C.bg)
+      at(leftTextX, y + 1, value, C.good, C.bg)
     end
   end
 
@@ -1231,8 +1206,8 @@ local function drawWatchDashboard(data, startY)
 
   -- Keep the chart dominant, but leave breathing room for sector labels
   -- and leader lines around the ring.
-  local rx = math.max(9, math.min(18, math.floor(chartW * 0.18)))
-  local ry = math.max(5, math.min(8, math.floor((chartH - 7) / 2)))
+  local rx = math.max(8, math.min(15, math.floor(chartW * 0.15)))
+  local ry = math.max(4, math.min(7, math.floor((chartH - 8) / 2)))
   local cx = math.floor(W / 2)
   local cy = chartY + math.floor(chartH / 2) + 1
   if cy - ry < chartY + 4 then cy = chartY + 4 + ry end
