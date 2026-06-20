@@ -43,7 +43,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION          = "1.2.0-CLEAN-LABELS"
+local VERSION          = "1.2.1-CENTER-PIE-SPACED"
 local BANK_PROTOCOL    = "quid_bank"
 local TREASURY_ACCOUNT = "treasury:quid_bank"
 local DB_TIMEOUT       = 4
@@ -871,7 +871,7 @@ end
 
 local function resolveLabelColumn(rows, minY, maxY)
   table.sort(rows, function(a, b) return (a.natural_y or 0) < (b.natural_y or 0) end)
-  local gap = 4
+  local gap = 3
 
   for i, r in ipairs(rows) do
     local y = clamp(r.natural_y or minY, minY, maxY)
@@ -903,7 +903,7 @@ local function drawPieLabels(cx, cy, rx, ry, slices, total, chartX, chartY, char
   local maxY = chartY + chartH - 4
   if maxY < minY then maxY = minY end
 
-  local labelW = 26
+  local labelW = 18
   local left, right = {}, {}
   local acc = 0
   for _, s in ipairs(slices or {}) do
@@ -929,8 +929,10 @@ local function drawPieLabels(cx, cy, rx, ry, slices, total, chartX, chartY, char
   -- Hard-separated label columns.
   -- Left labels live hard-left; right labels live hard-right.
   -- The pie is shifted left enough that the right column has a proper blank gap.
-  local leftTextX  = chartX + 4
-  local rightTextX = chartRight - labelW - 1
+  -- Keep the labels tied to the vertical part of their slice, but push the
+  -- left text hard-left and the right text hard-right for lots of whitespace.
+  local leftTextX  = chartX + 2
+  local rightTextX = chartRight - labelW
 
   local function drawOne(r)
     local s = r.sector
@@ -1214,7 +1216,7 @@ local function drawWatchDashboard(data, startY)
   -- Big chart, but deliberately centre-left so the right labels do not touch it.
   local rx = math.max(10, math.min(18, math.floor(chartW * 0.18)))
   local ry = math.max(5, math.min(8, math.floor((chartH - 7) / 2)))
-  local cx = math.floor(W * 0.37)
+  local cx = math.floor(W * 0.42)
   local cy = chartY + math.floor(chartH / 2) + 1
   if cy - ry < chartY + 4 then cy = chartY + 4 + ry end
   if cy + ry > chartBottom - 1 then cy = chartBottom - 1 - ry end
