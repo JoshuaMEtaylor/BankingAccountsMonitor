@@ -43,7 +43,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION          = "1.1.2-CENTRE-PIE"
+local VERSION          = "1.1.3-LABELLED-PIE"
 local BANK_PROTOCOL    = "quid_bank"
 local TREASURY_ACCOUNT = "treasury:quid_bank"
 local DB_TIMEOUT       = 4
@@ -837,6 +837,132 @@ local function drawPie(cx, cy, rx, ry, slices, total)
   end
 end
 
+local function clamp(n, lo, hi)
+  n = tonumber(n) or 0
+  if n < lo then return lo end
+  if n > hi then return hi end
+  return n
+end
+
+local function round(n)
+  n = tonumber(n) or 0
+  if n >= 0 then return math.floor(n + 0.5) end
+  return math.ceil(n - 0.5)
+end
+
+local function drawHLine(x1, x2, y, fg)
+  if y < 1 or y > H then return end
+  x1 = round(x1); x2 = round(x2)
+  if x2 < x1 then x1, x2 = x2, x1 end
+  x1 = clamp(x1, 1, W)
+  x2 = clamp(x2, 1, W)
+  if x2 >= x1 then line(x1, y, x2 - x1 + 1, "-", fg or C.grid, C.bg) end
+end
+
+local function drawVLine(x, y1, y2, fg)
+  x = round(x)
+  if x < 1 or x > W then return end
+  y1 = round(y1); y2 = round(y2)
+  if y2 < y1 then y1, y2 = y2, y1 end
+  y1 = clamp(y1, 1, H)
+  y2 = clamp(y2, 1, H)
+  for yy = y1, y2 do at(x, yy, "|", fg or C.grid, C.bg) end
+end
+
+local function resolveLabelColumn(rows, minY, maxY)
+  table.sort(rows, function(a, b) return (a.natural_y or 0) < (b.natural_y or 0) end)
+  local gap = 3
+
+  for i, r in ipairs(rows) do
+    local y = clamp(r.natural_y or minY, minY, maxY)
+    if i > 1 and y < rows[i - 1].label_y + gap then
+      y = rows[i - 1].label_y + gap
+    end
+    r.label_y = y
+  end
+
+  if #rows > 0 then
+    local overflow = (rows[#rows].label_y or maxY) - maxY
+    if overflow > 0 then
+      for _, r in ipairs(rows) do r.label_y = r.label_y - overflow end
+    end
+
+    local underflow = minY - (rows[1].label_y or minY)
+    if underflow > 0 then
+      for _, r in ipairs(rows) do r.label_y = r.label_y + underflow end
+    end
+  end
+end
+
+local function drawPieLabels(cx, cy, rx, ry, slices, total, chartX, chartY, chartW, chartH)
+  total = tonumber(total) or 0
+  if total <= 0 or not slices or #slices == 0 then return end
+
+  local chartRight = chartX + chartW - 1
+  local minY = chartY + 4
+  local maxY = chartY + chartH - 4
+  if maxY < minY then maxY = minY end
+
+  local left, right = {}, {}
+  local acc = 0
+  for _, s in ipairs(slices or {}) do
+    local v = tonumber(s.value) or 0
+    if v > 0 then
+      local mid = ((acc + (v / 2)) / total) * (2 * math.pi)
+      local c = math.cos(mid)
+      local sn = math.sin(mid)
+      local row = {
+        sector = s,
+        angle = mid,
+        side = c >= 0 and "right" or "left",
+        edge_x = round(cx + c * rx),
+        edge_y = round(cy + sn * ry),
+        natural_y = round(cy + sn * ry),
+        colour = s.color or C.grid,
+      }
+      if row.side == "right" then right[#right + 1] = row else left[#left + 1] = row end
+    end
+    acc = acc + v
+  end
+
+  resolveLabelColumn(left, minY, maxY)
+  resolveLabelColumn(right, minY, maxY)
+
+  local function drawOne(r)
+    local s = r.sector
+    local labelW = 24
+    local name = shortText(s.label or "Sector", 14)
+    local share = pct(s.value, total)
+    local value = shortText(money(s.value), 14)
+    local y = r.label_y or r.edge_y
+    local fg = r.colour or C.grid
+
+    if r.side == "right" then
+      local labelX = clamp(r.edge_x + 7, cx + rx + 3, chartRight - labelW - 2)
+      local jointX = clamp(r.edge_x + 3, r.edge_x + 1, labelX - 2)
+      drawHLine(r.edge_x + 1, jointX, r.edge_y, fg)
+      if y ~= r.edge_y then drawVLine(jointX, r.edge_y, y, fg) end
+      drawHLine(jointX, labelX - 2, y, fg)
+      at(labelX, y, " ", C.text, fg)
+      at(labelX + 2, y, shortText(name .. " " .. share, labelW - 2), C.text, C.bg)
+      at(labelX + 2, y + 1, value, C.good, C.bg)
+    else
+      local labelX = clamp(r.edge_x - labelW - 7, chartX + 3, cx - rx - labelW - 3)
+      local labelEnd = labelX + labelW - 1
+      local jointX = clamp(r.edge_x - 3, labelEnd + 2, r.edge_x - 1)
+      drawHLine(jointX, r.edge_x - 1, r.edge_y, fg)
+      if y ~= r.edge_y then drawVLine(jointX, r.edge_y, y, fg) end
+      drawHLine(labelEnd + 2, jointX, y, fg)
+      at(labelX, y, shortText(name .. " " .. share, labelW - 2), C.text, C.bg)
+      at(labelX, y + 1, value, C.good, C.bg)
+      at(labelEnd, y, " ", C.text, fg)
+    end
+  end
+
+  for _, r in ipairs(left) do drawOne(r) end
+  for _, r in ipairs(right) do drawOne(r) end
+end
+
 local function drawLegend(x, y, w, slices, total, maxRows)
   maxRows = maxRows or 8
   local row = 0
@@ -1092,8 +1218,10 @@ local function drawWatchDashboard(data, startY)
   at(chartX + 3, chartY + 2, totalLine, C.good, C.bg)
   at(W - #recentLine - 3, chartY + 2, recentLine, C.warn, C.bg)
 
-  local rx = math.max(10, math.min(30, math.floor(chartW * 0.30)))
-  local ry = math.max(6, math.min(11, math.floor((chartH - 5) / 2)))
+  -- Keep the chart dominant, but leave breathing room for sector labels
+  -- and leader lines around the ring.
+  local rx = math.max(10, math.min(21, math.floor(chartW * 0.22)))
+  local ry = math.max(6, math.min(9, math.floor((chartH - 6) / 2)))
   local cx = math.floor(W / 2)
   local cy = chartY + math.floor(chartH / 2) + 1
   if cy - ry < chartY + 4 then cy = chartY + 4 + ry end
@@ -1101,49 +1229,12 @@ local function drawWatchDashboard(data, startY)
 
   drawPie(cx, cy, rx, ry, slices, data.chart_total)
 
-  -- Centre label inside the donut.
+  -- Sector labels are now outside the donut and connected back to their slice.
+  -- Nothing is written in the middle of the chart.
   if slices and #slices > 0 then
-    local main = slices[1]
-    local name = upper(shortText(main.label or "Top", 12))
-    local share = pct(main.value, data.chart_total)
-    local total = shortText(money(data.chart_total), 17)
-    at(cx - math.floor(#name / 2), cy - 1, name, C.title, C.bg)
-    at(cx - math.floor(#share / 2), cy, share, C.good, C.bg)
-    at(cx - math.floor(#total / 2), cy + 1, total, C.dim, C.bg)
+    drawPieLabels(cx, cy, rx, ry, slices, data.chart_total, chartX, chartY, chartW, chartH)
   else
     at(cx - 6, cy, "NO SPEND", C.warn, C.bg)
-  end
-
-  -- Side legend deliberately sits outside the chart, not over it.
-  local sideY = chartY + 5
-  local maxSideRows = math.max(3, math.min(7, chartBottom - sideY - 1))
-  local leftX = chartX + 3
-  local leftW = math.max(12, (cx - rx) - leftX - 2)
-  local rightX = cx + rx + 4
-  local rightW = math.max(12, (chartX + chartW) - rightX - 2)
-
-  local rows = visibleRows()
-  if leftW >= 14 then
-    at(leftX, sideY - 2, "Department", C.label, C.bg)
-    at(leftX, sideY - 1, "share", C.dim, C.bg)
-    for i = 1, math.min(maxSideRows, #rows) do
-      local s = rows[i]
-      local yy = sideY + i - 1
-      at(leftX, yy, " ", C.text, s.color)
-      at(leftX + 2, yy, shortText(s.label, math.max(6, leftW - 8)), C.text, C.bg)
-      at(leftX + leftW - 5, yy, pct(s.chart_value, data.chart_total), C.dim, C.bg)
-    end
-  end
-
-  if rightW >= 13 then
-    at(rightX, sideY - 2, "Annual", C.label, C.bg)
-    at(rightX, sideY - 1, "outlay", C.dim, C.bg)
-    for i = 1, math.min(maxSideRows, #rows) do
-      local s = rows[i]
-      local yy = sideY + i - 1
-      at(rightX, yy, " ", C.text, s.color)
-      at(rightX + 2, yy, shortText(money(s.chart_value), math.max(8, rightW - 2)), C.good, C.bg)
-    end
   end
 
   -- Bottom strip: key state figures, low visual weight.
