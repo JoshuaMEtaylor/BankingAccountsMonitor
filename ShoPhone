@@ -1,23 +1,11 @@
 -- =============================================================================
 -- SHOPHONE
--- Pocket Computer Operating System
---
--- Purpose:
---   * Pocket-computer GUI shell for the Quid/JARVIS ecosystem
---   * Self-updates from GitHub on boot
---   * Provides an icon-based home screen for future apps
---
--- Install:
---   delete startup
---   wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/ShoPhone?cb=001 startup.lua
---   startup.lua
+-- Pocket Computer Phone-Style OS Shell
 -- =============================================================================
 
 local args = {...}
 
--- =============================================================================
 -- SELF UPDATE
--- =============================================================================
 if args[1] ~= "--updated" then
   term.setBackgroundColor(colors.black)
   term.setTextColor(colors.white)
@@ -25,211 +13,74 @@ if args[1] ~= "--updated" then
   term.setCursorPos(1, 1)
 
   print("[ ShoPhone ]")
-  print("Deleting old version...")
+  print("Updating...")
+
   fs.delete("startup.lua")
 
-  print("Downloading latest from GitHub...")
+  local cb = tostring(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
+  local url = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/ShoPhone?cb=" .. cb
 
-  local cache_bust = tostring(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
-  local update_url = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/ShoPhone?cb=" .. cache_bust
-
-  shell.run("wget " .. update_url .. " startup.lua")
+  shell.run("wget " .. url .. " startup.lua")
 
   if not fs.exists("startup.lua") then
-    print("")
     print("Download failed.")
     print("Expected GitHub file: ShoPhone")
     print("")
-    print("Manual install:")
-    print("delete startup")
+    print("Manual:")
     print("wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/ShoPhone?cb=001 startup.lua")
-    print("startup.lua")
     return
   end
 
-  print("Relaunching...")
-  sleep(0.5)
   shell.run("startup.lua", "--updated")
   return
 end
 
--- =============================================================================
 -- CONFIG
--- =============================================================================
-local VERSION = "0.1.0"
-local DEVICE_NAME_FILE = ".shophone_name"
-
+local VERSION = "0.2.0"
 local W, H = term.getSize()
 
-local C = {
-  bg        = colors.black,
-  wallpaper = colors.blue,
-  top       = colors.gray,
-  top_fg    = colors.white,
-  dock      = colors.gray,
-  card      = colors.lightGray,
-  card_fg   = colors.black,
-  text      = colors.white,
-  dim       = colors.lightGray,
-  title     = colors.yellow,
-  accent    = colors.cyan,
-  accent_fg = colors.black,
-  ok        = colors.lime,
-  warn      = colors.orange,
-  err       = colors.red,
-
-  bank      = colors.green,
-  contracts = colors.purple,
-  messages  = colors.orange,
-  companies = colors.blue,
-  market    = colors.brown,
-  news      = colors.red,
-  map       = colors.lime,
-  settings  = colors.lightBlue,
-}
-
 local apps = {
-  {
-    id = "bank",
-    name = "Bank",
-    icon = "$",
-    colour = C.bank,
-    desc = "Balances, transfers and standing orders"
-  },
-  {
-    id = "contracts",
-    name = "Contracts",
-    icon = "#",
-    colour = C.contracts,
-    desc = "Jobs, claims and company work"
-  },
-  {
-    id = "messages",
-    name = "Messages",
-    icon = "@",
-    colour = C.messages,
-    desc = "Citizen mail and alerts"
-  },
-  {
-    id = "companies",
-    name = "Companies",
-    icon = "C",
-    colour = C.companies,
-    desc = "Company tools and management"
-  },
-  {
-    id = "market",
-    name = "Market",
-    icon = "M",
-    colour = C.market,
-    desc = "Trade, shops and offers"
-  },
-  {
-    id = "news",
-    name = "News",
-    icon = "N",
-    colour = C.news,
-    desc = "JARVIS bulletins"
-  },
-  {
-    id = "map",
-    name = "Map",
-    icon = "^",
-    colour = C.map,
-    desc = "Location and town services"
-  },
-  {
-    id = "settings",
-    name = "Settings",
-    icon = "*",
-    colour = C.settings,
-    desc = "Device configuration"
-  },
+  { name = "Bank",      icon = "$", col = colors.green },
+  { name = "Contracts", icon = "#", col = colors.purple },
+  { name = "Messages",  icon = "@", col = colors.orange },
+  { name = "Companies", icon = "C", col = colors.blue },
+  { name = "Market",    icon = "M", col = colors.brown },
+  { name = "News",      icon = "N", col = colors.red },
+  { name = "Map",       icon = "^", col = colors.lime },
+  { name = "Settings",  icon = "*", col = colors.lightBlue },
 }
 
-local state = {
-  message = "Ready",
-  message_colour = C.dim,
-  selected = nil,
-  device_name = "ShoPhone",
-  page = "home",
-}
+local selected = nil
+local message = "Ready"
 
--- =============================================================================
--- BASIC HELPERS
--- =============================================================================
-local function refreshSize()
+-- DRAW HELPERS
+local function size()
   W, H = term.getSize()
 end
 
-local function trim(s)
-  s = tostring(s or "")
-  return s:match("^%s*(.-)%s*$")
-end
-
-local function loadDeviceName()
-  if fs.exists(DEVICE_NAME_FILE) then
-    local h = fs.open(DEVICE_NAME_FILE, "r")
-    if h then
-      local value = trim(h.readAll() or "")
-      h.close()
-      if value ~= "" then
-        state.device_name = value
-      end
-    end
-  end
-end
-
-local function saveDeviceName(name)
-  name = trim(name)
-  if name == "" then name = "ShoPhone" end
-
-  local h = fs.open(DEVICE_NAME_FILE, "w")
-  if h then
-    h.write(name)
-    h.close()
-  end
-
-  state.device_name = name
-end
-
-local function setMessage(msg, colour)
-  state.message = tostring(msg or "")
-  state.message_colour = colour or C.dim
-end
-
-local function cls(bg)
-  refreshSize()
+local function clear(bg)
+  size()
   term.setCursorBlink(false)
-  term.setBackgroundColor(bg or C.wallpaper)
-  term.setTextColor(C.text)
+  term.setBackgroundColor(bg or colors.black)
+  term.setTextColor(colors.white)
   term.clear()
   term.setCursorPos(1, 1)
 end
 
-local function at(x, y, text, fg, bg)
-  refreshSize()
-  if y < 1 or y > H or x > W then return end
-  if x < 1 then x = 1 end
-
+local function writeAt(x, y, text, fg, bg)
+  size()
+  if x < 1 or y < 1 or x > W or y > H then return end
   term.setCursorPos(x, y)
   if bg then term.setBackgroundColor(bg) end
   if fg then term.setTextColor(fg) end
-
-  local maxw = W - x + 1
-  if maxw > 0 then
-    term.write(tostring(text or ""):sub(1, maxw))
-  end
+  term.write(tostring(text or ""):sub(1, W - x + 1))
 end
 
 local function fill(x, y, w, h, bg)
-  refreshSize()
+  size()
   if w <= 0 or h <= 0 then return end
-  if x < 1 then x = 1 end
-
-  term.setBackgroundColor(bg or C.bg)
-  local row = string.rep(" ", math.max(0, w))
-
+  term.setBackgroundColor(bg)
+  local row = string.rep(" ", w)
   for yy = y, y + h - 1 do
     if yy >= 1 and yy <= H then
       term.setCursorPos(x, yy)
@@ -238,347 +89,158 @@ local function fill(x, y, w, h, bg)
   end
 end
 
-local function centre(y, text, fg, bg)
+local function center(y, text, fg, bg)
   text = tostring(text or "")
-  at(math.max(1, math.floor((W - #text) / 2) + 1), y, text, fg, bg)
+  writeAt(math.floor((W - #text) / 2) + 1, y, text, fg, bg)
 end
 
-local function button(x, y, w, label, bg, fg)
-  fill(x, y, w, 1, bg or C.accent)
-  local tx = x + math.max(0, math.floor((w - #label) / 2))
-  at(tx, y, label, fg or C.accent_fg, bg or C.accent)
-  return { x1 = x, x2 = x + w - 1, y1 = y, y2 = y }
+local function hit(b, x, y)
+  return b and x >= b.x1 and x <= b.x2 and y >= b.y1 and y <= b.y2
 end
 
-local function hit(b, mx, my)
-  return b and mx >= b.x1 and mx <= b.x2 and my >= b.y1 and my <= b.y2
-end
-
-local function drawTopBar()
-  fill(1, 1, W, 1, C.top)
-  at(2, 1, state.device_name, C.top_fg, C.top)
-
-  local clock = textutils.formatTime(os.time(), true)
-  at(W - #clock, 1, clock, C.dim, C.top)
-end
-
-local function drawStatusBar()
-  fill(1, H, W, 1, C.dock)
-  at(2, H, tostring(state.message or ""):sub(1, W - 2), state.message_colour or C.dim, C.dock)
-end
-
-local function drawWallpaper()
-  cls(C.wallpaper)
-
-  for y = 2, H - 1 do
-    local colour = (y % 2 == 0) and C.wallpaper or colors.blue
-    fill(1, y, W, 1, colour)
-  end
-end
-
-local function drawFrame(title)
-  drawWallpaper()
-  drawTopBar()
-  if title then
-    centre(3, title, C.title, C.wallpaper)
-  end
-  drawStatusBar()
-end
-
--- =============================================================================
 -- BOOT
--- =============================================================================
-local function progressBar(y, pct)
-  local width = math.max(10, W - 8)
-  local filled = math.floor(width * pct)
+local function boot()
+  clear(colors.black)
+  center(5, "ShoPhone", colors.yellow, colors.black)
+  center(7, "Starting...", colors.lightGray, colors.black)
+
+  local barW = W - 8
   local x = 4
 
-  at(x, y, "[" .. string.rep("=", filled) .. string.rep(" ", width - filled) .. "]", C.ok, C.bg)
-end
-
-local function bootScreen()
-  refreshSize()
-  cls(C.bg)
-
-  centre(3, "ShoPhone", C.title, C.bg)
-  centre(4, "Pocket OS", C.dim, C.bg)
-  centre(6, "Version " .. VERSION, C.dim, C.bg)
-
-  local stages = {
-    "Loading shell",
-    "Mounting icons",
-    "Preparing apps",
-    "Starting interface",
-    "Ready"
-  }
-
-  for i, stage in ipairs(stages) do
-    fill(1, 8, W, 1, C.bg)
-    centre(8, stage .. "...", C.text, C.bg)
-    progressBar(10, i / #stages)
-    sleep(0.25)
+  for i = 1, barW do
+    writeAt(x, 9, "[" .. string.rep("=", i) .. string.rep(" ", barW - i) .. "]", colors.lime, colors.black)
+    sleep(0.03)
   end
-
-  centre(12, "Welcome", C.ok, C.bg)
-  sleep(0.35)
 end
 
--- =============================================================================
--- ICON GUI
--- =============================================================================
-local function iconBox(x, y, app, selected)
-  local iconW = 7
-  local iconH = 4
+-- HOME SCREEN
+local function topBar()
+  fill(1, 1, W, 1, colors.gray)
+  writeAt(2, 1, "ShoPhone", colors.white, colors.gray)
+  local t = textutils.formatTime(os.time(), true)
+  writeAt(W - #t, 1, t, colors.lightGray, colors.gray)
+end
 
-  local bg = selected and colors.white or app.colour
-  local fg = selected and colors.black or colors.white
+local function bottomBar()
+  fill(1, H, W, 1, colors.gray)
+  writeAt(2, H, message, colors.white, colors.gray)
+end
 
-  fill(x, y, iconW, iconH, bg)
+local function drawIcon(x, y, app, active)
+  local bg = active and colors.white or app.col
+  local fg = active and colors.black or colors.white
 
-  at(x + 3, y + 1, app.icon, fg, bg)
+  fill(x, y, 7, 3, bg)
+  center(y + 1, "", fg, bg)
+  writeAt(x + 3, y + 1, app.icon, fg, bg)
 
   local label = app.name
-  local labelX = x + math.floor((iconW - math.min(#label, iconW)) / 2)
-  at(labelX, y + 3, label:sub(1, iconW), fg, bg)
+  local lx = x + math.floor((7 - math.min(#label, 7)) / 2)
+  writeAt(lx, y + 3, label:sub(1, 7), colors.white, colors.black)
 
-  return {
-    x1 = x,
-    x2 = x + iconW - 1,
-    y1 = y,
-    y2 = y + iconH - 1,
-    app = app,
-  }
-end
-
-local function layoutIcons()
-  local iconW = 7
-  local iconH = 4
-  local gapX = 2
-  local gapY = 1
-
-  local cols = math.max(1, math.floor((W - 2 + gapX) / (iconW + gapX)))
-  if cols > 3 then cols = 3 end
-
-  local totalW = (cols * iconW) + ((cols - 1) * gapX)
-  local startX = math.max(1, math.floor((W - totalW) / 2) + 1)
-  local startY = 4
-
-  local boxes = {}
-
-  for i, app in ipairs(apps) do
-    local col = ((i - 1) % cols)
-    local row = math.floor((i - 1) / cols)
-
-    local x = startX + (col * (iconW + gapX))
-    local y = startY + (row * (iconH + gapY))
-
-    if y + iconH < H - 1 then
-      boxes[#boxes + 1] = {
-        x = x,
-        y = y,
-        app = app,
-        index = i,
-      }
-    end
-  end
-
-  return boxes
+  return { x1 = x, x2 = x + 6, y1 = y, y2 = y + 3, app = app }
 end
 
 local function drawHome()
-  drawFrame()
+  clear(colors.black)
+  topBar()
 
-  centre(3, "Home", C.title, C.wallpaper)
+  center(3, "Home", colors.yellow, colors.black)
 
-  local boxes = layoutIcons()
-  local hitboxes = {}
+  local boxes = {}
+  local cols = 3
+  local iconW = 7
+  local gapX = 2
+  local gapY = 2
+  local startX = math.floor((W - ((cols * iconW) + ((cols - 1) * gapX))) / 2) + 1
+  local startY = 5
 
-  for _, b in ipairs(boxes) do
-    hitboxes[#hitboxes + 1] = iconBox(b.x, b.y, b.app, state.selected == b.index)
-    hitboxes[#hitboxes].index = b.index
-  end
+  for i, app in ipairs(apps) do
+    local col = (i - 1) % cols
+    local row = math.floor((i - 1) / cols)
+    local x = startX + col * (iconW + gapX)
+    local y = startY + row * (4 + gapY)
 
-  local hintY = H - 2
-  if hintY > 3 then
-    centre(hintY, "Click icon  |  Q shutdown", C.dim, C.wallpaper)
-  end
-
-  drawStatusBar()
-
-  return hitboxes
-end
-
--- =============================================================================
--- APP PLACEHOLDERS
--- =============================================================================
-local function drawAppPlaceholder(app)
-  drawFrame(app.name)
-
-  local cardY = 5
-  local cardH = math.max(5, H - 8)
-
-  fill(2, cardY, W - 2, cardH, C.card)
-
-  at(4, cardY + 1, "[" .. app.icon .. "] " .. app.name, C.card_fg, C.card)
-  at(4, cardY + 3, app.desc, colors.gray, C.card)
-
-  at(4, cardY + 5, "This app is a placeholder.", C.card_fg, C.card)
-  at(4, cardY + 6, "Backend wiring comes next.", colors.gray, C.card)
-
-  local bw = math.max(8, W - 6)
-  local bBack = button(4, H - 2, bw, "Back", C.top, C.top_fg)
-
-  drawStatusBar()
-  return bBack
-end
-
-local function settingsApp()
-  local input = state.device_name
-  local editing = false
-
-  while true do
-    drawFrame("Settings")
-
-    fill(2, 5, W - 2, H - 8, C.card)
-
-    at(4, 6, "Device name", C.card_fg, C.card)
-
-    fill(4, 8, W - 8, 1, colors.white)
-    at(5, 8, input:sub(1, W - 10), colors.black, colors.white)
-
-    at(4, 10, "Click Edit to rename this ShoPhone.", colors.gray, C.card)
-    at(4, 11, "This is local only for now.", colors.gray, C.card)
-
-    local half = math.floor((W - 10) / 2)
-    local bEdit = button(4, H - 3, half, editing and "Save" or "Edit", C.accent, C.accent_fg)
-    local bBack = button(6 + half, H - 3, half, "Back", C.top, C.top_fg)
-
-    if editing then
-      at(4, H - 2, "Type name. Enter saves. Backspace edits.", C.dim, C.wallpaper)
-      term.setCursorBlink(true)
-      term.setCursorPos(math.min(W - 4, 5 + #input), 8)
-    else
-      at(4, H - 2, "Version " .. VERSION, C.dim, C.wallpaper)
-      term.setCursorBlink(false)
-    end
-
-    drawStatusBar()
-
-    local ev, p1, p2, p3 = os.pullEvent()
-
-    if ev == "mouse_click" then
-      if hit(bBack, p2, p3) then
-        term.setCursorBlink(false)
-        return
-      elseif hit(bEdit, p2, p3) then
-        if editing then
-          saveDeviceName(input)
-          setMessage("Device renamed.", C.ok)
-          editing = false
-        else
-          editing = true
-          setMessage("Editing device name.", C.dim)
-        end
-      end
-
-    elseif ev == "char" and editing then
-      if #input < 18 then input = input .. p1 end
-
-    elseif ev == "key" and editing then
-      if p1 == keys.backspace then
-        input = input:sub(1, -2)
-      elseif p1 == keys.enter then
-        saveDeviceName(input)
-        setMessage("Device renamed.", C.ok)
-        editing = false
-      elseif p1 == keys.escape then
-        input = state.device_name
-        editing = false
-      end
-
-    elseif ev == "key" and not editing then
-      if p1 == keys.backspace or p1 == keys.escape then return end
+    if y + 3 < H then
+      boxes[#boxes + 1] = drawIcon(x, y, app, selected == i)
+      boxes[#boxes].index = i
     end
   end
-end
 
-local function openApp(app)
-  if app.id == "settings" then
-    settingsApp()
-    return
+  if H > 18 then
+    center(H - 2, "Click app  |  Q off", colors.lightGray, colors.black)
   end
 
-  setMessage("Opened " .. app.name .. ".", C.dim)
+  bottomBar()
+  return boxes
+end
 
+local function appScreen(app)
   while true do
-    local bBack = drawAppPlaceholder(app)
-    local ev, p1, p2, p3 = os.pullEvent()
+    clear(colors.black)
+    topBar()
 
+    fill(3, 4, W - 4, H - 7, colors.lightGray)
+    center(5, app.icon, colors.black, colors.lightGray)
+    center(7, app.name, colors.black, colors.lightGray)
+    center(10, "Coming soon", colors.gray, colors.lightGray)
+
+    local bw = W - 8
+    fill(4, H - 2, bw, 1, colors.gray)
+    center(H - 2, "Back", colors.white, colors.gray)
+
+    bottomBar()
+
+    local ev, a, b, c = os.pullEvent()
     if ev == "mouse_click" then
-      if hit(bBack, p2, p3) then return end
+      if c == H - 2 then return end
     elseif ev == "key" then
-      if p1 == keys.backspace or p1 == keys.escape or p1 == keys.q then return end
+      if a == keys.backspace or a == keys.escape or a == keys.q then return end
     end
   end
 end
 
--- =============================================================================
--- MAIN LOOP
--- =============================================================================
-local function shutdownScreen()
-  cls(C.bg)
-  centre(math.floor(H / 2), "Shutting down ShoPhone...", C.warn, C.bg)
-  sleep(0.35)
-  cls(C.bg)
-end
+-- MAIN
+boot()
 
-local function main()
-  loadDeviceName()
-  bootScreen()
+while true do
+  local boxes = drawHome()
+  local ev, a, b, c = os.pullEvent()
 
-  while true do
-    local hitboxes = drawHome()
-    local ev, p1, p2, p3 = os.pullEvent()
-
-    if ev == "mouse_click" then
-      local mx, my = p2, p3
-      local opened = false
-
-      for _, box in ipairs(hitboxes) do
-        if hit(box, mx, my) then
-          state.selected = box.index
-          setMessage(box.app.name .. ": " .. box.app.desc, C.dim)
-          drawHome()
-          sleep(0.08)
-          openApp(box.app)
-          state.selected = nil
-          setMessage("Ready", C.dim)
-          opened = true
-          break
-        end
+  if ev == "mouse_click" then
+    for _, box in ipairs(boxes) do
+      if hit(box, b, c) then
+        selected = box.index
+        message = box.app.name
+        drawHome()
+        sleep(0.08)
+        appScreen(box.app)
+        selected = nil
+        message = "Ready"
+        break
       end
+    end
 
-      if not opened then
-        state.selected = nil
-      end
+  elseif ev == "key" then
+    if a == keys.q then
+      clear(colors.black)
+      center(math.floor(H / 2), "Power off", colors.orange, colors.black)
+      sleep(0.4)
+      clear(colors.black)
+      return
 
-    elseif ev == "key" then
-      if p1 == keys.q then
-        shutdownScreen()
-        return
-      elseif p1 == keys.left or p1 == keys.up then
-        state.selected = (state.selected or 1) - 1
-        if state.selected < 1 then state.selected = #apps end
-      elseif p1 == keys.right or p1 == keys.down then
-        state.selected = (state.selected or 0) + 1
-        if state.selected > #apps then state.selected = 1 end
-      elseif p1 == keys.enter and state.selected then
-        openApp(apps[state.selected])
-        state.selected = nil
-        setMessage("Ready", C.dim)
-      end
+    elseif a == keys.left or a == keys.up then
+      selected = (selected or 1) - 1
+      if selected < 1 then selected = #apps end
+
+    elseif a == keys.right or a == keys.down then
+      selected = (selected or 0) + 1
+      if selected > #apps then selected = 1 end
+
+    elseif a == keys.enter and selected then
+      appScreen(apps[selected])
+      selected = nil
+      message = "Ready"
     end
   end
 end
-
-main()
