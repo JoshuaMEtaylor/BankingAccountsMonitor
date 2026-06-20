@@ -2,23 +2,21 @@
 -- SERVICE PAYMENT TERMINAL
 -- ServicePaymentTerminal
 --
--- v1.2.5-HALLOWAY-DINING-TARGET
+-- v1.2.8-TREASURY-COVER-VISUAL
 --
 -- Dining Hall / Restaurant point-of-sale for MineColonies citizens.
 --
--- This does NOT try to read waiter/cook inventories. MineColonies keeps food on
--- the worker, and the Colony Integrator does not expose that inventory in a
--- useful way. Instead this terminal watches citizen saturation changes:
---
---   hungry citizen near Dining Hall + saturation gain = inferred meal served
---
--- Price is calculated by the bank's wide sector price oracle:
---   1. saturation gain tier, as the quantity/meal-size proxy
---   2. Food CPI / Hospitality sector pressure
---   3. current positive inflation_rate as an immediate price-pressure floor
+-- Current simple mode:
+--   any positive citizen saturation change = one salmon meal
+--   base salmon meal price = 2 Q
 --
 -- Payment route:
---   citizen account -> detected Dining Hall company account via bank hospitality_meal_payment endpoint
+--   1. Ask the bank to run hospitality_meal_payment.
+--   2. The bank may charge the citizen first and then treasury covers any gap.
+--   3. This terminal displays the split as citizen paid / treasury covered.
+--
+-- Important:
+--   The terminal no longer treats bank-covered shortfall as unpaid.
 -- =============================================================================
 
 local args = {...}
@@ -44,38 +42,21 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION = "1.2.7-SALMON-SAT-CHARGE"
+local VERSION = "1.2.8-TREASURY-COVER-VISUAL"
 local BANK_PROTOCOL = "quid_bank"
-local TARGET_COMPANY = "company:hospitality" -- fallback only; the real target is resolved from bank employment mappings
+local TARGET_COMPANY = "company:hospitality" -- fallback only; real target is resolved from bank mappings/accounts
 
 local SCAN_SECONDS = 2
 local DINING_RADIUS = 28
-local NEAR_GRACE_SECONDS = 25
 local MEAL_COOLDOWN_SECONDS = 0
-
 local MIN_SAT_GAIN = 0.01
-local SMALL_GAIN = 2.00
-local NORMAL_GAIN = 5.00
-local LARGE_GAIN = 9.00
-local FULL_GAIN = 13.00
 
 local SALMON_BASE_PRICE = 2.00
 local BASE_NORMAL_MEAL_PRICE = SALMON_BASE_PRICE
 local MIN_CHARGE = 1
 
--- Local fallback has no built-in inflation. If the bank oracle is unreachable,
--- use base meal prices rather than inventing a permanent starter shock.
-local LOCAL_PRICE_PRESSURE_FLOOR = 0.00
-local LOCAL_GENERAL_SENSITIVITY = 1.00
-local LOCAL_FOOD_SENSITIVITY = 1.40
-local LOCAL_FOOD_BIAS = 0.05
-
 local STATE_FILE = "data/service_payment_state.db"
 local CONFIG_FILE = "data/service_payment_config.db"
-
--- Temporary simple POS mode:
--- any positive saturation increase is treated as one salmon meal.
--- Charge the fixed base salmon price; do not tier by saturation/CPI yet.
 
 -- =============================================================================
 -- RUNTIME
@@ -90,8 +71,6 @@ local last_message = "Booting..."
 local last_colour = colors.lightGray
 local W, H = term.getSize()
 
-local prices = {}
-local inflation_state = {}
 local pricing = {
   general_index = 1.00,
   food_index = 1.00,
@@ -99,13 +78,13 @@ local pricing = {
   normal_meal = BASE_NORMAL_MEAL_PRICE,
   live_food_prices = 0,
   monetary_pressure = 0,
-  source = "local_fallback",
+  source = "salmon_base_price",
 }
 
 local state = {
-  citizens = {},       -- [citizen_id] = { name, sat, near_at, last_charge_at }
-  receivables = {},    -- local note only, bank does not enforce this yet
-  events = {},         -- recent local event history
+  citizens = {},
+  receivables = {},
+  events = {},
 }
 
 local stats = {
@@ -114,8 +93,13 @@ local stats = {
   near_dining = 0,
   saturation_rises = 0,
   meals_charged = 0,
-  charged = 0,
-  unpaid = 0,
+
+  -- Paid values from successful bank responses.
+  charged = 0,              -- full company revenue received
+  citizen_paid = 0,         -- amount pulled from colonist accounts
+  treasury_covered = 0,     -- amount paid by treasury subsidy/fallback
+  unpaid = 0,               -- true remaining uncovered shortfall only
+
   skipped_cooldown = 0,
   skipped_not_near = 0,
   skipped_small_gain = 0,
@@ -123,6 +107,9 @@ local stats = {
   pricing_refreshes = 0,
   last_gain = 0,
   last_charge = 0,
+  last_citizen_paid = 0,
+  last_treasury_covered = 0,
+  last_uncovered = 0,
 }
 
 -- =============================================================================
@@ -190,30 +177,10 @@ local function roundMoney(n)
   return math.max(MIN_CHARGE, math.floor(n + 0.5))
 end
 
-local function applyLocalPriceShock(reason)
-  local pressure = tonumber(LOCAL_PRICE_PRESSURE_FLOOR) or 0
-  if pressure < 0 then pressure = 0 end
-  pricing.general_index = math.max(1, 1 + (pressure * LOCAL_GENERAL_SENSITIVITY))
-  pricing.food_index = math.max(1, 1 + (pressure * LOCAL_FOOD_SENSITIVITY) + LOCAL_FOOD_BIAS)
-  pricing.effective_index = pricing.food_index
-  pricing.normal_meal = BASE_NORMAL_MEAL_PRICE * pricing.food_index
-  pricing.monetary_pressure = pressure
-  pricing.source = reason or "local_price_shock_fallback"
-end
-
-
 local function countTable(t)
   local n = 0
   for _ in pairs(t or {}) do n = n + 1 end
   return n
-end
-
-local function simpleItemName(name)
-  name = lower(name)
-  name = name:gsub("^minecraft:", "")
-  name = name:gsub("^minecolonies:", "")
-  name = name:gsub("^%w+:", "")
-  return name
 end
 
 local function normalType(t)
@@ -222,11 +189,6 @@ local function normalType(t)
   t = t:gsub("com%.minecolonies%.job%.", "")
   t = t:gsub("[^%w_%-]", "")
   return lower(t)
-end
-
-local function currentMinecraftDay()
-  if os.day then return math.floor(tonumber(os.day()) or 0) end
-  return math.floor(now() / 1200000)
 end
 
 local function getPos(v)
@@ -297,23 +259,17 @@ local function isSafeCompanyId(id)
   id = tostring(id or "")
   if id == "" then return false end
   if not id:find("^company:") then return false end
-  -- Never accept raw Java/MineColonies class names as bank company accounts.
-  -- The bug was: com.minecolonies.building.cook -> company:com_minecolonies_building_cook
   if id:find("minecolonies", 1, true) or id:find("building", 1, true) or id:find("%.") then return false end
   return true
 end
 
 local function diningCompanyIdForBuilding(b)
   if type(b) ~= "table" then return nil end
-
-  -- Only accept explicit company IDs if a future integrator exposes a real bank
-  -- account. Do NOT derive a company account from building name/type.
   local explicit = b.company_id or b.companyId or b.account_id or b.accountId or b.business_id or b.businessId
   if explicit and tostring(explicit) ~= "" then
     explicit = tostring(explicit)
     if explicit:find("^company:") and isSafeCompanyId(explicit) then return explicit end
   end
-
   return nil
 end
 
@@ -373,7 +329,6 @@ local function bankReq(req, timeout)
   end
 end
 
-
 -- =============================================================================
 -- COMPANY TARGET RESOLUTION
 -- =============================================================================
@@ -393,7 +348,6 @@ local function resolveHospitalityCompanyFromMappings()
   if not ok or type(res) ~= "table" or type(res.employees) ~= "table" then return nil, nil end
 
   local score = {}
-  local label = {}
   for _, e in ipairs(res.employees or {}) do
     if type(e) == "table" then
       local cid = tostring(e.company_id or "")
@@ -408,7 +362,6 @@ local function resolveHospitalityCompanyFromMappings()
 
       if isSafeCompanyId(cid) and (industry == "hospitality" or textHasHospitality(text)) then
         score[cid] = (score[cid] or 0) + (industry == "hospitality" and 5 or 1)
-        label[cid] = tostring(e.company_name or cid)
       end
     end
   end
@@ -438,10 +391,7 @@ local function resolveHospitalityCompanyFromAccounts()
       if name:find("restaurant", 1, true) then sc = sc + 70 end
       if name:find("cook", 1, true) then sc = sc + 60 end
       if name:find("halloway", 1, true) then sc = sc + 50 end
-
-      if isSafeCompanyId(cid) and sc > bestScore then
-        best, bestScore = cid, sc
-      end
+      if isSafeCompanyId(cid) and sc > bestScore then best, bestScore = cid, sc end
     end
   end
 
@@ -450,14 +400,10 @@ local function resolveHospitalityCompanyFromAccounts()
 end
 
 local function resolveHospitalityCompany(dining)
-  -- If the building data ever provides a real bank company id, accept it.
   for _, d in ipairs(dining or {}) do
     if d and isSafeCompanyId(d.company_id) then return d.company_id, "building_company_id" end
   end
 
-  -- Normal route: ColonyBusinessIntegrator syncs workers to the bank, and the
-  -- bank knows their industry/company mapping. This gives the exact random
-  -- ticker company id instead of inventing company:com_minecolonies_building_cook.
   local cid, source = resolveHospitalityCompanyFromMappings()
   if cid then return cid, source end
 
@@ -472,8 +418,6 @@ end
 -- PRICING
 -- =============================================================================
 local function refreshPricing()
-  -- For now the dining hall only serves salmon. Do not ask the bank oracle for
-  -- CPI/tiered prices here; just display and charge the fixed salmon base price.
   pricing.general_index = 1.00
   pricing.food_index = 1.00
   pricing.effective_index = 1.00
@@ -493,9 +437,6 @@ end
 local function priceMeal(gain)
   local tier, label = mealTierForGain(gain)
   if tier <= 0 then return 0, label, tier end
-
-  -- Current debug/bring-up rule:
-  -- any positive sat gain = one salmon served = fixed base salmon price.
   return roundMoney(SALMON_BASE_PRICE), "salmon", 1.00
 end
 
@@ -553,7 +494,7 @@ local function diningBuildings(buildings)
 end
 
 local function isNearDining(pos, dining)
-  if not pos then return false, nil end
+  if not pos then return false, nil, nil end
   local best, bestDist = nil, 999999
   for _, d in ipairs(dining or {}) do
     local dd = dist(pos, d.pos)
@@ -562,7 +503,6 @@ local function isNearDining(pos, dining)
   if best and bestDist <= DINING_RADIUS then return true, best, bestDist end
   return false, best, bestDist
 end
-
 
 local function collectWorkText(v, out, depth, seen)
   out = out or {}
@@ -591,9 +531,6 @@ end
 
 local function isDiningStaffCitizen(z)
   if type(z) ~= "table" then return false end
-
-  -- Prefer the citizen's explicit work/job fields. Do not scan the whole citizen
-  -- table, because unrelated fields can contain building/location metadata.
   local chunks = {}
   local fields = {
     "work", "workBuilding", "work_building", "job", "jobName", "job_name",
@@ -635,6 +572,49 @@ local function totalReceivables()
   return total
 end
 
+local function decodeMealPayment(res, requested)
+  requested = tonumber(requested) or 0
+
+  local company_received = tonumber(res.company_received or res.paid or res.amount_paid or res.amount or 0) or 0
+  local citizen_paid = tonumber(res.citizen_paid or res.from_citizen or res.citizen_amount or 0)
+  local treasury_paid = tonumber(res.treasury_paid or res.treasury_covered or res.subsidy_paid or res.state_paid or res.subsidy or 0)
+  local shortfall = tonumber(res.shortfall or res.unpaid or res.remaining_shortfall or 0) or 0
+
+  -- Compatibility with older bank response: old server only returned paid/shortfall.
+  -- If paid == requested and shortfall == 0, treat it as fully covered, not unpaid.
+  if company_received >= requested and shortfall <= 0 then
+    shortfall = 0
+  end
+
+  -- If the patched bank returned a full paid amount but did not yet include split
+  -- fields, keep the terminal truthful: company got paid; split unknown.
+  if not citizen_paid then citizen_paid = 0 end
+  if not treasury_paid then treasury_paid = 0 end
+
+  local split_total = citizen_paid + treasury_paid
+  if company_received > 0 and split_total == 0 then
+    -- Unknown split, keep it out of subsidy totals rather than inventing it.
+    citizen_paid = company_received
+  elseif company_received > 0 and split_total < company_received and treasury_paid > 0 then
+    treasury_paid = treasury_paid + (company_received - split_total)
+  end
+
+  local covered = citizen_paid + treasury_paid
+  if covered < company_received then covered = company_received end
+  local uncovered = math.max(0, requested - covered)
+  if shortfall > uncovered then uncovered = shortfall end
+
+  return {
+    company_received = company_received,
+    citizen_paid = citizen_paid,
+    treasury_paid = treasury_paid,
+    uncovered = uncovered,
+    tx_id = res.tx_id or res.payment_tx_id or res.citizen_tx_id,
+    treasury_tx_id = res.treasury_tx_id or res.subsidy_tx_id,
+    raw = res,
+  }
+end
+
 local function chargeCitizenMeal(citizen_id, name, amount, label, gain, company_id)
   company_id = company_id or active_company_id or TARGET_COMPANY
   local ok, res = bankReq({
@@ -643,21 +623,25 @@ local function chargeCitizenMeal(citizen_id, name, amount, label, gain, company_
     company_id = company_id,
     amount = amount,
     item = label,
-    memo = "Dining Hall " .. label .. " (sat +" .. string.format("%.1f", gain) .. ", CPI x" .. string.format("%.3f", pricing.effective_index) .. ")",
+    memo = "Dining Hall " .. label .. " (sat +" .. string.format("%.1f", gain) .. ", treasury fallback if needed)",
   }, 6)
 
   if ok and type(res) == "table" then
-    local paid = tonumber(res.paid) or 0
-    local shortfall = tonumber(res.shortfall) or 0
+    local pay = decodeMealPayment(res, amount)
 
     stats.meals_charged = stats.meals_charged + 1
-    stats.charged = stats.charged + paid
-    stats.unpaid = stats.unpaid + shortfall
-    stats.last_charge = paid
+    stats.charged = stats.charged + pay.company_received
+    stats.citizen_paid = stats.citizen_paid + pay.citizen_paid
+    stats.treasury_covered = stats.treasury_covered + pay.treasury_paid
+    stats.unpaid = stats.unpaid + pay.uncovered
+    stats.last_charge = pay.company_received
+    stats.last_citizen_paid = pay.citizen_paid
+    stats.last_treasury_covered = pay.treasury_paid
+    stats.last_uncovered = pay.uncovered
 
-    if shortfall > 0 then
+    if pay.uncovered > 0 then
       state.receivables = state.receivables or {}
-      state.receivables[citizen_id] = (tonumber(state.receivables[citizen_id]) or 0) + shortfall
+      state.receivables[citizen_id] = (tonumber(state.receivables[citizen_id]) or 0) + pay.uncovered
     end
 
     addEvent({
@@ -668,18 +652,24 @@ local function chargeCitizenMeal(citizen_id, name, amount, label, gain, company_
       label = label,
       gain = gain,
       amount = amount,
-      paid = paid,
-      shortfall = shortfall,
+      company_received = pay.company_received,
+      citizen_paid = pay.citizen_paid,
+      treasury_paid = pay.treasury_paid,
+      uncovered = pay.uncovered,
+      tx_id = pay.tx_id,
+      treasury_tx_id = pay.treasury_tx_id,
       normal_meal = pricing.normal_meal,
       food_index = pricing.food_index,
       general_index = pricing.general_index,
       effective_index = pricing.effective_index,
     })
 
-    if paid > 0 then
-      setMsg("Charged " .. tostring(name) .. " " .. money(paid) .. " to " .. tostring(company_id), colors.lime)
+    if pay.uncovered > 0 then
+      setMsg(tostring(name) .. " meal partly unpaid: " .. money(pay.uncovered), colors.orange)
+    elseif pay.treasury_paid > 0 then
+      setMsg("Meal paid " .. money(pay.company_received) .. " for " .. tostring(name) .. " (Treasury covered " .. money(pay.treasury_paid) .. ")", colors.lime)
     else
-      setMsg(tostring(name) .. " could not pay " .. money(amount) .. " for " .. label, colors.orange)
+      setMsg("Meal paid " .. money(pay.company_received) .. " for " .. tostring(name), colors.lime)
     end
     return true
   end
@@ -726,10 +716,6 @@ local function processCitizen(z, dining)
       stats.saturation_rises = stats.saturation_rises + 1
       stats.last_gain = gain
 
-      -- Current bring-up rule requested:
-      -- ANY positive saturation increase means the last citizen who changed ate
-      -- the current food item. Charge them the fixed base salmon price.
-      -- No staff exemption, no near-dining gate, no tiering, no CPI pricing.
       local amount, label = priceMeal(gain)
       if amount > 0 then
         local company_id = rec.near_company_id or active_company_id or TARGET_COMPANY
@@ -867,9 +853,10 @@ local function draw()
   at(2, 15, "Pricing:      fixed base food price", colors.lightGray)
 
   at(2, 17, "Sat rises:    " .. tostring(stats.saturation_rises) .. "   Last gain: +" .. string.format("%.1f", stats.last_gain), colors.lightGray)
-  at(2, 18, "Meals:        " .. tostring(stats.meals_charged) .. "   Charged: " .. money(stats.charged) .. "   Unpaid: " .. money(stats.unpaid), colors.lime)
-  at(2, 19, "Mode:         charge any positive sat change; no staff/near/tier filter", colors.orange)
-  at(2, 20, "Receivables:  " .. money(totalReceivables()), totalReceivables() > 0 and colors.orange or colors.gray)
+  at(2, 18, "Meals:        " .. tostring(stats.meals_charged) .. "   Revenue: " .. money(stats.charged), colors.lime)
+  at(2, 19, "Paid by:      Citizens " .. money(stats.citizen_paid) .. "   Treasury " .. money(stats.treasury_covered), stats.treasury_covered > 0 and colors.yellow or colors.lightGray)
+  at(2, 20, "Uncovered:    " .. money(stats.unpaid) .. "   Receivables: " .. money(totalReceivables()), stats.unpaid > 0 and colors.orange or colors.gray)
+  at(2, 21, "Last split:   citizen " .. money(stats.last_citizen_paid) .. " / treasury " .. money(stats.last_treasury_covered), colors.lightGray)
 
   local third = math.floor((W - 8) / 3)
   local bScan = button(2, H - 3, third, "Poll Now", colors.purple)
@@ -889,8 +876,7 @@ local function loadConfig()
 
   if tonumber(cfg.scan_seconds) then SCAN_SECONDS = math.max(1, tonumber(cfg.scan_seconds)) end
   if tonumber(cfg.dining_radius) then DINING_RADIUS = math.max(4, tonumber(cfg.dining_radius)) end
-  if tonumber(cfg.near_grace_seconds) then NEAR_GRACE_SECONDS = math.max(1, tonumber(cfg.near_grace_seconds)) end
-  if tonumber(cfg.meal_cooldown_seconds) then MEAL_COOLDOWN_SECONDS = math.max(1, tonumber(cfg.meal_cooldown_seconds)) end
+  if tonumber(cfg.meal_cooldown_seconds) then MEAL_COOLDOWN_SECONDS = math.max(0, tonumber(cfg.meal_cooldown_seconds)) end
   if tonumber(cfg.base_normal_meal_price) then BASE_NORMAL_MEAL_PRICE = math.max(0.1, tonumber(cfg.base_normal_meal_price)) end
   if cfg.target_company or cfg.company_id then
     local t = tostring(cfg.target_company or cfg.company_id)
