@@ -38,7 +38,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION = "1.0.7-NO-PUBLIC-SKIP"
+local VERSION = "1.0.8-BANKREQ-FORWARD-FIX"
 local BANK_PROTOCOL = "quid_bank"
 local DB_TIMEOUT = 5
 local CHECK_INTERVAL = 10
@@ -325,6 +325,8 @@ local function wageBand(jobText)
   return nil, "unknown"
 end
 
+local bankReq -- forward declaration; defined in NETWORK section before runtime use
+
 local function tableValue(t, key, fallback)
   if type(t) ~= "table" then return fallback end
   local v = tonumber(t[key])
@@ -455,7 +457,7 @@ local function discoverBank()
   return false
 end
 
-local function bankReq(req, timeout)
+function bankReq(req, timeout)
   timeout = timeout or DB_TIMEOUT
   if not db_id then return false, "No bank server" end
   rednet.send(db_id, req, BANK_PROTOCOL)
