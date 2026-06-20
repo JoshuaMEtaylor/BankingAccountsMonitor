@@ -55,7 +55,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION       = "1.0.3"
+local VERSION       = "1.0.4"
 local DEAL_PROTOCOL = "quid_deals"
 local BANK_PROTOCOL = "quid_bank"
 local DB_TIMEOUT    = 5
@@ -656,8 +656,8 @@ local function handlePropose(req)
     proposer_id = user.citizen_id,
     amount = math.floor(amount),
     frequency = lower(req.frequency or req.interval or "monthly"),
-    start_date = start_date,
-    next_due = start_date,
+    start_date = copyTable(start_date),
+    next_due = copyTable(start_date),
     note = trim(req.note or req.memo or ""),
     status = "pending",
     recurring = true,
