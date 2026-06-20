@@ -11,8 +11,10 @@
 --   * Let public contract boards list contracts
 --   * Let citizens/companies claim contracts
 --
--- This does NOT move money yet.
--- Escrow/payment hooks come next once the posting/claim flow is proven.
+-- Contract rewards are paid by the bank when completion is confirmed.
+-- MineColonies/courier delivery can now complete contracts automatically:
+-- if a courier deposits any positive amount of a requested item, the order is
+-- treated as fulfilled and the reward is paid to the warehouse/logistics company.
 -- =============================================================================
 
 local args = {...}
@@ -51,7 +53,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION            = "1.0.25-AUTO-PRUNE-CLOSED"
+local VERSION            = "1.0.27-COURIER-DEPOSIT-COMPLETE"
 local LABEL              = "Quid-Contracts"
 local PROTOCOL           = "quid_contracts"
 local PROTOCOL_BROADCAST = "quid_contracts_discovery"
@@ -423,7 +425,7 @@ end
 local function findLiveContractBySourceKey(key)
   if not key or key == "" then return nil, nil end
   for id, c in pairs(contracts) do
-    if c.source_key == key and (c.status == "open" or c.status == "claimed" or c.status == "pending_completion") then
+    if c.source_key == key and (c.status == "open" or c.status == "claimed" or c.status == "pending_completion" or c.status == "pending_payout") then
       return id, c
     end
   end
@@ -940,10 +942,216 @@ local function payContract(c)
     return true, res
   end
 
+
   c.payout_status = "failed"
   c.payout_error = tostring(res)
   c.payout_failed_at = timestamp()
   return false, res
+end
+
+local function suppliedItemsFromCourierRequest(req)
+  req = type(req) == "table" and req or {}
+
+  local raw = req.deposited_items or req.delivered_items or req.fulfilled_items or req.items
+  if type(raw) == "table" then
+    -- Accept either a list of items or a single item table.
+    if raw.item or raw.id or raw.name then raw = { raw } end
+    local norm = normaliseItems(raw)
+    if #norm > 0 then return norm end
+  end
+
+  local item = trim(req.item or req.item_id or req.deposited_item or req.delivered_item or req.name or "")
+  local display = trim(req.display or req.display_name or req.label or item)
+  local count = tonumber(req.count or req.amount or req.qty or req.quantity or req.deposited_count or req.delivered_count or 0) or 0
+  count = math.floor(count)
+
+  if item ~= "" and count > 0 then
+    return {
+      {
+        item = item,
+        display = display ~= "" and display or item,
+        count = count,
+      }
+    }
+  end
+
+  return {}
+end
+
+local function courierDepositMatchesContract(c, supplied_items)
+  local required = normaliseItems(c and c.items or {})
+  local supplied = normaliseItems(supplied_items or {})
+
+  if #required <= 0 then return false, "Contract has no required items" end
+  if #supplied <= 0 then return false, "Courier delivery reported no deposited items" end
+
+  for _, sup in ipairs(supplied) do
+    local supplied_item = trim(sup.item or sup.id or sup.name or "")
+    local supplied_count = math.floor(tonumber(sup.count or sup.amount or sup.qty or 0) or 0)
+
+    if supplied_item ~= "" and supplied_count > 0 then
+      for _, req_item in ipairs(required) do
+        local required_item = trim(req_item.item or req_item.id or req_item.name or "")
+        if supplied_item == required_item then
+          return true, {
+            item = supplied_item,
+            display = sup.display or req_item.display or supplied_item,
+            deposited = supplied_count,
+            requested = tonumber(req_item.count or 0) or 0,
+          }
+        end
+      end
+    end
+  end
+
+  return false, "Courier deposited item is not one of this contract's requested items"
+end
+
+local function findCourierContract(req)
+  req = type(req) == "table" and req or {}
+
+  local direct_id = trim(req.contract_id or req.id or "")
+  if direct_id ~= "" then
+    return direct_id, contracts[direct_id], direct_id ~= "" and nil or "Missing contract_id"
+  end
+
+  local key = trim(req.source_key or req.key or "")
+  if key == "" then key = sourceKey(req) end
+
+  if key ~= "" then
+    for id, c in pairs(contracts or {}) do
+      if type(c) == "table"
+        and c.source_key == key
+        and (c.status == "open" or c.status == "claimed" or c.status == "pending_completion" or c.status == "pending_payout") then
+        return id, c, nil
+      end
+    end
+    return nil, nil, "No active contract found for source_key " .. tostring(key)
+  end
+
+  -- Last-resort convenience: if the courier only reports an item, find one
+  -- matching active MineColonies contract. This only succeeds when exactly one
+  -- candidate exists, otherwise the courier must send source_key/contract_id.
+  local supplied = suppliedItemsFromCourierRequest(req)
+  local matches = {}
+  for id, c in pairs(contracts or {}) do
+    if type(c) == "table"
+      and (c.status == "open" or c.status == "claimed" or c.status == "pending_completion" or c.status == "pending_payout")
+      and (c.source_type == "minecolonies_request" or tostring(c.source_key or ""):find("^mc_live:")) then
+      local ok = courierDepositMatchesContract(c, supplied)
+      if ok then matches[#matches + 1] = { id = id, contract = c } end
+    end
+  end
+
+  if #matches == 1 then return matches[1].id, matches[1].contract, nil end
+  if #matches == 0 then return nil, nil, "No matching active courier contract found" end
+  return nil, nil, "Multiple matching contracts found; send source_key or contract_id"
+end
+
+local function resolveWarehouseCompanyForCourier(req, c)
+  req = type(req) == "table" and req or {}
+  local ref = trim(
+    req.warehouse_company_id
+    or req.warehouse_company
+    or req.logistics_company_id
+    or req.logistics_company
+    or req.company_id
+    or req.claimant
+    or req.claimant_company
+    or c.claimed_company_id
+    or c.claimed_by
+    or ""
+  )
+
+  if ref == "" then
+    return false, "Missing warehouse/logistics company for courier payout"
+  end
+
+  local ok, acc_or_err = resolveCompanyAccount(ref)
+  if not ok then return false, acc_or_err end
+  return true, acc_or_err
+end
+
+local function completeContractFromCourierDeposit(sender_id, req)
+  local id, c, find_err = findCourierContract(req)
+  if not c then return false, find_err or "Contract not found" end
+
+  if c.status == "fulfilled" or c.status == "paid" or c.payout_status == "paid" then
+    return true, { contract = publicContract(c), already_fulfilled = true, message = "Contract already fulfilled/paid" }
+  end
+
+  if c.status ~= "open" and c.status ~= "claimed" and c.status ~= "pending_completion" and c.status ~= "pending_payout" then
+    return false, "Contract is not active: " .. tostring(c.status)
+  end
+
+  local supplied = suppliedItemsFromCourierRequest(req)
+  local match_ok, match_info = courierDepositMatchesContract(c, supplied)
+  if not match_ok then return false, match_info end
+
+  local wh_ok, wh_or_err = resolveWarehouseCompanyForCourier(req, c)
+  if not wh_ok then return false, wh_or_err end
+
+  local warehouse_id = wh_or_err.account_id or wh_or_err.company_id
+  local warehouse_name = wh_or_err.display_name or wh_or_err.name or warehouse_id
+
+  -- If the courier is fulfilling an unclaimed order, claim it directly for the
+  -- warehouse/logistics company. If it is already claimed by another party, do
+  -- not silently steal the payout unless force_warehouse_claim is explicitly set.
+  local current_claimant = trim(c.claimed_company_id or c.claimed_by or "")
+  if current_claimant ~= "" and current_claimant ~= warehouse_id and req.force_warehouse_claim ~= true then
+    return false, "Contract already claimed by " .. tostring(current_claimant) .. "; refusing to pay warehouse " .. tostring(warehouse_id)
+  end
+
+  c.status = "claimed"
+  c.claimed_by = warehouse_id
+  c.claimed_type = "company"
+  c.claimed_company_id = warehouse_id
+  c.claimed_name = warehouse_name
+  c.claimed_ticker = wh_or_err.ticker
+  c.claimed_at = c.claimed_at or timestamp()
+
+  c.courier_delivery_detected = true
+  c.courier_delivery_sender = sender_id
+  c.courier_delivery_at = timestamp()
+  c.courier_delivery_items = supplied
+  c.fulfilled_items = supplied
+  c.courier_match = match_info
+  c.fulfillment_rule = "courier_any_positive_deposit"
+
+  local paid_ok, paid_res = payContract(c)
+
+  if paid_ok then
+    c.status = "fulfilled"
+    c.fulfilled_at = timestamp()
+    c.updated = timestamp()
+    c.fulfillment_note = req.note or (
+      "Courier completed contract by depositing " ..
+      tostring(match_info.deposited or "?") .. "x " .. tostring(match_info.display or match_info.item or "item") ..
+      ". Quantity threshold ignored for rigid NPC courier."
+    )
+    c.completion_confirmed_by = "courier:" .. tostring(sender_id)
+    c.completion_mode = "courier_deposit"
+    writeFile(FILE.contracts, contracts)
+    audit("COURIER_FULFILLED", warehouse_id, sender_id, id)
+    return true, {
+      contract = publicContract(c),
+      payout = paid_res,
+      matched = match_info,
+      message = "Courier delivery accepted; contract fulfilled and warehouse paid"
+    }
+  end
+
+  c.status = "pending_payout"
+  c.updated = timestamp()
+  c.fulfillment_note = req.note or "Courier delivery accepted, but payout failed"
+  c.payout_status = "failed"
+  c.payout_error = tostring(paid_res)
+  c.payout_failed_at = timestamp()
+  c.completion_confirmed_by = "courier:" .. tostring(sender_id)
+  c.completion_mode = "courier_deposit_pending_payout"
+  writeFile(FILE.contracts, contracts)
+  audit("COURIER_PAYOUT_FAILED", warehouse_id, sender_id, id .. " " .. tostring(paid_res))
+  return false, "Courier delivery accepted, but payout failed: " .. tostring(paid_res)
 end
 
 local function markFulfilled(sender_id, req)
@@ -1234,7 +1442,59 @@ local function syncSourceContracts(sender_id, req)
         -- contract even though the request is still present.
         local meta = key and active_meta[key] or nil
         local auto_shrink_done = false
-        if c.status == "claimed" and type(meta) == "table" then
+
+        -- Courier integration path:
+        -- If the integrator/courier reports that a courier deposited any positive
+        -- quantity for this source_key, complete the contract immediately and pay
+        -- the warehouse/logistics company. This deliberately ignores the old
+        -- random/fixed fulfilment amount because the courier NPC is deterministic.
+        if type(meta) == "table" and c.status ~= "fulfilled" then
+          local courier_count = tonumber(
+            meta.courier_deposited_count
+            or meta.courier_deposit_count
+            or meta.deposited_count
+            or meta.delivered_count
+            or meta.amount
+            or 0
+          ) or 0
+
+          local courier_done = meta.courier_completed == true
+            or meta.courier_deposit == true
+            or meta.courier_delivered == true
+            or courier_count > 0
+
+          if courier_done then
+            local item_hint = meta.item or meta.item_id or meta.name
+            if not item_hint and type(c.items) == "table" and type(c.items[1]) == "table" then
+              item_hint = c.items[1].item
+            end
+
+            local okCourier, resCourier = completeContractFromCourierDeposit(sender_id, {
+              contract_id = id,
+              source_key = key,
+              warehouse_company_id = meta.warehouse_company_id or meta.warehouse_company or meta.logistics_company_id or meta.logistics_company or meta.company_id or req.warehouse_company_id or req.warehouse_company,
+              deposited_items = meta.deposited_items or meta.delivered_items or meta.items,
+              item = item_hint,
+              count = courier_count > 0 and courier_count or 1,
+              note = "Auto-completed from courier deposit metadata in source sync.",
+              force_warehouse_claim = meta.force_warehouse_claim == true or req.force_warehouse_claim == true,
+            })
+
+            if okCourier then
+              auto_completed = auto_completed + 1
+              auto_shrink_done = true
+            else
+              payout_failed = payout_failed + 1
+              c.status = c.status == "pending_payout" and "pending_payout" or c.status
+              c.updated = timestamp()
+              c.fulfillment_note = "Courier deposit metadata detected, but completion failed: " .. tostring(resCourier)
+              audit("COURIER_META_FAILED", c.claimed_by or "unknown", sender_id, id .. " " .. tostring(resCourier))
+              auto_shrink_done = true
+            end
+          end
+        end
+
+        if not auto_shrink_done and c.status == "claimed" and type(meta) == "table" then
           local old_max = tonumber(c.quantity_max or 0) or 0
           local new_max = tonumber(meta.quantity_max or meta.max_count or old_max) or old_max
           local fixed = tonumber(c.fixed_quantity or meta.fixed_quantity or 0) or 0
@@ -1335,6 +1595,10 @@ handlers["get_contract"] = getContract
 handlers["claim_contract"] = claimContract
 handlers["unclaim_contract"] = unclaimContract
 handlers["mark_fulfilled"] = markFulfilled
+handlers["courier_complete_contract"] = completeContractFromCourierDeposit
+handlers["courier_fulfill_contract"] = completeContractFromCourierDeposit
+handlers["courier_contract_delivery"] = completeContractFromCourierDeposit
+handlers["record_courier_delivery"] = completeContractFromCourierDeposit
 handlers["cancel_contract"] = cancelContract
 handlers["sync_source_contracts"] = syncSourceContracts
 handlers["list_claimant_companies"] = listClaimantCompanies
