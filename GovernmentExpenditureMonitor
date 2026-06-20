@@ -43,7 +43,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION          = "1.1.3-LABELLED-PIE"
+local VERSION          = "1.1.4-OUTSIDE-LABELS"
 local BANK_PROTOCOL    = "quid_bank"
 local TREASURY_ACCOUNT = "treasury:quid_bank"
 local DB_TIMEOUT       = 4
@@ -915,9 +915,10 @@ local function drawPieLabels(cx, cy, rx, ry, slices, total, chartX, chartY, char
         sector = s,
         angle = mid,
         side = c >= 0 and "right" or "left",
-        edge_x = round(cx + c * rx),
-        edge_y = round(cy + sn * ry),
-        natural_y = round(cy + sn * ry),
+        -- Start the leader line just OUTSIDE the donut so the labels never cut through the pie itself.
+        edge_x = round(cx + c * (rx + 2)),
+        edge_y = round(cy + sn * (ry + 1)),
+        natural_y = round(cy + sn * (ry + 1)),
         colour = s.color or C.grid,
       }
       if row.side == "right" then right[#right + 1] = row else left[#left + 1] = row end
@@ -938,19 +939,19 @@ local function drawPieLabels(cx, cy, rx, ry, slices, total, chartX, chartY, char
     local fg = r.colour or C.grid
 
     if r.side == "right" then
-      local labelX = clamp(r.edge_x + 7, cx + rx + 3, chartRight - labelW - 2)
-      local jointX = clamp(r.edge_x + 3, r.edge_x + 1, labelX - 2)
-      drawHLine(r.edge_x + 1, jointX, r.edge_y, fg)
+      local labelX = clamp(r.edge_x + 8, cx + rx + 5, chartRight - labelW - 2)
+      local jointX = clamp(r.edge_x + 3, r.edge_x + 1, labelX - 3)
+      drawHLine(r.edge_x, jointX, r.edge_y, fg)
       if y ~= r.edge_y then drawVLine(jointX, r.edge_y, y, fg) end
       drawHLine(jointX, labelX - 2, y, fg)
       at(labelX, y, " ", C.text, fg)
       at(labelX + 2, y, shortText(name .. " " .. share, labelW - 2), C.text, C.bg)
       at(labelX + 2, y + 1, value, C.good, C.bg)
     else
-      local labelX = clamp(r.edge_x - labelW - 7, chartX + 3, cx - rx - labelW - 3)
+      local labelX = clamp(r.edge_x - labelW - 8, chartX + 3, cx - rx - labelW - 5)
       local labelEnd = labelX + labelW - 1
-      local jointX = clamp(r.edge_x - 3, labelEnd + 2, r.edge_x - 1)
-      drawHLine(jointX, r.edge_x - 1, r.edge_y, fg)
+      local jointX = clamp(r.edge_x - 3, labelEnd + 3, r.edge_x - 1)
+      drawHLine(jointX, r.edge_x, r.edge_y, fg)
       if y ~= r.edge_y then drawVLine(jointX, r.edge_y, y, fg) end
       drawHLine(labelEnd + 2, jointX, y, fg)
       at(labelX, y, shortText(name .. " " .. share, labelW - 2), C.text, C.bg)
