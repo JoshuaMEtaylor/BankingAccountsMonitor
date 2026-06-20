@@ -52,7 +52,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION          = "1.0.16-STIMULUS"
+local VERSION          = "1.0.17-DEF-RES-PAY"
 local PROTOCOL         = "quid_bank"
 local TREASURY_ACCOUNT = "treasury:quid_bank"
 local DB_TIMEOUT       = 5
@@ -1029,13 +1029,6 @@ local WORKER_PAY_SECTORS = {
     tiers = { "skilled", "elite" },
     defaults = { skilled = 3, elite = 5 },
   },
-  {
-    key = "logistics",
-    label = "Logistics",
-    help = "Public logistics payroll. Used for state couriers/delivery workers if treated as public.",
-    tiers = { "unskilled", "skilled" },
-    defaults = { unskilled = 1, skilled = 2 },
-  },
 }
 
 local function defaultSectorRates()
@@ -1056,7 +1049,6 @@ local function normaliseRatesForUI(rates)
   -- Backwards compatibility with old flat worker rates.
   if rates.researcher then out.research.skilled = tonumber(rates.researcher) or out.research.skilled end
   if rates.soldier then out.defence.skilled = tonumber(rates.soldier) or out.defence.skilled end
-  if rates.courier then out.logistics.unskilled = tonumber(rates.courier) or out.logistics.unskilled end
 
   for _, s in ipairs(WORKER_PAY_SECTORS) do
     if type(rates[s.key]) == "table" then
