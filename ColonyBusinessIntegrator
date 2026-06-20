@@ -32,7 +32,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION = "1.0.20-LIFECYCLE-HARD-REPLACE"
+local VERSION = "1.0.21-COUNT-DIAGNOSTICS"
 local BANK_PROTOCOL = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT = 5
@@ -72,7 +72,15 @@ local last_colour = colors.lightGray
 local W, H = term.getSize()
 
 local stats = {
+  -- raw_buildings is the full MineColonies getBuildings() count. This includes
+  -- residences, town hall, decorations and other non-business structures.
+  -- buildings_seen is now the ECONOMIC built-building count used by this script.
+  raw_buildings = 0,
   buildings_seen = 0,
+  economic_buildings = 0,
+  ignored_buildings = 0,
+  unbuilt_buildings = 0,
+  stale_locations_removed = 0,
   businesses_registered = 0,
   industry_count = 0,
   business_locations = 0,
@@ -230,17 +238,18 @@ local function draw()
   at(2, 5, "Contracts: " .. tostring(contract_id or "not connected"), contract_id and colors.lime or colors.red)
   at(2, 6, "Auto:      " .. (auto_mode and "ON" or "OFF"), auto_mode and colors.lime or colors.orange)
 
-  at(2, 8,  "Buildings: " .. tostring(stats.buildings_seen) .. "   Industries: " .. tostring(countTable(industry_companies)) .. " (new " .. tostring(stats.businesses_registered) .. ")", colors.lightGray)
-  at(2, 9,  "Locations: " .. tostring(countTable(businesses)) .. "   Model: industry company + locations", colors.lightGray)
-  at(2, 10, "Citizens:  " .. tostring(stats.citizens_seen) .. "   Accounts: " .. tostring(countTable(citizens_map)) .. " (new " .. tostring(stats.citizens_registered) .. ", removed " .. tostring(stats.citizens_retired or 0) .. ")", colors.lightGray)
-  at(2, 11, "Roster:    " .. tostring(stats.citizen_source or "none") .. "   Sent: " .. tostring(stats.citizen_roster_sent or 0), colors.lightGray)
-  at(2, 11, "Requests:  " .. tostring(stats.requests_seen) .. "   Contracts: " .. tostring(stats.contracts_posted), colors.lime)
-  at(2, 12, "Skipped:   unmapped " .. tostring(stats.skipped_unmapped) .. " / unfunded " .. tostring(stats.skipped_unfunded), colors.orange)
-  at(2, 13, "Pricing:   base " .. tostring(BASE_CONTRACT_FEE) .. " Q, index x" .. string.format("%.3f", PRICE_INDEX) .. ", rate " .. string.format("%.2f%%", INFLATION_RATE * 100), colors.lightGray)
+  at(2, 8,  "Buildings: econ " .. tostring(stats.economic_buildings or stats.buildings_seen or 0) .. " / raw " .. tostring(stats.raw_buildings or 0) .. "   ignored " .. tostring(stats.ignored_buildings or 0), colors.lightGray)
+  at(2, 9,  "Locations: " .. tostring(countTable(businesses)) .. "   Industries: " .. tostring(countTable(industry_companies)) .. " (new " .. tostring(stats.businesses_registered) .. ")", colors.lightGray)
+  at(2, 10, "Model:     1 industry company + many verified business locations", colors.lightGray)
+  at(2, 11, "Citizens:  " .. tostring(stats.citizens_seen) .. "   Accounts: " .. tostring(countTable(citizens_map)) .. " (new " .. tostring(stats.citizens_registered) .. ", removed " .. tostring(stats.citizens_retired or 0) .. ")", colors.lightGray)
+  at(2, 12, "Roster:    " .. tostring(stats.citizen_source or "none") .. "   Sent: " .. tostring(stats.citizen_roster_sent or 0) .. "   Removed locs: " .. tostring(stats.stale_locations_removed or 0), colors.lightGray)
+  at(2, 13, "Requests:  " .. tostring(stats.requests_seen) .. "   Contracts: " .. tostring(stats.contracts_posted), colors.lime)
+  at(2, 14, "Skipped:   unmapped " .. tostring(stats.skipped_unmapped) .. " / unfunded " .. tostring(stats.skipped_unfunded), colors.orange)
+  at(2, 15, "Pricing:   base " .. tostring(BASE_CONTRACT_FEE) .. " Q, index x" .. string.format("%.3f", PRICE_INDEX) .. ", rate " .. string.format("%.2f%%", INFLATION_RATE * 100), colors.lightGray)
 
   local last = "never"
   if stats.last_scan > 0 then last = tostring(math.floor((now() - stats.last_scan) / 1000)) .. "s ago" end
-  at(2, 15, "Last scan: " .. last, colors.lightGray)
+  at(2, 17, "Last scan: " .. last, colors.lightGray)
 
   local bw = math.floor((W - 8) / 3)
   local bScan = button(2, H - 3, bw, "Scan Now", colors.purple)
@@ -696,9 +705,29 @@ local function migrateIndustryMappings()
 end
 
 local function scanBusinesses(buildings)
+  local active_keys = {}
+  local economic = 0
+  local ignored = 0
+  local unbuilt = 0
+
+  -- Rebuild the per-company location lists from the current live building scan.
+  -- The industry company accounts stay, but stale/missing physical locations no
+  -- longer linger in building_companies.db forever.
+  for _, company in pairs(industry_companies or {}) do
+    if type(company) == "table" then
+      company.locations = {}
+      company.location_count = 0
+    end
+  end
+
   for _, b in ipairs(buildings or {}) do
-    if b.built and isEconomic(b) then
+    local built = b and b.built and true or false
+    if not built then
+      unbuilt = unbuilt + 1
+    elseif isEconomic(b) then
+      economic = economic + 1
       local key = buildingKey(b)
+      active_keys[key] = true
       local industry = buildingIndustry(b)
       local company = getIndustryCompany(industry)
       if not company then
@@ -711,9 +740,46 @@ local function scanBusinesses(buildings)
           setMsg("Added " .. tostring(b.name or key) .. " to " .. company.name, colors.lime)
         end
       end
+    else
+      ignored = ignored + 1
     end
   end
 
+  local removed = 0
+  for key, _ in pairs(businesses or {}) do
+    if not active_keys[key] then
+      businesses[key] = nil
+      removed = removed + 1
+    end
+  end
+
+  -- Re-count locations after stale removal.
+  for _, company in pairs(industry_companies or {}) do
+    local n = 0
+    for key, rec in pairs(businesses or {}) do
+      if type(rec) == "table" and rec.company_id == company.company_id then
+        company.locations = company.locations or {}
+        company.locations[key] = {
+          key = key,
+          building_type = rec.building_type,
+          building_name = rec.building_name,
+          location = rec.location,
+          level = rec.level,
+          attached_at = rec.attached_at,
+          updated_at = rec.updated_at,
+        }
+        n = n + 1
+      end
+    end
+    company.location_count = n
+    company.updated_at = now()
+  end
+
+  stats.economic_buildings = economic
+  stats.buildings_seen = economic
+  stats.ignored_buildings = ignored
+  stats.unbuilt_buildings = unbuilt
+  stats.stale_locations_removed = removed
   stats.industry_count = countTable(industry_companies)
   stats.business_locations = countTable(businesses)
   writeFile(FILE_BUSINESSES, businesses)
@@ -1915,7 +1981,12 @@ local function scanOnce()
   requests = asArray(requests, "id")
   local citizens = buildLiveCitizenRoster(rawCitizens, buildings)
 
-  stats.buildings_seen = #buildings
+  stats.raw_buildings = #buildings
+  stats.buildings_seen = 0
+  stats.economic_buildings = 0
+  stats.ignored_buildings = 0
+  stats.unbuilt_buildings = 0
+  stats.stale_locations_removed = 0
   stats.requests_seen = 0
   stats.skipped_unmapped = 0
   stats.skipped_unfunded = 0
