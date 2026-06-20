@@ -55,7 +55,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION       = "1.0.2"
+local VERSION       = "1.0.3"
 local DEAL_PROTOCOL = "quid_deals"
 local BANK_PROTOCOL = "quid_bank"
 local DB_TIMEOUT    = 5
@@ -63,10 +63,12 @@ local DB_TIMEOUT    = 5
 local FILE = {
   deals = "data/shomail_deals.db",
   state = "data/shomail_state.db",
+  notifications = "data/shomail_notifications.db",
   audit = "data/shomail_audit.log",
 }
 
 local deals = {}
+local notifications = {}
 local state = {
   counter = 0,
   bank_id = nil,
@@ -126,6 +128,7 @@ end
 
 local function saveDeals() return writeFile(FILE.deals, deals) end
 local function saveState() return writeFile(FILE.state, state) end
+local function saveNotifications() return writeFile(FILE.notifications, notifications) end
 
 local function trim(s)
   return tostring(s or ""):match("^%s*(.-)%s*$")
@@ -370,11 +373,19 @@ local function executePayment(deal)
     }
     deal.payment_count = (tonumber(deal.payment_count) or 0) + 1
     deal.next_due = advanceDate(deal.next_due or state.world_date, deal.frequency)
+
+    notifyAccount(deal.from_id, "payment_sent", "Payment sent", tostring(deal.title or deal.deal_id) .. " paid " .. tostring(amount) .. " Q", deal.deal_id)
+    notifyAccount(deal.to_id, "payment_received", "Payment received", tostring(deal.title or deal.deal_id) .. " paid " .. tostring(amount) .. " Q", deal.deal_id)
+
     appendAudit("PAID " .. tostring(deal.deal_id) .. " tx=" .. tostring(res.tx_id))
     return true, res
   end
 
   deal.last_error = tostring(res or "Payment failed")
+
+  notifyAccount(deal.from_id, "payment_failed", "Payment failed", tostring(deal.title or deal.deal_id) .. ": " .. tostring(deal.last_error), deal.deal_id)
+  notifyAccount(deal.to_id, "payment_failed", "Payment failed", tostring(deal.title or deal.deal_id) .. ": " .. tostring(deal.last_error), deal.deal_id)
+
   appendAudit("PAYMENT_FAILED " .. tostring(deal.deal_id) .. " " .. tostring(deal.last_error))
   return false, deal.last_error
 end
@@ -407,6 +418,64 @@ local function addSuggestion(out, seen, account_id, label, kind)
     kind = tostring(kind or "account"),
   }
 end
+
+
+local function notifyAccount(account_id, event_type, title, body, deal_id)
+  account_id = tostring(account_id or "")
+  if account_id == "" then return false end
+
+  notifications[account_id] = notifications[account_id] or {
+    unread = 0,
+    items = {},
+  }
+
+  local box = notifications[account_id]
+  box.unread = (tonumber(box.unread) or 0) + 1
+
+  box.items[#box.items + 1] = {
+    id = "NOTIF-" .. tostring(os.epoch("utc")) .. "-" .. tostring(#box.items + 1),
+    event_type = tostring(event_type or "message"),
+    title = tostring(title or "ShoMail"),
+    body = tostring(body or ""),
+    deal_id = deal_id,
+    read = false,
+    created_at = os.epoch("utc"),
+  }
+
+  while #box.items > 50 do table.remove(box.items, 1) end
+
+  saveNotifications()
+  appendAudit("NOTIFY " .. account_id .. " " .. tostring(event_type) .. " " .. tostring(deal_id or ""))
+  return true
+end
+
+local function unreadFor(account_id)
+  local box = notifications[tostring(account_id or "")]
+  if type(box) ~= "table" then return 0 end
+  return tonumber(box.unread) or 0
+end
+
+local function markSeen(account_id)
+  local box = notifications[tostring(account_id or "")]
+  if type(box) ~= "table" then return 0 end
+
+  local previous = tonumber(box.unread) or 0
+  box.unread = 0
+
+  for _, item in ipairs(box.items or {}) do
+    item.read = true
+  end
+
+  saveNotifications()
+  return previous
+end
+
+local function otherParty(deal, user_id)
+  if not deal then return nil end
+  if deal.from_id == user_id then return deal.to_id end
+  return deal.from_id
+end
+
 
 local function handleSuggest(req)
   local ok, user = auth(req.username, req.password)
@@ -617,6 +686,9 @@ local function handlePropose(req)
 
   deals[deal_id] = deal
   saveDeals()
+
+  notifyAccount(deal.to_id, "deal_proposed", "New deal proposed", tostring(deal.title) .. " from " .. tostring(deal.from_id), deal_id)
+
   appendAudit("PROPOSE " .. deal_id .. " " .. deal.from_id .. "->" .. deal.to_id)
 
   return true, { deal = publicDeal(deal) }
@@ -663,6 +735,10 @@ local function handleAccept(req)
   deal.history[#deal.history + 1] = { action = "accepted", actor = user.citizen_id, at = os.epoch("utc") }
 
   saveDeals()
+
+  local other = otherParty(deal, user.citizen_id)
+  notifyAccount(other, "deal_accepted", "Deal accepted", tostring(deal.title or deal.deal_id) .. " was accepted", deal.deal_id)
+
   appendAudit("ACCEPT " .. deal.deal_id .. " by " .. user.citizen_id)
 
   return true, { deal = publicDeal(deal) }
@@ -686,6 +762,10 @@ local function handleDecline(req)
   deal.history[#deal.history + 1] = { action = "declined", actor = user.citizen_id, at = os.epoch("utc") }
 
   saveDeals()
+
+  local other = otherParty(deal, user.citizen_id)
+  notifyAccount(other, "deal_declined", "Deal declined", tostring(deal.title or deal.deal_id) .. " was declined", deal.deal_id)
+
   appendAudit("DECLINE " .. deal.deal_id .. " by " .. user.citizen_id)
 
   return true, { deal = publicDeal(deal) }
@@ -736,6 +816,9 @@ local function handleCounter(req)
   end
 
   saveDeals()
+
+  notifyAccount(deal.to_id, "deal_countered", "Counter offer", tostring(deal.title or deal.deal_id) .. " has new terms", deal.deal_id)
+
   appendAudit("COUNTER " .. deal.deal_id .. " by " .. user.citizen_id)
 
   return true, { deal = publicDeal(deal) }
@@ -759,6 +842,10 @@ local function handleCancel(req)
   deal.history[#deal.history + 1] = { action = "cancelled", actor = user.citizen_id, at = os.epoch("utc") }
 
   saveDeals()
+
+  local other = otherParty(deal, user.citizen_id)
+  notifyAccount(other, "deal_cancelled", "Deal cancelled", tostring(deal.title or deal.deal_id) .. " was cancelled", deal.deal_id)
+
   appendAudit("CANCEL " .. deal.deal_id .. " by " .. user.citizen_id)
 
   return true, { deal = publicDeal(deal) }
@@ -789,6 +876,29 @@ local function handleRunDue()
   }
 end
 
+
+local function handleNotificationCount(req)
+  local ok, user = auth(req.username, req.password)
+  if not ok then return false, user end
+
+  local count = unreadFor(user.citizen_id)
+  return true, {
+    unread = count,
+    count = count,
+  }
+end
+
+local function handleMarkNotificationsSeen(req)
+  local ok, user = auth(req.username, req.password)
+  if not ok then return false, user end
+
+  local cleared = markSeen(user.citizen_id)
+  return true, {
+    cleared = cleared,
+    unread = 0,
+  }
+end
+
 local function handleRequest(req, sender)
   if type(req) ~= "table" then return false, "Bad request" end
 
@@ -798,6 +908,10 @@ local function handleRequest(req, sender)
       version = VERSION,
       world_date = copyTable(state.world_date),
     }
+  elseif req.type == "notification_count" then
+    return handleNotificationCount(req)
+  elseif req.type == "mark_notifications_seen" then
+    return handleMarkNotificationsSeen(req)
   elseif req.type == "get_world_date" then
     return true, { world_date = copyTable(state.world_date), label = dateLabel(state.world_date) }
   elseif req.type == "suggest_recipients" then
@@ -828,6 +942,7 @@ end
 -- =============================================================================
 local function load()
   deals = readFile(FILE.deals, {})
+  notifications = readFile(FILE.notifications, {})
   state = readFile(FILE.state, state) or state
   if type(state.world_date) ~= "table" then
     state.world_date = { year = 1, month = 1, day = 1 }
