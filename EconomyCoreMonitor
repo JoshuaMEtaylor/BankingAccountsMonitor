@@ -15,7 +15,7 @@
 -- Read-only. No banking controls. No trade panel. Contract GDP plus bank-side service GDP over 365 Minecraft days + in-view MCT clock + tapered money-supply inflation.
 -- =============================================================================
 
-local VERSION         = "0.5.19-SERVICE-GDP"
+local VERSION         = "0.5.20-WAGE-PRICE-PRESSURE"
 local PROTOCOL        = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT      = 5
@@ -755,8 +755,8 @@ local function fetchPriceOracle()
 
   local out = {
     connected = true,
-    model = tostring(res.model or "sector_price_oracle"),
-    status = stale and "Live sector CPI from cached bank price oracle" or "Live sector CPI from bank price oracle",
+    model = tostring(res.model or "national_wage_price_pressure"),
+    status = stale and "Cached national wage/price pressure" or "Live national wage/price pressure",
     note = res.note,
     time = tonumber(res.time),
     stale = stale == true,
@@ -765,6 +765,9 @@ local function fetchPriceOracle()
     inflation_percent = percent,
     old_price_index = tonumber(inflation.price_index),
     price_index_percent = tonumber(inflation.price_index_percent),
+    wage_price = type(res.wage_price) == "table" and res.wage_price or {},
+    national_price_index = tonumber(res.national_price_index),
+    wage_index = tonumber(res.wage_index),
     sectors = sectors,
     quotes = {},
   }
@@ -1247,10 +1250,9 @@ local function refreshSnapshot()
   local snap, err = fallbackSnapshot()
   if not snap then return false, err or "Could not build snapshot" end
 
-  -- Keep this monitor public-facing and read-only.
-  -- Do not poll the price oracle or quote endpoints from the display board.
-  -- Inflation is shown as a bank/economic metric only; sector CPI internals are hidden.
-  snap.price_oracle = nil
+  -- Read the national wage/price pressure oracle for display. This is one
+  -- honest national CPI/wage-index model, not fake separate sector CPIs.
+  snap.price_oracle = fetchPriceOracle()
 
   snap.mc_clock = minecraftClock()
   snap.gdp_period_mc_days = GDP_PERIOD_MC_DAYS
@@ -1441,15 +1443,52 @@ local function drawInequalityCard(x, y, w, h, snap)
 end
 
 local function drawMonetaryCard(x, y, w, h, snap)
+  local po = snap and snap.price_oracle or {}
+  local wp = type(po.wage_price) == "table" and po.wage_price or {}
   local m = snap and snap.monetary or {}
-  card(x, y, w, h, "MONETARY CONDITIONS", C.money)
-  metric(x + 2, y + 2, "Issued supply", fmtMoney(m.issued_supply), m.issued_supply and C.good or C.warn)
-  metric(x + 2, y + 3, "Private supply", fmtMoney(m.private_supply), m.private_supply and colors.white or C.warn)
-  metric(x + 2, y + 4, "Treasury reserve", fmtMoney(m.treasury_reserve), m.treasury_reserve and colors.white or C.warn)
-  metric(x + 2, y + 5, "Treasury Control", fmtPct(m.reserve_share, 2), m.reserve_share and colors.white or C.warn)
-  writeAt(x + 2, y + h - 1, shortText(m.status or "Awaiting supply data", w - 4), m.status and C.good or C.warn, C.bg)
-end
+  card(x, y, w, h, "PRICE / WAGE PRESSURE", C.money)
 
+  if not po.connected then
+    metric(x + 2, y + 2, "Issued supply", fmtMoney(m.issued_supply), m.issued_supply and C.good or C.warn)
+    metric(x + 2, y + 3, "Fallback inflation", fmtPct(snap and snap.inflation, 2), snap and snap.inflation and colors.white or C.warn)
+    writeAt(x + 2, y + h - 1, shortText(po.status or "Awaiting wage/price oracle", w - 4), C.warn, C.bg)
+    return
+  end
+
+  local priceIdx = tonumber(wp.national_price_index or po.national_price_index)
+  local wageIdx = tonumber(wp.wage_index or po.wage_index)
+  local priceAth = tonumber(wp.price_ath_index)
+  local stickyFloor = tonumber(wp.sticky_price_floor)
+  local moneyPressure = tonumber(wp.money_pressure)
+  local wagePressure = tonumber(wp.wage_cost_pressure)
+  local totalPressure = tonumber(wp.total_inflation_pressure)
+  local realWage = tonumber(wp.real_wage_ratio)
+  local wageTarget = tonumber(wp.wage_target_index)
+
+  metric(x + 2, y + 2, "Price index", fmtIndex(priceIdx, 3), priceIdx and colors.white or C.warn, 18)
+  metric(x + 2, y + 3, "Wage index", fmtIndex(wageIdx, 3), wageIdx and colors.white or C.warn, 18)
+  metric(x + 2, y + 4, "Real wage", realWage and fmtPct(realWage * 100, 1) or "Awaiting data", realWage and (realWage < 1 and C.warn or C.good) or C.warn, 18)
+  metric(x + 2, y + 5, "Wage target", fmtIndex(wageTarget, 3), wageTarget and colors.white or C.warn, 18)
+  metric(x + 2, y + 6, "Money pressure", moneyPressure and fmtPct(moneyPressure * 100, 2) or "Awaiting data", moneyPressure and colors.white or C.warn, 18)
+  metric(x + 2, y + 7, "Wage pressure", wagePressure and fmtPct(wagePressure * 100, 2) or "Awaiting data", wagePressure and wagePressure > 0 and C.warn or C.dim, 18)
+  metric(x + 2, y + 8, "Total pressure", totalPressure and fmtPct(totalPressure * 100, 2) or "Awaiting data", totalPressure and colors.white or C.warn, 18)
+  metric(x + 2, y + 9, "Sticky floor", fmtIndex(stickyFloor, 3), stickyFloor and colors.white or C.warn, 18)
+
+  local q = po.quotes or {}
+  local lineY = y + 11
+  if lineY <= y + h - 2 then
+    local meal = quoteLabel(q.dining_meal) or "n/a"
+    local large = quoteLabel(q.large_meal) or "n/a"
+    writeAt(x + 2, lineY, shortText("Meal normal/large: " .. meal .. " / " .. large, w - 4), C.text, C.bg)
+  end
+  if lineY + 1 <= y + h - 2 then
+    local build = quoteLabel(q.oak_planks_64) or "n/a"
+    local coal = quoteLabel(q.coal_16) or "n/a"
+    writeAt(x + 2, lineY + 1, shortText("64 planks: " .. build .. "   16 coal: " .. coal, w - 4), C.text, C.bg)
+  end
+
+  writeAt(x + 2, y + h - 1, shortText(po.status or "Live national wage/price pressure", w - 4), C.good, C.bg)
+end
 
 local function drawPriceOracleCard(x, y, w, h, snap)
   local po = snap and snap.price_oracle or {}
