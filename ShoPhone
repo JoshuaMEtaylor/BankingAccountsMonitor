@@ -49,7 +49,7 @@ end
 -- =============================================================================
 -- CONFIG / STATE
 -- =============================================================================
-local VERSION = "0.3.0"
+local VERSION = "0.3.1"
 
 local BANK_PROTOCOL = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
@@ -340,11 +340,125 @@ end
 
 -- =============================================================================
 -- BANK APP
+-- Visual style intentionally matches ClientTerminal / Quid Bank of Plenty.
 -- =============================================================================
+local QB = {
+  bg       = colors.lightGray,
+  card     = colors.white,
+  card_fg  = colors.black,
+  accent   = colors.purple,
+  accent_fg= colors.white,
+  header   = colors.purple,
+  hdr_fg   = colors.white,
+  label    = colors.gray,
+  body     = colors.black,
+  dim      = colors.gray,
+  in_bg    = colors.lightGray,
+  in_fg    = colors.black,
+  btn_pri  = colors.purple,
+  btn_sec  = colors.lightGray,
+  btn_dan  = colors.red,
+  btn_fg   = colors.white,
+  err      = colors.red,
+  ok       = colors.green,
+  money    = colors.black,
+  sep      = colors.lightGray,
+  tab_act  = colors.white,
+  tab_bg   = colors.gray,
+  tab_fg_a = colors.purple,
+  tab_fg_i = colors.white,
+}
+
+local function qCls()
+  size()
+  term.setCursorBlink(false)
+  term.setBackgroundColor(QB.bg)
+  term.setTextColor(QB.body)
+  term.clear()
+  term.setCursorPos(1, 1)
+end
+
+local function qAt(x, y, text, fg, bg)
+  size()
+  if x < 1 or y < 1 or x > W or y > H then return end
+  term.setCursorPos(x, y)
+  if bg then term.setBackgroundColor(bg) end
+  if fg then term.setTextColor(fg) end
+  term.write(tostring(text or ""):sub(1, W - x + 1))
+end
+
+local function qFill(x, y, w, h, bg)
+  size()
+  if w <= 0 or h <= 0 then return end
+  term.setBackgroundColor(bg or QB.card)
+  local row = string.rep(" ", math.max(0, w))
+  for yy = y, y + h - 1 do
+    if yy >= 1 and yy <= H then
+      term.setCursorPos(x, yy)
+      term.write(row:sub(1, math.max(0, W - x + 1)))
+    end
+  end
+end
+
+local function qCentre(y, text, fg, bg)
+  text = tostring(text or "")
+  qAt(math.max(1, math.floor((W - #text) / 2) + 1), y, text, fg, bg)
+end
+
+local function qTopBar()
+  qFill(1, 1, W, 1, QB.header)
+  qAt(2, 1, "QUID BANK OF PLENTY", QB.hdr_fg, QB.header)
+  qAt(W - #VERSION, 1, VERSION, QB.dim, QB.header)
+end
+
+local function qSep(y)
+  qFill(1, y, W, 1, QB.bg)
+  qAt(1, y, string.rep("\140", W), QB.sep, QB.bg)
+end
+
+local function qCard(x, y, w, h)
+  qFill(x, y, w, h, QB.card)
+end
+
+local function qBtn(x, y, w, label, col, fg)
+  col = col or QB.btn_pri
+  fg = fg or QB.btn_fg
+  if col == QB.card or col == QB.btn_sec then fg = QB.card_fg end
+  qFill(x, y, w, 1, col)
+  qAt(x + math.max(0, math.floor((w - #label) / 2)), y, label, fg, col)
+  return { x1 = x, x2 = x + w - 1, y1 = y, y2 = y }
+end
+
+local function qStatus(msg, col)
+  qFill(1, H, W, 1, QB.bg)
+  if msg and msg ~= "" then
+    qAt(2, H, tostring(msg):sub(1, W - 2), col or QB.dim, QB.bg)
+  end
+end
+
+local function qInput(x, y, w, value, masked, focused)
+  value = tostring(value or "")
+  local shown = masked and string.rep("*", #value) or value
+  qFill(x, y, w, 1, QB.in_bg)
+  qAt(x, y, (shown .. string.rep(" ", w)):sub(1, w), QB.in_fg, QB.in_bg)
+  if focused then
+    term.setCursorPos(x + math.min(#value, w - 1), y)
+    term.setCursorBlink(true)
+  end
+end
+
+local function qTabs(y, mode)
+  qFill(1, y, W, 1, QB.bg)
+  local tw = math.floor(W / 2)
+  local b1 = qBtn(1, y, tw, "  Log In  ", mode == "login" and QB.tab_act or QB.tab_bg, mode == "login" and QB.tab_fg_a or QB.tab_fg_i)
+  local b2 = qBtn(tw + 1, y, W - tw, "  Register  ", mode == "register" and QB.tab_act or QB.tab_bg, mode == "register" and QB.tab_fg_a or QB.tab_fg_i)
+  return b1, b2
+end
+
 local function bankConnect()
   if bank.server then return true end
 
-  local id, err = findServer(BANK_PROTOCOL, "Bank", function(msg)
+  local id, err = findServer(BANK_PROTOCOL, "QUID BANK OF PLENTY", function(msg)
     return (msg.success and type(msg.response) == "table") or msg.type == "treasury_online"
   end)
 
@@ -357,46 +471,95 @@ local function bankReq(payload)
   return request(bank.server, BANK_PROTOCOL, payload, TIMEOUT)
 end
 
+local function bankConnecting()
+  if bank.server then return true end
+  if not openModem() then
+    qCls()
+    qTopBar()
+    qCentre(math.floor(H / 2), "No modem found.", QB.err, QB.bg)
+    sleep(1.5)
+    return false
+  end
+
+  qCls()
+  qTopBar()
+  qCentre(math.floor(H / 2) - 1, "Connecting to Quid Bank...", QB.dim, QB.bg)
+
+  for attempt = 1, 8 do
+    qFill(1, math.floor(H / 2) + 1, W, 1, QB.bg)
+    qCentre(math.floor(H / 2) + 1, "Attempt " .. attempt .. " of 8", QB.dim, QB.bg)
+
+    rednet.broadcast({ type = "ping" }, BANK_PROTOCOL)
+    local sender, msg = rednet.receive(BANK_PROTOCOL, 4)
+
+    if sender and type(msg) == "table" then
+      if (msg.success and type(msg.response) == "table") or msg.type == "treasury_online" then
+        bank.server = sender
+        qCentre(math.floor(H / 2) + 1, "Connected.", QB.ok, QB.bg)
+        sleep(0.4)
+        return true
+      end
+    end
+  end
+
+  qCentre(math.floor(H / 2) + 1, "Connection failed.", QB.err, QB.bg)
+  sleep(1.5)
+  return false
+end
+
 local function bankLogin()
-  if not bankConnect() then return false end
+  if not bankConnecting() then return false end
 
   local mode = "login"
   local fields = { "", "" }
   local focus = 1
-  local msg, msgCol = "", C.err
+  local msg = ""
+  local msgCol = QB.err
 
   local function draw()
-    appFrame("Bank")
-    fill(2, 3, W - 2, H - 5, C.card)
+    qCls()
+    qTopBar()
+    term.setCursorBlink(false)
 
-    local bLogin = button(4, 4, math.floor((W - 8) / 2), "Login", mode == "login" and C.bank or C.btn)
-    local bReg = button(5 + math.floor((W - 8) / 2), 4, math.floor((W - 8) / 2), "Register", mode == "register" and C.bank or C.btn)
+    local tabLogin, tabReg = qTabs(3, mode)
 
-    at(4, 7, "Username", colors.gray, C.card)
-    inputLine(4, 8, W - 6, fields[1], false, focus == 1)
+    local cardY = 5
+    local cardH = H - cardY - 1
+    qCard(2, cardY, W - 2, cardH)
 
-    at(4, 10, "Password", colors.gray, C.card)
-    inputLine(4, 11, W - 6, fields[2], true, focus == 2)
+    qAt(4, cardY + 1, "Username", QB.label, QB.card)
+    qInput(4, cardY + 2, W - 6, fields[1], false, focus == 1)
 
-    local label = mode == "login" and "Log In" or "Create"
-    local bSubmit = button(4, 14, W - 6, label, C.bank)
-    local bBack = button(4, H - 2, W - 6, "Back", C.btn)
+    qAt(4, cardY + 4, "Password", QB.label, QB.card)
+    qInput(4, cardY + 5, W - 6, fields[2], true, focus == 2)
 
-    if msg ~= "" then at(4, 16, msg:sub(1, W - 6), msgCol, C.card) end
+    local submitLabel = mode == "login" and "Log In" or "Create Account"
+    local bSubmit = qBtn(4, cardY + 7, W - 6, submitLabel, QB.btn_pri)
+    local bBack = qBtn(4, H - 1, W - 6, "Back to ShoPhone", QB.btn_sec, QB.card_fg)
 
-    bottomBar()
-    return bLogin, bReg, bSubmit, bBack
+    if msg ~= "" then
+      qAt(4, cardY + 9, msg:sub(1, W - 6), msgCol, QB.card)
+    end
+
+    qStatus()
+
+    local cy = focus == 1 and (cardY + 2) or (cardY + 5)
+    local v = fields[focus] or ""
+    term.setCursorPos(4 + math.min(#v, W - 7), cy)
+    term.setCursorBlink(true)
+
+    return tabLogin, tabReg, bSubmit, bBack, cardY
   end
 
-  local bLogin, bReg, bSubmit, bBack = draw()
+  local tabLogin, tabReg, bSubmit, bBack, cardY = draw()
 
   local function submit()
     if fields[1] == "" or fields[2] == "" then
-      msg, msgCol = "Fill both fields", C.err
+      msg, msgCol = "Please fill in all fields", QB.err
       return false
     end
 
-    msg, msgCol = "Contacting bank...", C.dim
+    msg, msgCol = mode == "login" and "Authenticating..." or "Creating account...", QB.dim
     draw()
 
     local reqType = mode == "login" and "login" or "create_account"
@@ -418,7 +581,7 @@ local function bankLogin()
       return true
     end
 
-    msg, msgCol = tostring(res or "Login failed"), C.err
+    msg, msgCol = tostring(res or "Login failed"), QB.err
     return false
   end
 
@@ -427,30 +590,28 @@ local function bankLogin()
 
     if ev == "char" then
       if #fields[focus] < W - 7 then fields[focus] = fields[focus] .. a end
-      bLogin, bReg, bSubmit, bBack = draw()
+      tabLogin, tabReg, bSubmit, bBack, cardY = draw()
 
     elseif ev == "key" then
       if a == keys.backspace then
         fields[focus] = fields[focus]:sub(1, -2)
-      elseif a == keys.tab or a == keys.enter then
-        if a == keys.enter and focus == 2 then
-          if submit() then return true end
-        else
-          focus = focus == 1 and 2 or 1
-        end
+      elseif a == keys.tab then
+        focus = focus == 1 and 2 or 1
+      elseif a == keys.enter then
+        if focus == 1 then focus = 2 else if submit() then return true end end
       elseif a == keys.escape then
         return false
       end
-      bLogin, bReg, bSubmit, bBack = draw()
+      tabLogin, tabReg, bSubmit, bBack, cardY = draw()
 
     elseif ev == "mouse_click" then
       if hit(bBack, b, c) then return false end
-      if hit(bLogin, b, c) then mode = "login"; msg = "" end
-      if hit(bReg, b, c) then mode = "register"; msg = "" end
-      if c == 8 then focus = 1 end
-      if c == 11 then focus = 2 end
+      if hit(tabLogin, b, c) then mode = "login"; msg = "" end
+      if hit(tabReg, b, c) then mode = "register"; msg = "" end
+      if c == cardY + 2 then focus = 1 end
+      if c == cardY + 5 then focus = 2 end
       if hit(bSubmit, b, c) then if submit() then return true end end
-      bLogin, bReg, bSubmit, bBack = draw()
+      tabLogin, tabReg, bSubmit, bBack, cardY = draw()
     end
   end
 end
@@ -464,75 +625,49 @@ local function bankRefresh()
   return false, res
 end
 
-local function bankHistory()
-  appFrame("Bank")
-  center(math.floor(H / 2), "Loading history...", C.dim, C.wall)
-
-  local ok, res = bankReq({ type = "ledger_history", username = bank.username, password = bank.password, limit = 10 })
-
-  while true do
-    appFrame("History")
-    fill(2, 3, W - 2, H - 5, C.card)
-
-    if not ok or type(res) ~= "table" then
-      center(8, "Could not load history", C.err, C.card)
-    else
-      local hist = res.history or {}
-      bank.balance = res.balance or bank.balance
-      at(4, 4, "Balance: " .. money(bank.balance), C.card_fg, C.card)
-
-      if #hist == 0 then
-        at(4, 7, "No transactions yet.", colors.gray, C.card)
-      else
-        local y = 6
-        for i, tx in ipairs(hist) do
-          if y >= H - 3 then break end
-          local dir = tx.direction == "IN" and "+" or "-"
-          local col = tx.direction == "IN" and C.ok or C.err
-          at(4, y, tostring(tx.tx_id or ""):sub(1, 7), colors.gray, C.card)
-          at(12, y, dir .. tostring(tx.amount or 0) .. "q", col, C.card)
-          at(22, y, tostring(tx.memo or ""):sub(1, W - 23), colors.gray, C.card)
-          y = y + 1
-        end
-      end
-    end
-
-    local bBack = button(4, H - 2, W - 6, "Back", C.btn)
-    bottomBar()
-
-    local ev, a, b, c = os.pullEvent()
-    if ev == "mouse_click" and hit(bBack, b, c) then return end
-    if ev == "key" and (a == keys.backspace or a == keys.escape) then return end
-  end
-end
-
 local function bankTransfer()
   local fields = { "", "", "" }
   local focus = 1
-  local msg, msgCol = "", C.err
+  local msg = ""
+  local msgCol = QB.err
 
   local function draw()
-    appFrame("Transfer")
-    fill(2, 3, W - 2, H - 5, C.card)
+    qCls()
+    qTopBar()
+    term.setCursorBlink(false)
 
-    at(4, 4, "From: " .. bank.citizen_id, colors.gray, C.card)
-    at(4, 5, "Bal:  " .. money(bank.balance), C.card_fg, C.card)
+    qFill(1, 2, W, 2, QB.card)
+    qAt(3, 2, "From", QB.label, QB.card)
+    qAt(3, 3, bank.citizen_id or "", QB.card_fg, QB.card)
+    local bal = money(bank.balance)
+    qAt(W - #bal - 1, 2, "Balance", QB.label, QB.card)
+    qAt(W - #bal - 1, 3, bal, QB.money, QB.card)
 
-    at(4, 7, "Recipient", colors.gray, C.card)
-    inputLine(4, 8, W - 6, fields[1], false, focus == 1)
+    qSep(4)
+    qCard(2, 5, W - 2, H - 6)
 
-    at(4, 10, "Amount", colors.gray, C.card)
-    inputLine(4, 11, W - 6, fields[2], false, focus == 2)
+    qAt(4, 6, "Recipient", QB.label, QB.card)
+    qInput(4, 7, W - 6, fields[1], false, focus == 1)
 
-    at(4, 13, "Memo", colors.gray, C.card)
-    inputLine(4, 14, W - 6, fields[3], false, focus == 3)
+    qAt(4, 9, "Amount (Quid)", QB.label, QB.card)
+    qInput(4, 10, W - 6, fields[2], false, focus == 2)
 
-    local half = math.floor((W - 8) / 2)
-    local bSend = button(4, H - 2, half, "Send", C.bank)
-    local bBack = button(5 + half, H - 2, half, "Cancel", C.btn)
+    qAt(4, 12, "Memo (optional)", QB.label, QB.card)
+    qInput(4, 13, W - 6, fields[3], false, focus == 3)
 
-    if msg ~= "" then at(4, 16, msg:sub(1, W - 6), msgCol, C.card) end
-    bottomBar()
+    local bw = math.floor((W - 6) / 2)
+    local bSend = qBtn(4, 15, bw, "Send Transfer", QB.btn_pri)
+    local bBack = qBtn(bw + 5, 15, bw, "Cancel", QB.btn_sec, QB.card_fg)
+
+    if msg ~= "" then qAt(4, 17, msg:sub(1, W - 6), msgCol, QB.card) end
+
+    qStatus()
+
+    local cy = focus == 1 and 7 or (focus == 2 and 10 or 13)
+    local v = fields[focus] or ""
+    term.setCursorPos(4 + math.min(#v, W - 7), cy)
+    term.setCursorBlink(true)
+
     return bSend, bBack
   end
 
@@ -540,10 +675,10 @@ local function bankTransfer()
 
   local function submit()
     local amount = tonumber(fields[2])
-    if fields[1] == "" then msg, msgCol = "Enter recipient", C.err; return false end
-    if not amount or amount <= 0 then msg, msgCol = "Enter valid amount", C.err; return false end
+    if fields[1] == "" then msg, msgCol = "Enter a recipient", QB.err; return false end
+    if not amount or amount <= 0 then msg, msgCol = "Enter a valid amount", QB.err; return false end
 
-    msg, msgCol = "Sending...", C.dim
+    msg, msgCol = "Processing...", QB.dim
     draw()
 
     local ok, res = bankReq({
@@ -557,13 +692,25 @@ local function bankTransfer()
 
     if ok and type(res) == "table" then
       bankRefresh()
-      msg, msgCol = "Sent. Ref " .. tostring(res.tx_id or ""), C.ok
-      fields = { "", "", "" }
-      focus = 1
+      qCls()
+      qTopBar()
+      qCard(3, 4, W - 4, 9)
+      qCentre(5, "Transfer Complete", QB.ok, QB.card)
+      qAt(5, 7, "To:     ", QB.label, QB.card)
+      qAt(14, 7, fields[1], QB.card_fg, QB.card)
+      qAt(5, 8, "Amount: ", QB.label, QB.card)
+      qAt(14, 8, money(amount), QB.money, QB.card)
+      qAt(5, 9, "Ref:    ", QB.label, QB.card)
+      qAt(14, 9, tostring(res.tx_id or ""), QB.label, QB.card)
+      qAt(5, 11, "Balance:", QB.label, QB.card)
+      qAt(14, 11, money(bank.balance), QB.money, QB.card)
+      qBtn(math.floor(W / 2) - 5, 14, 12, "Back to Home", QB.btn_pri)
+      qStatus()
+      os.pullEvent("mouse_click")
       return true
     end
 
-    msg, msgCol = tostring(res or "Transfer failed"), C.err
+    msg, msgCol = tostring(res or "Transfer failed"), QB.err
     return false
   end
 
@@ -572,21 +719,81 @@ local function bankTransfer()
 
     if ev == "char" then
       if #fields[focus] < W - 7 then fields[focus] = fields[focus] .. a end
-
     elseif ev == "key" then
-      if a == keys.backspace then fields[focus] = fields[focus]:sub(1, -2)
-      elseif a == keys.tab then focus = focus % 3 + 1
+      if a == keys.backspace then
+        fields[focus] = fields[focus]:sub(1, -2)
+      elseif a == keys.tab then
+        focus = focus % 3 + 1
       elseif a == keys.enter then
         if focus < 3 then focus = focus + 1 else submit() end
-      elseif a == keys.escape then return end
-
+      elseif a == keys.escape then
+        return
+      end
     elseif ev == "mouse_click" then
       if hit(bBack, b, c) then return end
       if hit(bSend, b, c) then submit() end
-      if c == 8 then focus = 1 elseif c == 11 then focus = 2 elseif c == 14 then focus = 3 end
+      if c == 7 then focus = 1 elseif c == 10 then focus = 2 elseif c == 13 then focus = 3 end
     end
 
     bSend, bBack = draw()
+  end
+end
+
+local function bankHistory()
+  qCls()
+  qTopBar()
+  qCentre(math.floor(H / 2), "Loading transactions...", QB.dim, QB.bg)
+
+  local ok, res = bankReq({ type = "ledger_history", username = bank.username, password = bank.password, limit = 10 })
+
+  while true do
+    qCls()
+    qTopBar()
+
+    qFill(1, 2, W, 2, QB.card)
+    qAt(3, 2, "Transaction History", QB.card_fg, QB.card)
+    local bal = money((res and res.balance) or bank.balance)
+    qAt(W - #bal - 1, 2, bal, QB.money, QB.card)
+    qAt(3, 3, bank.citizen_id or "", QB.label, QB.card)
+
+    qSep(4)
+
+    if not ok or type(res) ~= "table" then
+      qCentre(8, "Could not load transactions.", QB.err, QB.bg)
+    else
+      local hist = res.history or {}
+      bank.balance = res.balance or bank.balance
+
+      qAt(2, 5, "Reference", QB.dim, QB.bg)
+      qAt(13, 5, "Type", QB.dim, QB.bg)
+      qAt(22, 5, "Amount", QB.dim, QB.bg)
+      qAt(33, 5, "Note", QB.dim, QB.bg)
+      qAt(1, 6, string.rep("-", W), QB.sep, QB.bg)
+
+      if #hist == 0 then
+        qCentre(9, "No transactions yet.", QB.dim, QB.bg)
+      else
+        for i, tx in ipairs(hist) do
+          local row = 6 + i
+          if row >= H - 1 then break end
+          local bg = i % 2 == 0 and QB.card or QB.bg
+          local col = tx.direction == "IN" and QB.ok or QB.err
+          local dir = tx.direction == "IN" and "+" or "-"
+          qFill(1, row, W, 1, bg)
+          qAt(2, row, tostring(tx.tx_id or ""):sub(1, 10), QB.dim, bg)
+          qAt(13, row, tostring(tx.type or ""):sub(1, 8), QB.dim, bg)
+          qAt(22, row, dir .. tostring(tx.amount or 0) .. "q", col, bg)
+          qAt(33, row, tostring(tx.memo or ""):sub(1, W - 33), QB.dim, bg)
+        end
+      end
+    end
+
+    local bBack = qBtn(2, H - 1, math.floor(W / 2) - 1, "< Back to Dashboard", QB.btn_sec, QB.card_fg)
+    qStatus()
+
+    local ev, a, b, c = os.pullEvent()
+    if ev == "mouse_click" and hit(bBack, b, c) then return end
+    if ev == "key" and (a == keys.backspace or a == keys.escape) then return end
   end
 end
 
@@ -594,25 +801,41 @@ local function bankDashboard()
   bankRefresh()
 
   while true do
-    appFrame("Bank")
-    fill(2, 3, W - 2, H - 5, C.card)
+    qCls()
+    qTopBar()
+    term.setCursorBlink(false)
 
-    at(4, 4, bank.display, C.card_fg, C.card)
-    at(4, 5, bank.title, colors.gray, C.card)
-    at(4, 7, "Balance", colors.gray, C.card)
-    at(4, 8, money(bank.balance), C.card_fg, C.card)
-    at(4, 10, "ID: " .. bank.citizen_id, colors.gray, C.card)
+    qFill(1, 2, W, 2, QB.card)
+    qAt(3, 2, bank.username or "", QB.card_fg, QB.card)
+    qAt(3, 3, bank.title or "Account Holder", QB.label, QB.card)
+    qAt(W - #(bank.citizen_id or "") - 1, 2, bank.citizen_id or "", QB.label, QB.card)
 
-    local half = math.floor((W - 8) / 2)
-    local bTransfer = button(4, 12, half, "Transfer", C.bank)
-    local bHistory = button(5 + half, 12, half, "History", C.bank)
-    local bRefresh = button(4, 14, half, "Refresh", C.btn)
-    local bLogout = button(5 + half, 14, half, "Logout", C.err)
-    local bBack = button(4, H - 2, W - 6, "Home", C.btn)
+    qSep(4)
 
-    bottomBar()
+    qCard(2, 5, W - 2, 4)
+    qAt(4, 5, "CURRENT BALANCE", QB.label, QB.card)
+    qAt(4, 6, money(bank.balance), QB.money, QB.card)
+    qAt(4, 7, "Available to spend", QB.label, QB.card)
+
+    qSep(9)
+
+    local bw = math.floor((W - 3) / 2)
+    local bTransfer = qBtn(2, 10, bw, "New Transfer", QB.btn_pri)
+    local bHistory = qBtn(bw + 3, 10, bw, "View History", QB.btn_pri)
+    local bRefresh = qBtn(2, 12, bw, "Refresh", QB.btn_sec, QB.card_fg)
+    local bLogout = qBtn(bw + 3, 12, bw, "Sign Out", QB.btn_dan)
+
+    qSep(14)
+
+    qFill(1, 15, W, H - 15, QB.bg)
+    qAt(3, 15, "Bank:   Quid Bank of Plenty", QB.dim, QB.bg)
+    qAt(3, 16, "Server: " .. tostring(bank.server), QB.dim, QB.bg)
+
+    local bBack = qBtn(2, H - 1, W - 2, "Back to ShoPhone", QB.btn_sec, QB.card_fg)
+    qStatus()
 
     local ev, a, b, c = os.pullEvent()
+
     if ev == "mouse_click" then
       if hit(bTransfer, b, c) then bankTransfer(); bankRefresh()
       elseif hit(bHistory, b, c) then bankHistory()
