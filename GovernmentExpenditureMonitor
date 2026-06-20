@@ -43,7 +43,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION          = "1.2.7-PIE-GUTTER-FIX"
+local VERSION          = "1.2.8-PRIVATE-LOGISTICS"
 local BANK_PROTOCOL    = "quid_bank"
 local TREASURY_ACCOUNT = "treasury:quid_bank"
 local DB_TIMEOUT       = 4
@@ -457,12 +457,16 @@ end
 local function classifyEmployeeSector(e)
   local ind = lower(e and e.industry or "")
   if ind == "defense" then return "defence" end
-  if ind == "defence" or ind == "research" or ind == "logistics" then return ind end
+  -- Only true government departments get public payroll forecasting here.
+  -- Logistics/courier is now private-sector, so it must not appear as state payroll.
+  if ind == "defence" or ind == "research" then return ind end
 
   local text = employeeText(e)
   if containsAny(text, { "soldier", "guard", "archer", "knight", "barracks", "tower", "combat", "defence", "defense" }) then return "defence" end
   if containsAny(text, { "research", "university", "library", "teacher", "student", "pupil", "school" }) then return "research" end
-  if containsAny(text, { "courier", "delivery", "warehouse", "logistics", "transport" }) then return "logistics" end
+
+  -- Courier/logistics employees are private now. They may still exist in employee
+  -- mappings, but they are not government payroll forecast.
   return nil
 end
 
@@ -475,9 +479,6 @@ local function wageTierForEmployee(e, sector)
   elseif sector == "research" then
     if containsAny(text, { "university", "professor", "alchemist", "enchant", "doctor", "scientist" }) then return "elite" end
     return "skilled"
-  elseif sector == "logistics" then
-    if containsAny(text, { "courier", "warehouse", "manager", "delivery" }) then return "skilled" end
-    return "unskilled"
   end
   return "skilled"
 end
@@ -661,9 +662,11 @@ local function finaliseData(data)
   for _, s in ipairs(data.order) do
     -- Public payroll forecast fills gaps between real payroll transactions.
     -- Non-payroll categories only use real treasury outflows.
-    if s.key == "defence" or s.key == "research" or s.key == "logistics" then
+    if s.key == "defence" or s.key == "research" then
       s.chart_value = math.max(s.actual_annual, s.forecast_annual)
     else
+      -- Logistics is now private. Only real treasury outflows count here,
+      -- never employee/payroll forecast.
       s.chart_value = s.actual_annual
     end
     data.chart_total = data.chart_total + s.chart_value
