@@ -408,7 +408,7 @@ end
 
 local function qTopBar()
   qFill(1, 1, W, 1, QB.header)
-  qAt(2, 1, "QUID BANK OF PLENTY", QB.hdr_fg, QB.header)
+  qAt(2, 1, "ShoMail", QB.hdr_fg, QB.header)
   qAt(W - #VERSION, 1, VERSION, QB.dim, QB.header)
 end
 
