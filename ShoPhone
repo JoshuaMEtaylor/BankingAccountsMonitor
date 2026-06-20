@@ -49,7 +49,7 @@ end
 -- =============================================================================
 -- CONFIG / STATE
 -- =============================================================================
-local VERSION = "0.5.5"
+local VERSION = "0.6.0"
 
 local BANK_PROTOCOL = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
@@ -99,6 +99,7 @@ local apps = {
 
 local selected = nil
 local message = "Ready"
+local phone_unlocked = false
 local shomail_unread = 0
 local shomail_last_poll = 0
 
@@ -671,6 +672,113 @@ local function bankLogin()
       if hit(bSubmit, b, c) then if submit() then return true end end
       tabLogin, tabReg, bSubmit, bBack, cardY = draw()
     end
+  end
+end
+
+
+local function shophoneLogin()
+  if bank.logged then
+    phone_unlocked = true
+    return true
+  end
+
+  if not bankConnecting() then return false end
+
+  local fields = { "", "" }
+  local focus = 1
+  local msg = ""
+  local msgCol = QB.err
+
+  local function draw()
+    qCls()
+
+    qFill(1, 1, W, 1, QB.header)
+    qAt(2, 1, "SHOPHONE LOGIN", QB.hdr_fg, QB.header)
+    qAt(W - #VERSION, 1, VERSION, QB.dim, QB.header)
+
+    qCard(2, 4, W - 2, H - 5)
+
+    qAt(4, 5, "Log in to unlock ShoPhone.", QB.label, QB.card)
+    qAt(4, 6, "Apps will use this account.", QB.label, QB.card)
+
+    qAt(4, 8, "Username", QB.label, QB.card)
+    qInput(4, 9, W - 6, fields[1], false, focus == 1)
+
+    qAt(4, 11, "Password", QB.label, QB.card)
+    qInput(4, 12, W - 6, fields[2], true, focus == 2)
+
+    local bLogin = qBtn(4, 15, W - 6, "Unlock", QB.btn_pri, QB.btn_fg)
+
+    if msg ~= "" then
+      qAt(4, 17, msg:sub(1, W - 6), msgCol, QB.card)
+    end
+
+    qStatus()
+
+    local cy = focus == 1 and 9 or 12
+    local v = fields[focus] or ""
+    term.setCursorPos(4 + math.min(#v, W - 7), cy)
+    term.setCursorBlink(true)
+
+    return bLogin
+  end
+
+  local bLogin = draw()
+
+  local function submit()
+    if fields[1] == "" or fields[2] == "" then
+      msg, msgCol = "Please fill in all fields", QB.err
+      return false
+    end
+
+    msg, msgCol = "Authenticating...", QB.dim
+    draw()
+
+    local ok, res = bankReq({
+      type = "login",
+      username = fields[1],
+      password = fields[2],
+    })
+
+    if ok and type(res) == "table" then
+      bank.logged = true
+      bank.username = fields[1]
+      bank.password = fields[2]
+      bank.citizen_id = res.citizen_id or ""
+      bank.display = res.display_name or fields[1]
+      bank.title = res.title or "Account Holder"
+      bank.balance = res.balance or 0
+      phone_unlocked = true
+      pollShoMailNotifications(true)
+      return true
+    end
+
+    msg, msgCol = tostring(res or "Login failed"), QB.err
+    return false
+  end
+
+  while true do
+    local ev, a, x, y = os.pullEvent()
+
+    if ev == "char" then
+      if #fields[focus] < W - 7 then fields[focus] = fields[focus] .. a end
+
+    elseif ev == "key" then
+      if a == keys.backspace then
+        fields[focus] = fields[focus]:sub(1, -2)
+      elseif a == keys.tab then
+        focus = focus == 1 and 2 or 1
+      elseif a == keys.enter then
+        if focus == 1 then focus = 2 else if submit() then return true end end
+      end
+
+    elseif ev == "mouse_click" then
+      if y == 9 then focus = 1 end
+      if y == 12 then focus = 2 end
+      if hit(bLogin, x, y) then if submit() then return true end end
+    end
+
+    bLogin = draw()
   end
 end
 
@@ -2214,8 +2322,22 @@ local function cClearForm()
 end
 
 local function companiesApp()
+  if not bank.logged then
+    if not shophoneLogin() then return end
+  end
+
   if not company.logged then
-    if not cLoginScreen() then return end
+    company.logged = true
+    company.username = bank.username
+    company.password = bank.password
+    company.citizen_id = bank.citizen_id
+    company.title = bank.title or "Account Holder"
+    company.login_user = bank.username
+    company.login_pass = ""
+    company.bank_server = bank.server
+    cSet("Logged in as " .. tostring(company.citizen_id), QC.ok)
+    cRefreshOwned(true)
+    cConnectContracts(true)
   end
 
   local focus = 1
@@ -2809,6 +2931,9 @@ local function dNewDeal()
     if not amount or amount <= 0 then dSet("Enter valid amount.", QB.err); return false end
     if not dConnect() then return false end
 
+    dSet("Sending proposal...", QB.dim)
+    draw()
+
     local ok, res = dReq({
       type = "propose_deal",
       username = bank.username,
@@ -2824,6 +2949,13 @@ local function dNewDeal()
 
     if ok then
       dSet("Deal proposal sent.", QB.ok)
+      dTop("Sent")
+      qCard(2, 6, W - 2, H - 8)
+      qCentre(9, "Proposal Sent", QB.ok, QB.card)
+      qCentre(11, tostring(deals.form.title):sub(1, W - 8), QB.card_fg, QB.card)
+      qCentre(13, "To: " .. tostring(deals.form.to_id):sub(1, W - 8), QB.label, QB.card)
+      dStatus()
+      sleep(0.7)
       deals.form.to_id = ""
       deals.form.title = ""
       deals.form.amount = ""
@@ -3011,6 +3143,9 @@ end
 -- MAIN
 -- =============================================================================
 boot()
+while not shophoneLogin() do
+  sleep(1)
+end
 
 while true do
   local boxes = drawHome()
