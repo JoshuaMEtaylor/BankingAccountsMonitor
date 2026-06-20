@@ -43,7 +43,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION          = "1.1.1-WATCH-ONLY"
+local VERSION          = "1.1.2-CENTRE-PIE"
 local BANK_PROTOCOL    = "quid_bank"
 local TREASURY_ACCOUNT = "treasury:quid_bank"
 local DB_TIMEOUT       = 4
@@ -1043,11 +1043,8 @@ local function drawCategoryList(x, y, w, h, data)
 end
 
 local function drawWatchDashboard(data, startY)
-  local bodyY = startY or 3
+  local bodyY = startY or 4
   local bottom = H - 1
-  local leftW = math.max(34, math.min(42, math.floor(W * 0.36)))
-  local rightX = leftW + 3
-  local rightW = W - rightX - 1
 
   local treasury = supplyValue(data, "treasury_balance")
   local issued = supplyValue(data, "in_circulation")
@@ -1055,52 +1052,136 @@ local function drawWatchDashboard(data, startY)
   local control = issued > 0 and (treasury / issued) or 0
   local slices = positiveSlices(data)
 
-  box(2, bodyY, leftW, 11, "State position")
-  kv(4, bodyY + 2, "Annual exposure", money(data.chart_total), C.good, leftW - 4)
-  kv(4, bodyY + 3, "Recent outflow", money(data.actual_total), C.warn, leftW - 4)
-  kv(4, bodyY + 4, "Daily actual avg", money(data.actual_daily), C.text, leftW - 4)
-  kv(4, bodyY + 5, "Public payroll/day", money(data.forecast_daily), C.label, leftW - 4)
-  kv(4, bodyY + 6, "Treasury reserve", money(treasury), C.good, leftW - 4)
-  kv(4, bodyY + 7, "Private supply", money(private), C.label, leftW - 4)
-  kv(4, bodyY + 8, "Treasury control", string.format("%.1f%%", control * 100), C.dim, leftW - 4)
-  kv(4, bodyY + 9, "Window", tostring(data.observed_days) .. " MC day(s)", C.dim, leftW - 4)
-
-  local catY = bodyY + 12
-  local catH = math.max(10, bottom - catY)
-  drawCategoryList(2, catY, leftW, catH, data)
-
-  local pieH = math.max(17, math.floor((bottom - bodyY) * 0.62))
-  if pieH > bottom - bodyY - 8 then pieH = math.max(15, bottom - bodyY - 8) end
-  local feedY = bodyY + pieH + 1
-  local feedH = math.max(6, bottom - feedY)
-
-  box(rightX, bodyY, rightW, pieH, "Annual expenditure mix")
-  at(rightX + 2, bodyY + 2, "Total: " .. money(data.chart_total), C.good, C.bg)
-  at(rightX + 2, bodyY + 3, "Forecast fills public payroll where recent transactions are missing.", C.dim, C.bg)
-
-  local pieAreaW = math.max(22, math.floor(rightW * 0.47))
-  local legendX = rightX + pieAreaW + 2
-  local legendW = math.max(24, rightW - pieAreaW - 4)
-  local rx = math.max(6, math.min(13, math.floor((pieAreaW - 4) / 2)))
-  local ry = math.max(4, math.min(8, math.floor((pieH - 7) / 2)))
-  local cx = rightX + 2 + math.floor(pieAreaW / 2)
-  local cy = bodyY + 5 + ry
-
-  drawPie(cx, cy, rx, ry, slices, data.chart_total)
-  drawLegend(legendX, bodyY + 5, legendW, slices, data.chart_total, math.max(4, pieH - 7))
-
-  if rightW > 45 and pieH > 14 then
-    at(rightX + 2, bodyY + pieH - 2, "Live categories: defence, research, welfare, logistics, administration, infrastructure, grants, finance, other", C.dim, C.bg)
+  local function centreText(y, text, fg)
+    text = tostring(text or "")
+    at(math.floor((W - #text) / 2) + 1, y, text, fg or C.text, C.bg)
   end
 
-  drawRecentFeed(rightX, feedY, rightW, feedH, data.outflows)
+  local function visibleRows()
+    local rows = {}
+    for _, s in ipairs(data.order or {}) do
+      if (s.chart_value or 0) > 0 or s.key == "defence" or s.key == "research" or s.key == "welfare" then
+        rows[#rows + 1] = s
+      end
+    end
+    table.sort(rows, function(a, b)
+      local av, bv = tonumber(a.chart_value or 0) or 0, tonumber(b.chart_value or 0) or 0
+      if av == bv then return tostring(a.label) < tostring(b.label) end
+      return av > bv
+    end)
+    return rows
+  end
+
+  -- Header line: keep this light. The chart is the centrepiece.
+  centreText(3, "Annual public expenditure mix", C.label)
+  at(3, 4, mcTime(), C.dim, C.bg)
+  at(W - 38, 4, "Live / read-only / auto refresh", C.dim, C.bg)
+
+  -- Main centred chart panel.
+  local chartX = 3
+  local chartY = 6
+  local chartW = W - 4
+  local chartH = math.max(16, H - 12)
+  if chartY + chartH > H - 4 then chartH = math.max(14, (H - 4) - chartY) end
+  local chartBottom = chartY + chartH - 1
+
+  box(chartX, chartY, chartW, chartH, "Expenditure composition")
+
+  local totalLine = "TOTAL " .. money(data.chart_total)
+  local recentLine = "RECENT " .. money(data.actual_total) .. " / " .. tostring(data.observed_days) .. " MC day(s)"
+  at(chartX + 3, chartY + 2, totalLine, C.good, C.bg)
+  at(W - #recentLine - 3, chartY + 2, recentLine, C.warn, C.bg)
+
+  local rx = math.max(10, math.min(30, math.floor(chartW * 0.30)))
+  local ry = math.max(6, math.min(11, math.floor((chartH - 5) / 2)))
+  local cx = math.floor(W / 2)
+  local cy = chartY + math.floor(chartH / 2) + 1
+  if cy - ry < chartY + 4 then cy = chartY + 4 + ry end
+  if cy + ry > chartBottom - 1 then cy = chartBottom - 1 - ry end
+
+  drawPie(cx, cy, rx, ry, slices, data.chart_total)
+
+  -- Centre label inside the donut.
+  if slices and #slices > 0 then
+    local main = slices[1]
+    local name = upper(shortText(main.label or "Top", 12))
+    local share = pct(main.value, data.chart_total)
+    local total = shortText(money(data.chart_total), 17)
+    at(cx - math.floor(#name / 2), cy - 1, name, C.title, C.bg)
+    at(cx - math.floor(#share / 2), cy, share, C.good, C.bg)
+    at(cx - math.floor(#total / 2), cy + 1, total, C.dim, C.bg)
+  else
+    at(cx - 6, cy, "NO SPEND", C.warn, C.bg)
+  end
+
+  -- Side legend deliberately sits outside the chart, not over it.
+  local sideY = chartY + 5
+  local maxSideRows = math.max(3, math.min(7, chartBottom - sideY - 1))
+  local leftX = chartX + 3
+  local leftW = math.max(12, (cx - rx) - leftX - 2)
+  local rightX = cx + rx + 4
+  local rightW = math.max(12, (chartX + chartW) - rightX - 2)
+
+  local rows = visibleRows()
+  if leftW >= 14 then
+    at(leftX, sideY - 2, "Department", C.label, C.bg)
+    at(leftX, sideY - 1, "share", C.dim, C.bg)
+    for i = 1, math.min(maxSideRows, #rows) do
+      local s = rows[i]
+      local yy = sideY + i - 1
+      at(leftX, yy, " ", C.text, s.color)
+      at(leftX + 2, yy, shortText(s.label, math.max(6, leftW - 8)), C.text, C.bg)
+      at(leftX + leftW - 5, yy, pct(s.chart_value, data.chart_total), C.dim, C.bg)
+    end
+  end
+
+  if rightW >= 13 then
+    at(rightX, sideY - 2, "Annual", C.label, C.bg)
+    at(rightX, sideY - 1, "outlay", C.dim, C.bg)
+    for i = 1, math.min(maxSideRows, #rows) do
+      local s = rows[i]
+      local yy = sideY + i - 1
+      at(rightX, yy, " ", C.text, s.color)
+      at(rightX + 2, yy, shortText(money(s.chart_value), math.max(8, rightW - 2)), C.good, C.bg)
+    end
+  end
+
+  -- Bottom strip: key state figures, low visual weight.
+  local stripY = chartBottom + 1
+  if stripY <= H - 3 then
+    line(3, stripY, W - 5, "-", C.grid, C.bg)
+    local colW = math.max(18, math.floor((W - 6) / 4))
+    local y1 = stripY + 1
+    at(4, y1, "Treasury", C.dim, C.bg)
+    at(14, y1, shortText(money(treasury), colW - 10), C.good, C.bg)
+    at(4 + colW, y1, "Payroll/day", C.dim, C.bg)
+    at(16 + colW, y1, shortText(money(data.forecast_daily), colW - 12), C.label, C.bg)
+    at(4 + (colW * 2), y1, "Private", C.dim, C.bg)
+    at(13 + (colW * 2), y1, shortText(money(private), colW - 9), C.label, C.bg)
+    at(4 + (colW * 3), y1, "Control", C.dim, C.bg)
+    at(13 + (colW * 3), y1, string.format("%.1f%%", control * 100), C.dim, C.bg)
+  end
+
+  -- Recent outflow ticker, kept to one line so it does not compete with the chart.
+  if H >= 29 then
+    local tickerY = H - 2
+    local text = "Recent: "
+    local shown = 0
+    for _, tx in ipairs(data.outflows or {}) do
+      if shown >= 3 then break end
+      local label = shortText(txField(tx, "memo", "description", "note") or txField(tx, "type", "tx_type") or "Outflow", 18)
+      text = text .. label .. " " .. money(amountOf(tx))
+      shown = shown + 1
+      if shown < 3 then text = text .. "  |  " end
+    end
+    if shown == 0 then text = text .. "no treasury outflows in current window" end
+    at(3, tickerY, shortText(text, W - 5), C.dim, C.bg)
+  end
 end
 
 local function drawScreen(data, err)
   cls()
   topBar()
-  at(2, 3, mcTime(), C.dim, C.bg)
-  at(W - 34, 3, "Live public expenditure display", C.dim, C.bg)
 
   if err then
     at(2, 5, "Unable to load expenditure data: " .. shortText(err, W - 4), C.bad, C.bg)
