@@ -43,7 +43,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION          = "1.2.6-LOWER-TOP-PADDING"
+local VERSION          = "1.2.7-PIE-GUTTER-FIX"
 local BANK_PROTOCOL    = "quid_bank"
 local TREASURY_ACCOUNT = "treasury:quid_bank"
 local DB_TIMEOUT       = 4
@@ -1237,14 +1237,13 @@ local function drawWatchDashboard(data, startY)
   -- Main centred chart panel.
   local chartX = 3
 
-  -- Push the chart area down. This creates real empty space between the
-  -- header/top figures and the pie instead of only changing the centre point.
-  local chartY = 9
+  -- Keep the top section in its original place.
+  -- The extra space is now between the top figures and the pie, not above the whole section.
+  local chartY = 6
   local chartW = W - 4
 
-  -- The bottom strip/ticker is gone, so the chart panel can safely use more
-  -- lower monitor space. This prevents the pie from being clamped back upward.
-  local chartH = math.max(18, H - 10)
+  -- Bottom strip/ticker is removed, so the chart can use the lower monitor area.
+  local chartH = math.max(18, H - 8)
   if chartY + chartH > H - 2 then chartH = math.max(16, (H - 2) - chartY) end
   local chartBottom = chartY + chartH - 1
 
@@ -1258,13 +1257,15 @@ local function drawWatchDashboard(data, startY)
 
   -- Bigger main chart, placed more centrally on the screen.
   -- The monitor is large enough to give the donut more presence.
-  -- Bigger chart, deliberately placed lower in the panel.
+  -- Bigger chart, but with a real gutter under the Total/Recent/Composition header.
   local rx = math.max(16, math.min(26, math.floor(chartW * 0.27)))
   local ry = math.max(8, math.min(13, math.floor((chartH - 6) / 2)))
   local cx = math.floor(W * 0.51)
-  local cy = chartY + math.floor(chartH / 2) + 6
-  -- Keep a hard top gutter above the pie so it cannot creep into the top figures.
-  if cy - ry < chartY + 7 then cy = chartY + 7 + ry end
+  local cy = chartY + math.floor(chartH / 2) + 5
+
+  -- The top figures live around chartY+2 and the divider at chartY+4.
+  -- Force the pie itself to start lower than that, leaving visible blank space.
+  if cy - ry < chartY + 8 then cy = chartY + 8 + ry end
   if cy + ry > chartBottom - 1 then cy = chartBottom - 1 - ry end
 
   drawPie(cx, cy, rx, ry, slices, data.chart_total)
