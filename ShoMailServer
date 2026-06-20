@@ -55,7 +55,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION       = "1.0.8"
+local VERSION       = "1.0.9"
 local DEAL_PROTOCOL = "quid_deals"
 local BANK_PROTOCOL = "quid_bank"
 local DB_TIMEOUT    = 5
@@ -669,6 +669,36 @@ local function handleList(req)
   }
 end
 
+
+local function userOwnsCompany(user, company_id)
+  company_id = tostring(company_id or "")
+  if company_id == "" or not company_id:find("^company:") then return false end
+
+  local ok, res = bankRequest({
+    type = "list_my_companies",
+    username = user.username,
+    password = user.password,
+  }, 5)
+
+  if ok and type(res) == "table" and type(res.companies) == "table" then
+    for _, co in ipairs(res.companies) do
+      if tostring(co.company_id or "") == company_id then
+        return true
+      end
+    end
+  end
+
+  return false
+end
+
+local function canPayFromAccount(user, account_id)
+  account_id = tostring(account_id or "")
+  if account_id == "" then return false end
+  if accountMatches(account_id, user.citizen_id, user.username) then return true end
+  if account_id:find("^company:") then return userOwnsCompany(user, account_id) end
+  return false
+end
+
 local function handlePropose(req)
   local ok, user = auth(req.username, req.password)
   if not ok then return false, user end
@@ -686,6 +716,10 @@ local function handlePropose(req)
   if from_id == "" then from_id = user.citizen_id end
   if not from_id:find(":") then from_id = "citizen:" .. lower(from_id):gsub("%s+", "_") end
 
+  if not canPayFromAccount(user, from_id) then
+    return false, "You are not allowed to create payments from " .. tostring(from_id)
+  end
+
   local start_date = parseDate(req.start_date or req.start or req.next_due) or copyTable(state.world_date)
 
   local deal_id = nextDealId()
@@ -693,6 +727,8 @@ local function handlePropose(req)
     deal_id = deal_id,
     title = title,
     from_id = from_id,
+    from_label = trim(req.from_label or ""),
+    from_kind = trim(req.from_kind or ""),
     to_id = to_id,
     proposer_id = user.citizen_id,
     amount = math.floor(amount),
@@ -715,9 +751,9 @@ local function handlePropose(req)
     }
   }
 
-  -- Store payer auth when the proposer is the payer. This lets due recurring
-  -- payments execute automatically later.
-  if accountMatches(from_id, user.citizen_id, user.username) then
+  -- Store payer auth when the proposer controls the payer account.
+  -- This covers personal accounts and companies owned by the logged-in citizen.
+  if canPayFromAccount(user, from_id) then
     deal.payer_auth = {
       username = user.username,
       password = user.password,
