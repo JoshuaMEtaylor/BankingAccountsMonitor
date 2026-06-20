@@ -1,0 +1,190 @@
+-- JARVIS PocketOS Prototype
+-- Basic boot screen, desktop GUI, app layout
+
+local VERSION = "0.1.0"
+local W, H = term.getSize()
+
+local C = {
+    bg = colors.black,
+    panel = colors.gray,
+    top = colors.gray,
+    text = colors.white,
+    dim = colors.lightGray,
+    title = colors.yellow,
+    good = colors.lime,
+    warn = colors.orange,
+    bad = colors.red,
+    selected = colors.blue,
+    app = colors.lightGray
+}
+
+local apps = {
+    { name = "Bank", icon = "$", desc = "Accounts & transfers" },
+    { name = "Contracts", icon = "#", desc = "Deals & jobs" },
+    { name = "Messages", icon = "@", desc = "Citizen mail" },
+    { name = "Companies", icon = "C", desc = "Business tools" },
+    { name = "News", icon = "N", desc = "Town bulletins" },
+    { name = "Settings", icon = "*", desc = "Device config" }
+}
+
+local selected = 1
+local status = "Ready"
+
+local function refresh()
+    W, H = term.getSize()
+end
+
+local function clear(bg)
+    refresh()
+    term.setBackgroundColor(bg or C.bg)
+    term.setTextColor(C.text)
+    term.clear()
+    term.setCursorPos(1, 1)
+end
+
+local function at(x, y, text, fg, bg)
+    refresh()
+    if y < 1 or y > H then return end
+    if x < 1 then x = 1 end
+    term.setCursorPos(x, y)
+    term.setTextColor(fg or C.text)
+    term.setBackgroundColor(bg or C.bg)
+    term.write(tostring(text or ""):sub(1, W - x + 1))
+end
+
+local function fill(x, y, w, h, bg)
+    refresh()
+    term.setBackgroundColor(bg or C.bg)
+    local row = string.rep(" ", math.max(0, w))
+    for yy = y, y + h - 1 do
+        if yy >= 1 and yy <= H then
+            term.setCursorPos(x, yy)
+            term.write(row:sub(1, W - x + 1))
+        end
+    end
+end
+
+local function center(y, text, fg, bg)
+    local x = math.floor((W - #text) / 2) + 1
+    at(x, y, text, fg, bg)
+end
+
+local function progressBar(y, pct)
+    local width = math.max(10, W - 6)
+    local filled = math.floor(width * pct)
+    local x = 4
+
+    at(x, y, "[" .. string.rep("=", filled) .. string.rep(" ", width - filled) .. "]", C.good, C.bg)
+end
+
+local function bootScreen()
+    clear(C.bg)
+
+    center(3, "JARVIS", C.title)
+    center(4, "Pocket Operating System", C.dim)
+    center(6, "Version " .. VERSION, C.dim)
+
+    local stages = {
+        "Loading kernel",
+        "Mounting apps",
+        "Checking modem",
+        "Preparing interface",
+        "Starting services"
+    }
+
+    for i, stage in ipairs(stages) do
+        center(8, stage .. "...", C.text)
+        progressBar(10, i / #stages)
+        sleep(0.35)
+    end
+
+    center(12, "Boot complete", C.good)
+    sleep(0.5)
+end
+
+local function drawTopBar()
+    fill(1, 1, W, 1, C.top)
+    at(2, 1, "JARVIS OS", C.title, C.top)
+
+    local clock = textutils.formatTime(os.time(), true)
+    at(W - #clock, 1, clock, C.dim, C.top)
+end
+
+local function drawStatusBar()
+    fill(1, H, W, 1, C.panel)
+    at(2, H, status, C.text, C.panel)
+end
+
+local function drawDesktop()
+    clear(C.bg)
+    drawTopBar()
+
+    center(3, "Home", C.title)
+
+    local startY = 5
+
+    for i, app in ipairs(apps) do
+        local y = startY + i - 1
+        local isSelected = i == selected
+        local bg = isSelected and C.selected or C.bg
+        local fg = isSelected and colors.white or C.text
+
+        fill(2, y, W - 2, 1, bg)
+
+        local line = string.format("%d. [%s] %-10s %s", i, app.icon, app.name, app.desc)
+        at(3, y, line, fg, bg)
+    end
+
+    at(2, H - 2, "Up/Down: Move   Enter: Open", C.dim)
+    at(2, H - 1, "Q: Shutdown", C.dim)
+
+    drawStatusBar()
+end
+
+local function placeholderApp(app)
+    clear(C.bg)
+    drawTopBar()
+
+    center(3, app.name, C.title)
+    center(5, app.desc, C.dim)
+
+    at(2, 8, "This app is not connected yet.", C.text)
+    at(2, 10, "Next step: build the " .. app.name .. " app screen.", C.dim)
+
+    at(2, H - 1, "Press any key to return.", C.dim)
+    drawStatusBar()
+
+    os.pullEvent("key")
+end
+
+local function runDesktop()
+    while true do
+        drawDesktop()
+
+        local event, key = os.pullEvent("key")
+
+        if key == keys.up then
+            selected = selected - 1
+            if selected < 1 then selected = #apps end
+
+        elseif key == keys.down then
+            selected = selected + 1
+            if selected > #apps then selected = 1 end
+
+        elseif key == keys.enter then
+            status = "Opening " .. apps[selected].name
+            placeholderApp(apps[selected])
+            status = "Ready"
+
+        elseif key == keys.q then
+            clear(C.bg)
+            center(math.floor(H / 2), "Shutting down...", C.warn)
+            sleep(0.5)
+            clear(C.bg)
+            return
+        end
+    end
+end
+
+bootScreen()
+runDesktop()
