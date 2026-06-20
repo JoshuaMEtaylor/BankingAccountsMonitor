@@ -49,7 +49,7 @@ end
 -- =============================================================================
 -- CONFIG / STATE
 -- =============================================================================
-local VERSION = "0.5.0"
+local VERSION = "0.5.1"
 
 local BANK_PROTOCOL = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
@@ -2254,11 +2254,17 @@ local function dStatus()
   end
 end
 
+local function dMailTop()
+  qFill(1, 1, W, 1, QB.header)
+  qAt(2, 1, "SHOMAIL", QB.hdr_fg, QB.header)
+  qAt(W - #VERSION, 1, VERSION, QB.dim, QB.header)
+end
+
 local function dTop(title)
   qCls()
-  qTopBar()
+  dMailTop()
   qFill(1, 2, W, 2, QB.card)
-  qAt(3, 2, title or "Messages", QB.card_fg, QB.card)
+  qAt(3, 2, title or "ShoMail", QB.card_fg, QB.card)
   if bank.logged then
     qAt(3, 3, tostring(bank.username) .. " / " .. tostring(bank.citizen_id), QB.label, QB.card)
   else
