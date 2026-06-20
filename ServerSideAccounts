@@ -22,7 +22,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.4.23-WAGE-PRICE-SYNTAX-FIX"
+local VERSION  = "1.4.24-LOGISTICS-PRIVATE"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -1836,10 +1836,6 @@ local DEFAULT_WORKER_PAY_RATES = {
     skilled = 3,
     elite = 5,
   },
-  logistics = {
-    unskilled = 1,
-    skilled = 2,
-  },
 }
 
 local function copyWorkerPayDefaults()
@@ -1860,7 +1856,6 @@ local function normaliseWorkerPayRates(src)
   -- Backwards compatibility with the old flat keys.
   if src.researcher then out.research.skilled = math.floor(tonumber(src.researcher) or out.research.skilled) end
   if src.soldier then out.defence.skilled = math.floor(tonumber(src.soldier) or out.defence.skilled) end
-  if src.courier then out.logistics.unskilled = math.floor(tonumber(src.courier) or out.logistics.unskilled) end
 
   for sector, tiers in pairs(DEFAULT_WORKER_PAY_RATES) do
     if type(src[sector]) == "table" then
@@ -1874,7 +1869,6 @@ local function normaliseWorkerPayRates(src)
   -- Compatibility fields for old payroll terminals.
   out.researcher = out.research.skilled
   out.soldier = out.defence.skilled
-  out.courier = out.logistics.unskilled
 
   return out
 end
@@ -2422,16 +2416,16 @@ end
 -- This lets CompanyPayroll run on a separate terminal without a colony integrator
 -- or local mapping files.
 --
--- Important: public workers do not need a registered company.  Defence,
--- research, and state logistics mappings are accepted with treasury:quid_bank
--- as their payer so the normal payroll terminal can pay them from the Treasury.
+-- Important: public workers do not need a registered company. Defence and
+-- research mappings are accepted with treasury:quid_bank as their payer.
+-- Logistics/courier workers are private-sector and should keep their company.
 handlers["sync_employee_mappings"] = function(sender_id, req)
   local incoming = req and (req.employees or req.mappings) or {}
   if type(incoming) ~= "table" then return false, "Missing employees table" end
 
   local function isPublicIndustry(industry)
     industry = lower(industry or "")
-    return industry == "defence" or industry == "research" or industry == "logistics"
+    return industry == "defence" or industry == "research"
   end
 
   local now_ts = timestamp()
@@ -2448,10 +2442,8 @@ handlers["sync_employee_mappings"] = function(sender_id, req)
       local industry = lower(e.industry or "general")
       local company_id = tostring(e.company_id or "")
 
-      -- Public/state jobs are ALWAYS paid by the Treasury.
-      -- Do not preserve a generated industry company such as company:must for
-      -- research/defence/logistics workers. Those companies may exist for
-      -- accounting/sector display, but they are not the wage payer.
+      -- Public/state jobs are paid by the Treasury.
+      -- Logistics/courier workers are now private, so their company mapping is preserved.
       local company_name = e.company_name
       if isPublicIndustry(industry) then
         company_id = "treasury:quid_bank"
@@ -2511,7 +2503,7 @@ end
 
 local function isPublicEmploymentIndustry(industry)
   industry = lower(industry or "")
-  return industry == "defence" or industry == "research" or industry == "logistics"
+  return industry == "defence" or industry == "research"
 end
 
 local function coercePublicEmploymentMappings(reason)
@@ -2540,8 +2532,37 @@ local function coercePublicEmploymentMappings(reason)
   return changed
 end
 
+local function releasePrivateLogisticsEmploymentMappings(reason)
+  local changed = 0
+  local now_ts = timestamp()
+
+  for citizen_id, rec in pairs(employment_mappings or {}) do
+    if type(rec) == "table" and rec.active ~= false and lower(rec.industry or "") == "logistics" then
+      local target = trim(rec.original_company_id or "")
+      if target ~= "" and target ~= "treasury:quid_bank" and accountExists(target) and companies[target] then
+        rec.company_id = target
+        rec.company_name = rec.original_company_name or (companies[target] and (companies[target].name or companies[target].display_name)) or target
+        rec.pay_type = "company"
+        rec.public_payroll_released = true
+        rec.public_payroll_released_reason = reason or "logistics_private"
+        rec.updated_at = now_ts
+        employment_mappings[citizen_id] = rec
+        changed = changed + 1
+      end
+    end
+  end
+
+  if changed > 0 then
+    saveEmployment()
+    audit("ACTION", "STATE", "db", "RELEASE_PRIVATE_LOGISTICS", tostring(changed))
+  end
+
+  return changed
+end
+
 -- LIST_EMPLOYEE_MAPPINGS
 handlers["list_employee_mappings"] = function(sender_id, req)
+  local released = releasePrivateLogisticsEmploymentMappings("list_employee_mappings")
   local coerced = coercePublicEmploymentMappings("list_employee_mappings")
   local result = {}
   local active_only = not (req and req.include_inactive == true)
@@ -2556,11 +2577,11 @@ handlers["list_employee_mappings"] = function(sender_id, req)
   table.sort(result, function(a,b)
     return tostring(a.display_name or a.citizen_id or "") < tostring(b.display_name or b.citizen_id or "")
   end)
-  return true, { employees = result, count = #result, public_coerced = coerced }
+  return true, { employees = result, count = #result, public_coerced = coerced, logistics_released = released }
 end
 
 -- FIX_PUBLIC_EMPLOYEE_MAPPINGS
--- One-shot admin helper for old databases where research/defence/logistics
+-- One-shot admin helper for old databases where research/defence
 -- workers were mapped to generated companies. This rewrites them to Treasury.
 handlers["fix_public_employee_mappings"] = function(sender_id, req)
   local changed = coercePublicEmploymentMappings("manual_fix")
@@ -2929,7 +2950,6 @@ handlers["get_worker_pay_rates"] = function(sender_id, req)
     sectors = {
       { key = "defence", label = "Defence", tiers = { "unskilled", "skilled", "elite" } },
       { key = "research", label = "Research", tiers = { "skilled", "elite" } },
-      { key = "logistics", label = "Logistics", tiers = { "unskilled", "skilled" } },
     }
   }
 end
