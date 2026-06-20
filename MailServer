@@ -1,0 +1,754 @@
+-- =============================================================================
+-- SHOMAIL / QUID DEAL SERVER
+-- ShoMailServer
+--
+-- Backend for ShoPhone Messages/ShoMail:
+--   * proposed deals
+--   * accept / decline
+--   * counter offers
+--   * active recurring payment agreements
+--
+-- Protocol:
+--   quid_deals
+--
+-- Uses the existing Quid Bank server over:
+--   quid_bank
+--
+-- GitHub file name:
+--   ShoMailServer
+-- =============================================================================
+
+local args = {...}
+
+-- =============================================================================
+-- SELF UPDATE
+-- =============================================================================
+if args[1] ~= "--updated" then
+  print("[ ShoMail Server ]")
+  print("Deleting old version...")
+  fs.delete("startup.lua")
+  print("Downloading latest from GitHub...")
+
+  local cb = tostring(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
+  local url = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/ShoMailServer?cb=" .. cb
+
+  shell.run("wget " .. url .. " startup.lua")
+
+  if not fs.exists("startup.lua") then
+    print("")
+    print("Download failed.")
+    print("Expected GitHub file: ShoMailServer")
+    print("")
+    print("Manual install:")
+    print("delete startup")
+    print("wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/ShoMailServer?cb=001 startup.lua")
+    print("startup.lua")
+    return
+  end
+
+  print("Relaunching...")
+  sleep(0.5)
+  shell.run("startup.lua", "--updated")
+  return
+end
+
+-- =============================================================================
+-- CONFIG
+-- =============================================================================
+local VERSION       = "1.0.0"
+local DEAL_PROTOCOL = "quid_deals"
+local BANK_PROTOCOL = "quid_bank"
+local DB_TIMEOUT    = 5
+
+local FILE = {
+  deals = "data/shomail_deals.db",
+  state = "data/shomail_state.db",
+  audit = "data/shomail_audit.log",
+}
+
+local deals = {}
+local state = {
+  counter = 0,
+  bank_id = nil,
+  world_date = {
+    year = 1,
+    month = 1,
+    day = 1,
+  },
+}
+
+local modem_name = nil
+
+-- =============================================================================
+-- HELPERS
+-- =============================================================================
+local function ensureDir(path)
+  local parts = {}
+  for part in string.gmatch(path, "[^/]+") do parts[#parts + 1] = part end
+  table.remove(parts)
+
+  local current = ""
+  for _, part in ipairs(parts) do
+    current = current == "" and part or (current .. "/" .. part)
+    if not fs.exists(current) then fs.makeDir(current) end
+  end
+end
+
+local function writeFile(path, data)
+  ensureDir(path)
+  local f = fs.open(path, "w")
+  if not f then return false end
+  f.write(textutils.serialize(data))
+  f.close()
+  return true
+end
+
+local function readFile(path, fallback)
+  if not fs.exists(path) then return fallback end
+  local f = fs.open(path, "r")
+  if not f then return fallback end
+  local text = f.readAll()
+  f.close()
+
+  local ok, data = pcall(textutils.unserialize, text)
+  if ok and data ~= nil then return data end
+  return fallback
+end
+
+local function appendAudit(line)
+  ensureDir(FILE.audit)
+  local f = fs.open(FILE.audit, "a")
+  if f then
+    f.writeLine(tostring(os.epoch("utc")) .. " | " .. tostring(line))
+    f.close()
+  end
+end
+
+local function saveDeals() return writeFile(FILE.deals, deals) end
+local function saveState() return writeFile(FILE.state, state) end
+
+local function trim(s)
+  return tostring(s or ""):match("^%s*(.-)%s*$")
+end
+
+local function lower(s)
+  return string.lower(tostring(s or ""))
+end
+
+local function nextDealId()
+  state.counter = (tonumber(state.counter) or 0) + 1
+  saveState()
+  return "DEAL-" .. string.format("%06d", state.counter)
+end
+
+local function copyTable(t)
+  local out = {}
+  if type(t) ~= "table" then return out end
+  for k, v in pairs(t) do
+    if type(v) == "table" then
+      out[k] = copyTable(v)
+    else
+      out[k] = v
+    end
+  end
+  return out
+end
+
+local function parseDate(value)
+  if type(value) == "table" then
+    return {
+      year = tonumber(value.year) or tonumber(value.y) or 1,
+      month = tonumber(value.month) or tonumber(value.m) or 1,
+      day = tonumber(value.day) or tonumber(value.d) or 1,
+    }
+  end
+
+  value = trim(value)
+  if value == "" then return nil end
+
+  local y, m, d = value:match("^(%d+)%D+(%d+)%D+(%d+)$")
+  if not y then return nil end
+
+  return {
+    year = tonumber(y) or 1,
+    month = tonumber(m) or 1,
+    day = tonumber(d) or 1,
+  }
+end
+
+local function dateKey(d)
+  if type(d) ~= "table" then return 0 end
+  return ((tonumber(d.year) or 0) * 372) + ((tonumber(d.month) or 0) * 31) + (tonumber(d.day) or 0)
+end
+
+local function isDue(d)
+  return dateKey(state.world_date) >= dateKey(d)
+end
+
+local function dateLabel(d)
+  if type(d) ~= "table" then return "" end
+  return "Y" .. tostring(d.year or 1) .. " M" .. tostring(d.month or 1) .. " D" .. tostring(d.day or 1)
+end
+
+local function advanceDate(d, frequency)
+  d = copyTable(d or state.world_date)
+  frequency = lower(frequency)
+
+  if frequency == "daily" or frequency == "day" then
+    d.day = (tonumber(d.day) or 1) + 1
+
+  elseif frequency == "weekly" or frequency == "week" then
+    d.day = (tonumber(d.day) or 1) + 7
+
+  elseif frequency == "yearly" or frequency == "annual" or frequency == "annually" or frequency == "year" then
+    d.year = (tonumber(d.year) or 1) + 1
+
+  else
+    d.month = (tonumber(d.month) or 1) + 1
+  end
+
+  while d.day > 30 do
+    d.day = d.day - 30
+    d.month = (tonumber(d.month) or 1) + 1
+  end
+
+  while d.month > 12 do
+    d.month = d.month - 12
+    d.year = (tonumber(d.year) or 1) + 1
+  end
+
+  return d
+end
+
+local function publicDeal(deal)
+  local d = copyTable(deal)
+  d.payer_auth = nil
+  return d
+end
+
+local function accountMatches(account_id, citizen_id, username)
+  account_id = tostring(account_id or "")
+  citizen_id = tostring(citizen_id or "")
+  username = tostring(username or "")
+
+  if account_id == citizen_id then return true end
+  if account_id == ("citizen:" .. lower(username):gsub("%s+", "_")) then return true end
+  return false
+end
+
+-- =============================================================================
+-- NETWORK / BANK
+-- =============================================================================
+local function openModem()
+  if modem_name and rednet.isOpen(modem_name) then return true end
+
+  for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.getType(name) == "modem" then
+      local m = peripheral.wrap(name)
+      if m and m.isWireless and m.isWireless() then
+        rednet.open(name)
+        modem_name = name
+        return true
+      end
+    end
+  end
+
+  for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.getType(name) == "modem" then
+      rednet.open(name)
+      modem_name = name
+      return true
+    end
+  end
+
+  return false
+end
+
+local function findBank()
+  if state.bank_id then return state.bank_id end
+
+  rednet.broadcast({ type = "ping" }, BANK_PROTOCOL)
+  local sender, msg = rednet.receive(BANK_PROTOCOL, 3)
+
+  if sender and type(msg) == "table" then
+    if msg.type == "treasury_online" or (msg.success == true and type(msg.response) == "table") then
+      state.bank_id = sender
+      saveState()
+      return sender
+    end
+  end
+
+  return nil
+end
+
+local function bankRequest(payload, timeout)
+  timeout = timeout or DB_TIMEOUT
+
+  local bank_id = findBank()
+  if not bank_id then return false, "No bank server found" end
+
+  rednet.send(bank_id, payload, BANK_PROTOCOL)
+
+  local deadline = os.clock() + timeout
+  while true do
+    local remaining = deadline - os.clock()
+    if remaining <= 0 then
+      state.bank_id = nil
+      saveState()
+      return false, "No response from bank"
+    end
+
+    local sender, msg = rednet.receive(BANK_PROTOCOL, remaining)
+    if sender == bank_id and type(msg) == "table" and msg.success ~= nil then
+      return msg.success, msg.response
+    end
+  end
+end
+
+local function auth(username, password)
+  local ok, res = bankRequest({
+    type = "login",
+    username = username,
+    password = password,
+  })
+
+  if ok and type(res) == "table" then
+    return true, {
+      username = username,
+      password = password,
+      citizen_id = res.citizen_id,
+      display_name = res.display_name,
+      title = res.title,
+    }
+  end
+
+  return false, tostring(res or "Authentication failed")
+end
+
+local function executePayment(deal)
+  local amount = tonumber(deal.amount) or 0
+  if amount <= 0 then return false, "Invalid deal amount" end
+
+  if type(deal.payer_auth) ~= "table" then
+    return false, "No payer authorisation stored"
+  end
+
+  local ok, res
+
+  -- Citizen payer: use normal transfer with stored payer login.
+  if tostring(deal.from_id or ""):find("^citizen:") then
+    ok, res = bankRequest({
+      type = "transfer",
+      username = deal.payer_auth.username,
+      password = deal.payer_auth.password,
+      to_id = deal.to_id,
+      amount = amount,
+      memo = "ShoMail recurring: " .. tostring(deal.title or deal.deal_id),
+    }, 10)
+
+  -- Company payer: use company_withdraw if the payer auth belongs to the owner.
+  elseif tostring(deal.from_id or ""):find("^company:") then
+    ok, res = bankRequest({
+      type = "company_withdraw",
+      username = deal.payer_auth.username,
+      password = deal.payer_auth.password,
+      company_id = deal.from_id,
+      amount = amount,
+      memo = "ShoMail recurring: " .. tostring(deal.title or deal.deal_id),
+      to_id = deal.to_id,
+    }, 10)
+
+  else
+    return false, "Unsupported payer account: " .. tostring(deal.from_id)
+  end
+
+  if ok and type(res) == "table" then
+    deal.last_payment = {
+      tx_id = res.tx_id,
+      amount = amount,
+      paid_at = copyTable(state.world_date),
+    }
+    deal.payment_count = (tonumber(deal.payment_count) or 0) + 1
+    deal.next_due = advanceDate(deal.next_due or state.world_date, deal.frequency)
+    appendAudit("PAID " .. tostring(deal.deal_id) .. " tx=" .. tostring(res.tx_id))
+    return true, res
+  end
+
+  deal.last_error = tostring(res or "Payment failed")
+  appendAudit("PAYMENT_FAILED " .. tostring(deal.deal_id) .. " " .. tostring(deal.last_error))
+  return false, deal.last_error
+end
+
+local function processDueDeals()
+  local paid = 0
+  local failed = 0
+
+  for _, deal in pairs(deals) do
+    if type(deal) == "table" and deal.status == "active" and deal.recurring ~= false then
+      if deal.next_due and isDue(deal.next_due) then
+        local ok = executePayment(deal)
+        if ok then paid = paid + 1 else failed = failed + 1 end
+      end
+    end
+  end
+
+  if paid > 0 or failed > 0 then saveDeals() end
+  return paid, failed
+end
+
+-- =============================================================================
+-- REQUEST HANDLERS
+-- =============================================================================
+local function handleList(req)
+  local ok, user = auth(req.username, req.password)
+  if not ok then return false, user end
+
+  local mode = tostring(req.mode or "inbox")
+  local out = {}
+
+  for _, deal in pairs(deals) do
+    if type(deal) == "table" then
+      local involved = deal.from_id == user.citizen_id or deal.to_id == user.citizen_id
+      local sent = deal.proposer_id == user.citizen_id
+
+      if mode == "active" then
+        if involved and deal.status == "active" then out[#out + 1] = publicDeal(deal) end
+
+      elseif mode == "sent" then
+        if sent then out[#out + 1] = publicDeal(deal) end
+
+      else
+        -- inbox: pending/countered proposals aimed at this user
+        if deal.to_id == user.citizen_id and deal.status ~= "active" and deal.status ~= "declined" and deal.status ~= "cancelled" then
+          out[#out + 1] = publicDeal(deal)
+        end
+      end
+    end
+  end
+
+  table.sort(out, function(a, b)
+    return tostring(a.updated_at or a.created_at or "") > tostring(b.updated_at or b.created_at or "")
+  end)
+
+  return true, {
+    deals = out,
+    count = #out,
+    world_date = copyTable(state.world_date),
+  }
+end
+
+local function handlePropose(req)
+  local ok, user = auth(req.username, req.password)
+  if not ok then return false, user end
+
+  local to_id = trim(req.to_id)
+  local title = trim(req.title)
+  local amount = tonumber(req.amount)
+
+  if to_id == "" then return false, "Missing recipient" end
+  if not to_id:find(":") then to_id = "citizen:" .. lower(to_id):gsub("%s+", "_") end
+  if title == "" then return false, "Missing deal title" end
+  if not amount or amount <= 0 then return false, "Invalid amount" end
+
+  local from_id = trim(req.from_id)
+  if from_id == "" then from_id = user.citizen_id end
+  if not from_id:find(":") then from_id = "citizen:" .. lower(from_id):gsub("%s+", "_") end
+
+  local start_date = parseDate(req.start_date or req.start or req.next_due) or copyTable(state.world_date)
+
+  local deal_id = nextDealId()
+  local deal = {
+    deal_id = deal_id,
+    title = title,
+    from_id = from_id,
+    to_id = to_id,
+    proposer_id = user.citizen_id,
+    amount = math.floor(amount),
+    frequency = lower(req.frequency or req.interval or "monthly"),
+    start_date = start_date,
+    next_due = start_date,
+    note = trim(req.note or req.memo or ""),
+    status = "pending",
+    recurring = true,
+    created_at = os.epoch("utc"),
+    updated_at = os.epoch("utc"),
+    history = {
+      {
+        action = "proposed",
+        actor = user.citizen_id,
+        amount = math.floor(amount),
+        frequency = lower(req.frequency or req.interval or "monthly"),
+        at = os.epoch("utc"),
+      }
+    }
+  }
+
+  -- Store payer auth when the proposer is the payer. This lets due recurring
+  -- payments execute automatically later.
+  if accountMatches(from_id, user.citizen_id, user.username) then
+    deal.payer_auth = {
+      username = user.username,
+      password = user.password,
+      citizen_id = user.citizen_id,
+    }
+  end
+
+  deals[deal_id] = deal
+  saveDeals()
+  appendAudit("PROPOSE " .. deal_id .. " " .. deal.from_id .. "->" .. deal.to_id)
+
+  return true, { deal = publicDeal(deal) }
+end
+
+local function getDeal(req)
+  local id = trim(req.deal_id or req.id)
+  if id == "" then return nil, "Missing deal_id" end
+  local deal = deals[id]
+  if type(deal) ~= "table" then return nil, "Deal not found" end
+  return deal
+end
+
+local function handleAccept(req)
+  local ok, user = auth(req.username, req.password)
+  if not ok then return false, user end
+
+  local deal, err = getDeal(req)
+  if not deal then return false, err end
+
+  if deal.to_id ~= user.citizen_id and deal.from_id ~= user.citizen_id then
+    return false, "You are not part of this deal"
+  end
+
+  if deal.status == "declined" or deal.status == "cancelled" then
+    return false, "Deal is closed"
+  end
+
+  -- If the accepter is the payer, store their auth for future recurring payment execution.
+  if accountMatches(deal.from_id, user.citizen_id, user.username) then
+    deal.payer_auth = {
+      username = user.username,
+      password = user.password,
+      citizen_id = user.citizen_id,
+    }
+  end
+
+  deal.status = "active"
+  deal.accepted_by = user.citizen_id
+  deal.accepted_at = os.epoch("utc")
+  deal.updated_at = os.epoch("utc")
+  deal.next_due = deal.next_due or deal.start_date or copyTable(state.world_date)
+  deal.history = deal.history or {}
+  deal.history[#deal.history + 1] = { action = "accepted", actor = user.citizen_id, at = os.epoch("utc") }
+
+  saveDeals()
+  appendAudit("ACCEPT " .. deal.deal_id .. " by " .. user.citizen_id)
+
+  return true, { deal = publicDeal(deal) }
+end
+
+local function handleDecline(req)
+  local ok, user = auth(req.username, req.password)
+  if not ok then return false, user end
+
+  local deal, err = getDeal(req)
+  if not deal then return false, err end
+
+  if deal.to_id ~= user.citizen_id and deal.from_id ~= user.citizen_id then
+    return false, "You are not part of this deal"
+  end
+
+  deal.status = "declined"
+  deal.declined_by = user.citizen_id
+  deal.updated_at = os.epoch("utc")
+  deal.history = deal.history or {}
+  deal.history[#deal.history + 1] = { action = "declined", actor = user.citizen_id, at = os.epoch("utc") }
+
+  saveDeals()
+  appendAudit("DECLINE " .. deal.deal_id .. " by " .. user.citizen_id)
+
+  return true, { deal = publicDeal(deal) }
+end
+
+local function handleCounter(req)
+  local ok, user = auth(req.username, req.password)
+  if not ok then return false, user end
+
+  local deal, err = getDeal(req)
+  if not deal then return false, err end
+
+  if deal.to_id ~= user.citizen_id and deal.from_id ~= user.citizen_id then
+    return false, "You are not part of this deal"
+  end
+
+  local terms = req.terms or {}
+  local amount = tonumber(terms.amount or req.amount or deal.amount)
+  if not amount or amount <= 0 then return false, "Invalid counter amount" end
+
+  -- Counter flips attention to the other party.
+  local other
+  if deal.to_id == user.citizen_id then other = deal.from_id else other = deal.to_id end
+
+  deal.amount = math.floor(amount)
+  deal.frequency = lower(terms.frequency or req.frequency or deal.frequency or "monthly")
+  deal.note = trim(terms.note or req.note or deal.note or "")
+  deal.status = "countered"
+  deal.to_id = other
+  deal.proposer_id = user.citizen_id
+  deal.updated_at = os.epoch("utc")
+  deal.history = deal.history or {}
+  deal.history[#deal.history + 1] = {
+    action = "countered",
+    actor = user.citizen_id,
+    amount = deal.amount,
+    frequency = deal.frequency,
+    at = os.epoch("utc"),
+  }
+
+  -- If countering user is payer, update payer auth.
+  if accountMatches(deal.from_id, user.citizen_id, user.username) then
+    deal.payer_auth = {
+      username = user.username,
+      password = user.password,
+      citizen_id = user.citizen_id,
+    }
+  end
+
+  saveDeals()
+  appendAudit("COUNTER " .. deal.deal_id .. " by " .. user.citizen_id)
+
+  return true, { deal = publicDeal(deal) }
+end
+
+local function handleCancel(req)
+  local ok, user = auth(req.username, req.password)
+  if not ok then return false, user end
+
+  local deal, err = getDeal(req)
+  if not deal then return false, err end
+
+  if deal.to_id ~= user.citizen_id and deal.from_id ~= user.citizen_id and deal.proposer_id ~= user.citizen_id then
+    return false, "You are not part of this deal"
+  end
+
+  deal.status = "cancelled"
+  deal.cancelled_by = user.citizen_id
+  deal.updated_at = os.epoch("utc")
+  deal.history = deal.history or {}
+  deal.history[#deal.history + 1] = { action = "cancelled", actor = user.citizen_id, at = os.epoch("utc") }
+
+  saveDeals()
+  appendAudit("CANCEL " .. deal.deal_id .. " by " .. user.citizen_id)
+
+  return true, { deal = publicDeal(deal) }
+end
+
+local function handleClock(req)
+  local d = parseDate(req.date or req.world_date or req)
+  if not d then return false, "Invalid world date. Use year/month/day." end
+
+  state.world_date = d
+  saveState()
+
+  local paid, failed = processDueDeals()
+
+  return true, {
+    world_date = copyTable(state.world_date),
+    paid = paid,
+    failed = failed,
+  }
+end
+
+local function handleRunDue()
+  local paid, failed = processDueDeals()
+  return true, {
+    world_date = copyTable(state.world_date),
+    paid = paid,
+    failed = failed,
+  }
+end
+
+local function handleRequest(req, sender)
+  if type(req) ~= "table" then return false, "Bad request" end
+
+  if req.type == "ping" then
+    return true, {
+      type = "deal_server_online",
+      version = VERSION,
+      world_date = copyTable(state.world_date),
+    }
+  elseif req.type == "list_deals" then
+    return handleList(req)
+  elseif req.type == "propose_deal" then
+    return handlePropose(req)
+  elseif req.type == "accept_deal" then
+    return handleAccept(req)
+  elseif req.type == "decline_deal" then
+    return handleDecline(req)
+  elseif req.type == "counter_deal" then
+    return handleCounter(req)
+  elseif req.type == "cancel_deal" then
+    return handleCancel(req)
+  elseif req.type == "update_clock" or req.type == "set_world_date" then
+    return handleClock(req)
+  elseif req.type == "run_due_deals" or req.type == "tick_deals" then
+    return handleRunDue()
+  end
+
+  return false, "Unknown request type: " .. tostring(req.type)
+end
+
+-- =============================================================================
+-- ENTRY
+-- =============================================================================
+local function load()
+  deals = readFile(FILE.deals, {})
+  state = readFile(FILE.state, state) or state
+  if type(state.world_date) ~= "table" then
+    state.world_date = { year = 1, month = 1, day = 1 }
+  end
+end
+
+local function main()
+  term.setBackgroundColor(colors.black)
+  term.setTextColor(colors.white)
+  term.clear()
+  term.setCursorPos(1, 1)
+
+  print("ShoMail Deal Server " .. VERSION)
+  print("Protocol: " .. DEAL_PROTOCOL)
+
+  if not openModem() then
+    print("ERROR: No modem found.")
+    return
+  end
+
+  load()
+  findBank()
+
+  print("Modem: " .. tostring(modem_name))
+  print("Bank:  " .. tostring(state.bank_id or "not found yet"))
+  print("Deals: " .. tostring(#(deals or {})))
+  print("Date:  " .. dateLabel(state.world_date))
+  print("")
+  print("Listening...")
+
+  local lastDueCheck = os.clock()
+
+  while true do
+    local sender, req = rednet.receive(DEAL_PROTOCOL, 1)
+
+    if sender then
+      local ok, res = handleRequest(req, sender)
+      rednet.send(sender, { success = ok, response = res }, DEAL_PROTOCOL)
+    end
+
+    -- Passive safety check every 10 seconds in case a world-clock updater has
+    -- changed state or due deals are pending.
+    if os.clock() - lastDueCheck >= 10 then
+      lastDueCheck = os.clock()
+      processDueDeals()
+    end
+  end
+end
+
+main()
