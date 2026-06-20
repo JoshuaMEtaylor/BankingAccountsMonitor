@@ -49,7 +49,7 @@ end
 -- =============================================================================
 -- CONFIG / STATE
 -- =============================================================================
-local VERSION = "0.6.2"
+local VERSION = "0.6.4"
 
 local BANK_PROTOCOL = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
@@ -2410,6 +2410,7 @@ local deals = {
   mode = "inbox",
   list = {},
   selected = 1,
+  scroll = 0,
   msg = "",
   msg_col = QB.dim,
   form = {
@@ -2428,6 +2429,12 @@ local function dSet(msg, col)
   deals.msg = tostring(msg or "")
   deals.msg_col = col or QB.dim
 end
+
+local function nextRequestId()
+  local n = tostring(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
+  return tostring(os.getComputerID()) .. "-" .. n .. "-" .. tostring(math.random(1000, 9999))
+end
+
 
 local function dStatus()
   qFill(1, H, W, 1, QB.bg)
@@ -2486,7 +2493,32 @@ end
 
 local function dReq(payload, timeout)
   if not deals.server then return false, "No deal server connected" end
-  return request(deals.server, DEAL_PROTOCOL, payload, timeout or TIMEOUT)
+  timeout = timeout or TIMEOUT
+  payload = payload or {}
+  payload.request_id = payload.request_id or nextRequestId()
+
+  rednet.send(deals.server, payload, DEAL_PROTOCOL)
+
+  local deadline = os.clock() + timeout
+  while true do
+    local remaining = deadline - os.clock()
+    if remaining <= 0 then
+      return false, "No response from ShoMail server"
+    end
+
+    local sender, msg = rednet.receive(DEAL_PROTOCOL, remaining)
+    if sender == deals.server and type(msg) == "table" then
+      -- New server echoes request_id. Ignore packets meant for someone else.
+      if msg.request_id == payload.request_id then
+        return msg.success == true, msg.response
+      end
+
+      -- Compatibility fallback for older servers without request_id.
+      if msg.request_id == nil and msg.success ~= nil then
+        return msg.success == true, msg.response
+      end
+    end
+  end
 end
 
 local function dMarkNotificationsSeen()
@@ -2681,30 +2713,63 @@ local function dDrawList()
 
   qCard(2, 7, W - 2, H - 10)
 
-  if #deals.list == 0 then
-    qAt(4, 8, "No deals found.", QB.label, QB.card)
-  else
-    local y = 8
-    for i, deal in ipairs(deals.list) do
-      if y >= H - 4 then break end
+  local listTop = 8
+  local listBottom = H - 4
+  local rowH = 2
+  local visible = math.max(1, math.floor((listBottom - listTop + 1) / rowH))
+  local total = #deals.list
 
+  if deals.selected < 1 then deals.selected = 1 end
+  if deals.selected > total then deals.selected = total end
+  if deals.selected < 1 then deals.selected = 1 end
+
+  if deals.scroll < 0 then deals.scroll = 0 end
+  if deals.selected <= deals.scroll then deals.scroll = deals.selected - 1 end
+  if deals.selected > deals.scroll + visible then deals.scroll = deals.selected - visible end
+
+  local maxScroll = math.max(0, total - visible)
+  if deals.scroll > maxScroll then deals.scroll = maxScroll end
+
+  if total == 0 then
+    qAt(4, listTop, "No deals found.", QB.label, QB.card)
+  else
+    local y = listTop
+    for i = deals.scroll + 1, math.min(total, deals.scroll + visible) do
+      local deal = deals.list[i]
       local active = i == deals.selected
       local bg = active and QB.in_bg or QB.card
-      qFill(3, y, W - 4, 2, bg)
+      qFill(3, y, W - 5, 2, bg)
 
-      qAt(4, y, dDealTitle(deal):sub(1, W - 8), QB.card_fg, bg)
-      qAt(4, y + 1, dDealParty(deal):sub(1, W - 18), QB.label, bg)
+      qAt(4, y, dDealTitle(deal):sub(1, W - 9), QB.card_fg, bg)
+      qAt(4, y + 1, dDealParty(deal):sub(1, W - 19), QB.label, bg)
 
       local amt = dDealAmount(deal)
-      if amt ~= "" then qAt(W - #amt - 1, y + 1, amt, QB.ok, bg) end
+      if amt ~= "" then qAt(W - #amt - 2, y + 1, amt, QB.ok, bg) end
 
-      y = y + 2
+      y = y + rowH
     end
   end
 
+  -- simple scrollbar on the right edge of the card
+  local barX = W - 2
+  local barY = listTop
+  local barH = math.max(1, listBottom - listTop + 1)
+  qFill(barX, barY, 1, barH, QB.in_bg)
+
+  if total > visible then
+    local knobH = math.max(1, math.floor((visible / total) * barH + 0.5))
+    local denom = math.max(1, total - visible)
+    local knobY = barY + math.floor(((barH - knobH) * deals.scroll) / denom + 0.5)
+    if knobY < barY then knobY = barY end
+    if knobY + knobH - 1 > barY + barH - 1 then knobY = barY + barH - knobH end
+    qFill(barX, knobY, 1, knobH, QB.btn_pri)
+  else
+    qFill(barX, barY, 1, barH, QB.btn_sec)
+  end
+
   local third = math.floor((W - 10) / 3)
-  local bPrev = qBtn(4, H - 3, third, "Prev", QB.btn_sec, QB.card_fg)
-  local bNext = qBtn(5 + third, H - 3, third, "Next", QB.btn_sec, QB.card_fg)
+  local bPrev = qBtn(4, H - 3, third, "Up", QB.btn_sec, QB.card_fg)
+  local bNext = qBtn(5 + third, H - 3, third, "Down", QB.btn_sec, QB.card_fg)
   local bOpen = qBtn(6 + (third * 2), H - 3, third, "Open", QB.btn_pri, QB.btn_fg)
 
   local half = math.floor((W - 8) / 2)
@@ -2712,7 +2777,7 @@ local function dDrawList()
   local bRefresh = qBtn(5 + half, H - 2, half, "Refresh", QB.btn_pri, QB.btn_fg)
 
   dStatus()
-  return tabs, bPrev, bNext, bOpen, bRefresh, bHome
+  return tabs, bPrev, bNext, bOpen, bRefresh, bHome, visible
 end
 local function dAction(deal, action, extra)
   if not deal then return false end
@@ -2824,8 +2889,14 @@ local function dDetail(deal)
     local nextDue = tostring(deal.next_due or deal.start_date or deal.start or "")
     if nextDue ~= "" then qAt(4, 12, "Due:    " .. nextDue:sub(1, W - 13), QB.label, QB.card) end
 
+    local body = tostring(deal.message or deal.body or "")
     local note = tostring(deal.note or deal.memo or deal.description or "")
-    if note ~= "" then
+
+    if body ~= "" then
+      qAt(4, 14, "Message:", QB.label, QB.card)
+      qAt(4, 15, body:sub(1, W - 6), QB.card_fg, QB.card)
+      if #body > W - 6 then qAt(4, 16, body:sub(W - 5, (W - 6) * 2), QB.card_fg, QB.card) end
+    elseif note ~= "" then
       qAt(4, 14, "Note:", QB.label, QB.card)
       qAt(4, 15, note:sub(1, W - 6), QB.card_fg, QB.card)
     end
@@ -2861,7 +2932,7 @@ local function dDetail(deal)
         if terms then dAction(deal, "counter_deal", { terms = terms }); return end
       end
       if bCancel and hit(bCancel, x, y) then
-        if dAction(deal, "cancel_deal") then
+        if dAction(deal, status == "active" and "end_arrangement" or "cancel_deal") then
           dTop(status == "active" and "Ended" or "Cancelled")
           qCard(2, 6, W - 2, H - 8)
           qCentre(9, status == "active" and "Arrangement Ended" or "Deal Cancelled", QB.err, QB.card)
@@ -2881,6 +2952,7 @@ end
 
 local function dNewDeal()
   local focus = 1
+  local sending = false
   local currentDateLabel, currentDate = dCurrentDateLabel()
 
   local function draw()
@@ -2902,7 +2974,7 @@ local function dNewDeal()
     local bFreq = qBtn(15, 16, math.max(10, W - 17), freqLabel, focus == 4 and QB.btn_pri or QB.btn_sec, focus == 4 and QB.btn_fg or QB.card_fg)
 
     local half = math.floor((W - 8) / 2)
-    local bSend = qBtn(4, H - 2, half, "Propose", QB.btn_pri, QB.btn_fg)
+    local bSend = qBtn(4, H - 2, half, sending and "Sending..." or "Propose", sending and QB.btn_sec or QB.btn_pri, sending and QB.card_fg or QB.btn_fg)
     local bBack = qBtn(5 + half, H - 2, half, "Back", QB.btn_sec, QB.card_fg)
 
     local suggestionButtons = {}
@@ -2938,12 +3010,18 @@ local function dNewDeal()
   end
 
   local function send()
+    if sending then
+      dSet("Already sending proposal...", QB.warn)
+      return false
+    end
+
     local amount = tonumber(deals.form.amount)
     if deals.form.to_id == "" then dSet("Enter recipient.", QB.err); return false end
     if deals.form.title == "" then dSet("Enter title.", QB.err); return false end
     if not amount or amount <= 0 then dSet("Enter valid amount.", QB.err); return false end
     if not dConnect() then return false end
 
+    sending = true
     dSet("Sending proposal...", QB.dim)
     draw()
 
@@ -2959,6 +3037,8 @@ local function dNewDeal()
       start_date = currentDate,
       note = deals.form.note,
     }, 8)
+
+    sending = false
 
     if ok then
       dSet("Deal proposal sent.", QB.ok)
@@ -2982,6 +3062,7 @@ local function dNewDeal()
       return true
     end
 
+    sending = false
     dSet("Send failed: " .. tostring(res), QB.err)
     return false
   end
@@ -3080,7 +3161,7 @@ local function messagesApp()
       dList()
     end
 
-    local tabs, bPrev, bNext, bOpen, bRefresh, bHome = dDrawList()
+    local tabs, bPrev, bNext, bOpen, bRefresh, bHome, visibleRows = dDrawList()
 
     local ev, a, x, y = os.pullEvent()
 
@@ -3090,6 +3171,7 @@ local function messagesApp()
         if hit(tab, x, y) then
           deals.mode = tab.mode
           deals.selected = 1
+          deals.scroll = 0
           if deals.mode ~= "new" then dList() end
           tabbed = true
           break
@@ -3109,9 +3191,16 @@ local function messagesApp()
           dList()
         else
           local row = y - 8
-          local idx = math.floor(row / 2) + 1
+          local idx = deals.scroll + math.floor(row / 2) + 1
           if idx >= 1 and idx <= #deals.list then deals.selected = idx end
         end
+      end
+
+    elseif ev == "mouse_scroll" then
+      if a > 0 then
+        deals.selected = math.min(#deals.list, deals.selected + 1)
+      else
+        deals.selected = math.max(1, deals.selected - 1)
       end
 
     elseif ev == "key" then
