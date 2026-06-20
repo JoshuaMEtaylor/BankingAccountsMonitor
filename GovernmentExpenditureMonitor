@@ -43,7 +43,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION          = "1.1.4-OUTSIDE-LABELS"
+local VERSION          = "1.1.5-OFFSET-LEADERS"
 local BANK_PROTOCOL    = "quid_bank"
 local TREASURY_ACCOUNT = "treasury:quid_bank"
 local DB_TIMEOUT       = 4
@@ -903,6 +903,11 @@ local function drawPieLabels(cx, cy, rx, ry, slices, total, chartX, chartY, char
   local maxY = chartY + chartH - 4
   if maxY < minY then maxY = minY end
 
+  -- Keep visible air between the donut and all leader lines.
+  local radial_gap_x = 5
+  local radial_gap_y = 2
+  local label_gap = 10
+
   local left, right = {}, {}
   local acc = 0
   for _, s in ipairs(slices or {}) do
@@ -915,10 +920,10 @@ local function drawPieLabels(cx, cy, rx, ry, slices, total, chartX, chartY, char
         sector = s,
         angle = mid,
         side = c >= 0 and "right" or "left",
-        -- Start the leader line just OUTSIDE the donut so the labels never cut through the pie itself.
-        edge_x = round(cx + c * (rx + 2)),
-        edge_y = round(cy + sn * (ry + 1)),
-        natural_y = round(cy + sn * (ry + 1)),
+        -- Anchor every leader line clearly outside the donut.
+        edge_x = round(cx + c * (rx + radial_gap_x)),
+        edge_y = round(cy + sn * (ry + radial_gap_y)),
+        natural_y = round(cy + sn * (ry + radial_gap_y)),
         colour = s.color or C.grid,
       }
       if row.side == "right" then right[#right + 1] = row else left[#left + 1] = row end
@@ -939,8 +944,8 @@ local function drawPieLabels(cx, cy, rx, ry, slices, total, chartX, chartY, char
     local fg = r.colour or C.grid
 
     if r.side == "right" then
-      local labelX = clamp(r.edge_x + 8, cx + rx + 5, chartRight - labelW - 2)
-      local jointX = clamp(r.edge_x + 3, r.edge_x + 1, labelX - 3)
+      local labelX = clamp(r.edge_x + label_gap, cx + rx + radial_gap_x + 3, chartRight - labelW - 2)
+      local jointX = clamp(r.edge_x + 4, r.edge_x + 2, labelX - 3)
       drawHLine(r.edge_x, jointX, r.edge_y, fg)
       if y ~= r.edge_y then drawVLine(jointX, r.edge_y, y, fg) end
       drawHLine(jointX, labelX - 2, y, fg)
@@ -948,9 +953,9 @@ local function drawPieLabels(cx, cy, rx, ry, slices, total, chartX, chartY, char
       at(labelX + 2, y, shortText(name .. " " .. share, labelW - 2), C.text, C.bg)
       at(labelX + 2, y + 1, value, C.good, C.bg)
     else
-      local labelX = clamp(r.edge_x - labelW - 8, chartX + 3, cx - rx - labelW - 5)
+      local labelX = clamp(r.edge_x - labelW - label_gap, chartX + 3, cx - rx - labelW - radial_gap_x - 3)
       local labelEnd = labelX + labelW - 1
-      local jointX = clamp(r.edge_x - 3, labelEnd + 3, r.edge_x - 1)
+      local jointX = clamp(r.edge_x - 4, labelEnd + 3, r.edge_x - 2)
       drawHLine(jointX, r.edge_x, r.edge_y, fg)
       if y ~= r.edge_y then drawVLine(jointX, r.edge_y, y, fg) end
       drawHLine(labelEnd + 2, jointX, y, fg)
