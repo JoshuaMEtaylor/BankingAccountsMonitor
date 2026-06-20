@@ -3,7 +3,7 @@
 -- GovernmentExpenditureMonitor
 --
 -- Rebuilt public monitor for state expenditure.
--- Presents live treasury expenditure by category with a small pie chart and tabs.
+-- Presents live treasury expenditure by category with a clean watch-only pie chart.
 -- Read-only. Does not mutate bank state, payroll, inflation, contracts, or treasury.
 -- =============================================================================
 
@@ -43,7 +43,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION          = "1.1.0-TABS-PIE"
+local VERSION          = "1.1.1-WATCH-ONLY"
 local BANK_PROTOCOL    = "quid_bank"
 local TREASURY_ACCOUNT = "treasury:quid_bank"
 local DB_TIMEOUT       = 4
@@ -59,8 +59,6 @@ local monitor_name = nil
 local using_monitor = false
 
 local W, H = term.getSize()
-local active_tab = "overview"
-local tab_hits = {}
 local last_message = "Booting..."
 local last_colour = colors.lightGray
 local last_refresh_ms = 0
@@ -1004,33 +1002,124 @@ local function drawSectorTab(data, key, startY)
   end
 end
 
+
+local function drawCategoryList(x, y, w, h, data)
+  box(x, y, w, h, "Expenditure by department")
+  local total = math.max(1, tonumber(data and data.chart_total) or 0)
+  at(x + 2, y + 2, "Department", C.label, C.bg)
+  at(x + math.max(18, w - 25), y + 2, "Share", C.label, C.bg)
+  at(x + w - 11, y + 2, "Annual", C.label, C.bg)
+
+  local rowY = y + 4
+  local maxRows = math.max(0, h - 5)
+  local rows = {}
+
+  for _, s in ipairs(data.order or {}) do
+    rows[#rows + 1] = s
+  end
+
+  table.sort(rows, function(a, b)
+    local av, bv = tonumber(a.chart_value or 0) or 0, tonumber(b.chart_value or 0) or 0
+    if av == bv then return tostring(a.label) < tostring(b.label) end
+    return av > bv
+  end)
+
+  local printed = 0
+  for _, s in ipairs(rows) do
+    if printed >= maxRows then break end
+    if s.chart_value > 0 or s.key == "defence" or s.key == "research" or s.key == "welfare" then
+      local yy = rowY + printed
+      at(x + 2, yy, shortText(s.label, 15), C.text, C.bg)
+      drawTinyBar(x + 18, yy, math.max(6, w - 43), s.chart_value, total, s.color)
+      at(x + math.max(18, w - 25), yy, pct(s.chart_value, total), C.dim, C.bg)
+      at(x + w - 11, yy, shortText(money(s.chart_value), 11), C.good, C.bg)
+      printed = printed + 1
+    end
+  end
+
+  if printed == 0 then
+    at(x + 2, y + 4, "No treasury outflows or public payroll forecast yet.", C.dim, C.bg)
+  end
+end
+
+local function drawWatchDashboard(data, startY)
+  local bodyY = startY or 3
+  local bottom = H - 1
+  local leftW = math.max(34, math.min(42, math.floor(W * 0.36)))
+  local rightX = leftW + 3
+  local rightW = W - rightX - 1
+
+  local treasury = supplyValue(data, "treasury_balance")
+  local issued = supplyValue(data, "in_circulation")
+  local private = supplyValue(data, "citizen_holdings") + supplyValue(data, "company_holdings") + supplyValue(data, "escrow_held")
+  local control = issued > 0 and (treasury / issued) or 0
+  local slices = positiveSlices(data)
+
+  box(2, bodyY, leftW, 11, "State position")
+  kv(4, bodyY + 2, "Annual exposure", money(data.chart_total), C.good, leftW - 4)
+  kv(4, bodyY + 3, "Recent outflow", money(data.actual_total), C.warn, leftW - 4)
+  kv(4, bodyY + 4, "Daily actual avg", money(data.actual_daily), C.text, leftW - 4)
+  kv(4, bodyY + 5, "Public payroll/day", money(data.forecast_daily), C.label, leftW - 4)
+  kv(4, bodyY + 6, "Treasury reserve", money(treasury), C.good, leftW - 4)
+  kv(4, bodyY + 7, "Private supply", money(private), C.label, leftW - 4)
+  kv(4, bodyY + 8, "Treasury control", string.format("%.1f%%", control * 100), C.dim, leftW - 4)
+  kv(4, bodyY + 9, "Window", tostring(data.observed_days) .. " MC day(s)", C.dim, leftW - 4)
+
+  local catY = bodyY + 12
+  local catH = math.max(10, bottom - catY)
+  drawCategoryList(2, catY, leftW, catH, data)
+
+  local pieH = math.max(17, math.floor((bottom - bodyY) * 0.62))
+  if pieH > bottom - bodyY - 8 then pieH = math.max(15, bottom - bodyY - 8) end
+  local feedY = bodyY + pieH + 1
+  local feedH = math.max(6, bottom - feedY)
+
+  box(rightX, bodyY, rightW, pieH, "Annual expenditure mix")
+  at(rightX + 2, bodyY + 2, "Total: " .. money(data.chart_total), C.good, C.bg)
+  at(rightX + 2, bodyY + 3, "Forecast fills public payroll where recent transactions are missing.", C.dim, C.bg)
+
+  local pieAreaW = math.max(22, math.floor(rightW * 0.47))
+  local legendX = rightX + pieAreaW + 2
+  local legendW = math.max(24, rightW - pieAreaW - 4)
+  local rx = math.max(6, math.min(13, math.floor((pieAreaW - 4) / 2)))
+  local ry = math.max(4, math.min(8, math.floor((pieH - 7) / 2)))
+  local cx = rightX + 2 + math.floor(pieAreaW / 2)
+  local cy = bodyY + 5 + ry
+
+  drawPie(cx, cy, rx, ry, slices, data.chart_total)
+  drawLegend(legendX, bodyY + 5, legendW, slices, data.chart_total, math.max(4, pieH - 7))
+
+  if rightW > 45 and pieH > 14 then
+    at(rightX + 2, bodyY + pieH - 2, "Live categories: defence, research, welfare, logistics, administration, infrastructure, grants, finance, other", C.dim, C.bg)
+  end
+
+  drawRecentFeed(rightX, feedY, rightW, feedH, data.outflows)
+end
+
 local function drawScreen(data, err)
   cls()
   topBar()
   at(2, 3, mcTime(), C.dim, C.bg)
-  local tabs = buildTabs(data)
-  local tabBottom = drawTabs(tabs)
+  at(W - 34, 3, "Live public expenditure display", C.dim, C.bg)
 
   if err then
-    at(2, tabBottom + 2, "Unable to load expenditure data: " .. shortText(err, W - 4), C.bad, C.bg)
-    at(2, tabBottom + 4, "Diagnostics:", C.label, C.bg)
-    local y = tabBottom + 5
+    at(2, 5, "Unable to load expenditure data: " .. shortText(err, W - 4), C.bad, C.bg)
+    at(2, 7, "Diagnostics:", C.label, C.bg)
+    local y = 8
     for k, v in pairs(last_diagnostics or {}) do
       if y >= H - 1 then break end
       at(4, y, tostring(k) .. ": " .. shortText(v, W - 8), C.dim, C.bg)
       y = y + 1
     end
   elseif not data then
-    at(2, tabBottom + 2, "Awaiting data...", C.warn, C.bg)
-  elseif active_tab == "overview" then
-    drawOverview(data, tabBottom)
+    at(2, 5, "Awaiting expenditure data...", C.warn, C.bg)
   else
-    drawSectorTab(data, active_tab, tabBottom)
+    drawWatchDashboard(data, 5)
   end
 
   local age = "never"
   if last_refresh_ms > 0 then age = tostring(math.floor((nowMs() - last_refresh_ms) / 1000)) .. "s ago" end
-  last_message = "Live refresh: " .. age .. " | touch tabs/cycle | R refresh | arrows tabs | Q quit | source " .. tostring(last_data_source)
+  last_message = "Live refresh " .. age .. " | source " .. tostring(last_data_source) .. " | read-only monitor"
   last_colour = C.dim
   statusBar()
 end
@@ -1061,10 +1150,6 @@ local function main()
       latest = res
       latest_err = nil
       last_refresh_ms = nowMs()
-      local tabs = buildTabs(latest)
-      local exists = false
-      for _, t in ipairs(tabs) do if t.key == active_tab then exists = true end end
-      if not exists then active_tab = "overview" end
     else
       latest = nil
       latest_err = tostring(res)
@@ -1076,39 +1161,10 @@ local function main()
   local timer = os.startTimer(REFRESH_SECONDS)
 
   while true do
-    local ev, p1, p2, p3 = os.pullEvent()
+    local ev, p1 = os.pullEvent()
     if ev == "timer" and p1 == timer then
       refresh()
       timer = os.startTimer(REFRESH_SECONDS)
-
-    elseif ev == "monitor_touch" then
-      local mx, my = p2, p3
-      local tab = hitTab(mx, my)
-      if tab then active_tab = tab else nextTab(buildTabs(latest), 1) end
-      drawScreen(latest, latest_err)
-
-    elseif ev == "mouse_click" then
-      local mx, my = p2, p3
-      local tab = hitTab(mx, my)
-      if tab then active_tab = tab else nextTab(buildTabs(latest), 1) end
-      drawScreen(latest, latest_err)
-
-    elseif ev == "key" then
-      if p1 == keys.q then
-        cls()
-        at(2, 2, "Government Expenditure Monitor closed.", C.dim, C.bg)
-        term.redirect(native_term)
-        return
-      elseif p1 == keys.r then
-        refresh()
-        timer = os.startTimer(REFRESH_SECONDS)
-      elseif p1 == keys.right or p1 == keys.down then
-        nextTab(buildTabs(latest), 1)
-        drawScreen(latest, latest_err)
-      elseif p1 == keys.left or p1 == keys.up then
-        nextTab(buildTabs(latest), -1)
-        drawScreen(latest, latest_err)
-      end
     end
   end
 end
