@@ -10,12 +10,12 @@
 --   MONETARY CONDITIONS
 --   POPULATION
 --   COMPANIES
---   TRANSACTIONS PER DAY
+--   TRANSACTIONS TODAY
 --
 -- Read-only. No banking controls. No trade panel. Contract GDP plus bank-side service GDP over 365 Minecraft days + in-view MCT clock + tapered money-supply inflation.
 -- =============================================================================
 
-local VERSION         = "0.5.20-WAGE-PRICE-PRESSURE"
+local VERSION         = "0.5.21-REAL-TX-MONETARY"
 local PROTOCOL        = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT      = 5
@@ -44,6 +44,7 @@ local ACCOUNT_LIST_POLL_SECONDS   = 120
 local CONTRACT_STATUS_POLL_SECONDS = 30
 local CONTRACT_LIST_POLL_SECONDS   = 120
 local ECONOMIC_GDP_POLL_SECONDS    = 60
+local TX_STATS_POLL_SECONDS        = 15
 
 local native_term = term.current()
 local monitor = nil
@@ -1012,9 +1013,9 @@ local function normaliseNationalStats(raw)
   local gdpCap = num(outputRaw.gdp_per_capita)
   if not gdpCap and gdp and population and population > 0 then gdpCap = gdp / population end
 
-  local txDay = num(activityRaw.transactions_per_day or scaleRaw.transactions_per_day)
-  local txStatus = activityRaw.status or "Live / estimated"
-  if not txDay then txDay, txStatus = estimateTxPerDay(totalTx) end
+  local txStats = raw.transaction_stats or activityRaw.transaction_stats or {}
+  local txToday = type(txStats.today) == "table" and txStats.today or {}
+  local txStatus = txStats.note or activityRaw.status or "Awaiting real bank transaction stats"
 
   return {
     mode = "official national_statistics",
@@ -1045,11 +1046,17 @@ local function normaliseNationalStats(raw)
       population = population,
       companies = companies,
       transactions_total = totalTx,
-      transactions_per_day = txDay,
-      tx_day_status = txStatus,
+      transactions_today = num(txToday.total),
+      economic_transactions_today = num(txToday.economic),
+      admin_transactions_today = num(txToday.admin),
+      payroll_transactions_today = num(txToday.payroll),
+      service_transactions_today = num(txToday.service),
+      transaction_value_today = num(txToday.value),
+      tx_today_status = txStatus,
       top_companies = scaleRaw.top_companies or scaleRaw.company_top10 or raw.top_companies or {},
       source = raw.source or "national_statistics",
     },
+    tx_stats = txStats,
     contracts = raw.contracts or raw.contract_activity or {},
   }
 end
@@ -1131,8 +1138,17 @@ local function fallbackSnapshot()
   if not companyCount and derivedCompanies > 0 then companyCount = derivedCompanies end
 
   local txTotal = num(status.tx_count)
-  local txDay, txStatus = nil, "Status tx counter unavailable"
-  if txTotal then txDay, txStatus = estimateTxPerDay(txTotal) end
+  local txStats = nil
+  local txToday = {}
+  local txStatus = "Awaiting real bank transaction stats"
+  local okTx, txRes = cachedDbRequest({ type = "transaction_stats" }, 3, TX_STATS_POLL_SECONDS)
+  if okTx and type(txRes) == "table" then
+    txStats = txRes
+    txToday = type(txRes.today) == "table" and txRes.today or {}
+    txStatus = txRes.note or "Real bank-side MC-day transaction count"
+  else
+    endpointErrors[#endpointErrors + 1] = "tx_stats=" .. shortText(tostring(txRes), 36)
+  end
 
   -- Prefer the bank's actual inflation state. The older adaptive monetary
   -- calculation remains only as a fallback if that endpoint is unavailable.
@@ -1224,11 +1240,17 @@ local function fallbackSnapshot()
       population = population,
       companies = companyCount,
       transactions_total = txTotal,
-      transactions_per_day = txDay,
-      tx_day_status = txStatus,
+      transactions_today = num(txToday.total),
+      economic_transactions_today = num(txToday.economic),
+      admin_transactions_today = num(txToday.admin),
+      payroll_transactions_today = num(txToday.payroll),
+      service_transactions_today = num(txToday.service),
+      transaction_value_today = num(txToday.value),
+      tx_today_status = txStatus,
       top_companies = topCompaniesFromAccounts(accounts),
       source = sourceText,
     },
+    tx_stats = txStats,
     contracts = contractEco,
     service_gdp = bankServiceGdp,
     hospitality_gdp = bankHospitalityGdp,
@@ -1446,48 +1468,45 @@ local function drawMonetaryCard(x, y, w, h, snap)
   local po = snap and snap.price_oracle or {}
   local wp = type(po.wage_price) == "table" and po.wage_price or {}
   local m = snap and snap.monetary or {}
-  card(x, y, w, h, "PRICE / WAGE PRESSURE", C.money)
+  card(x, y, w, h, "MONETARY CONDITIONS", C.money)
+
+  local issued = tonumber(m.issued_supply)
+  local private = tonumber(m.private_supply)
+  local treasury = tonumber(m.treasury_reserve)
+  local reserve = tonumber(m.reserve_share)
+
+  metric(x + 2, y + 2, "Issued supply", fmtMoney(issued), issued and C.good or C.warn, 18)
+  metric(x + 2, y + 3, "Private supply", fmtMoney(private), private and colors.white or C.warn, 18)
+  metric(x + 2, y + 4, "Treasury", fmtMoney(treasury), treasury and colors.white or C.warn, 18)
+  metric(x + 2, y + 5, "Treasury share", reserve and fmtPct(reserve, 1) or "Awaiting data", reserve and colors.white or C.warn, 18)
 
   if not po.connected then
-    metric(x + 2, y + 2, "Issued supply", fmtMoney(m.issued_supply), m.issued_supply and C.good or C.warn)
-    metric(x + 2, y + 3, "Fallback inflation", fmtPct(snap and snap.inflation, 2), snap and snap.inflation and colors.white or C.warn)
+    metric(x + 2, y + 7, "Fallback inflation", fmtPct(snap and snap.inflation, 2), snap and snap.inflation and colors.white or C.warn, 18)
     writeAt(x + 2, y + h - 1, shortText(po.status or "Awaiting wage/price oracle", w - 4), C.warn, C.bg)
     return
   end
 
   local priceIdx = tonumber(wp.national_price_index or po.national_price_index)
   local wageIdx = tonumber(wp.wage_index or po.wage_index)
-  local priceAth = tonumber(wp.price_ath_index)
   local stickyFloor = tonumber(wp.sticky_price_floor)
   local moneyPressure = tonumber(wp.money_pressure)
   local wagePressure = tonumber(wp.wage_cost_pressure)
   local totalPressure = tonumber(wp.total_inflation_pressure)
   local realWage = tonumber(wp.real_wage_ratio)
   local wageTarget = tonumber(wp.wage_target_index)
+  local bankRate = tonumber(po.inflation_percent)
 
-  metric(x + 2, y + 2, "Price index", fmtIndex(priceIdx, 3), priceIdx and colors.white or C.warn, 18)
-  metric(x + 2, y + 3, "Wage index", fmtIndex(wageIdx, 3), wageIdx and colors.white or C.warn, 18)
-  metric(x + 2, y + 4, "Real wage", realWage and fmtPct(realWage * 100, 1) or "Awaiting data", realWage and (realWage < 1 and C.warn or C.good) or C.warn, 18)
-  metric(x + 2, y + 5, "Wage target", fmtIndex(wageTarget, 3), wageTarget and colors.white or C.warn, 18)
-  metric(x + 2, y + 6, "Money pressure", moneyPressure and fmtPct(moneyPressure * 100, 2) or "Awaiting data", moneyPressure and colors.white or C.warn, 18)
-  metric(x + 2, y + 7, "Wage pressure", wagePressure and fmtPct(wagePressure * 100, 2) or "Awaiting data", wagePressure and wagePressure > 0 and C.warn or C.dim, 18)
-  metric(x + 2, y + 8, "Total pressure", totalPressure and fmtPct(totalPressure * 100, 2) or "Awaiting data", totalPressure and colors.white or C.warn, 18)
+  metric(x + 2, y + 7, "Inflation rate", bankRate and fmtPct(bankRate, 2) or "Awaiting data", bankRate and colors.white or C.warn, 18)
+  metric(x + 2, y + 8, "Price index", fmtIndex(priceIdx, 3), priceIdx and colors.white or C.warn, 18)
   metric(x + 2, y + 9, "Sticky floor", fmtIndex(stickyFloor, 3), stickyFloor and colors.white or C.warn, 18)
+  metric(x + 2, y + 10, "Wage index", fmtIndex(wageIdx, 3), wageIdx and colors.white or C.warn, 18)
+  metric(x + 2, y + 11, "Wage target", fmtIndex(wageTarget, 3), wageTarget and colors.white or C.warn, 18)
+  metric(x + 2, y + 12, "Real wage", realWage and fmtPct(realWage * 100, 1) or "Awaiting data", realWage and (realWage < 1 and C.warn or C.good) or C.warn, 18)
+  metric(x + 2, y + 13, "Money pressure", moneyPressure and fmtPct(moneyPressure * 100, 2) or "Awaiting data", moneyPressure and colors.white or C.warn, 18)
+  metric(x + 2, y + 14, "Wage pressure", wagePressure and fmtPct(wagePressure * 100, 2) or "Awaiting data", wagePressure and wagePressure > 0 and C.warn or C.dim, 18)
+  metric(x + 2, y + 15, "Total pressure", totalPressure and fmtPct(totalPressure * 100, 2) or "Awaiting data", totalPressure and colors.white or C.warn, 18)
 
-  local q = po.quotes or {}
-  local lineY = y + 11
-  if lineY <= y + h - 2 then
-    local meal = quoteLabel(q.dining_meal) or "n/a"
-    local large = quoteLabel(q.large_meal) or "n/a"
-    writeAt(x + 2, lineY, shortText("Meal normal/large: " .. meal .. " / " .. large, w - 4), C.text, C.bg)
-  end
-  if lineY + 1 <= y + h - 2 then
-    local build = quoteLabel(q.oak_planks_64) or "n/a"
-    local coal = quoteLabel(q.coal_16) or "n/a"
-    writeAt(x + 2, lineY + 1, shortText("64 planks: " .. build .. "   16 coal: " .. coal, w - 4), C.text, C.bg)
-  end
-
-  writeAt(x + 2, y + h - 1, shortText(po.status or "Live national wage/price pressure", w - 4), C.good, C.bg)
+  writeAt(x + 2, y + h - 1, shortText(po.status or "Live monetary + wage pressure", w - 4), C.good, C.bg)
 end
 
 local function drawPriceOracleCard(x, y, w, h, snap)
@@ -1554,38 +1573,40 @@ local function drawScaleCard(x, y, w, h, snap)
   card(x, y, w, h, "POPULATION / COMPANIES / TRANSACTIONS", C.scale)
   metric(x + 2, y + 2, "Population", tostring(s.population or "Awaiting data"), s.population and colors.white or C.warn)
   metric(x + 2, y + 3, "Companies", tostring(s.companies or "Awaiting data"), s.companies and colors.white or C.warn)
-  metric(x + 2, y + 4, "Transactions / day", s.transactions_per_day and (fmtNum(s.transactions_per_day, 1) .. " / day") or "Collecting baseline", s.transactions_per_day and colors.white or C.warn)
+  metric(x + 2, y + 4, "TX today", s.transactions_today ~= nil and tostring(s.transactions_today) or "Awaiting data", s.transactions_today ~= nil and colors.white or C.warn)
+  local txBreak = "E/A/P/S: " .. tostring(s.economic_transactions_today or 0) .. "/" .. tostring(s.admin_transactions_today or 0) .. "/" .. tostring(s.payroll_transactions_today or 0) .. "/" .. tostring(s.service_transactions_today or 0)
+  writeAt(x + 2, y + 5, shortText(txBreak, w - 4), C.text, C.bg)
 
   local c = snap and snap.contracts or {}
   local contractLine = "Contracts O/C/F: " .. tostring(c.open or 0) .. "/" .. tostring(c.claimed or 0) .. "/" .. tostring(c.fulfilled or 0)
-  writeAt(x + 2, y + 5, shortText(contractLine, w - 4), c.connected and C.good or C.warn, C.bg)
+  writeAt(x + 2, y + 6, shortText(contractLine, w - 4), c.connected and C.good or C.warn, C.bg)
 
   local svc = snap and snap.service_gdp or nil
   local hosp = snap and snap.hospitality_gdp or nil
   local conGdp = snap and snap.contract_gdp or nil
   local serviceLine = "GDP split C/S: " .. fmtMoney(conGdp or 0) .. " / " .. fmtMoney(svc or 0)
-  writeAt(x + 2, y + 6, shortText(serviceLine, w - 4), (svc and svc > 0) and C.good or C.dim, C.bg)
+  writeAt(x + 2, y + 7, shortText(serviceLine, w - 4), (svc and svc > 0) and C.good or C.dim, C.bg)
   if hosp and hosp > 0 then
-    writeAt(x + 2, y + 7, shortText("Restaurant/meals GDP: " .. fmtMoney(hosp), w - 4), colors.yellow, C.bg)
+    writeAt(x + 2, y + 8, shortText("Restaurant/meals GDP: " .. fmtMoney(hosp), w - 4), colors.yellow, C.bg)
   end
 
-  writeAt(x + 2, y + 9, "Top companies", colors.white, C.bg)
+  writeAt(x + 2, y + 10, "Top companies", colors.white, C.bg)
   local top = s.top_companies or {}
   if type(top) ~= "table" or #top == 0 then
-    writeAt(x + 2, y + 10, "No company account data", C.warn, C.bg)
+    writeAt(x + 2, y + 11, "No company account data", C.warn, C.bg)
   else
-    local maxRows = math.min(10, #top, math.max(1, h - 12))
+    local maxRows = math.min(10, #top, math.max(1, h - 13))
     for i = 1, maxRows do
       local company = top[i] or {}
       local name = shortText(company.name or company.id or ("Company " .. i), math.max(8, w - 18))
       local bal = fmtMoney(company.balance)
       local line = tostring(i) .. ". " .. name
-      writeAt(x + 2, y + 9 + i, shortText(line, w - 18), C.text, C.bg)
-      writeAt(x + w - #bal - 2, y + 9 + i, bal, colors.white, C.bg)
+      writeAt(x + 2, y + 10 + i, shortText(line, w - 18), C.text, C.bg)
+      writeAt(x + w - #bal - 2, y + 10 + i, bal, colors.white, C.bg)
     end
   end
 
-  writeAt(x + 2, y + h - 1, shortText(s.tx_day_status or "Awaiting tx counter", w - 4), C.dim, C.bg)
+  writeAt(x + 2, y + h - 1, shortText(s.tx_today_status or "Awaiting real transaction stats", w - 4), C.dim, C.bg)
 end
 
 local function drawHeader(snap)
