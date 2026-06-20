@@ -43,7 +43,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION          = "1.2.2-BIGGER-CENTRAL-PIE"
+local VERSION          = "1.2.3-BIG-DETAILED-PIE"
 local BANK_PROTOCOL    = "quid_bank"
 local TREASURY_ACCOUNT = "treasury:quid_bank"
 local DB_TIMEOUT       = 4
@@ -809,27 +809,65 @@ local function drawPie(cx, cy, rx, ry, slices, total)
     return
   end
 
-  for yy = cy - ry, cy + ry do
-    for xx = cx - rx, cx + rx do
-      local dx = (xx - cx) / math.max(1, rx)
-      local dy = (yy - cy) / math.max(1, ry)
-      if (dx * dx) + (dy * dy) <= 1 then
-        local ang = atan2(dy, dx)
-        if ang < 0 then ang = ang + (2 * math.pi) end
-        local share = (ang / (2 * math.pi)) * total
-        local s = sectorAtShare(slices, share)
-        if s then
-          at(xx, yy, " ", colors.white, s.color)
+  -- Use light supersampling so the donut reads less jagged on large monitors.
+  -- We still draw in monitor cells, but sampling multiple sub-points gives a
+  -- smoother outer edge, inner hole, and cleaner slice boundaries.
+  local irx = math.max(1, math.floor(rx * 0.22))
+  local iry = math.max(1, math.floor(ry * 0.22))
+  local sample_offsets = {
+    { -0.30, -0.30 }, {  0.30, -0.30 },
+    { -0.30,  0.30 }, {  0.30,  0.30 },
+  }
+
+  for yy = cy - ry - 1, cy + ry + 1 do
+    for xx = cx - rx - 1, cx + rx + 1 do
+      local inside_count = 0
+      local sector_hits = {}
+
+      for _, off in ipairs(sample_offsets) do
+        local sx = xx + off[1]
+        local sy = yy + off[2]
+
+        local odx = (sx - cx) / math.max(1, rx)
+        local ody = (sy - cy) / math.max(1, ry)
+        local outer = (odx * odx) + (ody * ody) <= 1
+
+        if outer then
+          local idx = (sx - cx) / math.max(1, irx)
+          local idy = (sy - cy) / math.max(1, iry)
+          local inner = (idx * idx) + (idy * idy) <= 1
+
+          if not inner then
+            inside_count = inside_count + 1
+            local ang = atan2(ody, odx)
+            if ang < 0 then ang = ang + (2 * math.pi) end
+            local share = (ang / (2 * math.pi)) * total
+            local s = sectorAtShare(slices, share)
+            if s then
+              sector_hits[s.key or s.label or tostring(s.color)] = {
+                sector = s,
+                count = (sector_hits[s.key or s.label or tostring(s.color)] and sector_hits[s.key or s.label or tostring(s.color)].count or 0) + 1
+              }
+            end
+          end
+        end
+      end
+
+      if inside_count >= 2 then
+        local best = nil
+        for _, row in pairs(sector_hits) do
+          if (not best) or row.count > best.count then best = row end
+        end
+        if best and best.sector then
+          at(xx, yy, " ", colors.white, best.sector.color)
         end
       end
     end
   end
 
-  -- small hollow centre, makes the chart look cleaner on monitors
-  local irx = math.max(1, math.floor(rx * 0.24))
-  local iry = math.max(1, math.floor(ry * 0.24))
-  for yy = cy - iry, cy + iry do
-    for xx = cx - irx, cx + irx do
+  -- Hollow centre
+  for yy = cy - iry - 1, cy + iry + 1 do
+    for xx = cx - irx - 1, cx + irx + 1 do
       local dx = (xx - cx) / math.max(1, irx)
       local dy = (yy - cy) / math.max(1, iry)
       if (dx * dx) + (dy * dy) <= 1 then at(xx, yy, " ", C.bg, C.bg) end
@@ -1213,9 +1251,9 @@ local function drawWatchDashboard(data, startY)
 
   -- Bigger main chart, placed more centrally on the screen.
   -- The monitor is large enough to give the donut more presence.
-  local rx = math.max(12, math.min(21, math.floor(chartW * 0.21)))
-  local ry = math.max(6, math.min(10, math.floor((chartH - 6) / 2)))
-  local cx = math.floor(W * 0.46)
+  local rx = math.max(14, math.min(24, math.floor(chartW * 0.24)))
+  local ry = math.max(7, math.min(12, math.floor((chartH - 5) / 2)))
+  local cx = math.floor(W * 0.48)
   local cy = chartY + math.floor(chartH / 2) + 1
   if cy - ry < chartY + 4 then cy = chartY + 4 + ry end
   if cy + ry > chartBottom - 1 then cy = chartBottom - 1 - ry end
