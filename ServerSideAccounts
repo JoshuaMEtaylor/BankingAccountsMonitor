@@ -22,7 +22,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.4.24-LOGISTICS-PRIVATE"
+local VERSION  = "1.4.25-REAL-TX-STATS"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -67,6 +67,7 @@ local FILE = {
   config       = "data/config.db",
   employment   = "data/employment_mappings.db",
   colony_deleted = "data/colony_deleted_citizens.db",
+  transaction_stats = "data/transaction_stats.db",
 }
 
 local LEDGER_KEEP_RECENT_TX = 500
@@ -93,6 +94,7 @@ local price_oracle = {}
 local inflation_state = {}
 local config    = {}
 local colony_deleted_citizens = {} -- [citizen:mc_*] = tombstone record blocking boot repair/recovery
+local transaction_stats = {} -- bank-side real transaction counts by Minecraft day
 
 local tx_counter    = 0
 local sh_counter    = 0
@@ -203,6 +205,61 @@ local function readLines(path)
   end
   f.close()
   return lines
+end
+
+local function txCurrentMinecraftDay()
+  if os.day then
+    local ok, day = pcall(os.day, "ingame")
+    if ok and tonumber(day) then return math.floor(tonumber(day)) end
+    ok, day = pcall(os.day)
+    if ok and tonumber(day) then return math.floor(tonumber(day)) end
+  end
+  return math.floor(timestamp() / 1200000)
+end
+
+local function txCategory(tx_type, from_id, to_id)
+  tx_type = string.upper(tostring(tx_type or "TRANSFER"))
+  local economic = false
+  local admin = false
+  local monetary = false
+  local payroll = false
+  local service = false
+  local contract = false
+  local company = false
+  local personal = false
+
+  if tx_type == "MINT" or tx_type == "BURN" then
+    monetary = true; admin = true
+  elseif tx_type == "GRANT" or tx_type == "TREASURY_GRANT" or tx_type == "STIMULUS" or tx_type == "ESTATE_RECOVERY" then
+    admin = true
+  end
+
+  if tx_type == "COMPANY_PAYROLL" or tx_type == "GOVERNMENT_PAYROLL" then
+    payroll = true; economic = true
+  end
+
+  if tx_type == "HOSPITALITY_MEAL" or tx_type == "HOSPITALITY_SUBSIDY" or tx_type == "SERVICE_PAYMENT" then
+    service = true; economic = true
+  end
+
+  if tx_type == "CONTRACT_REWARD" or tx_type == "CONTRACT_PAYOUT" or tx_type == "CONTRACT_PAYMENT" then
+    contract = true; economic = true
+  end
+
+  if tostring(from_id or ""):find("^company:") or tostring(to_id or ""):find("^company:") then
+    company = true
+  end
+
+  if tx_type == "TRANSFER" or tx_type == "WIRE" or tx_type == "WIRE_TRANSFER" then
+    personal = true
+  end
+
+  if company and not admin and not monetary then economic = true end
+
+  return {
+    economic = economic, admin = admin, monetary = monetary, payroll = payroll,
+    service = service, contract = contract, company = company, personal = personal,
+  }
 end
 
 -- =============================================================================
@@ -388,6 +445,7 @@ local function saveInflation() return writeFile(FILE.inflation, inflation_state)
 local function saveConfig()    return writeFile(FILE.config,    config)    end
 local function saveEmployment() return writeFile(FILE.employment, employment_mappings) end
 local function saveColonyDeleted() return writeFile(FILE.colony_deleted, colony_deleted_citizens) end
+local function saveTransactionStats() return writeFile(FILE.transaction_stats, transaction_stats) end
 
 local function saveCoreBankFiles()
   local results = {
@@ -421,6 +479,141 @@ local function saveCoreBankFiles()
   end
 
   return true, "hard files written", results
+end
+
+local function ensureTransactionStats()
+  transaction_stats = type(transaction_stats) == "table" and transaction_stats or {}
+  transaction_stats.days = type(transaction_stats.days) == "table" and transaction_stats.days or {}
+  transaction_stats.seen = type(transaction_stats.seen) == "table" and transaction_stats.seen or {}
+  transaction_stats.updated = transaction_stats.updated or timestamp()
+  transaction_stats.model = "bank_side_mc_day_transaction_counts_v1"
+  return transaction_stats
+end
+
+local function emptyTxDay(day)
+  return {
+    day = day,
+    total = 0,
+    economic = 0,
+    admin = 0,
+    monetary = 0,
+    payroll = 0,
+    service = 0,
+    contract = 0,
+    company = 0,
+    personal = 0,
+    by_type = {},
+    value = 0,
+    economic_value = 0,
+    admin_value = 0,
+    monetary_value = 0,
+    payroll_value = 0,
+    service_value = 0,
+    contract_value = 0,
+    company_value = 0,
+    personal_value = 0,
+    first_tx = nil,
+    last_tx = nil,
+    updated = timestamp(),
+  }
+end
+
+local function trimTransactionStats()
+  ensureTransactionStats()
+  local today = txCurrentMinecraftDay()
+  local keep_after = today - 90
+  for dayKey, _ in pairs(transaction_stats.days or {}) do
+    local d = tonumber(dayKey)
+    if d and d < keep_after then transaction_stats.days[dayKey] = nil end
+  end
+
+  -- Keep the seen map compact. This is only for duplicate protection, not a full ledger.
+  local seenCount = 0
+  for _ in pairs(transaction_stats.seen or {}) do seenCount = seenCount + 1 end
+  if seenCount > 1500 then
+    local kept = {}
+    local floorTx = math.max(0, tx_counter - 1000)
+    for tx, day in pairs(transaction_stats.seen or {}) do
+      local n = tonumber(tostring(tx):match("TX%-(%d+)"))
+      if n and n >= floorTx then kept[tx] = day end
+    end
+    transaction_stats.seen = kept
+  end
+end
+
+local function recordTransactionStat(tx_id, tx_type, from_id, to_id, amount)
+  if not tx_id or tx_id == "" then return false, "missing tx_id" end
+  ensureTransactionStats()
+  if transaction_stats.seen[tx_id] then return true, "already counted" end
+
+  local day = txCurrentMinecraftDay()
+  local dayKey = tostring(day)
+  transaction_stats.days[dayKey] = type(transaction_stats.days[dayKey]) == "table" and transaction_stats.days[dayKey] or emptyTxDay(day)
+  local rec = transaction_stats.days[dayKey]
+  local amt = tonumber(amount) or 0
+  local cat = txCategory(tx_type, from_id, to_id)
+
+  rec.total = (tonumber(rec.total) or 0) + 1
+  rec.value = (tonumber(rec.value) or 0) + amt
+  rec.by_type = type(rec.by_type) == "table" and rec.by_type or {}
+  rec.by_type[tx_type] = (tonumber(rec.by_type[tx_type]) or 0) + 1
+  rec.first_tx = rec.first_tx or tx_id
+  rec.last_tx = tx_id
+  rec.updated = timestamp()
+
+  local function bump(flag, countKey, valueKey)
+    if flag then
+      rec[countKey] = (tonumber(rec[countKey]) or 0) + 1
+      rec[valueKey] = (tonumber(rec[valueKey]) or 0) + amt
+    end
+  end
+
+  bump(cat.economic, "economic", "economic_value")
+  bump(cat.admin, "admin", "admin_value")
+  bump(cat.monetary, "monetary", "monetary_value")
+  bump(cat.payroll, "payroll", "payroll_value")
+  bump(cat.service, "service", "service_value")
+  bump(cat.contract, "contract", "contract_value")
+  bump(cat.company, "company", "company_value")
+  bump(cat.personal, "personal", "personal_value")
+
+  transaction_stats.seen[tx_id] = day
+  transaction_stats.last_tx_id = tx_id
+  transaction_stats.last_type = tx_type
+  transaction_stats.last_day = day
+  transaction_stats.updated = timestamp()
+  trimTransactionStats()
+  return saveTransactionStats()
+end
+
+local function transactionStatsSummary(day)
+  ensureTransactionStats()
+  day = math.floor(tonumber(day) or txCurrentMinecraftDay())
+  local today = transaction_stats.days[tostring(day)] or emptyTxDay(day)
+  local yesterday = transaction_stats.days[tostring(day - 1)] or emptyTxDay(day - 1)
+  local week = emptyTxDay(day)
+  week.day = day
+  week.window_days = 7
+  for d = day - 6, day do
+    local rec = transaction_stats.days[tostring(d)]
+    if type(rec) == "table" then
+      for _, k in ipairs({"total","economic","admin","monetary","payroll","service","contract","company","personal","value","economic_value","admin_value","monetary_value","payroll_value","service_value","contract_value","company_value","personal_value"}) do
+        week[k] = (tonumber(week[k]) or 0) + (tonumber(rec[k]) or 0)
+      end
+    end
+  end
+  return {
+    model = transaction_stats.model or "bank_side_mc_day_transaction_counts_v1",
+    current_day = day,
+    today = today,
+    yesterday = yesterday,
+    last_7_days = week,
+    updated = transaction_stats.updated,
+    last_tx_id = transaction_stats.last_tx_id,
+    last_type = transaction_stats.last_type,
+    source = "ServerSideAccounts transfer() hard counter",
+    note = "Real bank-side transaction counts by Minecraft day. This is not a monitor pace estimate.",
+  }
 end
 
 -- =============================================================================
@@ -670,6 +863,11 @@ local function transfer(from_id, to_id, amount, tx_type, memo, actor, allow_over
     -- Keep the pending file. On next boot the bank will try to write the missing
     -- ledger line from this settled transaction, without applying balances again.
     audit("ERROR", actor or "SYSTEM", "db", tx_type, "ledger write deferred for " .. tx_id .. ": " .. tostring(ledger_err))
+  end
+
+  local stat_ok, stat_err = recordTransactionStat(tx_id, tx_type, from_id, to_id, amount)
+  if not stat_ok then
+    audit("ERROR", actor or "SYSTEM", "db", "TX_STATS", "stat write failed for " .. tx_id .. ": " .. tostring(stat_err))
   end
 
   audit("ACTION", actor or "SYSTEM", "db", tx_type,
@@ -1174,14 +1372,17 @@ local DEFAULT_PRICE_ORACLE = {
       max_daily_price_deflation = 0.03,
       max_daily_price_inflation = 0.08,
       max_total_pressure = 3.00,
-      wage_catchup_rate = 0.06,        -- move 6% of the remaining wage gap/day
-      max_daily_wage_gain = 0.015,     -- hard cap: +1.5% wage index/day
-      max_daily_wage_decline = 0.001,  -- wages barely fall
-      wage_target_cushion = 1.08,      -- wages may drift slightly above prices
+      wage_policy_version = 2,
+      wage_catchup_rate = 0.025,       -- move 2.5% of the remaining wage gap/day
+      max_daily_wage_gain = 0.0015,    -- hard cap: +0.15% wage index/day before damping
+      max_daily_wage_decline = 0.0002, -- wages barely fall
+      wage_target_cushion = 1.03,      -- wages may drift slightly above prices, but slowly
       wage_target_ath_cap = 1.00,      -- but not above the price shock ATH
-      wage_pressure_start_ratio = 0.85,
-      wage_pressure_sensitivity = 0.025,
-      max_wage_cost_pressure = 0.015,
+      wage_pressure_start_ratio = 0.95,
+      wage_pressure_sensitivity = 0.012,
+      max_wage_cost_pressure = 0.008,
+      wage_damping_start_index = 2.00, -- once wages are meaningfully higher, growth slows further
+      wage_damping_exponent = 0.70,
     },
   },
   sectors = {
@@ -1333,9 +1534,24 @@ local function wagePricePolicy()
   price_oracle.wage_price = type(price_oracle.wage_price) == "table" and price_oracle.wage_price or cloneTable(DEFAULT_PRICE_ORACLE.wage_price)
   local wp = price_oracle.wage_price
   wp.policy = type(wp.policy) == "table" and wp.policy or {}
-  for k, v in pairs(DEFAULT_PRICE_ORACLE.wage_price.policy) do
-    wp.policy[k] = tonumber(wp.policy[k]) or v
+
+  local defaults = DEFAULT_PRICE_ORACLE.wage_price.policy
+  local currentVersion = tonumber(wp.policy.wage_policy_version or 0) or 0
+
+  -- v2 deliberately slows wage catch-up. With integer wages, a +1 Q rise on a
+  -- 5 Q worker is a 20% raise, so the wage index must not compound like a
+  -- normal percentage investment. Existing old policies are migrated once.
+  if currentVersion < 2 then
+    for k, v in pairs(defaults) do
+      wp.policy[k] = v
+    end
+  else
+    for k, v in pairs(defaults) do
+      wp.policy[k] = tonumber(wp.policy[k]) or v
+    end
   end
+
+  wp.policy.wage_policy_version = tonumber(wp.policy.wage_policy_version) or 2
   return wp.policy
 end
 
@@ -1419,13 +1635,27 @@ local function updateWagePriceState(force)
 
   if elapsed > 0 then
     for _ = 1, elapsed do
+      -- Wage damping is intentionally based on the wage index itself. Early
+      -- catch-up is slow but noticeable; once wages are several times their
+      -- base level, growth slows heavily so integer +1 Q raises cannot turn
+      -- into yearly doubling at high nominal pay levels.
+      local dampingStart = tonumber(policy.wage_damping_start_index) or 2.0
+      local dampingExp = tonumber(policy.wage_damping_exponent) or 0.70
+      local wageDamping = 1
+      if wageIndex > dampingStart and dampingStart > 0 then
+        wageDamping = pow(wageIndex / dampingStart, dampingExp)
+        if wageDamping < 1 then wageDamping = 1 end
+      end
+
       if wageIndex < wageTarget then
         local gap = wageTarget - wageIndex
-        local step = math.min(gap * (tonumber(policy.wage_catchup_rate) or 0.06), wageIndex * (tonumber(policy.max_daily_wage_gain) or 0.015))
+        local catchupRate = (tonumber(policy.wage_catchup_rate) or 0.025) / wageDamping
+        local maxGainRate = (tonumber(policy.max_daily_wage_gain) or 0.0015) / wageDamping
+        local step = math.min(gap * catchupRate, wageIndex * maxGainRate)
         if step < 0 then step = 0 end
         wageIndex = wageIndex + step
       elseif wageIndex > wageTarget then
-        local decline = wageIndex * (tonumber(policy.max_daily_wage_decline) or 0.001)
+        local decline = wageIndex * (tonumber(policy.max_daily_wage_decline) or 0.0002)
         wageIndex = math.max(wageTarget, wageIndex - decline)
       end
     end
@@ -1451,7 +1681,7 @@ local function updateWagePriceState(force)
   wp.last_day = today
   wp.updated = timestamp()
   wp.model = "national_wage_price_pressure_v1"
-  wp.note = "One national price index. Wages catch up slowly; wage cost pressure is deliberately small."
+  wp.note = "One national price index. Wages catch up slowly with damping; wage cost pressure is deliberately small."
 
   price_oracle.wage_price = wp
   savePriceOracle()
@@ -1836,6 +2066,10 @@ local DEFAULT_WORKER_PAY_RATES = {
     skilled = 3,
     elite = 5,
   },
+  logistics = {
+    unskilled = 1,
+    skilled = 2,
+  },
 }
 
 local function copyWorkerPayDefaults()
@@ -1856,6 +2090,7 @@ local function normaliseWorkerPayRates(src)
   -- Backwards compatibility with the old flat keys.
   if src.researcher then out.research.skilled = math.floor(tonumber(src.researcher) or out.research.skilled) end
   if src.soldier then out.defence.skilled = math.floor(tonumber(src.soldier) or out.defence.skilled) end
+  if src.courier then out.logistics.unskilled = math.floor(tonumber(src.courier) or out.logistics.unskilled) end
 
   for sector, tiers in pairs(DEFAULT_WORKER_PAY_RATES) do
     if type(src[sector]) == "table" then
@@ -1869,6 +2104,7 @@ local function normaliseWorkerPayRates(src)
   -- Compatibility fields for old payroll terminals.
   out.researcher = out.research.skilled
   out.soldier = out.defence.skilled
+  out.courier = out.logistics.unskilled
 
   return out
 end
@@ -2416,16 +2652,16 @@ end
 -- This lets CompanyPayroll run on a separate terminal without a colony integrator
 -- or local mapping files.
 --
--- Important: public workers do not need a registered company. Defence and
--- research mappings are accepted with treasury:quid_bank as their payer.
--- Logistics/courier workers are private-sector and should keep their company.
+-- Important: public workers do not need a registered company.  Defence,
+-- research, and state logistics mappings are accepted with treasury:quid_bank
+-- as their payer so the normal payroll terminal can pay them from the Treasury.
 handlers["sync_employee_mappings"] = function(sender_id, req)
   local incoming = req and (req.employees or req.mappings) or {}
   if type(incoming) ~= "table" then return false, "Missing employees table" end
 
   local function isPublicIndustry(industry)
     industry = lower(industry or "")
-    return industry == "defence" or industry == "research"
+    return industry == "defence" or industry == "research" or industry == "logistics"
   end
 
   local now_ts = timestamp()
@@ -2442,8 +2678,10 @@ handlers["sync_employee_mappings"] = function(sender_id, req)
       local industry = lower(e.industry or "general")
       local company_id = tostring(e.company_id or "")
 
-      -- Public/state jobs are paid by the Treasury.
-      -- Logistics/courier workers are now private, so their company mapping is preserved.
+      -- Public/state jobs are ALWAYS paid by the Treasury.
+      -- Do not preserve a generated industry company such as company:must for
+      -- research/defence/logistics workers. Those companies may exist for
+      -- accounting/sector display, but they are not the wage payer.
       local company_name = e.company_name
       if isPublicIndustry(industry) then
         company_id = "treasury:quid_bank"
@@ -2503,7 +2741,7 @@ end
 
 local function isPublicEmploymentIndustry(industry)
   industry = lower(industry or "")
-  return industry == "defence" or industry == "research"
+  return industry == "defence" or industry == "research" or industry == "logistics"
 end
 
 local function coercePublicEmploymentMappings(reason)
@@ -2532,37 +2770,8 @@ local function coercePublicEmploymentMappings(reason)
   return changed
 end
 
-local function releasePrivateLogisticsEmploymentMappings(reason)
-  local changed = 0
-  local now_ts = timestamp()
-
-  for citizen_id, rec in pairs(employment_mappings or {}) do
-    if type(rec) == "table" and rec.active ~= false and lower(rec.industry or "") == "logistics" then
-      local target = trim(rec.original_company_id or "")
-      if target ~= "" and target ~= "treasury:quid_bank" and accountExists(target) and companies[target] then
-        rec.company_id = target
-        rec.company_name = rec.original_company_name or (companies[target] and (companies[target].name or companies[target].display_name)) or target
-        rec.pay_type = "company"
-        rec.public_payroll_released = true
-        rec.public_payroll_released_reason = reason or "logistics_private"
-        rec.updated_at = now_ts
-        employment_mappings[citizen_id] = rec
-        changed = changed + 1
-      end
-    end
-  end
-
-  if changed > 0 then
-    saveEmployment()
-    audit("ACTION", "STATE", "db", "RELEASE_PRIVATE_LOGISTICS", tostring(changed))
-  end
-
-  return changed
-end
-
 -- LIST_EMPLOYEE_MAPPINGS
 handlers["list_employee_mappings"] = function(sender_id, req)
-  local released = releasePrivateLogisticsEmploymentMappings("list_employee_mappings")
   local coerced = coercePublicEmploymentMappings("list_employee_mappings")
   local result = {}
   local active_only = not (req and req.include_inactive == true)
@@ -2577,11 +2786,11 @@ handlers["list_employee_mappings"] = function(sender_id, req)
   table.sort(result, function(a,b)
     return tostring(a.display_name or a.citizen_id or "") < tostring(b.display_name or b.citizen_id or "")
   end)
-  return true, { employees = result, count = #result, public_coerced = coerced, logistics_released = released }
+  return true, { employees = result, count = #result, public_coerced = coerced }
 end
 
 -- FIX_PUBLIC_EMPLOYEE_MAPPINGS
--- One-shot admin helper for old databases where research/defence
+-- One-shot admin helper for old databases where research/defence/logistics
 -- workers were mapped to generated companies. This rewrites them to Treasury.
 handlers["fix_public_employee_mappings"] = function(sender_id, req)
   local changed = coercePublicEmploymentMappings("manual_fix")
@@ -2950,6 +3159,7 @@ handlers["get_worker_pay_rates"] = function(sender_id, req)
     sectors = {
       { key = "defence", label = "Defence", tiers = { "unskilled", "skilled", "elite" } },
       { key = "research", label = "Research", tiers = { "skilled", "elite" } },
+      { key = "logistics", label = "Logistics", tiers = { "unskilled", "skilled" } },
     }
   }
 end
@@ -3192,6 +3402,12 @@ handlers["set_price_pressure_floor"] = function(sender_id, req)
   return true, { floor = floor, indices = sectorIndexSnapshot() }
 end
 
+-- TRANSACTION_STATS
+handlers["transaction_stats"] = function(sender_id, req)
+  local day = req and req.day or nil
+  return true, transactionStatsSummary(day)
+end
+
 -- STATUS
 handlers["status"] = function(sender_id, req)
   local function count(t)
@@ -3240,6 +3456,7 @@ handlers["status"] = function(sender_id, req)
     last_colony_citizen_sync = config.last_colony_citizen_sync,
     company_count    = count(companies),
     tx_count         = tx_counter,
+    transaction_stats = transactionStatsSummary(),
     audit_count      = audit_counter,
     supply           = supply,
     inflation         = inf,
@@ -3910,6 +4127,8 @@ local function initFiles()
   price_oracle = readFile(FILE.price_oracle) or {}
   employment_mappings = readFile(FILE.employment) or {}
   colony_deleted_citizens = readFile(FILE.colony_deleted) or {}
+  transaction_stats = readFile(FILE.transaction_stats) or {}
+  ensureTransactionStats()
   inflation_state = readFile(FILE.inflation) or {}
   ensureInflationState()
   ensurePriceOracle()
@@ -3937,6 +4156,7 @@ local function initFiles()
   print("  Companies: " .. count(companies))
   print("  Employment mappings: " .. count(employment_mappings))
   print("  Deleted colony citizens: " .. count(colony_deleted_citizens))
+  print("  Transaction stat days: " .. count(transaction_stats.days or {}))
   print("  Price oracle sectors: " .. count(price_oracle.sectors or {}))
 end
 
@@ -4052,6 +4272,7 @@ local function drawStatus()
   print("  Companies: " .. count(companies))
   print("  Employment mappings: " .. count(employment_mappings))
   print("  Deleted colony citizens: " .. count(colony_deleted_citizens))
+  print("  Transaction stat days: " .. count(transaction_stats.days or {}))
   print("  Price oracle sectors: " .. count(price_oracle.sectors or {}))
   term.setTextColor(colors.lime)
   print("  Treasury:  " .. deriveBalance("treasury:quid_bank") .. " Quid")
