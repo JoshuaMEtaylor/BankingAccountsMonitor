@@ -22,7 +22,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.4.16-HARD-FILE-ESTATE"
+local VERSION  = "1.4.18-SERVICE-GDP"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -1789,15 +1789,37 @@ local function isGovernmentAccount(id)
     or id:find("^treasury:") ~= nil
 end
 
+-- GDP output categories read from the bank ledger.
+-- Important: payroll, grants, deposits, withdrawals and ordinary personal
+-- transfers are not output. The restaurant/Dining Hall creates service output
+-- when a meal is sold. If the Treasury covers a broke colonist, that subsidy
+-- still counts as hospitality GDP because the company provided the meal.
 local GDP_TX_TYPES = {
-  COMPANY_PAYROLL = true,
-  COMPANY_TRANSFER = true,
+  COMPANY_TRANSFER = true,   -- B2B/private company service payment
   CONTRACT_PAYOUT = true,
   CONTRACT_REWARD = true,
   PRIVATE_SERVICE = true,
   LIVING_COST = true,
   HOSPITALITY_MEAL = true,
-  TRANSFER = true,
+  HOSPITALITY_SUBSIDY = true,
+}
+
+local GDP_CONTRACT_TX_TYPES = {
+  CONTRACT_PAYOUT = true,
+  CONTRACT_REWARD = true,
+}
+
+local GDP_SERVICE_TX_TYPES = {
+  COMPANY_TRANSFER = true,
+  PRIVATE_SERVICE = true,
+  LIVING_COST = true,
+  HOSPITALITY_MEAL = true,
+  HOSPITALITY_SUBSIDY = true,
+}
+
+local GDP_HOSPITALITY_TX_TYPES = {
+  HOSPITALITY_MEAL = true,
+  HOSPITALITY_SUBSIDY = true,
 }
 
 local function isPrivateGDPTransaction(tx_type, from_id, to_id)
@@ -1807,6 +1829,13 @@ local function isPrivateGDPTransaction(tx_type, from_id, to_id)
 
   if tx_type == "MINT" or tx_type == "BURN" or tx_type == "GRANT" then return false end
   if tx_type == "COMPANY_DEPOSIT" or tx_type == "COMPANY_WITHDRAW" then return false end
+  if tx_type == "COMPANY_PAYROLL" or tx_type == "TRANSFER" then return false end
+
+  -- A Treasury meal subsidy is not a pure transfer in this economy. It is the
+  -- state paying for an actual hospitality service that was delivered to a
+  -- colonist, so it counts as service GDP.
+  if tx_type == "HOSPITALITY_SUBSIDY" then return true end
+
   if isGovernmentAccount(from_id) or isGovernmentAccount(to_id) then return false end
 
   return GDP_TX_TYPES[tx_type] == true
@@ -1817,7 +1846,16 @@ local function calculatePrivateGDP(window_ms)
   local cutoff = timestamp() - window_ms
   local total = 0
   local count = 0
+  local service_total = 0
+  local service_count = 0
+  local hospitality_total = 0
+  local hospitality_count = 0
+  local contract_total = 0
+  local contract_count = 0
+  local non_contract_total = 0
+  local non_contract_count = 0
   local by_type = {}
+  local events_by_type = {}
 
   for _, line in ipairs(readLines(FILE.ledger)) do
     local tx_id, ts, tx_type, from_id, to_id, amount, memo, status =
@@ -1834,6 +1872,25 @@ local function calculatePrivateGDP(window_ms)
         total = total + amount
         count = count + 1
         by_type[tx_type] = (by_type[tx_type] or 0) + amount
+        events_by_type[tx_type] = (events_by_type[tx_type] or 0) + 1
+
+        if GDP_CONTRACT_TX_TYPES[tx_type] then
+          contract_total = contract_total + amount
+          contract_count = contract_count + 1
+        else
+          non_contract_total = non_contract_total + amount
+          non_contract_count = non_contract_count + 1
+        end
+
+        if GDP_SERVICE_TX_TYPES[tx_type] then
+          service_total = service_total + amount
+          service_count = service_count + 1
+        end
+
+        if GDP_HOSPITALITY_TX_TYPES[tx_type] then
+          hospitality_total = hospitality_total + amount
+          hospitality_count = hospitality_count + 1
+        end
       end
     end
   end
@@ -1855,11 +1912,22 @@ local function calculatePrivateGDP(window_ms)
     window_ms = window_ms,
     private_gdp = math.floor(total),
     gdp = math.floor(total),
+    service_gdp = math.floor(service_total),
+    services_gdp = math.floor(service_total),
+    hospitality_gdp = math.floor(hospitality_total),
+    meal_gdp = math.floor(hospitality_total),
+    contract_gdp = math.floor(contract_total),
+    non_contract_gdp = math.floor(non_contract_total),
     gdp_per_capita = per_capita,
     population = population,
     transaction_count = count,
+    service_events = service_count,
+    hospitality_events = hospitality_count,
+    contract_events = contract_count,
+    non_contract_events = non_contract_count,
     by_type = by_type,
-    note = "Private GDP estimate from recent non-government settled transaction flow."
+    events_by_type = events_by_type,
+    note = "GDP estimate from settled output/service transactions. Hospitality meal payments and Treasury meal subsidies count as service GDP."
   }
 end
 
@@ -2204,10 +2272,27 @@ end
 handlers["economic_gdp"] = function(sender_id, req)
   local days = tonumber(req and req.days) or 7
   if days < 1 then days = 1 end
-  if days > 30 then days = 30 end
+  if days > 365 then days = 365 end
   local window_ms = days * 1200000
   local snap = calculatePrivateGDP(window_ms)
   snap.days = days
+
+  -- Lets dashboards combine ContractServer GDP with bank-side service GDP
+  -- without double-counting contract payouts already visible on ContractServer.
+  if req and (req.service_only == true or req.services_only == true) then
+    snap.gdp = snap.service_gdp or 0
+    snap.private_gdp = snap.gdp
+    snap.gdp_per_capita = (snap.population and snap.population > 0) and math.floor(snap.gdp / snap.population) or 0
+    snap.mode = "service_only"
+  elseif req and req.exclude_contracts == true then
+    snap.gdp = snap.non_contract_gdp or snap.service_gdp or 0
+    snap.private_gdp = snap.gdp
+    snap.gdp_per_capita = (snap.population and snap.population > 0) and math.floor(snap.gdp / snap.population) or 0
+    snap.mode = "exclude_contracts"
+  else
+    snap.mode = "all_output"
+  end
+
   return true, snap
 end
 
@@ -2421,15 +2506,24 @@ end
 
 -- HOSPITALITY_MEAL_PAYMENT
 -- System-side charge for inferred Dining Hall / Restaurant meal events.
--- Does not overdraft the citizen and does not auto-charge the treasury.
--- If the citizen cannot cover the full meal, the paid amount is transferred and
--- the unpaid shortfall is returned to the POS terminal for local receivables tracking.
+--
+-- Payment policy:
+--   1. Charge the citizen as much as they can afford, up to the meal price.
+--   2. If the citizen cannot cover the full price, the Treasury pays the rest.
+--   3. The hospitality company always receives the full meal price.
+--
+-- This keeps Dining Hall service flowing instead of creating unpaid receivables
+-- when colonists are broke. The Treasury leg is an explicit state subsidy, not
+-- a mint: money moves from treasury:quid_bank to the hospitality company. The
+-- Treasury leg allows overdraft so a meal event never fails just because the
+-- Treasury float is temporarily low.
 handlers["hospitality_meal_payment"] = function(sender_id, req)
   local citizen_id = req.citizen_id
   local company_id = req.company_id
   local amount = tonumber(req.amount)
   local item = tostring(req.item or "meal")
   local memo = req.memo or ("Hospitality meal: " .. item)
+  local treasury_id = req.treasury_id or "treasury:quid_bank"
 
   if not citizen_id or citizen_id == "" then return false, "Missing citizen_id" end
   if not company_id or company_id == "" then return false, "Missing company_id" end
@@ -2439,35 +2533,91 @@ handlers["hospitality_meal_payment"] = function(sender_id, req)
 
   if not accountExists(citizen_id) then return false, "Citizen account not found: " .. tostring(citizen_id) end
   if not accountExists(company_id) then return false, "Hospitality company account not found: " .. tostring(company_id) end
+  if not accountExists(treasury_id) then return false, "Treasury account not found: " .. tostring(treasury_id) end
 
   local zacc = accounts[citizen_id]
   local cacc = accounts[company_id]
+  local tacc = accounts[treasury_id]
   if not zacc or zacc.type ~= "citizen" then return false, "Source is not a citizen account" end
   if not cacc or cacc.type ~= "company" then return false, "Destination is not a company account" end
+  if not tacc or tacc.type ~= "treasury" then return false, "Subsidy source is not a treasury account" end
 
-  local bal = deriveBalance(citizen_id)
-  local paid = amount
-  if bal < paid then paid = bal end
-  paid = math.floor(tonumber(paid) or 0)
+  local citizen_balance = math.floor(tonumber(deriveBalance(citizen_id)) or 0)
+  local citizen_paid = amount
+  if citizen_balance < citizen_paid then citizen_paid = citizen_balance end
+  if citizen_paid < 0 then citizen_paid = 0 end
+  citizen_paid = math.floor(citizen_paid)
 
-  local shortfall = amount - paid
-  local tx = nil
+  local treasury_paid = amount - citizen_paid
+  if treasury_paid < 0 then treasury_paid = 0 end
+  treasury_paid = math.floor(treasury_paid)
 
-  if paid > 0 then
-    local ok, res = transfer(citizen_id, company_id, paid, "HOSPITALITY_MEAL", memo, "HOSPITALITY:" .. tostring(sender_id), false)
+  local citizen_tx = nil
+  local treasury_tx = nil
+
+  if citizen_paid > 0 then
+    local ok, res = transfer(
+      citizen_id,
+      company_id,
+      citizen_paid,
+      "HOSPITALITY_MEAL",
+      memo,
+      "HOSPITALITY:" .. tostring(sender_id),
+      false
+    )
     if not ok then return false, res end
-    tx = res
+    citizen_tx = res
   end
+
+  if treasury_paid > 0 then
+    local subsidy_memo = "Treasury meal subsidy for " .. tostring(citizen_id) .. ": " .. tostring(item)
+    local ok, res = transfer(
+      treasury_id,
+      company_id,
+      treasury_paid,
+      "HOSPITALITY_SUBSIDY",
+      subsidy_memo,
+      "HOSPITALITY_SUBSIDY:" .. tostring(sender_id),
+      true
+    )
+    if not ok then return false, res end
+    treasury_tx = res
+  end
+
+  local tx_id = nil
+  if type(citizen_tx) == "table" and citizen_tx.tx_id then tx_id = citizen_tx.tx_id end
+  if not tx_id and type(treasury_tx) == "table" and treasury_tx.tx_id then tx_id = treasury_tx.tx_id end
+
+  audit("ACTION", "STATE", sender_id, "HOSPITALITY_MEAL_SETTLED",
+    tostring(citizen_id) .. " -> " .. tostring(company_id)
+    .. " total=" .. tostring(amount)
+    .. " citizen=" .. tostring(citizen_paid)
+    .. " treasury=" .. tostring(treasury_paid))
 
   return true, {
     citizen_id = citizen_id,
     company_id = company_id,
+    treasury_id = treasury_id,
     requested = amount,
-    paid = paid,
-    shortfall = shortfall,
+
+    -- Backwards-compatible fields expected by existing ServicePaymentTerminal.
+    -- paid is the total amount the company received, so the terminal treats the
+    -- meal as successfully settled instead of unpaid.
+    paid = citizen_paid + treasury_paid,
+    shortfall = 0,
+
+    citizen_paid = citizen_paid,
+    treasury_paid = treasury_paid,
+    subsidized = treasury_paid > 0,
     item = item,
-    tx = tx,
-    tx_id = type(tx) == "table" and tx.tx_id or nil,
+    tx = citizen_tx or treasury_tx,
+    citizen_tx = citizen_tx,
+    treasury_tx = treasury_tx,
+    tx_id = tx_id,
+    tx_ids = {
+      citizen = type(citizen_tx) == "table" and citizen_tx.tx_id or nil,
+      treasury = type(treasury_tx) == "table" and treasury_tx.tx_id or nil,
+    },
   }
 end
 
