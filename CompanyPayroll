@@ -38,7 +38,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION = "1.0.8-BANKREQ-FORWARD-FIX"
+local VERSION = "1.0.9-WAGE-INDEX"
 local BANK_PROTOCOL = "quid_bank"
 local DB_TIMEOUT = 5
 local CHECK_INTERVAL = 10
@@ -57,6 +57,9 @@ local last_colour = colors.lightGray
 
 local price_index = 1.00
 local inflation_rate = 0.00
+local wage_index = 1.00
+local national_price_index = 1.00
+local wage_cost_pressure = 0.00
 local gdp_per_capita = 0
 local private_gdp = 0
 local gdp_days = 7
@@ -396,8 +399,13 @@ local function governmentWage(industry, jobText)
 
   local sector_rates = worker_pay_rates[industry]
   local fallback = defaults[industry] and defaults[industry][tier] or 1
-  local amount = tableValue(sector_rates, tier, fallback)
-  return tier, amount
+  local base = tableValue(sector_rates, tier, fallback)
+
+  -- FiscalControls sets the base government rate. The national wage index then
+  -- applies slow cost-of-living catch-up on top, same as the wider economy.
+  local indexed = math.floor((base * math.max(1, tonumber(wage_index) or 1)) + 0.5)
+  if indexed < base then indexed = base end
+  return tier, indexed, base
 end
 
 local function calculateWage(base)
@@ -408,13 +416,15 @@ local function calculateWage(base)
   if gdp_bonus > GDP_BONUS_CAP then gdp_bonus = GDP_BONUS_CAP end
   if gdp_bonus < 0 then gdp_bonus = 0 end
 
-  local inflation_excess = math.max(0, (tonumber(price_index) or 1) - 1)
-  local inflation_bonus = math.floor(inflation_excess * base * INFLATION_PASS_THROUGH)
-  if inflation_bonus < 0 then inflation_bonus = 0 end
+  -- Old payroll used price_index directly. That made wages react too quickly.
+  -- The bank now maintains a separate wage_index that rises slowly behind CPI.
+  local indexed = math.floor((base * math.max(1, tonumber(wage_index) or 1)) + 0.5)
+  if indexed < base then indexed = base end
 
-  local wage = base + gdp_bonus + inflation_bonus
+  local wage_index_bonus = indexed - base
+  local wage = indexed + gdp_bonus
   if wage < 1 then wage = 1 end
-  return math.floor(wage), gdp_bonus, inflation_bonus
+  return math.floor(wage), gdp_bonus, wage_index_bonus
 end
 
 -- =============================================================================
@@ -481,24 +491,44 @@ local function findColony()
   return colony ~= nil
 end
 
+local function applyWagePriceState(st, root)
+  if type(root) == "table" and type(root.wage_price) == "table" then st = root.wage_price end
+  if type(st) == "table" and type(st.wage_price) == "table" then st = st.wage_price end
+  if type(st) == "table" then
+    wage_index = tonumber(st.wage_index) or wage_index
+    national_price_index = tonumber(st.national_price_index) or tonumber(st.price_index) or national_price_index
+    wage_cost_pressure = tonumber(st.wage_cost_pressure) or wage_cost_pressure
+  end
+end
+
 local function refreshInflation()
   local ok, res = bankReq({ type = "tick_inflation", day = mcDay() }, 4)
   if ok and type(res) == "table" then
     local st = res.state or res
-    price_index = tonumber(st.price_index) or price_index
+    price_index = tonumber(st.national_price_index or st.price_index) or price_index
     inflation_rate = tonumber(st.inflation_rate) or inflation_rate
-    return true
+    applyWagePriceState(st, res)
+  else
+    ok, res = bankReq({ type = "get_inflation_state" }, 4)
+    if ok and type(res) == "table" then
+      local st = res.state or res
+      price_index = tonumber(st.national_price_index or st.price_index) or price_index
+      inflation_rate = tonumber(st.inflation_rate) or inflation_rate
+      applyWagePriceState(st, res)
+    end
   end
 
-  ok, res = bankReq({ type = "get_inflation_state" }, 4)
-  if ok and type(res) == "table" then
-    local st = res.state or res
-    price_index = tonumber(st.price_index) or price_index
-    inflation_rate = tonumber(st.inflation_rate) or inflation_rate
-    return true
+  -- get_price_indices is the full national wage/price oracle. It is deliberately
+  -- called after tick so wages advance once per Minecraft day, not per redraw.
+  local okOracle, oracle = bankReq({ type = "get_price_indices" }, 4)
+  if okOracle and type(oracle) == "table" then
+    if type(oracle.wage_price) == "table" then applyWagePriceState(oracle.wage_price, oracle) end
+    price_index = tonumber(oracle.national_price_index) or price_index
+    national_price_index = tonumber(oracle.national_price_index) or national_price_index
+    wage_index = tonumber(oracle.wage_index) or wage_index
   end
 
-  return false
+  return ok or okOracle or false
 end
 
 local function refreshGDP()
@@ -657,8 +687,9 @@ local function addGovernmentWorker(out, z, account_id, name, jobText, industry, 
   end
   if not account_id or not PUBLIC_INDUSTRIES[industry] then return false end
 
-  local tier, govBase = governmentWage(industry, jobText)
-  if not tier or not govBase or govBase <= 0 then return false end
+  local tier, govWage, govBase = governmentWage(industry, jobText)
+  if not tier or not govWage or govWage <= 0 then return false end
+  govBase = govBase or govWage
 
   out[#out+1] = {
     citizen = z,
@@ -668,9 +699,9 @@ local function addGovernmentWorker(out, z, account_id, name, jobText, industry, 
     pay_type = "government",
     band = tier,
     base = govBase,
-    wage = govBase,
+    wage = govWage,
     gdp_bonus = 0,
-    inflation_bonus = 0,
+    inflation_bonus = math.max(0, govWage - govBase),
     company_id = "treasury:quid_bank",
     company_name = "Quid Treasury",
     industry = industry,
@@ -1048,8 +1079,9 @@ local function draw()
   at(2, 8,  "Minecraft day:       " .. tostring(mcDay()), colors.white)
   at(2, 9,  "GDP/capita 7d:       " .. money(gdp_per_capita), colors.cyan)
   at(2, 10, "Private GDP 7d:      " .. money(private_gdp), colors.cyan)
-  at(2, 11, "Price index:         x" .. string.format("%.3f", price_index), colors.lightGray)
-  at(2, 12, "Inflation pressure:  " .. pct(inflation_rate), inflation_rate >= 0 and colors.orange or colors.lime)
+  at(2, 11, "Price index:         x" .. string.format("%.3f", national_price_index or price_index), colors.lightGray)
+  at(2, 12, "Wage index:          x" .. string.format("%.3f", wage_index or 1), colors.lightGray)
+  at(2, 13, "Infl/wage pressure:  " .. pct(inflation_rate) .. " / " .. pct(wage_cost_pressure or 0), inflation_rate >= 0 and colors.orange or colors.lime)
 
   at(2, 14, "Eligible private/gov:     " .. tostring(stats.private_eligible) .. " / " .. tostring(stats.government_eligible), colors.white)
   at(2, 15, "Paid today private/gov:   " .. tostring(stats.private_paid_today) .. " / " .. tostring(stats.government_paid_today), colors.lightGray)
