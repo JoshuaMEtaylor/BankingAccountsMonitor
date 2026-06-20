@@ -1,11 +1,20 @@
 -- =============================================================================
 -- SHOPHONE
 -- Pocket Computer Phone-Style OS Shell
+--
+-- Apps added:
+--   * Bank      -> Quid Bank client app using protocol quid_bank
+--   * Contracts -> Contract browser/claimer using protocol quid_contracts
+--
+-- GitHub file name should be:
+--   ShoPhone
 -- =============================================================================
 
 local args = {...}
 
+-- =============================================================================
 -- SELF UPDATE
+-- =============================================================================
 if args[1] ~= "--updated" then
   term.setBackgroundColor(colors.black)
   term.setTextColor(colors.white)
@@ -27,7 +36,9 @@ if args[1] ~= "--updated" then
     print("Expected GitHub file: ShoPhone")
     print("")
     print("Manual:")
+    print("delete startup")
     print("wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/ShoPhone?cb=001 startup.lua")
+    print("startup.lua")
     return
   end
 
@@ -35,25 +46,83 @@ if args[1] ~= "--updated" then
   return
 end
 
--- CONFIG
-local VERSION = "0.2.0"
+-- =============================================================================
+-- CONFIG / STATE
+-- =============================================================================
+local VERSION = "0.3.0"
+
+local BANK_PROTOCOL = "quid_bank"
+local CONTRACT_PROTOCOL = "quid_contracts"
+local TIMEOUT = 5
+
 local W, H = term.getSize()
+local modemName = nil
+
+local C = {
+  bg = colors.black,
+  wall = colors.black,
+  top = colors.gray,
+  dock = colors.gray,
+  text = colors.white,
+  dim = colors.lightGray,
+  title = colors.yellow,
+  card = colors.lightGray,
+  card_fg = colors.black,
+  input = colors.white,
+  input_fg = colors.black,
+  ok = colors.lime,
+  err = colors.red,
+  warn = colors.orange,
+  btn = colors.gray,
+  btn_fg = colors.white,
+  bank = colors.green,
+  contracts = colors.purple,
+  messages = colors.orange,
+  companies = colors.blue,
+  market = colors.brown,
+  news = colors.red,
+  map = colors.lime,
+  settings = colors.lightBlue,
+}
 
 local apps = {
-  { name = "Bank",      icon = "$", col = colors.green },
-  { name = "Contracts", icon = "#", col = colors.purple },
-  { name = "Messages",  icon = "@", col = colors.orange },
-  { name = "Companies", icon = "C", col = colors.blue },
-  { name = "Market",    icon = "M", col = colors.brown },
-  { name = "News",      icon = "N", col = colors.red },
-  { name = "Map",       icon = "^", col = colors.lime },
-  { name = "Settings",  icon = "*", col = colors.lightBlue },
+  { id = "bank",      name = "Bank",      icon = "$", col = C.bank },
+  { id = "contracts", name = "Contracts", icon = "#", col = C.contracts },
+  { id = "messages",  name = "Messages",  icon = "@", col = C.messages },
+  { id = "companies", name = "Companies", icon = "C", col = C.companies },
+  { id = "market",    name = "Market",    icon = "M", col = C.market },
+  { id = "news",      name = "News",      icon = "N", col = C.news },
+  { id = "map",       name = "Map",       icon = "^", col = C.map },
+  { id = "settings",  name = "Settings",  icon = "*", col = C.settings },
 }
 
 local selected = nil
 local message = "Ready"
 
--- DRAW HELPERS
+local bank = {
+  server = nil,
+  logged = false,
+  username = "",
+  password = "",
+  citizen_id = "",
+  display = "",
+  title = "",
+  balance = 0,
+}
+
+local contract = {
+  server = nil,
+  filter = "open",
+  list = {},
+  selected = 1,
+  page = 1,
+  msg = "",
+  msg_col = C.dim,
+}
+
+-- =============================================================================
+-- BASIC HELPERS
+-- =============================================================================
 local function size()
   W, H = term.getSize()
 end
@@ -61,13 +130,13 @@ end
 local function clear(bg)
   size()
   term.setCursorBlink(false)
-  term.setBackgroundColor(bg or colors.black)
-  term.setTextColor(colors.white)
+  term.setBackgroundColor(bg or C.bg)
+  term.setTextColor(C.text)
   term.clear()
   term.setCursorPos(1, 1)
 end
 
-local function writeAt(x, y, text, fg, bg)
+local function at(x, y, text, fg, bg)
   size()
   if x < 1 or y < 1 or x > W or y > H then return end
   term.setCursorPos(x, y)
@@ -79,6 +148,7 @@ end
 local function fill(x, y, w, h, bg)
   size()
   if w <= 0 or h <= 0 then return end
+  if x < 1 then x = 1 end
   term.setBackgroundColor(bg)
   local row = string.rep(" ", w)
   for yy = y, y + h - 1 do
@@ -91,39 +161,141 @@ end
 
 local function center(y, text, fg, bg)
   text = tostring(text or "")
-  writeAt(math.floor((W - #text) / 2) + 1, y, text, fg, bg)
+  at(math.max(1, math.floor((W - #text) / 2) + 1), y, text, fg, bg)
+end
+
+local function button(x, y, w, label, bg, fg)
+  fill(x, y, w, 1, bg or C.btn)
+  at(x + math.max(0, math.floor((w - #label) / 2)), y, label, fg or C.btn_fg, bg or C.btn)
+  return { x1 = x, x2 = x + w - 1, y1 = y, y2 = y }
 end
 
 local function hit(b, x, y)
   return b and x >= b.x1 and x <= b.x2 and y >= b.y1 and y <= b.y2
 end
 
--- BOOT
-local function boot()
-  clear(colors.black)
-  center(5, "ShoPhone", colors.yellow, colors.black)
-  center(7, "Starting...", colors.lightGray, colors.black)
+local function money(n)
+  n = tonumber(n) or 0
+  local sign = ""
+  if n < 0 then sign = "-"; n = math.abs(n) end
+  local s = tostring(math.floor(n))
+  local out = ""
+  while #s > 3 do
+    out = "," .. s:sub(-3) .. out
+    s = s:sub(1, -4)
+  end
+  return sign .. s .. " Q"
+end
 
-  local barW = W - 8
-  local x = 4
-
-  for i = 1, barW do
-    writeAt(x, 9, "[" .. string.rep("=", i) .. string.rep(" ", barW - i) .. "]", colors.lime, colors.black)
-    sleep(0.03)
+local function inputLine(x, y, w, value, masked, active)
+  value = tostring(value or "")
+  local shown = masked and string.rep("*", #value) or value
+  fill(x, y, w, 1, C.input)
+  at(x, y, (shown .. string.rep(" ", w)):sub(1, w), C.input_fg, C.input)
+  if active then
+    term.setCursorPos(x + math.min(#value, w - 1), y)
+    term.setCursorBlink(true)
   end
 end
 
--- HOME SCREEN
-local function topBar()
-  fill(1, 1, W, 1, colors.gray)
-  writeAt(2, 1, "ShoPhone", colors.white, colors.gray)
+local function topBar(title)
+  fill(1, 1, W, 1, C.top)
+  at(2, 1, title or "ShoPhone", C.text, C.top)
   local t = textutils.formatTime(os.time(), true)
-  writeAt(W - #t, 1, t, colors.lightGray, colors.gray)
+  at(W - #t, 1, t, C.dim, C.top)
 end
 
-local function bottomBar()
-  fill(1, H, W, 1, colors.gray)
-  writeAt(2, H, message, colors.white, colors.gray)
+local function bottomBar(msg, col)
+  fill(1, H, W, 1, C.dock)
+  at(2, H, tostring(msg or message):sub(1, W - 2), col or C.text, C.dock)
+end
+
+local function appFrame(title)
+  clear(C.wall)
+  topBar(title)
+  bottomBar()
+end
+
+local function openModem()
+  if modemName and rednet.isOpen(modemName) then return true end
+
+  for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.getType(name) == "modem" then
+      local m = peripheral.wrap(name)
+      if m and m.isWireless and m.isWireless() then
+        rednet.open(name)
+        modemName = name
+        return true
+      end
+    end
+  end
+
+  for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.getType(name) == "modem" then
+      rednet.open(name)
+      modemName = name
+      return true
+    end
+  end
+
+  return false
+end
+
+local function request(server, protocol, payload, timeout)
+  if not server then return false, "No server" end
+
+  rednet.send(server, payload, protocol)
+
+  local deadline = os.clock() + (timeout or TIMEOUT)
+  while true do
+    local remaining = deadline - os.clock()
+    if remaining <= 0 then return false, "No response" end
+
+    local sender, msg = rednet.receive(protocol, remaining)
+    if sender == server and type(msg) == "table" then
+      if msg.success ~= nil then
+        return msg.success, msg.response
+      end
+      return true, msg
+    end
+  end
+end
+
+local function findServer(protocol, title, accept)
+  if not openModem() then return nil, "No modem" end
+
+  appFrame(title)
+  center(math.floor(H / 2) - 1, "Connecting...", C.dim, C.wall)
+
+  for i = 1, 8 do
+    center(math.floor(H / 2) + 1, "Attempt " .. i .. "/8", C.dim, C.wall)
+    rednet.broadcast({ type = "ping" }, protocol)
+    local sender, msg = rednet.receive(protocol, 3)
+    if sender and type(msg) == "table" then
+      if accept(msg) then
+        center(math.floor(H / 2) + 1, "Connected", C.ok, C.wall)
+        sleep(0.25)
+        return sender
+      end
+    end
+  end
+
+  return nil, "Server not found"
+end
+
+-- =============================================================================
+-- BOOT / HOME
+-- =============================================================================
+local function boot()
+  clear(colors.black)
+  center(5, "ShoPhone", C.title, colors.black)
+  center(7, "Starting...", C.dim, colors.black)
+
+  local barW = W - 8
+  for i = 1, barW do
+    at(4, 9, "[" .. string.rep("=", i) .. string.rep(" ", barW - i) .. "]", C.ok, colors.black)
+    sleep(0.015)
+  end
 end
 
 local function drawIcon(x, y, app, active)
@@ -131,27 +303,22 @@ local function drawIcon(x, y, app, active)
   local fg = active and colors.black or colors.white
 
   fill(x, y, 7, 3, bg)
-  center(y + 1, "", fg, bg)
-  writeAt(x + 3, y + 1, app.icon, fg, bg)
+  at(x + 3, y + 1, app.icon, fg, bg)
 
   local label = app.name
   local lx = x + math.floor((7 - math.min(#label, 7)) / 2)
-  writeAt(lx, y + 3, label:sub(1, 7), colors.white, colors.black)
+  at(lx, y + 3, label:sub(1, 7), colors.white, C.wall)
 
   return { x1 = x, x2 = x + 6, y1 = y, y2 = y + 3, app = app }
 end
 
 local function drawHome()
-  clear(colors.black)
-  topBar()
-
-  center(3, "Home", colors.yellow, colors.black)
+  clear(C.wall)
+  topBar("ShoPhone")
+  center(3, "Home", C.title, C.wall)
 
   local boxes = {}
-  local cols = 3
-  local iconW = 7
-  local gapX = 2
-  local gapY = 2
+  local cols, iconW, gapX, gapY = 3, 7, 2, 2
   local startX = math.floor((W - ((cols * iconW) + ((cols - 1) * gapX))) / 2) + 1
   local startY = 5
 
@@ -160,47 +327,618 @@ local function drawHome()
     local row = math.floor((i - 1) / cols)
     local x = startX + col * (iconW + gapX)
     local y = startY + row * (4 + gapY)
-
     if y + 3 < H then
       boxes[#boxes + 1] = drawIcon(x, y, app, selected == i)
       boxes[#boxes].index = i
     end
   end
 
-  if H > 18 then
-    center(H - 2, "Click app  |  Q off", colors.lightGray, colors.black)
-  end
-
+  if H > 18 then center(H - 2, "Click app  |  Q off", C.dim, C.wall) end
   bottomBar()
   return boxes
 end
 
-local function appScreen(app)
+-- =============================================================================
+-- BANK APP
+-- =============================================================================
+local function bankConnect()
+  if bank.server then return true end
+
+  local id, err = findServer(BANK_PROTOCOL, "Bank", function(msg)
+    return (msg.success and type(msg.response) == "table") or msg.type == "treasury_online"
+  end)
+
+  if id then bank.server = id; return true end
+  message = err or "Bank offline"
+  return false
+end
+
+local function bankReq(payload)
+  return request(bank.server, BANK_PROTOCOL, payload, TIMEOUT)
+end
+
+local function bankLogin()
+  if not bankConnect() then return false end
+
+  local mode = "login"
+  local fields = { "", "" }
+  local focus = 1
+  local msg, msgCol = "", C.err
+
+  local function draw()
+    appFrame("Bank")
+    fill(2, 3, W - 2, H - 5, C.card)
+
+    local bLogin = button(4, 4, math.floor((W - 8) / 2), "Login", mode == "login" and C.bank or C.btn)
+    local bReg = button(5 + math.floor((W - 8) / 2), 4, math.floor((W - 8) / 2), "Register", mode == "register" and C.bank or C.btn)
+
+    at(4, 7, "Username", colors.gray, C.card)
+    inputLine(4, 8, W - 6, fields[1], false, focus == 1)
+
+    at(4, 10, "Password", colors.gray, C.card)
+    inputLine(4, 11, W - 6, fields[2], true, focus == 2)
+
+    local label = mode == "login" and "Log In" or "Create"
+    local bSubmit = button(4, 14, W - 6, label, C.bank)
+    local bBack = button(4, H - 2, W - 6, "Back", C.btn)
+
+    if msg ~= "" then at(4, 16, msg:sub(1, W - 6), msgCol, C.card) end
+
+    bottomBar()
+    return bLogin, bReg, bSubmit, bBack
+  end
+
+  local bLogin, bReg, bSubmit, bBack = draw()
+
+  local function submit()
+    if fields[1] == "" or fields[2] == "" then
+      msg, msgCol = "Fill both fields", C.err
+      return false
+    end
+
+    msg, msgCol = "Contacting bank...", C.dim
+    draw()
+
+    local reqType = mode == "login" and "login" or "create_account"
+    local ok, res = bankReq({
+      type = reqType,
+      username = fields[1],
+      password = fields[2],
+      display_name = fields[1],
+    })
+
+    if ok and type(res) == "table" then
+      bank.logged = true
+      bank.username = fields[1]
+      bank.password = fields[2]
+      bank.citizen_id = res.citizen_id or ""
+      bank.display = res.display_name or fields[1]
+      bank.title = res.title or "Account Holder"
+      bank.balance = res.balance or 0
+      return true
+    end
+
+    msg, msgCol = tostring(res or "Login failed"), C.err
+    return false
+  end
+
   while true do
-    clear(colors.black)
-    topBar()
+    local ev, a, b, c = os.pullEvent()
 
-    fill(3, 4, W - 4, H - 7, colors.lightGray)
-    center(5, app.icon, colors.black, colors.lightGray)
-    center(7, app.name, colors.black, colors.lightGray)
-    center(10, "Coming soon", colors.gray, colors.lightGray)
+    if ev == "char" then
+      if #fields[focus] < W - 7 then fields[focus] = fields[focus] .. a end
+      bLogin, bReg, bSubmit, bBack = draw()
 
-    local bw = W - 8
-    fill(4, H - 2, bw, 1, colors.gray)
-    center(H - 2, "Back", colors.white, colors.gray)
+    elseif ev == "key" then
+      if a == keys.backspace then
+        fields[focus] = fields[focus]:sub(1, -2)
+      elseif a == keys.tab or a == keys.enter then
+        if a == keys.enter and focus == 2 then
+          if submit() then return true end
+        else
+          focus = focus == 1 and 2 or 1
+        end
+      elseif a == keys.escape then
+        return false
+      end
+      bLogin, bReg, bSubmit, bBack = draw()
+
+    elseif ev == "mouse_click" then
+      if hit(bBack, b, c) then return false end
+      if hit(bLogin, b, c) then mode = "login"; msg = "" end
+      if hit(bReg, b, c) then mode = "register"; msg = "" end
+      if c == 8 then focus = 1 end
+      if c == 11 then focus = 2 end
+      if hit(bSubmit, b, c) then if submit() then return true end end
+      bLogin, bReg, bSubmit, bBack = draw()
+    end
+  end
+end
+
+local function bankRefresh()
+  local ok, res = bankReq({ type = "balance", username = bank.username, password = bank.password })
+  if ok and type(res) == "table" then
+    bank.balance = res.balance or bank.balance
+    return true
+  end
+  return false, res
+end
+
+local function bankHistory()
+  appFrame("Bank")
+  center(math.floor(H / 2), "Loading history...", C.dim, C.wall)
+
+  local ok, res = bankReq({ type = "ledger_history", username = bank.username, password = bank.password, limit = 10 })
+
+  while true do
+    appFrame("History")
+    fill(2, 3, W - 2, H - 5, C.card)
+
+    if not ok or type(res) ~= "table" then
+      center(8, "Could not load history", C.err, C.card)
+    else
+      local hist = res.history or {}
+      bank.balance = res.balance or bank.balance
+      at(4, 4, "Balance: " .. money(bank.balance), C.card_fg, C.card)
+
+      if #hist == 0 then
+        at(4, 7, "No transactions yet.", colors.gray, C.card)
+      else
+        local y = 6
+        for i, tx in ipairs(hist) do
+          if y >= H - 3 then break end
+          local dir = tx.direction == "IN" and "+" or "-"
+          local col = tx.direction == "IN" and C.ok or C.err
+          at(4, y, tostring(tx.tx_id or ""):sub(1, 7), colors.gray, C.card)
+          at(12, y, dir .. tostring(tx.amount or 0) .. "q", col, C.card)
+          at(22, y, tostring(tx.memo or ""):sub(1, W - 23), colors.gray, C.card)
+          y = y + 1
+        end
+      end
+    end
+
+    local bBack = button(4, H - 2, W - 6, "Back", C.btn)
+    bottomBar()
+
+    local ev, a, b, c = os.pullEvent()
+    if ev == "mouse_click" and hit(bBack, b, c) then return end
+    if ev == "key" and (a == keys.backspace or a == keys.escape) then return end
+  end
+end
+
+local function bankTransfer()
+  local fields = { "", "", "" }
+  local focus = 1
+  local msg, msgCol = "", C.err
+
+  local function draw()
+    appFrame("Transfer")
+    fill(2, 3, W - 2, H - 5, C.card)
+
+    at(4, 4, "From: " .. bank.citizen_id, colors.gray, C.card)
+    at(4, 5, "Bal:  " .. money(bank.balance), C.card_fg, C.card)
+
+    at(4, 7, "Recipient", colors.gray, C.card)
+    inputLine(4, 8, W - 6, fields[1], false, focus == 1)
+
+    at(4, 10, "Amount", colors.gray, C.card)
+    inputLine(4, 11, W - 6, fields[2], false, focus == 2)
+
+    at(4, 13, "Memo", colors.gray, C.card)
+    inputLine(4, 14, W - 6, fields[3], false, focus == 3)
+
+    local half = math.floor((W - 8) / 2)
+    local bSend = button(4, H - 2, half, "Send", C.bank)
+    local bBack = button(5 + half, H - 2, half, "Cancel", C.btn)
+
+    if msg ~= "" then at(4, 16, msg:sub(1, W - 6), msgCol, C.card) end
+    bottomBar()
+    return bSend, bBack
+  end
+
+  local bSend, bBack = draw()
+
+  local function submit()
+    local amount = tonumber(fields[2])
+    if fields[1] == "" then msg, msgCol = "Enter recipient", C.err; return false end
+    if not amount or amount <= 0 then msg, msgCol = "Enter valid amount", C.err; return false end
+
+    msg, msgCol = "Sending...", C.dim
+    draw()
+
+    local ok, res = bankReq({
+      type = "transfer",
+      username = bank.username,
+      password = bank.password,
+      to_id = fields[1],
+      amount = amount,
+      memo = fields[3],
+    })
+
+    if ok and type(res) == "table" then
+      bankRefresh()
+      msg, msgCol = "Sent. Ref " .. tostring(res.tx_id or ""), C.ok
+      fields = { "", "", "" }
+      focus = 1
+      return true
+    end
+
+    msg, msgCol = tostring(res or "Transfer failed"), C.err
+    return false
+  end
+
+  while true do
+    local ev, a, b, c = os.pullEvent()
+
+    if ev == "char" then
+      if #fields[focus] < W - 7 then fields[focus] = fields[focus] .. a end
+
+    elseif ev == "key" then
+      if a == keys.backspace then fields[focus] = fields[focus]:sub(1, -2)
+      elseif a == keys.tab then focus = focus % 3 + 1
+      elseif a == keys.enter then
+        if focus < 3 then focus = focus + 1 else submit() end
+      elseif a == keys.escape then return end
+
+    elseif ev == "mouse_click" then
+      if hit(bBack, b, c) then return end
+      if hit(bSend, b, c) then submit() end
+      if c == 8 then focus = 1 elseif c == 11 then focus = 2 elseif c == 14 then focus = 3 end
+    end
+
+    bSend, bBack = draw()
+  end
+end
+
+local function bankDashboard()
+  bankRefresh()
+
+  while true do
+    appFrame("Bank")
+    fill(2, 3, W - 2, H - 5, C.card)
+
+    at(4, 4, bank.display, C.card_fg, C.card)
+    at(4, 5, bank.title, colors.gray, C.card)
+    at(4, 7, "Balance", colors.gray, C.card)
+    at(4, 8, money(bank.balance), C.card_fg, C.card)
+    at(4, 10, "ID: " .. bank.citizen_id, colors.gray, C.card)
+
+    local half = math.floor((W - 8) / 2)
+    local bTransfer = button(4, 12, half, "Transfer", C.bank)
+    local bHistory = button(5 + half, 12, half, "History", C.bank)
+    local bRefresh = button(4, 14, half, "Refresh", C.btn)
+    local bLogout = button(5 + half, 14, half, "Logout", C.err)
+    local bBack = button(4, H - 2, W - 6, "Home", C.btn)
 
     bottomBar()
 
     local ev, a, b, c = os.pullEvent()
     if ev == "mouse_click" then
-      if c == H - 2 then return end
-    elseif ev == "key" then
-      if a == keys.backspace or a == keys.escape or a == keys.q then return end
+      if hit(bTransfer, b, c) then bankTransfer(); bankRefresh()
+      elseif hit(bHistory, b, c) then bankHistory()
+      elseif hit(bRefresh, b, c) then bankRefresh()
+      elseif hit(bLogout, b, c) then bank.logged = false; return
+      elseif hit(bBack, b, c) then return end
+    elseif ev == "key" and (a == keys.escape or a == keys.backspace) then
+      return
     end
   end
 end
 
+local function bankApp()
+  if not bank.logged then
+    if not bankLogin() then return end
+  end
+  bankDashboard()
+end
+
+-- =============================================================================
+-- CONTRACTS APP
+-- =============================================================================
+local function contractSet(msg, col)
+  contract.msg = tostring(msg or "")
+  contract.msg_col = col or C.dim
+end
+
+local function contractConnect()
+  if contract.server then return true end
+
+  local id, err = findServer(CONTRACT_PROTOCOL, "Contracts", function(msg)
+    return msg.type == "contract_server_online" or (msg.success == true and type(msg.response) == "table")
+  end)
+
+  if id then contract.server = id; return true end
+  message = err or "Contracts offline"
+  return false
+end
+
+local function contractReq(payload, timeout)
+  return request(contract.server, CONTRACT_PROTOCOL, payload, timeout or TIMEOUT)
+end
+
+local function loadContracts()
+  local ok, res = contractReq({ type = "list_contracts", status = contract.filter }, 8)
+  if ok and type(res) == "table" then
+    contract.list = res.contracts or {}
+    if contract.selected > #contract.list then contract.selected = #contract.list end
+    if contract.selected < 1 then contract.selected = 1 end
+    contractSet("Loaded " .. #contract.list .. " contracts", C.ok)
+    return true
+  end
+  contractSet("Load failed: " .. tostring(res), C.err)
+  return false
+end
+
+local function loadCompanies()
+  local ok, res = contractReq({ type = "list_claimant_companies" }, 10)
+  if ok and type(res) == "table" and type(res.companies) == "table" then
+    return res.companies
+  end
+  contractSet("Company list failed", C.err)
+  return {}
+end
+
+local function drawContractTabs()
+  local labels = { "Open", "Claimed", "Done", "All" }
+  local vals = { "open", "claimed", "fulfilled", "all" }
+  local tw = math.floor(W / #labels)
+  local tabs = {}
+
+  for i, label in ipairs(labels) do
+    local x = ((i - 1) * tw) + 1
+    local active = contract.filter == vals[i]
+    tabs[i] = button(x, 3, tw, label, active and C.contracts or C.btn)
+    tabs[i].value = vals[i]
+  end
+
+  return tabs
+end
+
+local function contractClaim(c)
+  local companies = loadCompanies()
+  local sel = 1
+
+  while true do
+    appFrame("Claim")
+    fill(2, 3, W - 2, H - 5, C.card)
+
+    at(4, 4, tostring(c.contract_id or "?"), C.card_fg, C.card)
+    at(4, 5, tostring(c.title or "Contract"):sub(1, W - 6), colors.gray, C.card)
+    at(4, 6, "Reward: " .. money(c.reward), colors.gray, C.card)
+
+    at(4, 8, "Company", C.card_fg, C.card)
+
+    if #companies == 0 then
+      at(4, 10, "No companies available.", C.err, C.card)
+    else
+      local co = companies[sel]
+      local label = tostring(co.ticker or "?") .. " - " .. tostring(co.display_name or co.company_id or "")
+      at(4, 10, label:sub(1, W - 6), C.card_fg, C.card)
+    end
+
+    local third = math.floor((W - 10) / 3)
+    local bPrev = button(4, H - 2, third, "Prev", C.btn)
+    local bNext = button(5 + third, H - 2, third, "Next", C.btn)
+    local bClaim = button(6 + (third * 2), H - 2, third, "Claim", C.contracts)
+    bottomBar(contract.msg, contract.msg_col)
+
+    local ev, a, b, d = os.pullEvent()
+    if ev == "mouse_click" then
+      if hit(bPrev, b, d) and #companies > 0 then sel = sel - 1; if sel < 1 then sel = #companies end end
+      if hit(bNext, b, d) and #companies > 0 then sel = sel + 1; if sel > #companies then sel = 1 end end
+      if hit(bClaim, b, d) and companies[sel] then
+        local co = companies[sel]
+        local ok, res = contractReq({
+          type = "claim_contract",
+          contract_id = c.contract_id,
+          claimant = co.company_id,
+          claimant_type = "company",
+        }, 8)
+
+        if ok then
+          contractSet("Claimed as " .. tostring(co.company_id), C.ok)
+          loadContracts()
+          return
+        end
+        contractSet("Claim failed: " .. tostring(res), C.err)
+      end
+    elseif ev == "key" then
+      if a == keys.escape or a == keys.backspace then return end
+      if a == keys.left and #companies > 0 then sel = sel - 1; if sel < 1 then sel = #companies end end
+      if a == keys.right and #companies > 0 then sel = sel + 1; if sel > #companies then sel = 1 end end
+      if a == keys.enter and companies[sel] then
+        local co = companies[sel]
+        local ok, res = contractReq({
+          type = "claim_contract",
+          contract_id = c.contract_id,
+          claimant = co.company_id,
+          claimant_type = "company",
+        }, 8)
+        if ok then contractSet("Claimed", C.ok); loadContracts(); return end
+        contractSet("Claim failed: " .. tostring(res), C.err)
+      end
+    end
+  end
+end
+
+local function contractDetail(c)
+  if not c then return end
+  local scroll = 0
+
+  while true do
+    appFrame("Contract")
+    fill(2, 3, W - 2, H - 5, C.card)
+
+    at(4, 4, tostring(c.contract_id or "?") .. " " .. tostring(c.title or ""):sub(1, W - 12), C.card_fg, C.card)
+    at(4, 5, "Reward: " .. money(c.reward) .. "  " .. tostring(c.status or ""), colors.gray, C.card)
+    at(4, 6, "Poster: " .. tostring(c.poster or "?"):sub(1, W - 12), colors.gray, C.card)
+
+    at(4, 8, "Items", C.card_fg, C.card)
+    local items = c.items or {}
+    local maxRows = math.max(1, H - 14)
+    local first = scroll + 1
+    local last = math.min(#items, scroll + maxRows)
+    local y = 9
+
+    if #items == 0 then
+      at(4, y, "No item requirements.", colors.gray, C.card)
+    else
+      for i = first, last do
+        local it = items[i]
+        at(4, y, tostring(it.count or 0) .. "x " .. tostring(it.display or it.item):sub(1, W - 12), C.card_fg, C.card)
+        y = y + 1
+      end
+    end
+
+    local action = "Claim"
+    if c.status == "claimed" or c.status == "pending_completion" then action = "Waiting" end
+    if c.status == "fulfilled" then action = "Done" end
+    if c.status == "pending_payout" then action = "Retry" end
+
+    local third = math.floor((W - 10) / 3)
+    local bBack = button(4, H - 2, third, "Back", C.btn)
+    local bDown = button(5 + third, H - 2, third, "More", C.btn)
+    local bAction = button(6 + (third * 2), H - 2, third, action, C.contracts)
+
+    bottomBar(contract.msg, contract.msg_col)
+
+    local ev, a, b, d = os.pullEvent()
+    if ev == "mouse_click" then
+      if hit(bBack, b, d) then return
+      elseif hit(bDown, b, d) then
+        if #items > maxRows then scroll = scroll + maxRows; if scroll >= #items then scroll = 0 end end
+      elseif hit(bAction, b, d) then
+        if action == "Claim" then contractClaim(c); return
+        elseif action == "Retry" then
+          local ok, res = contractReq({ type = "retry_company_payment", contract_id = c.contract_id }, 10)
+          if ok and type(res) == "table" then contractSet("Retry sent", C.ok); return end
+          contractSet("Retry failed: " .. tostring(res), C.err)
+        else
+          contractSet("Contract is " .. action, C.warn)
+        end
+      end
+    elseif ev == "mouse_scroll" then
+      if a > 0 then scroll = math.min(math.max(0, #items - maxRows), scroll + 3)
+      else scroll = math.max(0, scroll - 3) end
+    elseif ev == "key" then
+      if a == keys.backspace or a == keys.escape then return end
+    end
+  end
+end
+
+local function contractsApp()
+  if not contractConnect() then return end
+  loadContracts()
+
+  while true do
+    appFrame("Contracts")
+    local tabs = drawContractTabs()
+
+    fill(2, 5, W - 2, H - 8, C.card)
+
+    local perPage = math.max(3, H - 11)
+    local totalPages = math.max(1, math.ceil(#contract.list / perPage))
+    if contract.page > totalPages then contract.page = totalPages end
+
+    local start = ((contract.page - 1) * perPage) + 1
+    local y = 6
+
+    if #contract.list == 0 then
+      at(4, y, "No contracts found.", colors.gray, C.card)
+    else
+      for i = start, math.min(#contract.list, start + perPage - 1) do
+        local c = contract.list[i]
+        local active = i == contract.selected
+        local bg = active and colors.white or C.card
+        fill(3, y, W - 4, 1, bg)
+        at(4, y, tostring(c.contract_id or "?"):sub(1, 7), active and colors.black or C.card_fg, bg)
+        at(12, y, tostring(c.title or "Contract"):sub(1, W - 25), active and colors.black or C.card_fg, bg)
+        local reward = money(c.reward or 0)
+        at(W - #reward - 1, y, reward, C.ok, bg)
+        y = y + 1
+      end
+    end
+
+    local third = math.floor((W - 10) / 3)
+    local bPrev = button(4, H - 3, third, "Prev", C.btn)
+    local bNext = button(5 + third, H - 3, third, "Next", C.btn)
+    local bOpen = button(6 + (third * 2), H - 3, third, "Open", C.contracts)
+    local bRefresh = button(4, H - 2, W - 6, "Refresh", C.contracts)
+
+    bottomBar(contract.msg, contract.msg_col)
+
+    local ev, a, b, d = os.pullEvent()
+
+    if ev == "mouse_click" then
+      local handledTab = false
+      for _, tab in ipairs(tabs) do
+        if hit(tab, b, d) then
+          contract.filter = tab.value
+          contract.selected = 1
+          contract.page = 1
+          loadContracts()
+          handledTab = true
+          break
+        end
+      end
+
+      if not handledTab then
+        if hit(bPrev, b, d) then
+          if contract.selected > 1 then contract.selected = contract.selected - 1 end
+          if contract.selected < start then contract.page = math.max(1, contract.page - 1) end
+        elseif hit(bNext, b, d) then
+          if contract.selected < #contract.list then contract.selected = contract.selected + 1 end
+          if contract.selected > contract.page * perPage then contract.page = contract.page + 1 end
+        elseif hit(bOpen, b, d) then
+          contractDetail(contract.list[contract.selected])
+          loadContracts()
+        elseif hit(bRefresh, b, d) then
+          loadContracts()
+        else
+          local row = d - 6 + 1
+          local idx = start + row - 1
+          if idx >= 1 and idx <= #contract.list then contract.selected = idx end
+        end
+      end
+
+    elseif ev == "key" then
+      if a == keys.backspace or a == keys.escape then return end
+      if a == keys.up and contract.selected > 1 then contract.selected = contract.selected - 1 end
+      if a == keys.down and contract.selected < #contract.list then contract.selected = contract.selected + 1 end
+      if a == keys.enter then contractDetail(contract.list[contract.selected]); loadContracts() end
+    end
+  end
+end
+
+-- =============================================================================
+-- PLACEHOLDER APPS
+-- =============================================================================
+local function placeholder(app)
+  while true do
+    appFrame(app.name)
+    fill(3, 4, W - 4, H - 7, C.card)
+    center(5, app.icon, C.card_fg, C.card)
+    center(7, app.name, C.card_fg, C.card)
+    center(10, "Coming soon", colors.gray, C.card)
+
+    local bBack = button(4, H - 2, W - 6, "Back", C.btn)
+    bottomBar()
+
+    local ev, a, b, c = os.pullEvent()
+    if ev == "mouse_click" and hit(bBack, b, c) then return end
+    if ev == "key" and (a == keys.backspace or a == keys.escape or a == keys.q) then return end
+  end
+end
+
+local function openApp(app)
+  if app.id == "bank" then bankApp()
+  elseif app.id == "contracts" then contractsApp()
+  else placeholder(app) end
+end
+
+-- =============================================================================
 -- MAIN
+-- =============================================================================
 boot()
 
 while true do
@@ -214,7 +952,7 @@ while true do
         message = box.app.name
         drawHome()
         sleep(0.08)
-        appScreen(box.app)
+        openApp(box.app)
         selected = nil
         message = "Ready"
         break
@@ -224,8 +962,8 @@ while true do
   elseif ev == "key" then
     if a == keys.q then
       clear(colors.black)
-      center(math.floor(H / 2), "Power off", colors.orange, colors.black)
-      sleep(0.4)
+      center(math.floor(H / 2), "Power off", C.warn, colors.black)
+      sleep(0.35)
       clear(colors.black)
       return
 
@@ -238,7 +976,7 @@ while true do
       if selected > #apps then selected = 1 end
 
     elseif a == keys.enter and selected then
-      appScreen(apps[selected])
+      openApp(apps[selected])
       selected = nil
       message = "Ready"
     end
