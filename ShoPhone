@@ -49,7 +49,7 @@ end
 -- =============================================================================
 -- CONFIG / STATE
 -- =============================================================================
-local VERSION = "0.6.0"
+local VERSION = "0.6.2"
 
 local BANK_PROTOCOL = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
@@ -989,15 +989,13 @@ local function bankDashboard()
     local bTransfer = qBtn(2, 10, bw, "New Transfer", QB.btn_pri)
     local bHistory = qBtn(bw + 3, 10, bw, "View History", QB.btn_pri)
     local bRefresh = qBtn(2, 12, bw, "Refresh", QB.btn_sec, QB.card_fg)
-    local bLogout = qBtn(bw + 3, 12, bw, "Sign Out", QB.btn_dan)
+    local bBack = qBtn(bw + 3, 12, bw, "Home", QB.btn_sec, QB.card_fg)
 
     qSep(14)
 
     qFill(1, 15, W, H - 15, QB.bg)
     qAt(3, 15, "Bank:   Quid Bank of Plenty", QB.dim, QB.bg)
     qAt(3, 16, "Server: " .. tostring(bank.server), QB.dim, QB.bg)
-
-    local bBack = qBtn(2, H - 1, W - 2, "Back to ShoPhone", QB.btn_sec, QB.card_fg)
     qStatus()
 
     local ev, a, b, c = os.pullEvent()
@@ -1006,7 +1004,6 @@ local function bankDashboard()
       if hit(bTransfer, b, c) then bankTransfer(); bankRefresh()
       elseif hit(bHistory, b, c) then bankHistory()
       elseif hit(bRefresh, b, c) then bankRefresh()
-      elseif hit(bLogout, b, c) then bank.logged = false; return
       elseif hit(bBack, b, c) then return end
     elseif ev == "key" and (a == keys.escape or a == keys.backspace) then
       return
@@ -1351,7 +1348,9 @@ local function contractsApp()
     local bPrev = button(4, H - 3, third, "Prev", C.btn)
     local bNext = button(5 + third, H - 3, third, "Next", C.btn)
     local bOpen = button(6 + (third * 2), H - 3, third, "Open", C.contracts)
-    local bRefresh = button(4, H - 2, W - 6, "Refresh", C.contracts)
+    local half = math.floor((W - 8) / 2)
+    local bHome = button(4, H - 2, half, "Home", C.btn)
+    local bRefresh = button(5 + half, H - 2, half, "Refresh", C.contracts)
 
     bottomBar(contract.msg, contract.msg_col)
 
@@ -1380,6 +1379,8 @@ local function contractsApp()
         elseif hit(bOpen, b, d) then
           contractDetail(contract.list[contract.selected])
           loadContracts()
+        elseif hit(bHome, b, d) then
+          return
         elseif hit(bRefresh, b, d) then
           loadContracts()
         else
@@ -2844,7 +2845,8 @@ local function dDetail(deal)
     else
       local half = math.floor((W - 8) / 2)
       bBack = qBtn(4, H - 2, half, "Back", QB.btn_sec, QB.card_fg)
-      bCancel = qBtn(5 + half, H - 2, half, "Cancel", QB.btn_dan, QB.btn_fg)
+      local endLabel = status == "active" and "End" or "Cancel"
+      bCancel = qBtn(5 + half, H - 2, half, endLabel, QB.btn_dan, QB.btn_fg)
     end
 
     dStatus()
@@ -2858,7 +2860,18 @@ local function dDetail(deal)
         local terms = dCounterForm(deal)
         if terms then dAction(deal, "counter_deal", { terms = terms }); return end
       end
-      if bCancel and hit(bCancel, x, y) then dAction(deal, "cancel_deal"); return end
+      if bCancel and hit(bCancel, x, y) then
+        if dAction(deal, "cancel_deal") then
+          dTop(status == "active" and "Ended" or "Cancelled")
+          qCard(2, 6, W - 2, H - 8)
+          qCentre(9, status == "active" and "Arrangement Ended" or "Deal Cancelled", QB.err, QB.card)
+          qCentre(11, dDealTitle(deal):sub(1, W - 8), QB.card_fg, QB.card)
+          qCentre(13, "Other party notified", QB.label, QB.card)
+          dStatus()
+          sleep(0.8)
+        end
+        return
+      end
 
     elseif ev == "key" then
       if a == keys.backspace or a == keys.escape then return end
