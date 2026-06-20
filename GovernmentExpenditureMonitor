@@ -43,7 +43,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION          = "1.1.8-SPACED-SIDES"
+local VERSION          = "1.2.0-CLEAN-LABELS"
 local BANK_PROTOCOL    = "quid_bank"
 local TREASURY_ACCOUNT = "treasury:quid_bank"
 local DB_TIMEOUT       = 4
@@ -871,7 +871,7 @@ end
 
 local function resolveLabelColumn(rows, minY, maxY)
   table.sort(rows, function(a, b) return (a.natural_y or 0) < (b.natural_y or 0) end)
-  local gap = 3
+  local gap = 4
 
   for i, r in ipairs(rows) do
     local y = clamp(r.natural_y or minY, minY, maxY)
@@ -926,8 +926,11 @@ local function drawPieLabels(cx, cy, rx, ry, slices, total, chartX, chartY, char
   resolveLabelColumn(right, minY, maxY)
 
   -- Fixed far-side columns. No pointers, no leader lines, just lots of room.
-  local leftTextX  = chartX + 5
-  local rightTextX = chartRight - labelW - 2
+  -- Hard-separated label columns.
+  -- Left labels live hard-left; right labels live hard-right.
+  -- The pie is shifted left enough that the right column has a proper blank gap.
+  local leftTextX  = chartX + 4
+  local rightTextX = chartRight - labelW - 1
 
   local function drawOne(r)
     local s = r.sector
@@ -937,11 +940,13 @@ local function drawPieLabels(cx, cy, rx, ry, slices, total, chartX, chartY, char
     local y = r.label_y or r.natural_y
 
     if r.side == "right" then
-      at(rightTextX, y, shortText(name .. " " .. share, labelW), C.text, C.bg)
-      at(rightTextX, y + 1, value, C.good, C.bg)
+      at(rightTextX, y, name, C.text, C.bg)
+      at(rightTextX, y + 1, share, C.dim, C.bg)
+      at(rightTextX, y + 2, value, C.good, C.bg)
     else
-      at(leftTextX, y, shortText(name .. " " .. share, labelW), C.text, C.bg)
-      at(leftTextX, y + 1, value, C.good, C.bg)
+      at(leftTextX, y, name, C.text, C.bg)
+      at(leftTextX, y + 1, share, C.dim, C.bg)
+      at(leftTextX, y + 2, value, C.good, C.bg)
     end
   end
 
@@ -1206,9 +1211,10 @@ local function drawWatchDashboard(data, startY)
 
   -- Keep the chart dominant, but leave breathing room for sector labels
   -- and leader lines around the ring.
-  local rx = math.max(9, math.min(17, math.floor(chartW * 0.17)))
+  -- Big chart, but deliberately centre-left so the right labels do not touch it.
+  local rx = math.max(10, math.min(18, math.floor(chartW * 0.18)))
   local ry = math.max(5, math.min(8, math.floor((chartH - 7) / 2)))
-  local cx = math.floor(W * 0.44)
+  local cx = math.floor(W * 0.37)
   local cy = chartY + math.floor(chartH / 2) + 1
   if cy - ry < chartY + 4 then cy = chartY + 4 + ry end
   if cy + ry > chartBottom - 1 then cy = chartBottom - 1 - ry end
@@ -1223,37 +1229,8 @@ local function drawWatchDashboard(data, startY)
     at(cx - 6, cy, "NO SPEND", C.warn, C.bg)
   end
 
-  -- Bottom strip: key state figures, low visual weight.
-  local stripY = chartBottom + 1
-  if stripY <= H - 3 then
-    line(3, stripY, W - 5, "-", C.grid, C.bg)
-    local colW = math.max(18, math.floor((W - 6) / 4))
-    local y1 = stripY + 1
-    at(4, y1, "Treasury", C.dim, C.bg)
-    at(14, y1, shortText(money(treasury), colW - 10), C.good, C.bg)
-    at(4 + colW, y1, "Payroll/day", C.dim, C.bg)
-    at(16 + colW, y1, shortText(money(data.forecast_daily), colW - 12), C.label, C.bg)
-    at(4 + (colW * 2), y1, "Private", C.dim, C.bg)
-    at(13 + (colW * 2), y1, shortText(money(private), colW - 9), C.label, C.bg)
-    at(4 + (colW * 3), y1, "Control", C.dim, C.bg)
-    at(13 + (colW * 3), y1, string.format("%.1f%%", control * 100), C.dim, C.bg)
-  end
+  -- Bottom strip and recent ticker removed to keep the chart area clean.
 
-  -- Recent outflow ticker, kept to one line so it does not compete with the chart.
-  if H >= 29 then
-    local tickerY = H - 2
-    local text = "Recent: "
-    local shown = 0
-    for _, tx in ipairs(data.outflows or {}) do
-      if shown >= 3 then break end
-      local label = shortText(txField(tx, "memo", "description", "note") or txField(tx, "type", "tx_type") or "Outflow", 18)
-      text = text .. label .. " " .. money(amountOf(tx))
-      shown = shown + 1
-      if shown < 3 then text = text .. "  |  " end
-    end
-    if shown == 0 then text = text .. "no treasury outflows in current window" end
-    at(3, tickerY, shortText(text, W - 5), C.dim, C.bg)
-  end
 end
 
 local function drawScreen(data, err)
@@ -1277,7 +1254,7 @@ local function drawScreen(data, err)
 
   local age = "never"
   if last_refresh_ms > 0 then age = tostring(math.floor((nowMs() - last_refresh_ms) / 1000)) .. "s ago" end
-  last_message = "Live refresh " .. age .. " | source " .. tostring(last_data_source) .. " | read-only monitor"
+  last_message = ""
   last_colour = C.dim
   statusBar()
 end
