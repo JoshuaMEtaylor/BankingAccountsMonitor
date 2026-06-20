@@ -49,7 +49,7 @@ end
 -- =============================================================================
 -- CONFIG / STATE
 -- =============================================================================
-local VERSION = "0.4.0"
+local VERSION = "0.4.1"
 
 local BANK_PROTOCOL = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
@@ -920,8 +920,34 @@ end
 local function contractClaim(c)
   local companies = loadCompanies()
   local sel = 1
+  local dropdown = false
+  local scroll = 0
 
-  while true do
+  local function labelFor(co)
+    if not co then return "Select company..." end
+    local ticker = tostring(co.ticker or "?")
+    local name = tostring(co.display_name or co.company_id or "")
+    return ticker .. " - " .. name
+  end
+
+  local function clamp()
+    if #companies == 0 then
+      sel = 0
+      scroll = 0
+      return
+    end
+    if sel < 1 then sel = 1 end
+    if sel > #companies then sel = #companies end
+
+    local rows = math.max(2, math.min(5, H - 13))
+    if sel <= scroll then scroll = sel - 1 end
+    if sel > scroll + rows then scroll = sel - rows end
+    if scroll < 0 then scroll = 0 end
+  end
+
+  local function draw()
+    clamp()
+
     appFrame("Claim")
     fill(2, 3, W - 2, H - 5, C.card)
 
@@ -931,59 +957,132 @@ local function contractClaim(c)
 
     at(4, 8, "Company", C.card_fg, C.card)
 
-    if #companies == 0 then
-      at(4, 10, "No companies available.", C.err, C.card)
+    local ddX, ddY, ddW = 4, 10, W - 8
+    local bSelect = button(ddX, ddY, ddW, labelFor(companies[sel]):sub(1, ddW), colors.lightGray, colors.black)
+    at(ddX + ddW - 2, ddY, dropdown and "^" or "v", colors.black, colors.lightGray)
+
+    local rowButtons = {}
+    if dropdown then
+      local rows = math.max(2, math.min(5, H - 15))
+      fill(ddX, ddY + 1, ddW, rows, colors.gray)
+
+      for i = 1, rows do
+        local idx = scroll + i
+        local co = companies[idx]
+        local yy = ddY + i
+        if co then
+          local active = idx == sel
+          local bg = active and C.contracts or colors.gray
+          local fg = colors.white
+          fill(ddX, yy, ddW, 1, bg)
+          at(ddX + 1, yy, labelFor(co):sub(1, ddW - 2), fg, bg)
+          rowButtons[#rowButtons + 1] = { x1 = ddX, x2 = ddX + ddW - 1, y1 = yy, y2 = yy, idx = idx }
+        end
+      end
+    elseif #companies == 0 then
+      at(4, 12, "No companies available.", C.err, C.card)
     else
       local co = companies[sel]
-      local label = tostring(co.ticker or "?") .. " - " .. tostring(co.display_name or co.company_id or "")
-      at(4, 10, label:sub(1, W - 6), C.card_fg, C.card)
+      at(4, 12, "Claim as:", colors.gray, C.card)
+      at(4, 13, tostring(co.company_id or "?"):sub(1, W - 6), C.card_fg, C.card)
     end
 
     local third = math.floor((W - 10) / 3)
-    local bPrev = button(4, H - 2, third, "Prev", C.btn)
-    local bNext = button(5 + third, H - 2, third, "Next", C.btn)
+    local bBack = button(4, H - 2, third, "Back", C.btn)
+    local bScroll = button(5 + third, H - 2, third, "List", C.btn)
     local bClaim = button(6 + (third * 2), H - 2, third, "Claim", C.contracts)
     bottomBar(contract.msg, contract.msg_col)
 
-    local ev, a, b, d = os.pullEvent()
-    if ev == "mouse_click" then
-      if hit(bPrev, b, d) and #companies > 0 then sel = sel - 1; if sel < 1 then sel = #companies end end
-      if hit(bNext, b, d) and #companies > 0 then sel = sel + 1; if sel > #companies then sel = 1 end end
-      if hit(bClaim, b, d) and companies[sel] then
-        local co = companies[sel]
-        local ok, res = contractReq({
-          type = "claim_contract",
-          contract_id = c.contract_id,
-          claimant = co.company_id,
-          claimant_type = "company",
-        }, 8)
+    return bBack, bScroll, bClaim, bSelect, rowButtons
+  end
 
-        if ok then
-          contractSet("Claimed as " .. tostring(co.company_id), C.ok)
-          loadContracts()
-          return
+  local function doClaim()
+    local co = companies[sel]
+    if not co then
+      contractSet("Choose a company first.", C.err)
+      return false
+    end
+
+    local ok, res = contractReq({
+      type = "claim_contract",
+      contract_id = c.contract_id,
+      claimant = co.company_id,
+      claimant_type = "company",
+    }, 8)
+
+    if ok then
+      contractSet("Claimed as " .. tostring(co.company_id), C.ok)
+      loadContracts()
+      return true
+    end
+
+    contractSet("Claim failed: " .. tostring(res), C.err)
+    return false
+  end
+
+  local bBack, bScroll, bClaim, bSelect, rowButtons = draw()
+
+  while true do
+    local ev, a, b, d = os.pullEvent()
+
+    if ev == "mouse_click" then
+      if hit(bBack, b, d) then return end
+
+      if hit(bSelect, b, d) or hit(bScroll, b, d) then
+        dropdown = not dropdown
+
+      elseif dropdown then
+        for _, rb in ipairs(rowButtons or {}) do
+          if hit(rb, b, d) then
+            sel = rb.idx
+            dropdown = false
+            break
+          end
         end
-        contractSet("Claim failed: " .. tostring(res), C.err)
+
+        if hit(bClaim, b, d) then
+          if doClaim() then return end
+        end
+
+      elseif hit(bClaim, b, d) then
+        if doClaim() then return end
       end
+
+      bBack, bScroll, bClaim, bSelect, rowButtons = draw()
+
+    elseif ev == "mouse_scroll" then
+      if #companies > 0 then
+        dropdown = true
+        sel = sel + (a > 0 and 1 or -1)
+        clamp()
+      end
+      bBack, bScroll, bClaim, bSelect, rowButtons = draw()
+
     elseif ev == "key" then
-      if a == keys.escape or a == keys.backspace then return end
-      if a == keys.left and #companies > 0 then sel = sel - 1; if sel < 1 then sel = #companies end end
-      if a == keys.right and #companies > 0 then sel = sel + 1; if sel > #companies then sel = 1 end end
-      if a == keys.enter and companies[sel] then
-        local co = companies[sel]
-        local ok, res = contractReq({
-          type = "claim_contract",
-          contract_id = c.contract_id,
-          claimant = co.company_id,
-          claimant_type = "company",
-        }, 8)
-        if ok then contractSet("Claimed", C.ok); loadContracts(); return end
-        contractSet("Claim failed: " .. tostring(res), C.err)
+      if a == keys.escape or a == keys.backspace then
+        return
+      elseif a == keys.space then
+        dropdown = not dropdown
+      elseif a == keys.up and #companies > 0 then
+        dropdown = true
+        sel = sel - 1
+        clamp()
+      elseif a == keys.down and #companies > 0 then
+        dropdown = true
+        sel = sel + 1
+        clamp()
+      elseif a == keys.enter then
+        if dropdown then
+          dropdown = false
+        else
+          if doClaim() then return end
+        end
       end
+
+      bBack, bScroll, bClaim, bSelect, rowButtons = draw()
     end
   end
 end
-
 local function contractDetail(c)
   if not c then return end
   local scroll = 0
@@ -1554,28 +1653,44 @@ local function cAccountStrip()
 end
 
 local function cTabs()
-  local labels = { company.active_id and "Dissolve" or "Register", "Company", "Capital", "Contracts", "Ops" }
-  local modes = { "register", "company", "capital", "contracts", "ops" }
-  local gap = 1
-  local available = W - 2 - ((#labels - 1) * gap)
-  local tw = math.floor(available / #labels)
-  if tw < 8 then tw = 8 end
-
-  cFill(1, 5, W, 1, QC.bg)
+  -- Pocket computers are too narrow for five full tabs on one line.
+  -- Use short labels across two rows:
+  --   Reg/Co/Cap
+  --   Cont/Ops
+  local labels = { company.active_id and "Diss" or "Reg", "Co", "Cap", "Cont", "Ops" }
+  local modes  = { "register", "company", "capital", "contracts", "ops" }
   local buttons = {}
-  local x = 2
-  for i, label in ipairs(labels) do
-    if x > W then break end
-    local ww = math.min(tw, W - x + 1)
-    local active = company.mode == modes[i]
-    local bg = active and QC.tab_act or QC.tab_inact
-    local fg = active and QC.tab_fg_a or QC.tab_fg_i
-    cFill(x, 5, ww, 1, bg)
-    local text = cShort(label, ww)
-    cAt(x + math.max(0, math.floor((ww - #text) / 2)), 5, text, fg, bg)
-    buttons[i] = { x1 = x, x2 = math.min(W, x + ww - 1), y1 = 5, y2 = 5, mode = modes[i] }
-    x = x + ww + gap
+
+  cFill(1, 5, W, 2, QC.bg)
+
+  local row1 = {1, 2, 3}
+  local row2 = {4, 5}
+
+  local function drawRow(row, y)
+    local gap = 1
+    local count = #row
+    local available = W - 2 - ((count - 1) * gap)
+    local tw = math.floor(available / count)
+    local x = 2
+
+    for _, i in ipairs(row) do
+      local label = labels[i]
+      local active = company.mode == modes[i]
+      local bg = active and QC.tab_act or QC.tab_inact
+      local fg = active and QC.tab_fg_a or QC.tab_fg_i
+      local ww = math.min(tw, W - x + 1)
+
+      cFill(x, y, ww, 1, bg)
+      cAt(x + math.max(0, math.floor((ww - #label) / 2)), y, label, fg, bg)
+
+      buttons[i] = { x1 = x, x2 = x + ww - 1, y1 = y, y2 = y, mode = modes[i] }
+      x = x + ww + gap
+    end
   end
+
+  drawRow(row1, 5)
+  drawRow(row2, 6)
+
   return buttons
 end
 
@@ -1872,7 +1987,7 @@ local function cDrawMain(focus)
   cCls(); cTop(); cAccountStrip()
   local tabs = cTabs()
 
-  local cardY = 7
+  local cardY = 8
   local btnY = H - 3
   cCard(2, cardY, W - 2, H - cardY - 1)
 
