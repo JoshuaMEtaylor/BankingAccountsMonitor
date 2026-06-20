@@ -55,7 +55,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION       = "1.0.1"
+local VERSION       = "1.0.2"
 local DEAL_PROTOCOL = "quid_deals"
 local BANK_PROTOCOL = "quid_bank"
 local DB_TIMEOUT    = 5
@@ -412,51 +412,115 @@ local function handleSuggest(req)
   local ok, user = auth(req.username, req.password)
   if not ok then return false, user end
 
-  local q = lower(trim(req.query or ""))
-  local limit = tonumber(req.limit) or 5
-  if limit < 1 then limit = 5 end
-  if limit > 10 then limit = 10 end
+  local q_raw = trim(req.query or "")
+  local q = lower(q_raw)
+  local limit = tonumber(req.limit) or 6
+  if limit < 1 then limit = 6 end
+  if limit > 12 then limit = 12 end
 
-  local out = {}
+  if q == "" then
+    return true, { suggestions = {}, count = 0 }
+  end
+
+  local suggestions = {}
   local seen = {}
 
-  local function maybe(account_id, label, kind)
+  local function startsWith(value, prefix)
+    value = lower(value or "")
+    prefix = lower(prefix or "")
+    return value:sub(1, #prefix) == prefix
+  end
+
+  local function stripAccountPrefix(id)
+    id = tostring(id or "")
+    return id:gsub("^citizen:", ""):gsub("^company:", "")
+  end
+
+  local function add(account_id, label, kind)
     account_id = tostring(account_id or "")
     label = tostring(label or account_id)
+    if account_id == "" or seen[account_id] then return end
 
-    if q == "" then return end
+    local short = stripAccountPrefix(account_id)
+    local hay1 = lower(short)
+    local hay2 = lower(account_id)
+    local hay3 = lower(label)
 
-    local hay = lower(account_id .. " " .. label)
-    if hay:find(q, 1, true) then
-      addSuggestion(out, seen, account_id, label, kind)
+    -- Prefix matching only. Typing A shows accounts beginning A.
+    -- Typing AK narrows to accounts beginning AK.
+    if not (startsWith(hay1, q) or startsWith(hay2, q) or startsWith(hay3, q)) then
+      return
+    end
+
+    seen[account_id] = true
+    suggestions[#suggestions + 1] = {
+      account_id = account_id,
+      label = label,
+      kind = tostring(kind or "account"),
+    }
+  end
+
+  local function absorbAccountList(list)
+    if type(list) ~= "table" then return end
+
+    for _, a in ipairs(list) do
+      if type(a) == "table" then
+        local account_id =
+          a.account_id or a.id or a.citizen_id or a.company_id or a.username or a.name
+
+        local label =
+          a.display_name or a.name or a.username or a.ticker or account_id
+
+        if a.ticker and a.name then
+          label = tostring(a.ticker) .. " - " .. tostring(a.name)
+        end
+
+        add(account_id, label, a.kind or a.type or "account")
+
+      else
+        add(a, a, "account")
+      end
+
+      if #suggestions >= limit then return end
     end
   end
 
-  -- Known people/accounts from previous deals.
-  for _, deal in pairs(deals) do
-    if type(deal) == "table" then
-      maybe(deal.from_id, deal.from_id, "deal_party")
-      maybe(deal.to_id, deal.to_id, "deal_party")
-      if #out >= limit then break end
+  local bankQueries = {
+    { type = "list_accounts" },
+    { type = "list_all_accounts" },
+    { type = "admin_list_accounts" },
+    { type = "view_accounts" },
+    { type = "list_citizens" },
+    { type = "list_companies" },
+  }
+
+  for _, query in ipairs(bankQueries) do
+    local ok2, res = bankRequest(query, 4)
+    if ok2 and type(res) == "table" then
+      absorbAccountList(res.accounts)
+      absorbAccountList(res.citizens)
+      absorbAccountList(res.companies)
+      absorbAccountList(res)
+
+      if #suggestions >= limit then break end
     end
   end
 
-  -- Always allow direct citizen:<typed> fallback.
-  if #out < limit and q ~= "" then
-    local clean = q:gsub("%s+", "_")
-    addSuggestion(out, seen, "citizen:" .. clean, "citizen:" .. clean, "typed")
+  table.sort(suggestions, function(a, b)
+    local aa = stripAccountPrefix(a.account_id)
+    local bb = stripAccountPrefix(b.account_id)
+    return lower(aa) < lower(bb)
+  end)
+
+  while #suggestions > limit do
+    table.remove(suggestions)
   end
 
   return true, {
-    suggestions = out,
-    count = #out,
+    suggestions = suggestions,
+    count = #suggestions,
   }
 end
-
-
--- =============================================================================
--- REQUEST HANDLERS
--- =============================================================================
 local function handleList(req)
   local ok, user = auth(req.username, req.password)
   if not ok then return false, user end
