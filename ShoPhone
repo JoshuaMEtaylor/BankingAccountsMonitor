@@ -49,10 +49,11 @@ end
 -- =============================================================================
 -- CONFIG / STATE
 -- =============================================================================
-local VERSION = "0.4.1"
+local VERSION = "0.5.0"
 
 local BANK_PROTOCOL = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
+local DEAL_PROTOCOL = "quid_deals"
 local TIMEOUT = 5
 
 local W, H = term.getSize()
@@ -2212,6 +2213,512 @@ local function companiesApp()
 end
 
 
+
+-- =============================================================================
+-- MESSAGES / DEALS APP
+-- Proposed deals + recurring payment agreements.
+-- Uses Bank login/session for identity.
+--
+-- Future backend protocol:
+--   quid_deals
+--
+-- Expected request types:
+--   list_deals, propose_deal, accept_deal, decline_deal, counter_deal, cancel_deal
+-- =============================================================================
+local deals = {
+  server = nil,
+  mode = "inbox",
+  list = {},
+  selected = 1,
+  msg = "",
+  msg_col = QB.dim,
+  form = {
+    to_id = "",
+    title = "",
+    amount = "",
+    frequency = "monthly",
+    start = "",
+    note = "",
+  }
+}
+
+local function dSet(msg, col)
+  deals.msg = tostring(msg or "")
+  deals.msg_col = col or QB.dim
+end
+
+local function dStatus()
+  qFill(1, H, W, 1, QB.bg)
+  if deals.msg ~= "" then
+    qAt(2, H, deals.msg:sub(1, W - 2), deals.msg_col, QB.bg)
+  end
+end
+
+local function dTop(title)
+  qCls()
+  qTopBar()
+  qFill(1, 2, W, 2, QB.card)
+  qAt(3, 2, title or "Messages", QB.card_fg, QB.card)
+  if bank.logged then
+    qAt(3, 3, tostring(bank.username) .. " / " .. tostring(bank.citizen_id), QB.label, QB.card)
+  else
+    qAt(3, 3, "Not logged in", QB.label, QB.card)
+  end
+  qSep(4)
+end
+
+local function dConnect()
+  if deals.server then return true end
+
+  if not openModem() then
+    dSet("No modem found.", QB.err)
+    return false
+  end
+
+  dTop("Messages")
+  qCentre(math.floor(H / 2), "Connecting to deal server...", QB.dim, QB.bg)
+
+  for attempt = 1, 5 do
+    qCentre(math.floor(H / 2) + 2, "Attempt " .. attempt .. " of 5", QB.dim, QB.bg)
+    rednet.broadcast({ type = "ping" }, DEAL_PROTOCOL)
+    local sender, msg = rednet.receive(DEAL_PROTOCOL, 2)
+
+    if sender and type(msg) == "table" then
+      if msg.type == "deal_server_online" or msg.type == "deals_server_online" or (msg.success == true and type(msg.response) == "table") then
+        deals.server = sender
+        dSet("Deal server connected.", QB.ok)
+        return true
+      end
+    end
+  end
+
+  dSet("No deal server found.", QB.warn)
+  return false
+end
+
+local function dReq(payload, timeout)
+  if not deals.server then return false, "No deal server connected" end
+  return request(deals.server, DEAL_PROTOCOL, payload, timeout or TIMEOUT)
+end
+
+local function dList()
+  if not dConnect() then
+    deals.list = {}
+    return false
+  end
+
+  local ok, res = dReq({
+    type = "list_deals",
+    username = bank.username,
+    password = bank.password,
+    citizen_id = bank.citizen_id,
+    mode = deals.mode,
+  }, 8)
+
+  if ok and type(res) == "table" then
+    deals.list = res.deals or res.messages or {}
+    if deals.selected > #deals.list then deals.selected = #deals.list end
+    if deals.selected < 1 then deals.selected = 1 end
+    dSet("Loaded " .. tostring(#deals.list) .. " deals.", QB.ok)
+    return true
+  end
+
+  deals.list = {}
+  dSet("Load failed: " .. tostring(res), QB.err)
+  return false
+end
+
+local function dTabs()
+  local labels = { "Inbox", "Active", "Sent", "New" }
+  local modes = { "inbox", "active", "sent", "new" }
+  local tw = math.floor(W / #labels)
+  local tabs = {}
+
+  qFill(1, 5, W, 1, QB.bg)
+
+  for i, label in ipairs(labels) do
+    local x = ((i - 1) * tw) + 1
+    local ww = i == #labels and (W - x + 1) or tw
+    local active = deals.mode == modes[i]
+    local bg = active and QB.tab_act or QB.tab_bg
+    local fg = active and QB.tab_fg_a or QB.tab_fg_i
+
+    qFill(x, 5, ww, 1, bg)
+    qAt(x + math.max(0, math.floor((ww - #label) / 2)), 5, label, fg, bg)
+    tabs[i] = { x1 = x, x2 = x + ww - 1, y1 = 5, y2 = 5, mode = modes[i] }
+  end
+
+  return tabs
+end
+
+local function dDealTitle(deal)
+  return tostring(deal.title or deal.subject or deal.memo or "Deal")
+end
+
+local function dDealParty(deal)
+  local from = tostring(deal.from_id or deal.from or deal.proposer or "?")
+  local to = tostring(deal.to_id or deal.to or deal.recipient or "?")
+  return from .. " -> " .. to
+end
+
+local function dDealStatus(deal)
+  return tostring(deal.status or deal.state or "pending")
+end
+
+local function dDealAmount(deal)
+  local amount = tonumber(deal.amount or deal.payment_amount or 0) or 0
+  local freq = tostring(deal.frequency or deal.interval or "")
+  if amount <= 0 then return freq end
+  if freq ~= "" then return money(amount) .. "/" .. freq end
+  return money(amount)
+end
+
+local function dDrawList()
+  dTop("Messages")
+  local tabs = dTabs()
+
+  qCard(2, 7, W - 2, H - 10)
+
+  if #deals.list == 0 then
+    qAt(4, 8, "No deals found.", QB.label, QB.card)
+  else
+    local y = 8
+    for i, deal in ipairs(deals.list) do
+      if y >= H - 4 then break end
+
+      local active = i == deals.selected
+      local bg = active and QB.in_bg or QB.card
+      qFill(3, y, W - 4, 2, bg)
+
+      qAt(4, y, dDealTitle(deal):sub(1, W - 8), QB.card_fg, bg)
+      qAt(4, y + 1, dDealParty(deal):sub(1, W - 18), QB.label, bg)
+
+      local amt = dDealAmount(deal)
+      if amt ~= "" then qAt(W - #amt - 1, y + 1, amt, QB.ok, bg) end
+
+      y = y + 2
+    end
+  end
+
+  local third = math.floor((W - 10) / 3)
+  local bPrev = qBtn(4, H - 3, third, "Prev", QB.btn_sec, QB.card_fg)
+  local bNext = qBtn(5 + third, H - 3, third, "Next", QB.btn_sec, QB.card_fg)
+  local bOpen = qBtn(6 + (third * 2), H - 3, third, "Open", QB.btn_pri, QB.btn_fg)
+  local bRefresh = qBtn(4, H - 2, W - 6, "Refresh", QB.btn_pri, QB.btn_fg)
+
+  dStatus()
+  return tabs, bPrev, bNext, bOpen, bRefresh
+end
+
+local function dAction(deal, action, extra)
+  if not deal then return false end
+  if not dConnect() then return false end
+
+  local payload = {
+    type = action,
+    username = bank.username,
+    password = bank.password,
+    citizen_id = bank.citizen_id,
+    deal_id = deal.deal_id or deal.id,
+  }
+
+  if extra then
+    for k, v in pairs(extra) do payload[k] = v end
+  end
+
+  local ok, res = dReq(payload, 8)
+
+  if ok then
+    dSet("Deal updated.", QB.ok)
+    dList()
+    return true
+  end
+
+  dSet("Action failed: " .. tostring(res), QB.err)
+  return false
+end
+
+local function dCounterForm(original)
+  local form = {
+    amount = tostring(original and (original.amount or original.payment_amount or "") or ""),
+    frequency = tostring(original and (original.frequency or original.interval or "monthly") or "monthly"),
+    note = tostring(original and (original.note or original.memo or "") or ""),
+  }
+  local focus = 1
+
+  local function draw()
+    dTop("Counter Offer")
+    qCard(2, 6, W - 2, H - 8)
+
+    qAt(4, 7, "Amount", QB.label, QB.card)
+    qInput(4, 8, W - 6, form.amount, false, focus == 1)
+
+    qAt(4, 10, "Frequency", QB.label, QB.card)
+    qInput(4, 11, W - 6, form.frequency, false, focus == 2)
+
+    qAt(4, 13, "Note", QB.label, QB.card)
+    qInput(4, 14, W - 6, form.note, false, focus == 3)
+
+    local half = math.floor((W - 8) / 2)
+    local bSend = qBtn(4, H - 2, half, "Send Counter", QB.btn_pri, QB.btn_fg)
+    local bBack = qBtn(5 + half, H - 2, half, "Back", QB.btn_sec, QB.card_fg)
+
+    dStatus()
+    return bSend, bBack
+  end
+
+  local bSend, bBack = draw()
+
+  while true do
+    local ev, a, x, y = os.pullEvent()
+
+    if ev == "char" then
+      if focus == 1 and #form.amount < 10 then form.amount = form.amount .. a end
+      if focus == 2 and #form.frequency < 16 then form.frequency = form.frequency .. a end
+      if focus == 3 and #form.note < 48 then form.note = form.note .. a end
+
+    elseif ev == "key" then
+      if a == keys.backspace then
+        if focus == 1 then form.amount = form.amount:sub(1, -2) end
+        if focus == 2 then form.frequency = form.frequency:sub(1, -2) end
+        if focus == 3 then form.note = form.note:sub(1, -2) end
+      elseif a == keys.tab then
+        focus = focus % 3 + 1
+      elseif a == keys.enter then
+        if focus < 3 then focus = focus + 1
+        else
+          return { amount = tonumber(form.amount) or 0, frequency = form.frequency, note = form.note }
+        end
+      elseif a == keys.escape then
+        return nil
+      end
+
+    elseif ev == "mouse_click" then
+      if hit(bBack, x, y) then return nil end
+      if hit(bSend, x, y) then
+        return { amount = tonumber(form.amount) or 0, frequency = form.frequency, note = form.note }
+      end
+      if y == 8 then focus = 1 elseif y == 11 then focus = 2 elseif y == 14 then focus = 3 end
+    end
+
+    bSend, bBack = draw()
+  end
+end
+
+local function dDetail(deal)
+  if not deal then return end
+
+  while true do
+    dTop("Deal")
+    qCard(2, 6, W - 2, H - 8)
+
+    qAt(4, 7, dDealTitle(deal):sub(1, W - 6), QB.card_fg, QB.card)
+    qAt(4, 9, "Status: " .. dDealStatus(deal), QB.label, QB.card)
+    qAt(4, 10, "Party:  " .. dDealParty(deal):sub(1, W - 13), QB.label, QB.card)
+    qAt(4, 11, "Terms:  " .. dDealAmount(deal):sub(1, W - 13), QB.label, QB.card)
+
+    local nextDue = tostring(deal.next_due or deal.start_date or deal.start or "")
+    if nextDue ~= "" then qAt(4, 12, "Due:    " .. nextDue:sub(1, W - 13), QB.label, QB.card) end
+
+    local note = tostring(deal.note or deal.memo or deal.description or "")
+    if note ~= "" then
+      qAt(4, 14, "Note:", QB.label, QB.card)
+      qAt(4, 15, note:sub(1, W - 6), QB.card_fg, QB.card)
+    end
+
+    local status = dDealStatus(deal)
+    local isPending = status == "pending" or status == "proposed" or status == "countered"
+
+    local bBack, bAccept, bDecline, bCounter, bCancel
+
+    if isPending then
+      local bw = math.floor((W - 12) / 4)
+      if bw < 6 then bw = 6 end
+      bBack = qBtn(4, H - 2, bw, "Back", QB.btn_sec, QB.card_fg)
+      bAccept = qBtn(5 + bw, H - 2, bw, "Accept", QB.btn_pri, QB.btn_fg)
+      bDecline = qBtn(6 + (bw * 2), H - 2, bw, "Decline", QB.btn_dan, QB.btn_fg)
+      bCounter = qBtn(7 + (bw * 3), H - 2, bw, "Change", QB.btn_sec, QB.card_fg)
+    else
+      local half = math.floor((W - 8) / 2)
+      bBack = qBtn(4, H - 2, half, "Back", QB.btn_sec, QB.card_fg)
+      bCancel = qBtn(5 + half, H - 2, half, "Cancel", QB.btn_dan, QB.btn_fg)
+    end
+
+    dStatus()
+
+    local ev, a, x, y = os.pullEvent()
+    if ev == "mouse_click" then
+      if hit(bBack, x, y) then return end
+      if bAccept and hit(bAccept, x, y) then dAction(deal, "accept_deal"); return end
+      if bDecline and hit(bDecline, x, y) then dAction(deal, "decline_deal"); return end
+      if bCounter and hit(bCounter, x, y) then
+        local terms = dCounterForm(deal)
+        if terms then dAction(deal, "counter_deal", { terms = terms }); return end
+      end
+      if bCancel and hit(bCancel, x, y) then dAction(deal, "cancel_deal"); return end
+
+    elseif ev == "key" then
+      if a == keys.backspace or a == keys.escape then return end
+    end
+  end
+end
+
+local function dNewDeal()
+  local focus = 1
+
+  local function draw()
+    dTop("New Deal")
+    qCard(2, 6, W - 2, H - 8)
+
+    qAt(4, 7, "Recipient", QB.label, QB.card)
+    qInput(4, 8, W - 6, deals.form.to_id, false, focus == 1)
+
+    qAt(4, 10, "Title", QB.label, QB.card)
+    qInput(4, 11, W - 6, deals.form.title, false, focus == 2)
+
+    qAt(4, 13, "Amount", QB.label, QB.card)
+    qInput(4, 14, W - 6, deals.form.amount, false, focus == 3)
+
+    qAt(4, 16, "Frequency", QB.label, QB.card)
+    qInput(4, 17, W - 6, deals.form.frequency, false, focus == 4)
+
+    local half = math.floor((W - 8) / 2)
+    local bSend = qBtn(4, H - 2, half, "Propose", QB.btn_pri, QB.btn_fg)
+    local bBack = qBtn(5 + half, H - 2, half, "Back", QB.btn_sec, QB.card_fg)
+
+    dStatus()
+    return bSend, bBack
+  end
+
+  local bSend, bBack = draw()
+
+  local function send()
+    local amount = tonumber(deals.form.amount)
+    if deals.form.to_id == "" then dSet("Enter recipient.", QB.err); return false end
+    if deals.form.title == "" then dSet("Enter title.", QB.err); return false end
+    if not amount or amount <= 0 then dSet("Enter valid amount.", QB.err); return false end
+    if not dConnect() then return false end
+
+    local ok, res = dReq({
+      type = "propose_deal",
+      username = bank.username,
+      password = bank.password,
+      from_id = bank.citizen_id,
+      to_id = deals.form.to_id,
+      title = deals.form.title,
+      amount = amount,
+      frequency = deals.form.frequency,
+      start_date = deals.form.start,
+      note = deals.form.note,
+    }, 8)
+
+    if ok then
+      dSet("Deal proposal sent.", QB.ok)
+      deals.form.to_id = ""
+      deals.form.title = ""
+      deals.form.amount = ""
+      deals.form.frequency = "monthly"
+      deals.form.start = ""
+      deals.form.note = ""
+      deals.mode = "sent"
+      dList()
+      return true
+    end
+
+    dSet("Send failed: " .. tostring(res), QB.err)
+    return false
+  end
+
+  while true do
+    local ev, a, x, y = os.pullEvent()
+
+    if ev == "char" then
+      if focus == 1 and #deals.form.to_id < 32 then deals.form.to_id = deals.form.to_id .. a end
+      if focus == 2 and #deals.form.title < 32 then deals.form.title = deals.form.title .. a end
+      if focus == 3 and #deals.form.amount < 10 then deals.form.amount = deals.form.amount .. a end
+      if focus == 4 and #deals.form.frequency < 16 then deals.form.frequency = deals.form.frequency .. a end
+
+    elseif ev == "key" then
+      if a == keys.backspace then
+        if focus == 1 then deals.form.to_id = deals.form.to_id:sub(1, -2) end
+        if focus == 2 then deals.form.title = deals.form.title:sub(1, -2) end
+        if focus == 3 then deals.form.amount = deals.form.amount:sub(1, -2) end
+        if focus == 4 then deals.form.frequency = deals.form.frequency:sub(1, -2) end
+      elseif a == keys.tab then
+        focus = focus % 4 + 1
+      elseif a == keys.enter then
+        if focus < 4 then focus = focus + 1 else if send() then return end end
+      elseif a == keys.escape then
+        return
+      end
+
+    elseif ev == "mouse_click" then
+      if hit(bBack, x, y) then return end
+      if hit(bSend, x, y) then if send() then return end end
+      if y == 8 then focus = 1 elseif y == 11 then focus = 2 elseif y == 14 then focus = 3 elseif y == 17 then focus = 4 end
+    end
+
+    bSend, bBack = draw()
+  end
+end
+
+local function messagesApp()
+  if not bank.logged then
+    if not bankLogin() then return end
+  end
+
+  dConnect()
+  dList()
+
+  while true do
+    if deals.mode == "new" then
+      dNewDeal()
+      deals.mode = "inbox"
+      dList()
+    end
+
+    local tabs, bPrev, bNext, bOpen, bRefresh = dDrawList()
+
+    local ev, a, x, y = os.pullEvent()
+
+    if ev == "mouse_click" then
+      local tabbed = false
+      for _, tab in ipairs(tabs or {}) do
+        if hit(tab, x, y) then
+          deals.mode = tab.mode
+          deals.selected = 1
+          if deals.mode ~= "new" then dList() end
+          tabbed = true
+          break
+        end
+      end
+
+      if not tabbed then
+        if bPrev and hit(bPrev, x, y) then
+          if deals.selected > 1 then deals.selected = deals.selected - 1 end
+        elseif bNext and hit(bNext, x, y) then
+          if deals.selected < #deals.list then deals.selected = deals.selected + 1 end
+        elseif bOpen and hit(bOpen, x, y) then
+          dDetail(deals.list[deals.selected])
+        elseif bRefresh and hit(bRefresh, x, y) then
+          dList()
+        else
+          local row = y - 8
+          local idx = math.floor(row / 2) + 1
+          if idx >= 1 and idx <= #deals.list then deals.selected = idx end
+        end
+      end
+
+    elseif ev == "key" then
+      if a == keys.escape or a == keys.backspace then return end
+      if a == keys.up and deals.selected > 1 then deals.selected = deals.selected - 1 end
+      if a == keys.down and deals.selected < #deals.list then deals.selected = deals.selected + 1 end
+      if a == keys.enter then dDetail(deals.list[deals.selected]) end
+    end
+  end
+end
+
+
 -- =============================================================================
 -- PLACEHOLDER APPS
 -- =============================================================================
@@ -2236,6 +2743,7 @@ local function openApp(app)
   if app.id == "bank" then bankApp()
   elseif app.id == "contracts" then contractsApp()
   elseif app.id == "companies" then companiesApp()
+  elseif app.id == "messages" then messagesApp()
   else placeholder(app) end
 end
 
