@@ -22,7 +22,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.4.18-SERVICE-GDP"
+local VERSION  = "1.4.19-GOV-PAYROLL"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -2503,6 +2503,33 @@ handlers["company_payroll"] = function(sender_id, req)
 end
 
 
+
+
+-- GOVERNMENT_PAYROLL
+-- Public-sector payroll paid from the Treasury using rates managed through FiscalControls.
+-- This deliberately uses its own transaction type instead of a generic grant so
+-- government expenditure/payroll monitors can separate wages from ad-hoc grants.
+handlers["government_payroll"] = function(sender_id, req)
+  local citizen_id = req.citizen_id or req.to_id
+  local amount = tonumber(req.amount)
+  local memo = req.memo or "Government payroll"
+
+  if not citizen_id or citizen_id == "" then return false, "Missing citizen_id" end
+  if not amount or amount <= 0 then return false, "Invalid amount" end
+  amount = math.floor(amount)
+  if amount <= 0 then return false, "Invalid integer amount" end
+
+  if not accountExists("treasury:quid_bank") then return false, "Treasury account not found" end
+  if not accountExists(citizen_id) then return false, "Citizen account not found: " .. tostring(citizen_id) end
+  if not citizens[citizen_id] then return false, "Citizen not registered: " .. tostring(citizen_id) end
+
+  local zacc = accounts[citizen_id]
+  if not zacc or zacc.type ~= "citizen" then return false, "Destination is not a citizen account" end
+
+  -- Government payroll spends existing treasury funds. If the treasury cannot
+  -- cover wages, print/grant policy should be handled from FiscalControls.
+  return transfer("treasury:quid_bank", citizen_id, amount, "GOVERNMENT_PAYROLL", memo, "GOVERNMENT_PAYROLL:" .. tostring(sender_id), false)
+end
 
 -- HOSPITALITY_MEAL_PAYMENT
 -- System-side charge for inferred Dining Hall / Restaurant meal events.
