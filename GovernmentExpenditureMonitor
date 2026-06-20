@@ -43,7 +43,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION          = "1.2.5-LOWER-PIE"
+local VERSION          = "1.2.6-LOWER-TOP-PADDING"
 local BANK_PROTOCOL    = "quid_bank"
 local TREASURY_ACCOUNT = "treasury:quid_bank"
 local DB_TIMEOUT       = 4
@@ -1236,10 +1236,16 @@ local function drawWatchDashboard(data, startY)
 
   -- Main centred chart panel.
   local chartX = 3
-  local chartY = 6
+
+  -- Push the chart area down. This creates real empty space between the
+  -- header/top figures and the pie instead of only changing the centre point.
+  local chartY = 9
   local chartW = W - 4
-  local chartH = math.max(16, H - 12)
-  if chartY + chartH > H - 4 then chartH = math.max(14, (H - 4) - chartY) end
+
+  -- The bottom strip/ticker is gone, so the chart panel can safely use more
+  -- lower monitor space. This prevents the pie from being clamped back upward.
+  local chartH = math.max(18, H - 10)
+  if chartY + chartH > H - 2 then chartH = math.max(16, (H - 2) - chartY) end
   local chartBottom = chartY + chartH - 1
 
   box(chartX, chartY, chartW, chartH, "Expenditure composition")
@@ -1248,15 +1254,17 @@ local function drawWatchDashboard(data, startY)
   local recentLine = "RECENT " .. money(data.actual_total) .. " / " .. tostring(data.observed_days) .. " MC day(s)"
   at(chartX + 3, chartY + 2, totalLine, C.good, C.bg)
   at(W - #recentLine - 3, chartY + 2, recentLine, C.warn, C.bg)
+  line(chartX + 2, chartY + 4, chartW - 4, "-", C.grid, C.bg)
 
   -- Bigger main chart, placed more centrally on the screen.
   -- The monitor is large enough to give the donut more presence.
-  -- Bigger chart, shifted further down to open more space above it.
+  -- Bigger chart, deliberately placed lower in the panel.
   local rx = math.max(16, math.min(26, math.floor(chartW * 0.27)))
-  local ry = math.max(8, math.min(13, math.floor((chartH - 4) / 2)))
+  local ry = math.max(8, math.min(13, math.floor((chartH - 6) / 2)))
   local cx = math.floor(W * 0.51)
-  local cy = chartY + math.floor(chartH / 2) + 4
-  if cy - ry < chartY + 4 then cy = chartY + 4 + ry end
+  local cy = chartY + math.floor(chartH / 2) + 6
+  -- Keep a hard top gutter above the pie so it cannot creep into the top figures.
+  if cy - ry < chartY + 7 then cy = chartY + 7 + ry end
   if cy + ry > chartBottom - 1 then cy = chartBottom - 1 - ry end
 
   drawPie(cx, cy, rx, ry, slices, data.chart_total)
