@@ -22,7 +22,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.4.21-PUBLIC-PAYROLL-COERCE"
+local VERSION  = "1.4.22-WAGE-PRICE-PRESSURE"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -1124,22 +1124,21 @@ end
 
 
 -- =============================================================================
--- WIDE SECTOR PRICE ORACLE
+NATIONAL PRICE + WAGE PRESSURE ORACLE
 --
--- This is deliberately broad rather than deep. MineColonies citizens are not
--- real economic agents, so this system does not try to make them change
--- behaviour. It simply gives the Quid economy width: food, construction,
--- logistics, fuel, tools/arms, research, defence, and general services all get
--- their own visible price pressure.
+-- The old sector CPI spread looked more precise than the simulation really is.
+-- We now use one national price index for all item/service quotes:
 --
--- Important design choice:
---   There is no built-in starter inflation. The oracle starts at x1.00 and only
---   moves from actual bank inflation, money-print shock, or an admin-set floor.
---   Prices rise easily but fall slowly: max 3% per Minecraft day, and never
---   below 75% of the sector ATH unless the oracle is deliberately rebased.
+--   final price = base price * national_price_index
+--
+-- Inflation pressure comes from money supply / printing / imported money and
+-- from a small wage-cost pressure once wages catch up enough to squeeze margins.
+-- Prices rise quickly, fall slowly, and cannot fall below a sticky share of ATH.
+-- Wages rise more slowly than prices, keep catching up after inflation cools,
+-- and only add small pressure so the system does not spiral without governance.
 -- =============================================================================
 local DEFAULT_PRICE_ORACLE = {
-  model = "wide_sector_price_oracle_v2_zero_base_sticky_deflation",
+  model = "national_wage_price_pressure_v1",
   min_index = 1.00,
   max_index = 8.00,
   immediate_pass_through = 1.00,
@@ -1158,6 +1157,33 @@ local DEFAULT_PRICE_ORACLE = {
   max_shock_pressure = 3.00,
   shock_decay_per_mc_day = 0.82,
   default_markup = 1.00,
+  wage_price = {
+    national_price_index = 1.00,
+    price_ath_index = 1.00,
+    sticky_price_floor = 1.00,
+    wage_index = 1.00,
+    wage_ath_index = 1.00,
+    money_pressure = 0.00,
+    wage_cost_pressure = 0.00,
+    total_inflation_pressure = 0.00,
+    real_wage_ratio = 1.00,
+    policy = {
+      -- Small numbers by design. Governance should matter; the economy should
+      -- not spiral on its own just because wages and prices exist.
+      sticky_floor_from_ath = 0.75,
+      max_daily_price_deflation = 0.03,
+      max_daily_price_inflation = 0.08,
+      max_total_pressure = 3.00,
+      wage_catchup_rate = 0.06,        -- move 6% of the remaining wage gap/day
+      max_daily_wage_gain = 0.015,     -- hard cap: +1.5% wage index/day
+      max_daily_wage_decline = 0.001,  -- wages barely fall
+      wage_target_cushion = 1.08,      -- wages may drift slightly above prices
+      wage_target_ath_cap = 1.00,      -- but not above the price shock ATH
+      wage_pressure_start_ratio = 0.85,
+      wage_pressure_sensitivity = 0.025,
+      max_wage_cost_pressure = 0.015,
+    },
+  },
   sectors = {
     general =      { label="General CPI",       sensitivity=1.00, bias=0.00 },
     food =         { label="Food CPI",          sensitivity=1.40, bias=0.05 },
@@ -1302,102 +1328,184 @@ local function inflationPressure()
   return pressure, rate, idx, floor, shock
 end
 
+local function wagePricePolicy()
+  ensurePriceOracle()
+  price_oracle.wage_price = type(price_oracle.wage_price) == "table" and price_oracle.wage_price or cloneTable(DEFAULT_PRICE_ORACLE.wage_price)
+  local wp = price_oracle.wage_price
+  wp.policy = type(wp.policy) == "table" and wp.policy or {}
+  for k, v in pairs(DEFAULT_PRICE_ORACLE.wage_price.policy) do
+    wp.policy[k] = tonumber(wp.policy[k]) or v
+  end
+  return wp.policy
+end
+
+local function ensureWagePriceState()
+  ensureInflationState()
+  ensurePriceOracle()
+  price_oracle.wage_price = type(price_oracle.wage_price) == "table" and price_oracle.wage_price or cloneTable(DEFAULT_PRICE_ORACLE.wage_price)
+  local wp = price_oracle.wage_price
+  local policy = wagePricePolicy()
+
+  local oldGeneral = type(price_oracle.sectors) == "table" and type(price_oracle.sectors.general) == "table" and price_oracle.sectors.general or {}
+  local seedIndex = tonumber(wp.national_price_index) or tonumber(oldGeneral.current_index) or tonumber(inflation_state.price_index) or 1
+  if seedIndex < 1 then seedIndex = 1 end
+
+  wp.national_price_index = seedIndex
+  wp.price_ath_index = math.max(1, tonumber(wp.price_ath_index) or tonumber(oldGeneral.ath_index) or seedIndex)
+  wp.sticky_price_floor = math.max(1, tonumber(wp.sticky_price_floor) or (wp.price_ath_index * (policy.sticky_floor_from_ath or 0.75)))
+  wp.wage_index = math.max(1, tonumber(wp.wage_index) or 1)
+  wp.wage_ath_index = math.max(1, tonumber(wp.wage_ath_index) or wp.wage_index)
+  wp.last_day = tonumber(wp.last_day) or currentMinecraftDay()
+  wp.updated = wp.updated or timestamp()
+  return wp
+end
+
+local function updateWagePriceState(force)
+  local wp = ensureWagePriceState()
+  local policy = wagePricePolicy()
+  local today = currentMinecraftDay()
+  local lastDay = math.floor(tonumber(wp.last_day) or today)
+  local elapsed = math.max(0, math.min(30, today - lastDay))
+
+  local moneyPressure, bankRate, bankIndex, adminFloor, printShock = inflationPressure()
+  moneyPressure = tonumber(moneyPressure) or 0
+  if moneyPressure < 0 then moneyPressure = 0 end
+
+  local priceIndex = math.max(1, tonumber(wp.national_price_index) or 1)
+  local priceAth = math.max(1, tonumber(wp.price_ath_index) or priceIndex)
+  local wageIndex = math.max(1, tonumber(wp.wage_index) or 1)
+
+  local ratio = wageIndex / math.max(0.01, priceIndex)
+  local wageStart = tonumber(policy.wage_pressure_start_ratio) or 0.85
+  local wagePressure = 0
+  if ratio > wageStart then
+    wagePressure = (ratio - wageStart) * (tonumber(policy.wage_pressure_sensitivity) or 0.025)
+  end
+  wagePressure = clamp(wagePressure, 0, tonumber(policy.max_wage_cost_pressure) or 0.015)
+
+  local totalPressure = clamp(moneyPressure + wagePressure, 0, tonumber(policy.max_total_pressure) or 3)
+  local targetPrice = 1 + totalPressure
+  targetPrice = clamp(targetPrice, tonumber(price_oracle.min_index) or 1, tonumber(price_oracle.max_index) or 8)
+
+  -- Prices rise immediately when pressure jumps, but fall slowly and never below
+  -- the sticky ATH floor. This is the core one-national-CPI rule.
+  if targetPrice >= priceIndex then
+    if elapsed > 0 then
+      local maxRise = tonumber(policy.max_daily_price_inflation) or 0.08
+      local allowedCeilingToday = priceIndex * pow(1 + maxRise, elapsed)
+      priceIndex = math.min(targetPrice, allowedCeilingToday)
+    else
+      -- Same-day repeated monitor/terminal polling must not ratchet prices.
+      priceIndex = priceIndex
+    end
+  else
+    local allowedFloorToday = priceIndex
+    if elapsed > 0 then
+      allowedFloorToday = priceIndex * pow(1 - (tonumber(policy.max_daily_price_deflation) or 0.03), elapsed)
+    end
+    priceIndex = math.max(targetPrice, allowedFloorToday)
+  end
+
+  priceAth = math.max(priceAth, priceIndex)
+  local stickyFloor = math.max(tonumber(price_oracle.min_index) or 1, priceAth * (tonumber(policy.sticky_floor_from_ath) or 0.75))
+  if priceIndex < stickyFloor then priceIndex = stickyFloor end
+  priceIndex = clamp(priceIndex, tonumber(price_oracle.min_index) or 1, tonumber(price_oracle.max_index) or 8)
+
+  -- Wages catch up slowly. They can drift slightly above current prices, but do
+  -- not exceed the previous price-shock ceiling. Wages barely decline.
+  local wageTarget = math.max(1, priceIndex * (tonumber(policy.wage_target_cushion) or 1.08))
+  wageTarget = math.min(wageTarget, priceAth * (tonumber(policy.wage_target_ath_cap) or 1.0))
+  if wageTarget < 1 then wageTarget = 1 end
+
+  if elapsed > 0 then
+    for _ = 1, elapsed do
+      if wageIndex < wageTarget then
+        local gap = wageTarget - wageIndex
+        local step = math.min(gap * (tonumber(policy.wage_catchup_rate) or 0.06), wageIndex * (tonumber(policy.max_daily_wage_gain) or 0.015))
+        if step < 0 then step = 0 end
+        wageIndex = wageIndex + step
+      elseif wageIndex > wageTarget then
+        local decline = wageIndex * (tonumber(policy.max_daily_wage_decline) or 0.001)
+        wageIndex = math.max(wageTarget, wageIndex - decline)
+      end
+    end
+  end
+
+  wageIndex = math.max(1, wageIndex)
+  local wageAth = math.max(tonumber(wp.wage_ath_index) or 1, wageIndex)
+
+  wp.national_price_index = priceIndex
+  wp.price_ath_index = priceAth
+  wp.sticky_price_floor = stickyFloor
+  wp.wage_index = wageIndex
+  wp.wage_ath_index = wageAth
+  wp.wage_target_index = wageTarget
+  wp.real_wage_ratio = wageIndex / math.max(0.01, priceIndex)
+  wp.money_pressure = moneyPressure
+  wp.wage_cost_pressure = wagePressure
+  wp.total_inflation_pressure = totalPressure
+  wp.bank_inflation_rate = bankRate
+  wp.bank_price_index = bankIndex
+  wp.admin_floor_pressure = adminFloor
+  wp.print_shock_pressure = printShock
+  wp.last_day = today
+  wp.updated = timestamp()
+  wp.model = "national_wage_price_pressure_v1"
+  wp.note = "One national price index. Wages catch up slowly; wage cost pressure is deliberately small."
+
+  price_oracle.wage_price = wp
+  savePriceOracle()
+  return wp
+end
+
 local function sectorIndex(sector)
   sector = lower(sector or "general")
   ensurePriceOracle()
   if not price_oracle.sectors[sector] then sector = "general" end
   local rec = price_oracle.sectors[sector] or price_oracle.sectors.general or {}
-  local pressure, rate, bank_index, floor, shock = inflationPressure()
+  local wp = updateWagePriceState(false)
+  local idx = tonumber(wp.national_price_index) or 1
 
-  local target_idx = 1 + (pressure * (tonumber(rec.sensitivity) or 1)) + (pressure > 0 and (tonumber(rec.bias) or 0) or 0)
-  target_idx = clamp(target_idx, tonumber(price_oracle.min_index) or 1, tonumber(price_oracle.max_index) or 8)
-
-  -- Sticky ATH + slow deflation rule:
-  -- Prices can rise instantly when pressure/shock appears. When pressure eases,
-  -- sellers only cut prices slowly: at most max_daily_deflation per Minecraft
-  -- day, and never below sticky_floor_from_ath of the sector ATH.
-  local sticky_ratio = tonumber(price_oracle.sticky_floor_from_ath) or 0.75
-  if sticky_ratio < 0 then sticky_ratio = 0.75 end
-  if sticky_ratio > 1 then sticky_ratio = 1 end
-
-  local old_ath = tonumber(rec.ath_index) or 1
-  local current = tonumber(rec.current_index) or 1
-  current = clamp(current, tonumber(price_oracle.min_index) or 1, tonumber(price_oracle.max_index) or 8)
-
-  local ath = math.max(1, old_ath, target_idx, current)
-  local sticky_floor = math.max(tonumber(price_oracle.min_index) or 1, ath * sticky_ratio)
-
-  local today = currentMinecraftDay()
-  local lastDay = math.floor(tonumber(rec.last_index_day) or today)
-  local elapsedDays = math.max(0, math.min(30, today - lastDay))
-  local maxDeflation = tonumber(price_oracle.max_daily_deflation) or 0.03
-  if maxDeflation < 0 then maxDeflation = 0.03 end
-  if maxDeflation > 0.25 then maxDeflation = 0.25 end
-
-  local idx = current
-  local deflation_limited = false
-  local sticky_active = false
-
-  if target_idx >= current then
-    -- Inflation is easy: raise immediately.
-    idx = target_idx
-  else
-    -- Deflation is slow and sticky. If this is the same MC day as the last
-    -- update, do not let repeated quote calls keep ratcheting prices down.
-    local allowed_floor_today = current
-    if elapsedDays > 0 then
-      allowed_floor_today = current * pow(1 - maxDeflation, elapsedDays)
-    end
-    idx = math.max(target_idx, allowed_floor_today)
-    if idx > target_idx + 0.0001 then deflation_limited = true end
-  end
-
-  if idx < sticky_floor then
-    idx = sticky_floor
-    sticky_active = true
-  end
-  idx = clamp(idx, tonumber(price_oracle.min_index) or 1, tonumber(price_oracle.max_index) or 8)
-
-  -- A post-limit price can also become the new ATH if current/target was higher.
-  ath = math.max(ath, idx)
-  sticky_floor = math.max(tonumber(price_oracle.min_index) or 1, ath * sticky_ratio)
-  if idx < sticky_floor then
-    idx = sticky_floor
-    sticky_active = true
-  end
-
-  local changed = false
-  if math.abs((tonumber(rec.ath_index) or 0) - ath) > 0.0001 then rec.ath_index = ath; changed = true end
-  if math.abs((tonumber(rec.current_index) or 0) - idx) > 0.0001 then rec.current_index = idx; changed = true end
-  if math.abs((tonumber(rec.raw_index) or 0) - target_idx) > 0.0001 then rec.raw_index = target_idx; changed = true end
-  if math.abs((tonumber(rec.sticky_floor_index) or 0) - sticky_floor) > 0.0001 then rec.sticky_floor_index = sticky_floor; changed = true end
-  if rec.last_index_day ~= today then rec.last_index_day = today; changed = true end
-  rec.sticky_active = sticky_active
-  rec.deflation_limited = deflation_limited
-  rec.last_pressure = pressure
+  -- All sectors deliberately use the same national index. Different goods vary
+  -- by base price only; we are not pretending to model separate supply chains.
+  rec.label = rec.label or ((sector == "general") and "National CPI" or (sector .. " CPI"))
+  rec.sensitivity = 1
+  rec.bias = 0
+  rec.raw_index = idx
+  rec.current_index = idx
+  rec.ath_index = tonumber(wp.price_ath_index) or idx
+  rec.sticky_floor_index = tonumber(wp.sticky_price_floor) or idx
+  rec.last_index_day = currentMinecraftDay()
+  rec.last_pressure = tonumber(wp.total_inflation_pressure) or 0
   rec.last_updated = timestamp()
-  if changed then savePriceOracle() end
+  rec.sticky_active = idx <= (tonumber(wp.sticky_price_floor) or 1) + 0.0001
+  rec.deflation_limited = false
 
   return idx, {
     sector = sector,
-    label = rec.label or sector,
-    monetary_pressure = pressure,
-    bank_inflation_rate = rate,
-    old_bank_price_index = bank_index,
-    price_pressure_floor = floor,
-    shock_pressure = shock,
-    sensitivity = tonumber(rec.sensitivity) or 1,
-    bias = tonumber(rec.bias) or 0,
-    raw_index = target_idx,
-    target_index = target_idx,
-    ath_index = ath,
+    label = rec.label or "National CPI",
+    monetary_pressure = tonumber(wp.money_pressure) or 0,
+    wage_cost_pressure = tonumber(wp.wage_cost_pressure) or 0,
+    total_inflation_pressure = tonumber(wp.total_inflation_pressure) or 0,
+    bank_inflation_rate = tonumber(wp.bank_inflation_rate) or 0,
+    old_bank_price_index = tonumber(wp.bank_price_index) or tonumber(inflation_state.price_index) or 1,
+    price_pressure_floor = tonumber(wp.admin_floor_pressure) or 0,
+    shock_pressure = tonumber(wp.print_shock_pressure) or 0,
+    sensitivity = 1,
+    bias = 0,
+    raw_index = idx,
+    target_index = idx,
+    ath_index = tonumber(wp.price_ath_index) or idx,
     current_index = idx,
-    sticky_floor_index = sticky_floor,
-    sticky_floor_from_ath = sticky_ratio,
-    max_daily_deflation = maxDeflation,
-    elapsed_days = elapsedDays,
-    sticky_active = sticky_active,
-    deflation_limited = deflation_limited,
+    sticky_floor_index = tonumber(wp.sticky_price_floor) or 1,
+    sticky_floor_from_ath = tonumber((wp.policy or {}).sticky_floor_from_ath) or 0.75,
+    max_daily_deflation = tonumber((wp.policy or {}).max_daily_price_deflation) or 0.03,
+    elapsed_days = 0,
+    sticky_active = rec.sticky_active,
+    deflation_limited = rec.deflation_limited,
+    wage_index = tonumber(wp.wage_index) or 1,
+    wage_target_index = tonumber(wp.wage_target_index) or 1,
+    real_wage_ratio = tonumber(wp.real_wage_ratio) or 1,
   }
 end
 
@@ -2240,7 +2348,12 @@ end
 -- GET_INFLATION_STATE
 handlers["get_inflation_state"] = function(sender_id, req)
   ensureInflationState()
-  return true, { state = inflation_state }
+  local wp = nil
+  if updateWagePriceState then wp = updateWagePriceState(false) end
+  inflation_state.wage_price = wp
+  inflation_state.wage_index = wp and wp.wage_index or nil
+  inflation_state.national_price_index = wp and wp.national_price_index or nil
+  return true, { state = inflation_state, wage_price = wp }
 end
 
 -- TICK_INFLATION
@@ -2253,8 +2366,15 @@ handlers["tick_inflation"] = function(sender_id, req)
     local okDecay, decayInfo = pcall(decayPriceOracleShock, elapsed)
     if okDecay then oracle_decay = decayInfo end
   end
+  local wp = nil
+  if updateWagePriceState then wp = updateWagePriceState(false) end
+  if type(state) == "table" then
+    state.wage_price = wp
+    state.wage_index = wp and wp.wage_index or nil
+    state.national_price_index = wp and wp.national_price_index or nil
+  end
   audit("ACTION", "STATE", sender_id, "TICK_INFLATION", "changed=" .. tostring(changed) .. " elapsed=" .. tostring(elapsed))
-  return true, { changed = changed, elapsed_days = elapsed, state = state, oracle_decay = oracle_decay }
+  return true, { changed = changed, elapsed_days = elapsed, state = state, wage_price = wp, oracle_decay = oracle_decay }
 end
 
 -- SET_INFLATION_POLICY
@@ -2917,6 +3037,8 @@ handlers["get_price_indices"] = function(sender_id, req)
   -- Historical mint shock import remains available through import_mint_shocks.
   local imported, skipped = 0, 0
 
+  local wp = updateWagePriceState(false)
+
   local okSnap, snapOrErr = pcall(sectorIndexSnapshot)
   if not okSnap then
     audit("ERROR", "SYSTEM", sender_id, "GET_PRICE_INDICES", "snapshot error: " .. tostring(snapOrErr))
@@ -2926,6 +3048,9 @@ handlers["get_price_indices"] = function(sender_id, req)
   return true, {
     model = price_oracle.model,
     sectors = snapOrErr,
+    wage_price = wp,
+    national_price_index = wp and wp.national_price_index or nil,
+    wage_index = wp and wp.wage_index or nil,
     inflation = inflation_state,
     shock_pressure = tonumber(price_oracle.shock_pressure) or 0,
     sticky_floor_from_ath = tonumber(price_oracle.sticky_floor_from_ath) or 0.75,
@@ -2934,7 +3059,7 @@ handlers["get_price_indices"] = function(sender_id, req)
     imported_mint_shocks = imported or 0,
     skipped_mint_shocks = skipped or 0,
     time = timestamp(),
-    note = "Zero baseline inflation. Sector CPI rises easily under pressure, falls slowly at max_daily_deflation, and cannot fall below sticky_floor_from_ath of ATH."
+    note = "National CPI model. Prices rise fast from money/wage pressure, fall slowly to sticky ATH floor; wages catch up slowly and add only small pressure."
   }
 end
 
@@ -3064,13 +3189,20 @@ handlers["status"] = function(sender_id, req)
   local okInf, infRes = pcall(ensureInflationState)
   if okInf then inf = infRes else inf = { error = tostring(infRes) } end
 
+  local wpStatus = nil
+  if updateWagePriceState then wpStatus = updateWagePriceState(false) end
+
   local indices = {
     available = type(price_oracle) == "table",
     model = type(price_oracle) == "table" and price_oracle.model or nil,
     shock_pressure = type(price_oracle) == "table" and tonumber(price_oracle.shock_pressure) or 0,
     sticky_floor_from_ath = type(price_oracle) == "table" and tonumber(price_oracle.sticky_floor_from_ath) or 0.75,
     max_daily_deflation = type(price_oracle) == "table" and tonumber(price_oracle.max_daily_deflation) or 0.03,
-    note = "Lightweight status only. Use get_price_indices for live sector CPI."
+    national_price_index = wpStatus and wpStatus.national_price_index or nil,
+    wage_index = wpStatus and wpStatus.wage_index or nil,
+    wage_cost_pressure = wpStatus and wpStatus.wage_cost_pressure or nil,
+    total_inflation_pressure = wpStatus and wpStatus.total_inflation_pressure or nil,
+    note = "Lightweight status. Use get_price_indices for full national wage/price pressure state."
   }
 
   return true, {
