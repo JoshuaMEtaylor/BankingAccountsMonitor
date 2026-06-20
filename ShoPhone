@@ -49,7 +49,7 @@ end
 -- =============================================================================
 -- CONFIG / STATE
 -- =============================================================================
-local VERSION = "0.3.1"
+local VERSION = "0.4.0"
 
 local BANK_PROTOCOL = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
@@ -1134,6 +1134,970 @@ local function contractsApp()
 end
 
 -- =============================================================================
+-- COMPANIES APP
+-- Embedded from CompanyTerminal flow/style, adapted for ShoPhone.
+-- =============================================================================
+local company = {
+  bank_server = nil,
+  contract_server = nil,
+  logged = false,
+  username = "",
+  password = "",
+  citizen_id = "",
+  title = "",
+  active_id = nil,
+  active = nil,
+  mode = "register",
+  msg = "",
+  msg_col = C.dim,
+
+  login_user = "",
+  login_pass = "",
+
+  reg_name = "",
+  reg_ticker = "",
+
+  edit_name = "",
+  edit_ticker = "",
+
+  capital_amount = "",
+  capital_memo = "Owner capital injection",
+
+  post_title = "",
+  post_reward = "",
+
+  ops_id = "",
+  ops_note = "",
+}
+
+local QC = {
+  bg        = colors.lightGray,
+  card      = colors.white,
+  card_fg   = colors.black,
+  header    = colors.purple,
+  hdr_fg    = colors.white,
+  accent    = colors.purple,
+  accent_fg = colors.white,
+  label     = colors.gray,
+  body      = colors.black,
+  dim       = colors.gray,
+  ok        = colors.green,
+  err       = colors.red,
+  warn      = colors.orange,
+  btn_pri   = colors.purple,
+  btn_sec   = colors.lightGray,
+  btn_dan   = colors.red,
+  btn_fg    = colors.white,
+  input_bg  = colors.lightGray,
+  input_fg  = colors.black,
+  tab_act   = colors.purple,
+  tab_inact = colors.gray,
+  tab_fg_a  = colors.white,
+  tab_fg_i  = colors.white,
+}
+
+local function cCls()
+  size()
+  term.setCursorBlink(false)
+  term.setBackgroundColor(QC.bg)
+  term.setTextColor(QC.body)
+  term.clear()
+  term.setCursorPos(1, 1)
+end
+
+local function cAt(x, y, text, fg, bg)
+  size()
+  if y < 1 or y > H or x > W then return end
+  if x < 1 then x = 1 end
+  term.setCursorPos(x, y)
+  if bg then term.setBackgroundColor(bg) end
+  if fg then term.setTextColor(fg) end
+  term.write(tostring(text or ""):sub(1, math.max(0, W - x + 1)))
+end
+
+local function cFill(x, y, w, h, bg)
+  size()
+  if w <= 0 or h <= 0 then return end
+  if x < 1 then x = 1 end
+  term.setBackgroundColor(bg or QC.card)
+  local row = string.rep(" ", math.max(0, w))
+  for yy = y, y + h - 1 do
+    if yy >= 1 and yy <= H then
+      term.setCursorPos(x, yy)
+      term.write(row:sub(1, math.max(0, W - x + 1)))
+    end
+  end
+end
+
+local function cCentre(y, text, fg, bg)
+  text = tostring(text or "")
+  cAt(math.max(1, math.floor((W - #text) / 2) + 1), y, text, fg, bg)
+end
+
+local function cTop()
+  cFill(1, 1, W, 1, QC.header)
+  cAt(2, 1, "QUID COMPANY TERMINAL", QC.hdr_fg, QC.header)
+  cAt(W - #VERSION, 1, VERSION, QC.dim, QC.header)
+end
+
+local function cCard(x, y, w, h) cFill(x, y, w, h, QC.card) end
+
+local function cBtn(x, y, w, label, bg, fg)
+  bg = bg or QC.btn_pri
+  fg = fg or QC.btn_fg
+  cFill(x, y, w, 1, bg)
+  cAt(x + math.max(0, math.floor((w - #label) / 2)), y, label, fg, bg)
+  return { x1 = x, x2 = x + w - 1, y1 = y, y2 = y }
+end
+
+local function cInput(x, y, w, value, masked, focused)
+  value = tostring(value or "")
+  local shown = masked and string.rep("*", #value) or value
+  cFill(x, y, w, 1, QC.input_bg)
+  cAt(x, y, (shown .. string.rep(" ", w)):sub(1, w), QC.input_fg, QC.input_bg)
+  if focused then
+    term.setCursorPos(x + math.min(#value, w - 1), y)
+    term.setCursorBlink(true)
+  end
+  return { x1 = x, x2 = x + w - 1, y1 = y, y2 = y }
+end
+
+local function cStatus()
+  cFill(1, H, W, 1, QC.bg)
+  if company.msg ~= "" then
+    cAt(2, H, company.msg:sub(1, W - 2), company.msg_col, QC.bg)
+  end
+end
+
+local function cSet(msg, col)
+  company.msg = tostring(msg or "")
+  company.msg_col = col or QC.dim
+end
+
+local function cTrim(s)
+  s = tostring(s or "")
+  return s:match("^%s*(.-)%s*$")
+end
+
+local function cTicker(s)
+  s = cTrim(s):upper()
+  s = s:gsub("%s+", "")
+  s = s:gsub("[^A-Z0-9_%-]", "")
+  return s
+end
+
+local function cCompanyId(ticker)
+  ticker = cTicker(ticker)
+  if ticker == "" then return "" end
+  return "company:" .. string.lower(ticker)
+end
+
+local function cNormalCompany(s)
+  s = cTrim(s)
+  if s == "" then return "" end
+  if s:find(":") then return s end
+  return cCompanyId(s)
+end
+
+local function cMoney(n)
+  return money(n)
+end
+
+local function cShort(s, maxLen)
+  s = tostring(s or "")
+  maxLen = maxLen or 30
+  if #s <= maxLen then return s end
+  return s:sub(1, maxLen - 3) .. "..."
+end
+
+local function cPositiveInt(s)
+  local n = tonumber(s)
+  if not n then return nil end
+  n = math.floor(n)
+  if n <= 0 then return nil end
+  return n
+end
+
+local function cDisplayTicker(co)
+  if type(co) == "table" and co.ticker and tostring(co.ticker) ~= "" then
+    return tostring(co.ticker)
+  end
+  if company.active_id then
+    return tostring(company.active_id):gsub("^company:", ""):upper()
+  end
+  return ""
+end
+
+local function cIsOwner()
+  return company.active and (company.active.owner_id == company.citizen_id or company.active.account_owner_id == company.citizen_id)
+end
+
+local function cBankReq(payload, timeout)
+  return request(company.bank_server, BANK_PROTOCOL, payload, timeout or TIMEOUT)
+end
+
+local function cContractReq(payload, timeout)
+  return request(company.contract_server, CONTRACT_PROTOCOL, payload, timeout or TIMEOUT)
+end
+
+local function cConnectBank()
+  if company.bank_server then return true end
+
+  local id, err = findServer(BANK_PROTOCOL, "QUID COMPANY TERMINAL", function(msg)
+    return msg.type == "treasury_online" or (msg.success == true and type(msg.response) == "table")
+  end)
+
+  if id then company.bank_server = id; return true end
+  cSet(err or "Bank connection failed.", QC.err)
+  return false
+end
+
+local function cConnectContracts(silent)
+  if company.contract_server then return true end
+  if not openModem() then
+    if not silent then cSet("No modem found.", QC.err) end
+    return false
+  end
+
+  rednet.broadcast({ type = "ping" }, CONTRACT_PROTOCOL)
+  local sender, msg = rednet.receive(CONTRACT_PROTOCOL, 2)
+
+  if sender and type(msg) == "table" then
+    if msg.type == "contract_server_online" or (msg.success == true and type(msg.response) == "table") then
+      company.contract_server = sender
+      if not silent then cSet("Contract server connected.", QC.ok) end
+      return true
+    end
+  end
+
+  if not silent then cSet("No contract server found.", QC.warn) end
+  return false
+end
+
+local function cResult(title, lines, colour)
+  cCls(); cTop(); cCard(2, 4, W - 2, H - 5)
+  cAt(4, 5, title, colour or QC.card_fg, QC.card)
+  local y = 7
+  for _, line in ipairs(lines or {}) do
+    if y > H - 3 then break end
+    cAt(4, y, tostring(line), colour or QC.card_fg, QC.card)
+    y = y + 1
+  end
+  local b = cBtn(4, H - 2, W - 6, "Continue", QC.btn_pri, QC.btn_fg)
+  cStatus()
+  while true do
+    local ev, a, x, y2 = os.pullEvent()
+    if ev == "mouse_click" and hit(b, x, y2) then return end
+    if ev == "key" and (a == keys.enter or a == keys.escape or a == keys.backspace) then return end
+  end
+end
+
+local function cConfirm(title, lines, yesLabel)
+  cCls(); cTop(); cCard(2, 4, W - 2, H - 5)
+  cAt(4, 5, title, QC.card_fg, QC.card)
+  local y = 7
+  for _, line in ipairs(lines or {}) do
+    if y > H - 4 then break end
+    cAt(4, y, tostring(line), QC.card_fg, QC.card)
+    y = y + 1
+  end
+  local bw = math.floor((W - 8) / 2)
+  local yes = cBtn(4, H - 2, bw, yesLabel or "Confirm", QC.btn_pri, QC.btn_fg)
+  local no = cBtn(5 + bw, H - 2, bw, "Back", QC.btn_sec, QC.card_fg)
+  cStatus()
+  while true do
+    local ev, a, x, y2 = os.pullEvent()
+    if ev == "mouse_click" then
+      if hit(yes, x, y2) then return true end
+      if hit(no, x, y2) then return false end
+    elseif ev == "key" then
+      if a == keys.enter then return true end
+      if a == keys.escape or a == keys.backspace then return false end
+    end
+  end
+end
+
+local function cLoadCompany(company_id)
+  company_id = cNormalCompany(company_id)
+  if company_id == "" then cSet("Enter ticker or company ID.", QC.err); return false end
+
+  local ok, res = cBankReq({ type = "company_info", company_id = company_id })
+  if ok and type(res) == "table" then
+    company.active_id = tostring(res.company_id or company_id)
+    company.active = res
+    company.edit_name = tostring(res.name or "")
+    company.edit_ticker = cDisplayTicker(res)
+
+    if cIsOwner() then cSet("Loaded owned company " .. company.active_id, QC.ok)
+    else cSet("Loaded company, but you are not owner.", QC.warn) end
+    return true
+  end
+
+  cSet("Company load failed: " .. tostring(res), QC.err)
+  return false
+end
+
+local function cRefreshOwned(silent)
+  if not company.logged then return false end
+
+  local ok, res = cBankReq({
+    type = "list_my_companies",
+    username = company.username,
+    password = company.password,
+  })
+
+  if ok and type(res) == "table" and type(res.companies) == "table" then
+    if not company.active_id and #res.companies > 0 then
+      local co = res.companies[1]
+      company.active_id = tostring(co.company_id or "")
+      company.active = co
+      company.edit_name = tostring(co.name or "")
+      company.edit_ticker = cDisplayTicker(co)
+    end
+    if not silent then cSet("Owned companies: " .. tostring(res.count or #res.companies), QC.ok) end
+    return true
+  end
+
+  if not silent then cSet("Owned company scan failed: " .. tostring(res), QC.warn) end
+  return false
+end
+
+local function cLoginScreen()
+  if not cConnectBank() then return false end
+
+  local focus = 1
+  local boxes = {}
+  local bLogin, bBack
+
+  local function draw()
+    cCls(); cTop(); cCard(2, 4, W - 2, H - 5)
+    cAt(4, 5, "Log in with your normal bank account.", QC.label, QC.card)
+    cAt(4, 6, "This unlocks company controls.", QC.label, QC.card)
+
+    cAt(4, 8, "Username", QC.card_fg, QC.card)
+    boxes[1] = cInput(4, 9, W - 6, company.login_user, false, focus == 1)
+
+    cAt(4, 11, "Password", QC.card_fg, QC.card)
+    boxes[2] = cInput(4, 12, W - 6, company.login_pass, true, focus == 2)
+
+    bLogin = cBtn(4, 15, W - 6, "Log In", QC.btn_pri, QC.btn_fg)
+    bBack = cBtn(4, H - 2, W - 6, "Back to ShoPhone", QC.btn_sec, QC.card_fg)
+    cStatus()
+  end
+
+  local function doLogin()
+    if cTrim(company.login_user) == "" or cTrim(company.login_pass) == "" then
+      cSet("Enter username and password.", QC.err)
+      return false
+    end
+
+    cSet("Authenticating...", QC.dim)
+    draw()
+
+    local ok, res = cBankReq({ type = "login", username = company.login_user, password = company.login_pass })
+    if ok and type(res) == "table" then
+      company.logged = true
+      company.username = company.login_user
+      company.password = company.login_pass
+      company.citizen_id = res.citizen_id or ""
+      company.title = res.title or "Account Holder"
+      company.login_pass = ""
+
+      cSet("Logged in as " .. tostring(company.citizen_id), QC.ok)
+      cRefreshOwned(true)
+      cConnectContracts(true)
+      return true
+    end
+
+    cSet(tostring(res or "Login failed"), QC.err)
+    return false
+  end
+
+  draw()
+
+  while true do
+    local ev, a, x, y = os.pullEvent()
+    if ev == "char" then
+      if focus == 1 and #company.login_user < 32 then company.login_user = company.login_user .. a end
+      if focus == 2 and #company.login_pass < 32 then company.login_pass = company.login_pass .. a end
+      draw()
+    elseif ev == "key" then
+      if a == keys.backspace then
+        if focus == 1 then company.login_user = company.login_user:sub(1, -2) end
+        if focus == 2 then company.login_pass = company.login_pass:sub(1, -2) end
+      elseif a == keys.tab then
+        focus = focus == 1 and 2 or 1
+      elseif a == keys.enter then
+        if focus == 1 then focus = 2 else if doLogin() then return true end end
+      elseif a == keys.escape then
+        return false
+      end
+      draw()
+    elseif ev == "mouse_click" then
+      if hit(bBack, x, y) then return false end
+      if hit(bLogin, x, y) then if doLogin() then return true end end
+      for i, box in ipairs(boxes) do if hit(box, x, y) then focus = i end end
+      draw()
+    end
+  end
+end
+
+local function cAccountStrip()
+  cFill(1, 2, W, 2, QC.card)
+  cAt(3, 2, company.username or "", QC.card_fg, QC.card)
+  cAt(3, 3, company.title or "Account Holder", QC.label, QC.card)
+  local id = company.citizen_id or ""
+  if id ~= "" then cAt(W - #id - 1, 2, id, QC.label, QC.card) end
+
+  local label = company.active_id and ("Company: " .. cDisplayTicker(company.active)) or "No active company"
+  cAt(3, 4, "Active: " .. cShort(label, W - 12), company.active_id and QC.ok or QC.warn, QC.bg)
+end
+
+local function cTabs()
+  local labels = { company.active_id and "Dissolve" or "Register", "Company", "Capital", "Contracts", "Ops" }
+  local modes = { "register", "company", "capital", "contracts", "ops" }
+  local gap = 1
+  local available = W - 2 - ((#labels - 1) * gap)
+  local tw = math.floor(available / #labels)
+  if tw < 8 then tw = 8 end
+
+  cFill(1, 5, W, 1, QC.bg)
+  local buttons = {}
+  local x = 2
+  for i, label in ipairs(labels) do
+    if x > W then break end
+    local ww = math.min(tw, W - x + 1)
+    local active = company.mode == modes[i]
+    local bg = active and QC.tab_act or QC.tab_inact
+    local fg = active and QC.tab_fg_a or QC.tab_fg_i
+    cFill(x, 5, ww, 1, bg)
+    local text = cShort(label, ww)
+    cAt(x + math.max(0, math.floor((ww - #text) / 2)), 5, text, fg, bg)
+    buttons[i] = { x1 = x, x2 = math.min(W, x + ww - 1), y1 = 5, y2 = 5, mode = modes[i] }
+    x = x + ww + gap
+  end
+  return buttons
+end
+
+local function cButtonRow(y, specs)
+  local out = {}
+  local n = #specs
+  if n <= 0 then return out end
+
+  local gap = 1
+  local x0 = 4
+  local total = W - 7
+  local bw = math.floor((total - ((n - 1) * gap)) / n)
+  if bw < 7 then bw = 7 end
+
+  for i, spec in ipairs(specs) do
+    local x = x0 + ((i - 1) * (bw + gap))
+    local ww = bw
+    if i == n then ww = math.max(7, W - x - 2) end
+    out[spec.key] = cBtn(x, y, ww, spec.label, spec.bg, spec.fg)
+  end
+  return out
+end
+
+local function cRegister()
+  if company.active_id then
+    if not cIsOwner() then cSet("Only owner can dissolve this company.", QC.err); return end
+    local payout = company.active and tonumber(company.active.cash_balance) or 0
+    if not cConfirm("Dissolve company", {
+      "Company: " .. tostring(company.active_id),
+      "Owner:   " .. tostring(company.citizen_id),
+      "Payout:  " .. cMoney(payout),
+      "",
+      "This deletes the company account after payout.",
+    }, "Dissolve") then
+      cSet("Dissolve cancelled.", QC.dim)
+      return
+    end
+
+    local ok, res = cBankReq({
+      type = "dissolve_company",
+      username = company.username,
+      password = company.password,
+      company_id = company.active_id,
+      memo = "Company dissolved by owner",
+    })
+
+    if ok and type(res) == "table" then
+      local paid = tonumber(res.paid_out) or 0
+      cResult("COMPANY DISSOLVED", {
+        "Company: " .. tostring(res.company_id or company.active_id),
+        "Owner:   " .. tostring(company.citizen_id),
+        "Paid:    " .. cMoney(paid),
+      }, QC.ok)
+      company.active_id = nil
+      company.active = nil
+      company.edit_name = ""
+      company.edit_ticker = ""
+      company.mode = "register"
+      cSet("Company dissolved.", QC.ok)
+    else
+      cSet("Dissolve failed: " .. tostring(res), QC.err)
+    end
+    return
+  end
+
+  local name = cTrim(company.reg_name)
+  local ticker = cTicker(company.reg_ticker)
+  local company_id = cCompanyId(ticker)
+
+  if name == "" then cSet("Missing company name.", QC.err); return end
+  if ticker == "" then cSet("Invalid ticker.", QC.err); return end
+
+  if not cConfirm("Confirm company registration", {
+    "Name:    " .. name,
+    "Ticker:  " .. ticker,
+    "Account: " .. company_id,
+    "Owner:   " .. tostring(company.citizen_id),
+  }, "Register") then
+    cSet("Registration cancelled.", QC.dim)
+    return
+  end
+
+  local ok, res = cBankReq({
+    type = "register_company",
+    name = name,
+    ticker = ticker,
+    biz_type = "general",
+    owner_id = company.citizen_id,
+    shares_total = 1000,
+    shares_public = 0,
+  })
+
+  if ok and type(res) == "table" then
+    company.active_id = tostring(res.company_id or company_id)
+    cLoadCompany(company.active_id)
+    company.reg_name = ""
+    company.reg_ticker = ""
+    company.mode = "company"
+    cResult("COMPANY REGISTERED", {
+      "Name:    " .. tostring(res.name or name),
+      "Ticker:  " .. tostring(res.ticker or ticker),
+      "Account: " .. tostring(company.active_id),
+      "Owner:   " .. tostring(company.citizen_id),
+    }, QC.ok)
+  else
+    cSet("Registration failed: " .. tostring(res), QC.err)
+  end
+end
+
+local function cUpdateCompany()
+  if not company.active_id then cSet("Load/select a company first.", QC.err); return end
+  if not cIsOwner() then cSet("Only the owner can edit this company.", QC.err); return end
+
+  local name = cTrim(company.edit_name)
+  local ticker = cTicker(company.edit_ticker)
+  if name == "" then cSet("Enter a company name.", QC.err); return end
+  if ticker == "" then cSet("Enter a valid ticker.", QC.err); return end
+
+  if not cConfirm("Update company", {
+    "Current: " .. tostring(company.active_id),
+    "Name:    " .. name,
+    "Ticker:  " .. ticker,
+  }, "Confirm") then
+    cSet("Company update cancelled.", QC.dim)
+    return
+  end
+
+  local ok, res = cBankReq({
+    type = "update_company",
+    username = company.username,
+    password = company.password,
+    company_id = company.active_id,
+    name = name,
+    ticker = ticker,
+  })
+
+  if ok and type(res) == "table" then
+    company.active_id = tostring(res.company_id or company.active_id)
+    cLoadCompany(company.active_id)
+    cSet("Company updated.", QC.ok)
+  else
+    cSet("Update failed: " .. tostring(res), QC.err)
+  end
+end
+
+local function cCapitalise(isPayout)
+  if not company.active_id then cSet("Load/select a company first.", QC.err); return end
+  if not cIsOwner() then cSet("Only the owner can move company funds.", QC.err); return end
+
+  local amount = cPositiveInt(company.capital_amount)
+  if not amount then cSet("Enter a valid amount.", QC.err); return end
+
+  local memo = cTrim(company.capital_memo)
+  if memo == "" then memo = isPayout and "Owner company payout" or "Owner capital injection" end
+
+  if isPayout then
+    if not cConfirm("Confirm company payout", {
+      "From: " .. tostring(company.active_id),
+      "To:   " .. tostring(company.citizen_id),
+      "Amt:  " .. cMoney(amount),
+      "Memo: " .. memo,
+    }, "Pay Out") then return end
+
+    local ok, res = cBankReq({
+      type = "company_withdraw",
+      username = company.username,
+      password = company.password,
+      company_id = company.active_id,
+      amount = amount,
+      memo = memo,
+    })
+
+    if ok then
+      company.capital_amount = ""
+      company.capital_memo = "Owner capital injection"
+      cLoadCompany(company.active_id)
+      cSet("Paid out " .. cMoney(amount), QC.ok)
+    else
+      cSet("Payout failed: " .. tostring(res), QC.err)
+    end
+  else
+    if not cConfirm("Confirm capital injection", {
+      "From: " .. tostring(company.citizen_id),
+      "To:   " .. tostring(company.active_id),
+      "Amt:  " .. cMoney(amount),
+      "Memo: " .. memo,
+    }, "Transfer") then return end
+
+    local ok, res = cBankReq({
+      type = "transfer",
+      username = company.username,
+      password = company.password,
+      to_id = company.active_id,
+      amount = amount,
+      memo = memo,
+    })
+
+    if ok then
+      company.capital_amount = ""
+      cLoadCompany(company.active_id)
+      cSet("Transferred " .. cMoney(amount), QC.ok)
+    else
+      cSet("Transfer failed: " .. tostring(res), QC.err)
+    end
+  end
+end
+
+local function cPostContract()
+  if not company.active_id then cSet("Load/select a company first.", QC.err); return end
+  if not cIsOwner() then cSet("Only the owner can post contracts.", QC.err); return end
+  if not cConnectContracts(false) then return end
+
+  local title = cTrim(company.post_title)
+  local reward = cPositiveInt(company.post_reward)
+  if title == "" then cSet("Missing contract title.", QC.err); return end
+  if not reward then cSet("Invalid reward.", QC.err); return end
+
+  if not cConfirm("Post company contract", {
+    "Company: " .. company.active_id,
+    "Title:   " .. title,
+    "Reward:  " .. cMoney(reward),
+    "",
+    "No escrow is locked yet.",
+  }, "Post") then return end
+
+  local ok, res = cContractReq({
+    type = "post_contract",
+    title = title,
+    description = "",
+    poster = company.active_id,
+    source_account = company.active_id,
+    source_company = company.active_id,
+    source_type = "company_terminal",
+    reward = reward,
+    items = {{ item = "company:work_order", display = "Company work order", count = 1 }},
+    escrow_status = "not_locked",
+  }, 8)
+
+  if ok and type(res) == "table" then
+    local c = res.contract or {}
+    company.post_title = ""
+    company.post_reward = ""
+    cResult("CONTRACT POSTED", {
+      "ID:      " .. tostring(c.contract_id or "?"),
+      "Company: " .. company.active_id,
+      "Reward:  " .. cMoney(reward),
+      "Status:  " .. tostring(c.status or "open"),
+    }, QC.ok)
+    cSet("Posted contract.", QC.ok)
+  else
+    cSet("Post failed: " .. tostring(res), QC.err)
+  end
+end
+
+local function cShowContracts()
+  if not company.active_id then cSet("Load/select a company first.", QC.err); return end
+  if not cConnectContracts(false) then return end
+
+  local ok, res = cContractReq({ type = "list_contracts", status = "all" }, 8)
+  if not ok or type(res) ~= "table" then cSet("Contract list failed: " .. tostring(res), QC.err); return end
+
+  local rows = {}
+  for _, ct in ipairs(res.contracts or {}) do
+    if ct.poster == company.active_id or ct.claimed_by == company.active_id or ct.source_company == company.active_id then
+      rows[#rows + 1] = tostring(ct.contract_id or "?") .. " | " .. tostring(ct.status or "?") .. " | " .. cMoney(ct.reward or 0) .. " | " .. cShort(ct.title or "", 20)
+      if #rows >= 14 then break end
+    end
+  end
+
+  if #rows == 0 then rows = {"No contracts found for " .. company.active_id} end
+  cResult("COMPANY CONTRACTS", rows, QC.card_fg)
+end
+
+local function cFulfilOrCancel(cancel)
+  if not company.active_id then cSet("Load/select a company first.", QC.err); return end
+  if not cConnectContracts(false) then return end
+
+  local id = cTrim(company.ops_id)
+  if id == "" then cSet("Enter contract ID.", QC.err); return end
+
+  if cancel then
+    if not cIsOwner() then cSet("Only owner can cancel contracts.", QC.err); return end
+    if not cConfirm("Cancel contract", {"Contract: " .. id}, "Cancel") then return end
+    local ok, res = cContractReq({ type = "cancel_contract", contract_id = id, reason = "Cancelled from ShoPhone by " .. tostring(company.citizen_id) }, 8)
+    if ok then cSet("Cancelled: " .. id, QC.ok) else cSet("Cancel failed: " .. tostring(res), QC.err) end
+  else
+    if not cConfirm("Mark fulfilled", {"Contract: " .. id, "Note: " .. cTrim(company.ops_note)}, "Fulfil") then return end
+    local ok, res = cContractReq({ type = "mark_fulfilled", contract_id = id, note = cTrim(company.ops_note) }, 8)
+    if ok then cSet("Marked fulfilled: " .. id, QC.ok) else cSet("Fulfil failed: " .. tostring(res), QC.err) end
+  end
+end
+
+local function cDrawMain(focus)
+  cCls(); cTop(); cAccountStrip()
+  local tabs = cTabs()
+
+  local cardY = 7
+  local btnY = H - 3
+  cCard(2, cardY, W - 2, H - cardY - 1)
+
+  local fields = {}
+  local buttons = {}
+  local fullW = W - 8
+
+  local function line(y, text, col)
+    if y < btnY then cAt(4, y, cShort(text, W - 8), col or QC.label, QC.card) end
+  end
+
+  if company.mode == "register" then
+    if company.active_id then
+      line(cardY + 1, "You already control a company.", QC.label)
+      line(cardY + 3, "Company: " .. cDisplayTicker(company.active), QC.ok)
+      if company.active then
+        line(cardY + 4, "Name: " .. tostring(company.active.name or "?"), QC.card_fg)
+        line(cardY + 5, "Balance to return: " .. cMoney(company.active.cash_balance or 0), QC.card_fg)
+      end
+      line(cardY + 7, "Dissolve returns company cash to owner.", QC.warn)
+      buttons = cButtonRow(btnY, {
+        { key = "dissolve", label = "Dissolve", bg = QC.btn_dan, fg = QC.btn_fg },
+        { key = "company", label = "Company", bg = QC.btn_sec, fg = QC.card_fg },
+        { key = "home", label = "Home", bg = QC.btn_sec, fg = QC.card_fg },
+      })
+    else
+      line(cardY + 1, "Register a player-made company.", QC.label)
+
+      cAt(4, cardY + 3, "Company Name", QC.card_fg, QC.card)
+      fields[1] = cInput(4, cardY + 4, fullW, company.reg_name, false, focus == 1)
+
+      cAt(4, cardY + 6, "Ticker", QC.card_fg, QC.card)
+      fields[2] = cInput(4, cardY + 7, fullW, company.reg_ticker, false, focus == 2)
+
+      local preview = cTicker(company.reg_ticker)
+      if preview == "" then preview = "<ticker>" end
+      line(cardY + 8, "Account ticker: " .. preview, QC.label)
+
+      buttons = cButtonRow(btnY, {
+        { key = "clear", label = "Clear", bg = QC.btn_sec, fg = QC.card_fg },
+        { key = "primary", label = "Register", bg = QC.btn_pri, fg = QC.btn_fg },
+        { key = "home", label = "Home", bg = QC.btn_sec, fg = QC.card_fg },
+      })
+    end
+
+  elseif company.mode == "company" then
+    line(cardY + 1, "Edit your company details.", QC.label)
+    line(cardY + 2, "Active: " .. tostring(company.active_id or "none"), company.active_id and QC.ok or QC.warn)
+
+    cAt(4, cardY + 4, "Company Name", QC.card_fg, QC.card)
+    fields[1] = cInput(4, cardY + 5, fullW, company.edit_name, false, focus == 1)
+
+    cAt(4, cardY + 7, "Ticker Symbol", QC.card_fg, QC.card)
+    fields[2] = cInput(4, cardY + 8, fullW, company.edit_ticker, false, focus == 2)
+
+    buttons = cButtonRow(btnY, {
+      { key = "save", label = "Confirm Change", bg = QC.btn_pri, fg = QC.btn_fg },
+      { key = "home", label = "Home", bg = QC.btn_sec, fg = QC.card_fg },
+    })
+
+  elseif company.mode == "capital" then
+    line(cardY + 1, "Move funds: personal <-> company.", QC.label)
+    line(cardY + 2, "Company: " .. tostring(company.active_id or "none"), company.active_id and QC.ok or QC.warn)
+
+    cAt(4, cardY + 3, "Amount", QC.card_fg, QC.card)
+    fields[1] = cInput(4, cardY + 4, fullW, company.capital_amount, false, focus == 1)
+
+    cAt(4, cardY + 5, "Memo", QC.card_fg, QC.card)
+    fields[2] = cInput(4, cardY + 6, fullW, company.capital_memo, false, focus == 2)
+
+    buttons = cButtonRow(btnY, {
+      { key = "payin", label = "Pay In", bg = QC.btn_pri, fg = QC.btn_fg },
+      { key = "payout", label = "Pay Out", bg = QC.btn_sec, fg = QC.card_fg },
+      { key = "home", label = "Home", bg = QC.btn_sec, fg = QC.card_fg },
+    })
+
+  elseif company.mode == "contracts" then
+    line(cardY + 1, "Post contract from selected company.", QC.label)
+    line(cardY + 2, "Contract server: " .. tostring(company.contract_server or "not connected"), company.contract_server and QC.ok or QC.warn)
+
+    cAt(4, cardY + 3, "Title", QC.card_fg, QC.card)
+    fields[1] = cInput(4, cardY + 4, fullW, company.post_title, false, focus == 1)
+
+    cAt(4, cardY + 6, "Reward Q", QC.card_fg, QC.card)
+    fields[2] = cInput(4, cardY + 7, fullW, company.post_reward, false, focus == 2)
+
+    buttons = cButtonRow(btnY, {
+      { key = "post", label = "Post", bg = QC.btn_pri, fg = QC.btn_fg },
+      { key = "home", label = "Home", bg = QC.btn_sec, fg = QC.card_fg },
+    })
+
+  elseif company.mode == "ops" then
+    line(cardY + 1, "Company contract operations.", QC.label)
+    line(cardY + 2, "Active: " .. tostring(company.active_id or "none"), company.active_id and QC.ok or QC.warn)
+
+    cAt(4, cardY + 4, "Contract ID", QC.card_fg, QC.card)
+    fields[1] = cInput(4, cardY + 5, fullW, company.ops_id, false, focus == 1)
+
+    cAt(4, cardY + 7, "Fulfilment Note", QC.card_fg, QC.card)
+    fields[2] = cInput(4, cardY + 8, fullW, company.ops_note, false, focus == 2)
+
+    buttons = cButtonRow(btnY, {
+      { key = "list", label = "View", bg = QC.btn_sec, fg = QC.card_fg },
+      { key = "fulfil", label = "Fulfil", bg = QC.btn_pri, fg = QC.btn_fg },
+      { key = "cancel", label = "Cancel", bg = QC.btn_dan, fg = QC.btn_fg },
+      { key = "home", label = "Home", bg = QC.btn_sec, fg = QC.card_fg },
+    })
+  end
+
+  cStatus()
+  return tabs, fields, buttons
+end
+
+local function cAppend(focus, ch)
+  if company.mode == "register" then
+    if focus == 1 and #company.reg_name < 32 then company.reg_name = company.reg_name .. ch end
+    if focus == 2 and #company.reg_ticker < 8 then company.reg_ticker = company.reg_ticker .. ch end
+  elseif company.mode == "company" then
+    if focus == 1 and #company.edit_name < 32 then company.edit_name = company.edit_name .. ch end
+    if focus == 2 and #company.edit_ticker < 8 then company.edit_ticker = company.edit_ticker .. ch end
+  elseif company.mode == "capital" then
+    if focus == 1 and #company.capital_amount < 10 then company.capital_amount = company.capital_amount .. ch end
+    if focus == 2 and #company.capital_memo < 48 then company.capital_memo = company.capital_memo .. ch end
+  elseif company.mode == "contracts" then
+    if focus == 1 and #company.post_title < 40 then company.post_title = company.post_title .. ch end
+    if focus == 2 and #company.post_reward < 10 then company.post_reward = company.post_reward .. ch end
+  elseif company.mode == "ops" then
+    if focus == 1 and #company.ops_id < 20 then company.ops_id = company.ops_id .. ch end
+    if focus == 2 and #company.ops_note < 64 then company.ops_note = company.ops_note .. ch end
+  end
+end
+
+local function cBackspace(focus)
+  if company.mode == "register" then
+    if focus == 1 then company.reg_name = company.reg_name:sub(1, -2) end
+    if focus == 2 then company.reg_ticker = company.reg_ticker:sub(1, -2) end
+  elseif company.mode == "company" then
+    if focus == 1 then company.edit_name = company.edit_name:sub(1, -2) end
+    if focus == 2 then company.edit_ticker = company.edit_ticker:sub(1, -2) end
+  elseif company.mode == "capital" then
+    if focus == 1 then company.capital_amount = company.capital_amount:sub(1, -2) end
+    if focus == 2 then company.capital_memo = company.capital_memo:sub(1, -2) end
+  elseif company.mode == "contracts" then
+    if focus == 1 then company.post_title = company.post_title:sub(1, -2) end
+    if focus == 2 then company.post_reward = company.post_reward:sub(1, -2) end
+  elseif company.mode == "ops" then
+    if focus == 1 then company.ops_id = company.ops_id:sub(1, -2) end
+    if focus == 2 then company.ops_note = company.ops_note:sub(1, -2) end
+  end
+end
+
+local function cClearForm()
+  if company.mode == "register" then
+    company.reg_name, company.reg_ticker = "", ""
+  elseif company.mode == "company" then
+    company.edit_name = company.active and tostring(company.active.name or "") or ""
+    company.edit_ticker = cDisplayTicker(company.active)
+  elseif company.mode == "capital" then
+    company.capital_amount = ""
+    company.capital_memo = "Owner capital injection"
+  elseif company.mode == "contracts" then
+    company.post_title, company.post_reward = "", ""
+  elseif company.mode == "ops" then
+    company.ops_id, company.ops_note = "", ""
+  end
+end
+
+local function companiesApp()
+  if not company.logged then
+    if not cLoginScreen() then return end
+  end
+
+  local focus = 1
+  local tabs, fields, buttons = cDrawMain(focus)
+
+  while true do
+    local ev, a, x, y = os.pullEvent()
+
+    if ev == "mouse_click" then
+      for _, tab in ipairs(tabs) do
+        if hit(tab, x, y) then
+          company.mode = tab.mode
+          focus = 1
+          if tab.mode == "contracts" or tab.mode == "ops" then cConnectContracts(true) end
+        end
+      end
+
+      for i, field in ipairs(fields or {}) do
+        if hit(field, x, y) then focus = i end
+      end
+
+      if buttons.home and hit(buttons.home, x, y) then return end
+      if buttons.clear and hit(buttons.clear, x, y) then cClearForm(); cSet("Form cleared.", QC.dim) end
+      if buttons.company and hit(buttons.company, x, y) then company.mode = "company"; focus = 1 end
+      if buttons.dissolve and hit(buttons.dissolve, x, y) then cRegister() end
+      if buttons.primary and hit(buttons.primary, x, y) then cRegister() end
+      if buttons.save and hit(buttons.save, x, y) then cUpdateCompany() end
+      if buttons.payin and hit(buttons.payin, x, y) then cCapitalise(false) end
+      if buttons.payout and hit(buttons.payout, x, y) then cCapitalise(true) end
+      if buttons.post and hit(buttons.post, x, y) then cPostContract() end
+      if buttons.list and hit(buttons.list, x, y) then cShowContracts() end
+      if buttons.fulfil and hit(buttons.fulfil, x, y) then cFulfilOrCancel(false) end
+      if buttons.cancel and hit(buttons.cancel, x, y) then cFulfilOrCancel(true) end
+
+      tabs, fields, buttons = cDrawMain(focus)
+
+    elseif ev == "char" then
+      cAppend(focus, a)
+      tabs, fields, buttons = cDrawMain(focus)
+
+    elseif ev == "key" then
+      if a == keys.backspace then
+        cBackspace(focus)
+      elseif a == keys.tab then
+        focus = focus == 1 and 2 or 1
+      elseif a == keys.escape then
+        return
+      end
+      tabs, fields, buttons = cDrawMain(focus)
+    end
+  end
+end
+
+
+-- =============================================================================
 -- PLACEHOLDER APPS
 -- =============================================================================
 local function placeholder(app)
@@ -1156,6 +2120,7 @@ end
 local function openApp(app)
   if app.id == "bank" then bankApp()
   elseif app.id == "contracts" then contractsApp()
+  elseif app.id == "companies" then companiesApp()
   else placeholder(app) end
 end
 
