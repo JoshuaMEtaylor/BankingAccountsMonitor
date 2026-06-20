@@ -2,21 +2,9 @@
 -- GOVERNMENT EXPENDITURE MONITOR
 -- GovernmentExpenditureMonitor
 --
--- Rebuilt from scratch.
---
--- Public/read-only monitor for actual treasury spending and forecast public
--- payroll. It does not mutate the bank, does not tick inflation, and does not
--- display internal economy rules.
---
--- Data sources:
---   * ServerSideAccounts: status / supply / treasury_history
---   * ServerSideAccounts: list_employee_mappings / get_worker_pay_rates
---
--- What it shows:
---   * Treasury reserve and supply
---   * Recent treasury outflows by category
---   * Annualised public payroll forecast by real mapped workers
---   * Recent treasury transaction feed
+-- Rebuilt public monitor for state expenditure.
+-- Presents live treasury expenditure by category with a small pie chart and tabs.
+-- Read-only. Does not mutate bank state, payroll, inflation, contracts, or treasury.
 -- =============================================================================
 
 local args = {...}
@@ -55,15 +43,14 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION          = "1.0.4-REBUILT-EXPENDITURE"
+local VERSION          = "1.1.0-TABS-PIE"
 local BANK_PROTOCOL    = "quid_bank"
 local TREASURY_ACCOUNT = "treasury:quid_bank"
-
 local DB_TIMEOUT       = 4
-local REFRESH_SECONDS  = 20
-local HISTORY_LIMIT    = 500
+local REFRESH_SECONDS  = 10
+local HISTORY_LIMIT    = 900
 local FISCAL_YEAR_DAYS = 365
-local MC_DAY_MS        = 20 * 60 * 1000
+local MC_DAY_MS        = 1200000 -- one Minecraft day is 20 real minutes
 
 local native_term = term.current()
 local bank_id = nil
@@ -71,64 +58,45 @@ local modem_name = nil
 local monitor_name = nil
 local using_monitor = false
 
+local W, H = term.getSize()
+local active_tab = "overview"
+local tab_hits = {}
 local last_message = "Booting..."
 local last_colour = colors.lightGray
 local last_refresh_ms = 0
-local last_error = ""
-local last_snapshot = nil
+local last_data_source = "none"
+local last_diagnostics = {}
 
--- =============================================================================
--- COLOURS
--- =============================================================================
 local C = {
-  bg      = colors.black,
-  top     = colors.gray,
-  text    = colors.white,
-  dim     = colors.lightGray,
-  label   = colors.cyan,
-  title   = colors.yellow,
-  good    = colors.lime,
-  warn    = colors.orange,
-  bad     = colors.red,
-  line    = colors.gray,
-
-  treasury = colors.green,
-  payroll  = colors.blue,
-  grants   = colors.purple,
-  contracts = colors.brown,
-  burn     = colors.red,
-  other    = colors.lightGray,
+  bg       = colors.black,
+  top      = colors.gray,
+  panel    = colors.black,
+  grid     = colors.gray,
+  title    = colors.yellow,
+  text     = colors.white,
+  dim      = colors.lightGray,
+  label    = colors.cyan,
+  good     = colors.lime,
+  warn     = colors.orange,
+  bad      = colors.red,
+  selected = colors.blue,
+  tab      = colors.gray,
 }
 
-local CATEGORY_COLOURS = {
-  public_payroll = colors.blue,
-  citizen_grants = colors.purple,
-  business_grants = colors.magenta,
-  state_contracts = colors.brown,
-  currency_burn = colors.red,
-  other = colors.lightGray,
+local CATEGORY_DEFS = {
+  { key = "defence",        label = "Defense",        short = "DEF", color = colors.red },
+  { key = "research",       label = "Research",       short = "RES", color = colors.purple },
+  { key = "welfare",        label = "Welfare",        short = "WEL", color = colors.lime },
+  { key = "logistics",      label = "Logistics",      short = "LOG", color = colors.blue },
+  { key = "administration", label = "Administration", short = "ADM", color = colors.orange },
+  { key = "infrastructure", label = "Infrastructure", short = "INF", color = colors.brown },
+  { key = "grants",         label = "Grants",         short = "GNT", color = colors.lightBlue },
+  { key = "finance",        label = "Finance",        short = "FIN", color = colors.cyan },
+  { key = "other",          label = "Other",          short = "OTH", color = colors.lightGray },
 }
 
-local CATEGORY_LABELS = {
-  public_payroll = "Public payroll",
-  citizen_grants = "Citizen grants",
-  business_grants = "Business grants",
-  state_contracts = "State contracts",
-  currency_burn = "Currency burn",
-  other = "Other spending",
-}
-
-local WORKER_SECTOR_LABELS = {
-  defence = "Defence payroll",
-  research = "Research payroll",
-  logistics = "Logistics payroll",
-}
-
-local WORKER_SECTOR_COLOURS = {
-  defence = colors.red,
-  research = colors.purple,
-  logistics = colors.blue,
-}
+local CATEGORY_LOOKUP = {}
+for _, cat in ipairs(CATEGORY_DEFS) do CATEGORY_LOOKUP[cat.key] = cat end
 
 -- =============================================================================
 -- BASIC HELPERS
@@ -138,11 +106,12 @@ local function nowMs()
   return math.floor(os.clock() * 1000)
 end
 
-local function clamp(n, lo, hi)
-  n = tonumber(n) or 0
-  if n < lo then return lo end
-  if n > hi then return hi end
-  return n
+local function refreshSize()
+  W, H = term.getSize()
+end
+
+local function trim(s)
+  return tostring(s or ""):match("^%s*(.-)%s*$")
 end
 
 local function lower(s)
@@ -153,78 +122,15 @@ local function upper(s)
   return string.upper(tostring(s or ""))
 end
 
-local function trim(s)
-  return tostring(s or ""):match("^%s*(.-)%s*$")
-end
-
-local function safeNumber(v, fallback)
-  local n = tonumber(v)
-  if n == nil then return fallback end
+local function clamp(n, lo, hi)
+  n = tonumber(n) or 0
+  if n < lo then return lo end
+  if n > hi then return hi end
   return n
-end
-
-local function countTable(t)
-  local n = 0
-  if type(t) ~= "table" then return 0 end
-  for _ in pairs(t) do n = n + 1 end
-  return n
-end
-
-local function getSize()
-  return term.getSize()
-end
-
-local function refreshSize()
-  return term.getSize()
-end
-
-local function clear(bg)
-  term.setCursorBlink(false)
-  term.setBackgroundColor(bg or C.bg)
-  term.setTextColor(C.text)
-  term.clear()
-  term.setCursorPos(1, 1)
-end
-
-local function at(x, y, text, fg, bg)
-  local w, h = getSize()
-  if y < 1 or y > h or x > w then return end
-  if x < 1 then x = 1 end
-  term.setCursorPos(x, y)
-  term.setTextColor(fg or C.text)
-  term.setBackgroundColor(bg or C.bg)
-  local maxw = w - x + 1
-  if maxw > 0 then
-    term.write(tostring(text or ""):sub(1, maxw))
-  end
-end
-
-local function fill(x, y, w, h, bg)
-  local sw, sh = getSize()
-  if w <= 0 or h <= 0 then return end
-  if x < 1 then x = 1 end
-  if x > sw then return end
-  term.setBackgroundColor(bg or C.bg)
-  local row = string.rep(" ", math.max(0, w))
-  for yy = y, y + h - 1 do
-    if yy >= 1 and yy <= sh then
-      term.setCursorPos(x, yy)
-      term.write(row:sub(1, math.max(0, sw - x + 1)))
-    end
-  end
-end
-
-local function short(text, maxLen)
-  text = tostring(text or "")
-  maxLen = tonumber(maxLen) or 30
-  if maxLen < 4 then return text:sub(1, maxLen) end
-  if #text <= maxLen then return text end
-  return text:sub(1, maxLen - 3) .. "..."
 end
 
 local function money(n)
-  n = tonumber(n)
-  if n == nil then return "n/a" end
+  n = tonumber(n) or 0
   local sign = ""
   if n < 0 then sign = "-"; n = math.abs(n) end
   local s = tostring(math.floor(n + 0.5))
@@ -243,165 +149,125 @@ local function pct(part, total)
   return string.format("%.1f%%", (part / total) * 100)
 end
 
-local function ageText(ms)
-  if not ms or ms <= 0 then return "never" end
-  local age = math.floor((nowMs() - ms) / 1000)
-  if age < 60 then return tostring(age) .. "s ago" end
-  local m = math.floor(age / 60)
-  if m < 60 then return tostring(m) .. "m ago" end
-  return tostring(math.floor(m / 60)) .. "h ago"
+local function shortText(text, maxLen)
+  text = tostring(text or "")
+  maxLen = tonumber(maxLen) or 30
+  if maxLen < 4 then return text:sub(1, maxLen) end
+  if #text <= maxLen then return text end
+  return text:sub(1, maxLen - 3) .. "..."
 end
 
-local function currentMcDay()
-  if os.day then
-    local ok, d = pcall(os.day, "ingame")
-    if ok and tonumber(d) then return math.floor(tonumber(d)) end
-    ok, d = pcall(os.day)
-    if ok and tonumber(d) then return math.floor(tonumber(d)) end
-  end
-  return math.floor(nowMs() / MC_DAY_MS)
-end
-
-local MONTHS = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" }
-
-local function isLeapYear(y)
-  y = math.floor(tonumber(y) or 0)
-  if y % 400 == 0 then return true end
-  if y % 100 == 0 then return false end
-  return y % 4 == 0
-end
-
-local function monthLen(m, y)
-  local base = {31,28,31,30,31,30,31,31,30,31,30,31}
-  local idx = (math.floor(tonumber(m) or 0) % 12) + 1
-  if idx == 2 and isLeapYear(y) then return 29 end
-  return base[idx]
-end
-
-local function mcDate()
-  local d = currentMcDay()
-  local year = 0
-  while d >= (isLeapYear(year) and 366 or 365) do
-    d = d - (isLeapYear(year) and 366 or 365)
-    year = year + 1
-  end
-
-  local month = 0
-  while d >= monthLen(month, year) do
-    d = d - monthLen(month, year)
-    month = month + 1
-  end
-
-  return string.format("%02d %s %04d", d, MONTHS[(month % 12) + 1], year)
-end
-
-local function mcTime()
-  local t = 0
-  if os.time then
-    local ok, r = pcall(os.time, "ingame")
-    if ok and tonumber(r) then t = tonumber(r) else t = tonumber(os.time()) or 0 end
-  end
-  t = t % 24
-  local hour = math.floor(t)
-  local min = math.floor((t - hour) * 60)
-  return string.format("%02d:%02dMCT", hour, min)
-end
-
--- =============================================================================
--- DISPLAY
--- =============================================================================
-local function useMonitorIfPresent()
-  local mon = nil
-  if peripheral.find then mon = peripheral.find("monitor") end
-  if not mon then
-    for _, name in ipairs(peripheral.getNames()) do
-      if peripheral.getType(name) == "monitor" then
-        mon = peripheral.wrap(name)
-        break
-      end
-    end
-  end
-
-  if mon then
-    local okName, name = pcall(peripheral.getName, mon)
-    monitor_name = okName and name or "monitor"
-    pcall(function() mon.setTextScale(0.5) end)
-    term.redirect(mon)
-    using_monitor = true
-    return true
-  end
-
-  term.redirect(native_term)
-  monitor_name = nil
-  using_monitor = false
-  return false
-end
-
-local function restoreTerminal()
-  term.redirect(native_term)
-  term.setBackgroundColor(colors.black)
-  term.setTextColor(colors.white)
+local function cls()
+  refreshSize()
   term.setCursorBlink(false)
+  term.setBackgroundColor(C.bg)
+  term.setTextColor(C.text)
   term.clear()
   term.setCursorPos(1, 1)
 end
 
+local function at(x, y, text, fg, bg)
+  refreshSize()
+  if y < 1 or y > H or x > W then return end
+  if x < 1 then x = 1 end
+  term.setCursorPos(x, y)
+  term.setTextColor(fg or C.text)
+  term.setBackgroundColor(bg or C.bg)
+  local maxw = W - x + 1
+  if maxw > 0 then term.write(tostring(text or ""):sub(1, maxw)) end
+end
+
+local function fill(x, y, w, h, bg)
+  refreshSize()
+  if w <= 0 or h <= 0 then return end
+  if x < 1 then x = 1 end
+  term.setBackgroundColor(bg or C.bg)
+  local row = string.rep(" ", math.max(0, w))
+  for yy = y, y + h - 1 do
+    if yy >= 1 and yy <= H then
+      term.setCursorPos(x, yy)
+      term.write(row:sub(1, math.max(0, W - x + 1)))
+    end
+  end
+end
+
+local function line(x, y, w, ch, fg, bg)
+  at(x, y, string.rep(ch or "-", math.max(0, w)), fg or C.grid, bg or C.bg)
+end
+
+local function box(x, y, w, h, title)
+  fill(x, y, w, h, C.panel)
+  line(x, y, w, "=", C.grid, C.panel)
+  if title and title ~= "" then at(x + 2, y, " " .. title .. " ", C.label, C.panel) end
+end
+
+local function kv(x, y, label, value, colour, width)
+  width = width or 34
+  at(x, y, shortText(label, math.max(8, width - 14)), C.dim, C.bg)
+  at(x + math.max(12, width - 14), y, shortText(value, 14), colour or C.text, C.bg)
+end
+
 local function topBar()
-  local w = getSize()
-  fill(1, 1, w, 1, C.top)
-  at(2, 1, "GOVERNMENT EXPENDITURE", C.title, C.top)
+  fill(1, 1, W, 1, C.top)
+  at(2, 1, "STATE EXPENDITURE", C.title, C.top)
   local right = "v" .. VERSION
-  at(w - #right, 1, right, C.dim, C.top)
+  local mid = ""
+  if bank_id then mid = "Bank " .. tostring(bank_id) end
+  if #mid > 0 then at(math.floor((W - #mid) / 2), 1, mid, C.dim, C.top) end
+  at(W - #right, 1, right, C.dim, C.top)
 end
 
-local function footer()
-  local w, h = getSize()
-  fill(1, h, w, 1, C.bg)
-  local msg = last_message
-  if msg == "" then
-    msg = "Refresh " .. tostring(REFRESH_SECONDS) .. "s | R refresh | Q quit"
-  end
-  at(2, h, short(msg, w - 3), last_colour, C.bg)
-end
-
-local function box(x, y, w, h, title, colour)
-  fill(x, y, w, h, C.bg)
-  at(x, y, string.rep("=", math.max(0, w)):sub(1, w), C.line, C.bg)
-  if title and title ~= "" then
-    at(x + 2, y, " " .. title .. " ", colour or C.label, C.bg)
-  end
-end
-
-local function metric(x, y, label, value, fg)
-  at(x, y, tostring(label), C.dim, C.bg)
-  at(x + 20, y, tostring(value), fg or C.text, C.bg)
-end
-
-local function bar(x, y, w, value, total, colour)
-  value = tonumber(value) or 0
-  total = tonumber(total) or 0
-  local filled = 0
-  if total > 0 and w > 0 then
-    filled = math.floor((value / total) * w + 0.5)
-    filled = clamp(filled, 0, w)
-  end
-  fill(x, y, w, 1, colors.gray)
-  if filled > 0 then fill(x, y, filled, 1, colour or C.good) end
-end
-
-local function drawConnect(message, colour)
-  clear(C.bg)
-  topBar()
-  at(2, 3, mcDate() .. " " .. mcTime(), C.dim, C.bg)
-  at(2, 5, message or "Connecting...", colour or C.dim, C.bg)
-  at(2, 7, "Modem: " .. tostring(modem_name or "none"), C.dim, C.bg)
-  at(2, 8, "Display: " .. (using_monitor and ("monitor " .. tostring(monitor_name)) or "terminal"), C.dim, C.bg)
-  footer()
+local function statusBar()
+  fill(1, H, W, 1, C.bg)
+  at(2, H, shortText(last_message or "", W - 2), last_colour, C.bg)
 end
 
 -- =============================================================================
--- NETWORK
+-- MINECRAFT CLOCK
 -- =============================================================================
+local function currentMcDay()
+  if os.day then return math.max(0, math.floor(tonumber(os.day()) or 0)) end
+  return math.floor(nowMs() / MC_DAY_MS)
+end
+
+local function mcTime()
+  local t = 0
+  if os.time then t = tonumber(os.time()) or 0 end
+  t = t % 24
+  local hour = math.floor(t)
+  local minute = math.floor((t - hour) * 60)
+  return string.format("Day %d  %02d:%02d MCT", currentMcDay(), hour, minute)
+end
+
+-- =============================================================================
+-- DISPLAY / NETWORK
+-- =============================================================================
+local function consoleLog(text)
+  local cur = term.current()
+  term.redirect(native_term)
+  term.setTextColor(colors.lightGray)
+  print("[GovEx] " .. tostring(text))
+  term.redirect(cur)
+end
+
+local function useMonitorIfPresent()
+  local mon = peripheral.find("monitor")
+  if mon then
+    local okName, name = pcall(peripheral.getName, mon)
+    monitor_name = okName and name or "monitor"
+    if mon.setTextScale then mon.setTextScale(0.5) end
+    term.redirect(mon)
+    using_monitor = true
+    refreshSize()
+    consoleLog("Rendering on monitor: " .. tostring(monitor_name))
+    return true
+  end
+  using_monitor = false
+  refreshSize()
+  consoleLog("No monitor found; using terminal")
+  return false
+end
+
 local function openModem()
   for _, name in ipairs(peripheral.getNames()) do
     if peripheral.getType(name) == "modem" then
@@ -413,7 +279,6 @@ local function openModem()
       end
     end
   end
-
   for _, name in ipairs(peripheral.getNames()) do
     if peripheral.getType(name) == "modem" then
       rednet.open(name)
@@ -421,68 +286,28 @@ local function openModem()
       return true
     end
   end
-
   return false
 end
 
-local function waitForBankResponse(target_id, timeout)
-  local deadline = os.clock() + (timeout or DB_TIMEOUT)
-  while true do
-    local remaining = deadline - os.clock()
-    if remaining <= 0 then return nil end
-    local sender, msg = rednet.receive(BANK_PROTOCOL, remaining)
-    if sender == target_id and type(msg) == "table" then
-      return msg
-    end
-  end
-end
-
-local function validateBank(sender)
-  rednet.send(sender, { type = "status" }, BANK_PROTOCOL)
-  local msg = waitForBankResponse(sender, 2)
-  if type(msg) == "table" and msg.success == true and type(msg.response) == "table" then
-    bank_id = sender
-    return true
-  end
-  return false
-end
-
-local function discoverBank()
-  bank_id = nil
-  for attempt = 1, 8 do
-    drawConnect("Finding Quid Bank... attempt " .. tostring(attempt), C.dim)
-    rednet.broadcast({ type = "ping" }, BANK_PROTOCOL)
-
-    local deadline = os.clock() + 3
-    while os.clock() < deadline do
-      local remaining = deadline - os.clock()
-      local sender, msg = rednet.receive(BANK_PROTOCOL, remaining)
-      if sender and type(msg) == "table" then
-        if msg.type == "treasury_online" or msg.success == true then
-          if validateBank(sender) then
-            last_message = "Connected to bank " .. tostring(bank_id)
-            last_colour = C.good
-            return true
-          end
-        end
-      end
-    end
-  end
-
-  last_message = "Bank server not found"
-  last_colour = C.bad
-  return false
+local function connectScreen(message, colour)
+  cls()
+  topBar()
+  at(2, 3, mcTime(), C.dim, C.bg)
+  at(2, 5, message or "Connecting...", colour or C.dim, C.bg)
+  at(2, 7, "Modem: " .. tostring(modem_name or "none"), C.dim, C.bg)
+  at(2, 8, "Monitor: " .. tostring(monitor_name or (using_monitor and "attached" or "terminal")), C.dim, C.bg)
+  statusBar()
 end
 
 local function dbRequest(req, timeout)
   timeout = timeout or DB_TIMEOUT
   if not bank_id then return false, "No bank connected" end
+
   rednet.send(bank_id, req, BANK_PROTOCOL)
   local deadline = os.clock() + timeout
-
   while true do
     local remaining = deadline - os.clock()
-    if remaining <= 0 then return false, "No response from bank" end
+    if remaining <= 0 then return false, "No response for " .. tostring(req and req.type) end
     local sender, msg = rednet.receive(BANK_PROTOCOL, remaining)
     if sender == bank_id and type(msg) == "table" and msg.success ~= nil then
       return msg.success, msg.response
@@ -490,14 +315,55 @@ local function dbRequest(req, timeout)
   end
 end
 
-local function endpoint(req, timeout)
-  local ok, success, response = pcall(dbRequest, req, timeout or DB_TIMEOUT)
-  if not ok then return false, tostring(success) end
-  return success, response
+local function validateBank(sender)
+  rednet.send(sender, { type = "status" }, BANK_PROTOCOL)
+  local deadline = os.clock() + 2
+  while true do
+    local rem = deadline - os.clock()
+    if rem <= 0 then return false end
+    local sid, msg = rednet.receive(BANK_PROTOCOL, rem)
+    if sid == sender and type(msg) == "table" and msg.success == true and type(msg.response) == "table" then
+      local r = msg.response
+      if r.supply or r.account_count or r.citizen_count or r.company_count then
+        bank_id = sender
+        return true
+      end
+    end
+  end
+end
+
+local function discoverBank()
+  for attempt = 1, 8 do
+    connectScreen("Finding Quid bank server... attempt " .. tostring(attempt), C.dim)
+    rednet.broadcast({ type = "ping" }, BANK_PROTOCOL)
+    local deadline = os.clock() + 3
+    while os.clock() < deadline do
+      local sid, msg = rednet.receive(BANK_PROTOCOL, deadline - os.clock())
+      if sid and type(msg) == "table" then
+        if msg.type == "treasury_online" or msg.success ~= nil then
+          if validateBank(sid) then
+            connectScreen("Connected to Quid bank " .. tostring(bank_id), C.good)
+            sleep(0.4)
+            return true
+          end
+        end
+      end
+    end
+  end
+  return false
+end
+
+local function endpoint(name, req)
+  local ok, res = dbRequest(req, DB_TIMEOUT)
+  last_diagnostics[name] = ok and "ok" or tostring(res)
+  if ok and type(res) == "table" then
+    return true, res
+  end
+  return false, res
 end
 
 -- =============================================================================
--- DATA CLASSIFICATION
+-- CLASSIFICATION
 -- =============================================================================
 local function txField(tx, ...)
   for i = 1, select("#", ...) do
@@ -511,642 +377,749 @@ local function txText(tx)
   local parts = {
     txField(tx, "type", "tx_type") or "",
     txField(tx, "memo", "description", "note") or "",
+    txField(tx, "sector", "payroll_sector", "department") or "",
     txField(tx, "from", "from_id") or "",
     txField(tx, "to", "to_id") or "",
-    txField(tx, "direction") or "",
+    txField(tx, "counterparty_id") or "",
+    txField(tx, "counterparty_name") or "",
   }
   return lower(table.concat(parts, " "))
+end
+
+local function containsAny(text, list)
+  text = lower(text or "")
+  for _, word in ipairs(list) do
+    if text:find(word, 1, true) then return true end
+  end
+  return false
 end
 
 local function txDirection(tx)
   local d = upper(txField(tx, "direction") or "")
   if d ~= "" then return d end
-
   local from_id = trim(txField(tx, "from", "from_id") or "")
   local to_id = trim(txField(tx, "to", "to_id") or "")
   if from_id == TREASURY_ACCOUNT then return "OUT" end
   if to_id == TREASURY_ACCOUNT then return "IN" end
-  if from_id == "SYSTEM" then return "MINT" end
-  if to_id == "SYSTEM" then return "BURN" end
   return "OTHER"
 end
 
 local function isTreasuryOutflow(tx)
-  local d = txDirection(tx)
-  if d == "OUT" or d == "BURN" then return true end
+  local typ = upper(txField(tx, "type", "tx_type") or "")
+  if typ == "MINT" or typ == "BURN" then return false end
+  if txDirection(tx) == "OUT" then return true end
   local from_id = trim(txField(tx, "from", "from_id") or "")
   return from_id == TREASURY_ACCOUNT
 end
 
-local function classifyTreasuryOutflow(tx)
+local function classifyTx(tx)
+  local explicit = lower(txField(tx, "sector", "payroll_sector", "department") or "")
+  if explicit == "defense" then return "defence" end
+  if CATEGORY_LOOKUP[explicit] then return explicit end
+
   local text = txText(tx)
-  local typ = upper(txField(tx, "type", "tx_type") or "")
-  local to_id = lower(txField(tx, "to", "to_id") or "")
 
-  if typ == "BURN" or to_id == "system" or text:find("burn", 1, true) then
-    return "currency_burn"
+  if containsAny(text, { "welfare", "food", "meal", "dining", "restaurant", "hospitality", "salmon", "subsidy", "benefit", "relief", "care", "service payment", "service_payment", "food service", "food servicing" }) then
+    return "welfare"
   end
-
-  if text:find("payroll", 1, true)
-    or text:find("salary", 1, true)
-    or text:find("wage", 1, true)
-    or text:find("worker pay", 1, true) then
-    return "public_payroll"
+  if containsAny(text, { "defence", "defense", "soldier", "guard", "archer", "knight", "barracks", "tower", "military", "security", "weapon", "armour", "armor" }) then
+    return "defence"
   end
-
-  if text:find("contract", 1, true)
-    or text:find("project", 1, true)
-    or text:find("building", 1, true)
-    or text:find("request", 1, true) then
-    return "state_contracts"
+  if containsAny(text, { "research", "university", "library", "school", "education", "teacher", "student", "pupil", "scholar", "science" }) then
+    return "research"
   end
-
-  if typ == "GRANT" or text:find("grant", 1, true) or text:find("stimulus", 1, true) then
-    if to_id:find("^company:") or text:find("business", 1, true) or text:find("company", 1, true) then
-      return "business_grants"
-    end
-    return "citizen_grants"
+  if containsAny(text, { "logistics", "courier", "delivery", "warehouse", "transport", "shipping", "hauling" }) then
+    return "logistics"
+  end
+  if containsAny(text, { "admin", "administration", "fiscal", "treasury", "state office", "bureau", "clerk" }) then
+    return "administration"
+  end
+  if containsAny(text, { "infrastructure", "construction", "builder", "road", "bridge", "public works", "maintenance", "repair", "build project" }) then
+    return "infrastructure"
+  end
+  if containsAny(text, { "grant", "stimulus", "aid", "support payment", "state support" }) then
+    return "grants"
+  end
+  if containsAny(text, { "interest", "loan", "debt", "bond", "finance charge" }) then
+    return "finance"
   end
 
   return "other"
 end
 
-local function workerText(e)
+local function employeeText(e)
+  local parts = {}
   if type(e) ~= "table" then return "" end
-  local parts = {
-    e.industry or "",
-    e.job_text or "",
-    e.work_type or "",
-    e.work_name or "",
-    e.company_name or "",
-    e.company_id or "",
-    e.display_name or "",
-  }
+  for _, k in ipairs({ "job_text", "job", "title", "role", "profession", "industry", "work_type", "work_name", "company_name" }) do
+    if e[k] then parts[#parts + 1] = tostring(e[k]) end
+  end
   return lower(table.concat(parts, " "))
 end
 
-local function publicSectorForEmployee(e)
-  local text = workerText(e)
-  local industry = lower(e and e.industry or "")
+local function classifyEmployeeSector(e)
+  local ind = lower(e and e.industry or "")
+  if ind == "defense" then return "defence" end
+  if ind == "defence" or ind == "research" or ind == "logistics" then return ind end
 
-  if industry == "defence" or industry == "defense" then return "defence" end
-  if industry == "research" then return "research" end
-  if industry == "logistics" then return "logistics" end
-
-  if text:find("guard", 1, true) or text:find("soldier", 1, true)
-    or text:find("archer", 1, true) or text:find("ranger", 1, true)
-    or text:find("knight", 1, true) or text:find("barracks", 1, true)
-    or text:find("combat", 1, true) or text:find("tower", 1, true)
-    or text:find("defence", 1, true) or text:find("defense", 1, true) then
-    return "defence"
-  end
-
-  if text:find("research", 1, true) or text:find("university", 1, true)
-    or text:find("library", 1, true) or text:find("teacher", 1, true)
-    or text:find("student", 1, true) or text:find("pupil", 1, true) then
-    return "research"
-  end
-
-  if text:find("courier", 1, true) or text:find("delivery", 1, true)
-    or text:find("warehouse", 1, true) or text:find("logistics", 1, true) then
-    return "logistics"
-  end
-
+  local text = employeeText(e)
+  if containsAny(text, { "soldier", "guard", "archer", "knight", "barracks", "tower", "combat", "defence", "defense" }) then return "defence" end
+  if containsAny(text, { "research", "university", "library", "teacher", "student", "pupil", "school" }) then return "research" end
+  if containsAny(text, { "courier", "delivery", "warehouse", "logistics", "transport" }) then return "logistics" end
   return nil
 end
 
-local function tierForEmployee(e, sector)
-  local text = workerText(e)
-
+local function wageTierForEmployee(e, sector)
+  local text = employeeText(e)
   if sector == "defence" then
-    if text:find("knight", 1, true) or text:find("captain", 1, true)
-      or text:find("officer", 1, true) or text:find("elite", 1, true) then
-      return "elite"
-    end
-    if text:find("guard", 1, true) or text:find("soldier", 1, true)
-      or text:find("archer", 1, true) or text:find("ranger", 1, true)
-      or text:find("barracks", 1, true) or text:find("tower", 1, true) then
-      return "skilled"
-    end
+    if containsAny(text, { "knight", "captain", "officer", "paladin", "commander" }) then return "elite" end
+    if containsAny(text, { "soldier", "guard", "archer", "ranger", "barracks", "tower" }) then return "skilled" end
     return "unskilled"
-  end
-
-  if sector == "research" then
-    if text:find("university", 1, true) or text:find("professor", 1, true)
-      or text:find("head", 1, true) or text:find("elite", 1, true) then
-      return "elite"
-    end
+  elseif sector == "research" then
+    if containsAny(text, { "university", "professor", "alchemist", "enchant", "doctor", "scientist" }) then return "elite" end
     return "skilled"
-  end
-
-  if sector == "logistics" then
-    if text:find("warehouse", 1, true) or text:find("manager", 1, true)
-      or text:find("skilled", 1, true) then
-      return "skilled"
-    end
+  elseif sector == "logistics" then
+    if containsAny(text, { "courier", "warehouse", "manager", "delivery" }) then return "skilled" end
     return "unskilled"
   end
-
-  return "unskilled"
+  return "skilled"
 end
 
-local function rateForEmployee(e, rates)
-  local sector = publicSectorForEmployee(e)
-  if not sector then return nil end
-
-  rates = type(rates) == "table" and rates or {}
-  local sector_rates = type(rates[sector]) == "table" and rates[sector] or {}
-  local tier = tierForEmployee(e, sector)
-  local daily = tonumber(sector_rates[tier])
-
-  if not daily then
-    if sector == "defence" then daily = tonumber(sector_rates.skilled or sector_rates.unskilled or sector_rates.elite) or 0
-    elseif sector == "research" then daily = tonumber(sector_rates.skilled or sector_rates.elite) or 0
-    elseif sector == "logistics" then daily = tonumber(sector_rates.unskilled or sector_rates.skilled) or 0
-    end
-  end
-
-  if not daily or daily <= 0 then return nil end
-  return daily, sector, tier
+local function displayName(e)
+  return tostring((e and (e.display_name or e.name or e.citizen_id)) or "unknown")
 end
 
 -- =============================================================================
--- ANALYSIS
+-- DATA FETCH / ANALYSIS
 -- =============================================================================
-local function emptyCategoryMap()
+local function newSector(cat)
   return {
-    public_payroll = { key="public_payroll", label=CATEGORY_LABELS.public_payroll, amount=0, count=0, colour=CATEGORY_COLOURS.public_payroll },
-    citizen_grants = { key="citizen_grants", label=CATEGORY_LABELS.citizen_grants, amount=0, count=0, colour=CATEGORY_COLOURS.citizen_grants },
-    business_grants = { key="business_grants", label=CATEGORY_LABELS.business_grants, amount=0, count=0, colour=CATEGORY_COLOURS.business_grants },
-    state_contracts = { key="state_contracts", label=CATEGORY_LABELS.state_contracts, amount=0, count=0, colour=CATEGORY_COLOURS.state_contracts },
-    currency_burn = { key="currency_burn", label=CATEGORY_LABELS.currency_burn, amount=0, count=0, colour=CATEGORY_COLOURS.currency_burn },
-    other = { key="other", label=CATEGORY_LABELS.other, amount=0, count=0, colour=CATEGORY_COLOURS.other },
+    key = cat.key,
+    label = cat.label,
+    short = cat.short,
+    color = cat.color,
+    actual = 0,
+    actual_annual = 0,
+    forecast_daily = 0,
+    forecast_annual = 0,
+    chart_value = 0,
+    tx_count = 0,
+    employees = 0,
+    transactions = {},
+    workers = {},
   }
 end
 
-local function listFromMap(map)
-  local out = {}
-  for _, row in pairs(map or {}) do
-    local value = tonumber(row.amount or row.annual or row.daily) or 0
-    if value > 0 or (tonumber(row.count) or 0) > 0 then
-      out[#out + 1] = row
-    end
+local function blankData()
+  local sectors = {}
+  local order = {}
+  for _, cat in ipairs(CATEGORY_DEFS) do
+    sectors[cat.key] = newSector(cat)
+    order[#order + 1] = sectors[cat.key]
   end
-  table.sort(out, function(a, b)
-    local av = tonumber(a.amount or a.annual or a.daily) or 0
-    local bv = tonumber(b.amount or b.annual or b.daily) or 0
-    return av > bv
-  end)
-  return out
-end
-
-local function analyseTreasuryHistory(history)
-  local rows = type(history) == "table" and history.history or {}
-  local categories = emptyCategoryMap()
-  local outflows = {}
-  local inflow_total = 0
-  local out_total = 0
-  local min_ts = nil
-  local max_ts = nil
-  local newest = nil
-
-  for _, tx in ipairs(rows or {}) do
-    local amount = tonumber(txField(tx, "amount") or 0) or 0
-    local ts = tonumber(txField(tx, "time", "timestamp") or 0) or 0
-    if ts > 0 then
-      if not min_ts or ts < min_ts then min_ts = ts end
-      if not max_ts or ts > max_ts then max_ts = ts end
-    end
-
-    if isTreasuryOutflow(tx) and amount > 0 then
-      local cat = classifyTreasuryOutflow(tx)
-      categories[cat] = categories[cat] or { key=cat, label=cat, amount=0, count=0, colour=C.other }
-      categories[cat].amount = categories[cat].amount + amount
-      categories[cat].count = categories[cat].count + 1
-      out_total = out_total + amount
-      outflows[#outflows + 1] = tx
-      if not newest or (ts > (tonumber(txField(newest, "time") or 0) or 0)) then newest = tx end
-    else
-      local dir = txDirection(tx)
-      if (dir == "IN" or dir == "MINT") and amount > 0 then
-        inflow_total = inflow_total + amount
-      end
-    end
-  end
-
-  local observed_days = 1
-  if min_ts and max_ts and max_ts > min_ts then
-    observed_days = math.max(1, math.ceil((max_ts - min_ts) / MC_DAY_MS))
-  end
-
-  local annualised = out_total * (FISCAL_YEAR_DAYS / observed_days)
-
   return {
-    raw_count = #rows,
-    total_seen = history and history.total_seen or #rows,
-    observed_days = observed_days,
-    outflow_total = out_total,
-    inflow_total = inflow_total,
-    annualised_outflow = annualised,
-    categories = listFromMap(categories),
-    category_map = categories,
-    outflows = outflows,
-    newest = newest,
+    sectors = sectors,
+    order = order,
+    transactions = {},
+    outflows = {},
+    status = {},
+    supply = {},
+    history_balance = nil,
+    observed_days = 1,
+    actual_total = 0,
+    actual_daily = 0,
+    actual_annual = 0,
+    forecast_daily = 0,
+    forecast_annual = 0,
+    chart_total = 0,
+    income_total = 0,
+    tx_count = 0,
+    source = "none",
   }
 end
 
-local function analysePublicPayroll(employees, rates)
-  local sectors = {
-    defence = { key="defence", label=WORKER_SECTOR_LABELS.defence, daily=0, annual=0, count=0, colour=WORKER_SECTOR_COLOURS.defence },
-    research = { key="research", label=WORKER_SECTOR_LABELS.research, daily=0, annual=0, count=0, colour=WORKER_SECTOR_COLOURS.research },
-    logistics = { key="logistics", label=WORKER_SECTOR_LABELS.logistics, daily=0, annual=0, count=0, colour=WORKER_SECTOR_COLOURS.logistics },
-  }
+local function requestTreasuryHistory()
+  local ok, res = endpoint("treasury_history", {
+    type = "treasury_history",
+    account_id = TREASURY_ACCOUNT,
+    limit = HISTORY_LIMIT,
+  })
+  if ok then last_data_source = "treasury_history"; return true, res end
 
-  local workers = {}
-  local active_count = 0
-  local mapped_count = 0
+  ok, res = endpoint("fiscal_history", {
+    type = "fiscal_history",
+    account_id = TREASURY_ACCOUNT,
+    limit = HISTORY_LIMIT,
+  })
+  if ok then last_data_source = "fiscal_history"; return true, res end
 
-  for _, e in ipairs(employees or {}) do
+  return false, res
+end
+
+local function transactionsFromHistory(res)
+  if type(res) ~= "table" then return {} end
+  if type(res.history) == "table" then return res.history end
+  if type(res.transactions) == "table" then return res.transactions end
+  if type(res.entries) == "table" then return res.entries end
+  return {}
+end
+
+local function amountOf(tx)
+  return tonumber(txField(tx, "amount", "value", "quid")) or 0
+end
+
+local function timeOf(tx)
+  return tonumber(txField(tx, "time", "timestamp", "ts", "created", "created_at")) or 0
+end
+
+local function analyseTransactions(data, historyRes)
+  data.transactions = transactionsFromHistory(historyRes)
+  data.history_balance = type(historyRes) == "table" and historyRes.balance or nil
+
+  local minT, maxT = nil, nil
+
+  for _, tx in ipairs(data.transactions or {}) do
+    local amt = amountOf(tx)
+    local t = timeOf(tx)
+    if t > 0 then
+      if not minT or t < minT then minT = t end
+      if not maxT or t > maxT then maxT = t end
+    end
+
+    local dir = txDirection(tx)
+    if dir == "IN" and amt > 0 then
+      data.income_total = data.income_total + amt
+    end
+
+    if isTreasuryOutflow(tx) and amt > 0 then
+      local key = classifyTx(tx)
+      local s = data.sectors[key] or data.sectors.other
+      s.actual = s.actual + amt
+      s.tx_count = s.tx_count + 1
+      s.transactions[#s.transactions + 1] = tx
+      data.actual_total = data.actual_total + amt
+      data.outflows[#data.outflows + 1] = tx
+    end
+  end
+
+  data.tx_count = #(data.transactions or {})
+  if minT and maxT and maxT > minT then
+    data.observed_days = math.max(1, math.ceil((maxT - minT) / MC_DAY_MS))
+  else
+    data.observed_days = 1
+  end
+
+  data.actual_daily = data.actual_total / data.observed_days
+  data.actual_annual = data.actual_daily * FISCAL_YEAR_DAYS
+
+  for _, s in ipairs(data.order) do
+    s.actual_annual = (s.actual / data.observed_days) * FISCAL_YEAR_DAYS
+  end
+end
+
+local function analysePayrollForecast(data, employeesRes, ratesRes)
+  local employees = {}
+  if type(employeesRes) == "table" then employees = employeesRes.employees or employeesRes.mappings or employeesRes end
+  if type(employees) ~= "table" then employees = {} end
+
+  local rates = {}
+  if type(ratesRes) == "table" then rates = ratesRes.rates or ratesRes end
+  if type(rates) ~= "table" then rates = {} end
+
+  for _, e in ipairs(employees) do
     if type(e) == "table" and e.active ~= false then
-      active_count = active_count + 1
-      local daily, sector, tier = rateForEmployee(e, rates)
-      if daily and sector then
-        local s = sectors[sector]
-        if s then
-          s.daily = s.daily + daily
-          s.annual = s.annual + (daily * FISCAL_YEAR_DAYS)
-          s.count = s.count + 1
-          mapped_count = mapped_count + 1
-          workers[#workers + 1] = {
-            name = tostring(e.display_name or e.name or e.citizen_id or "worker"),
-            citizen_id = tostring(e.citizen_id or ""),
-            sector = sector,
+      local sector = classifyEmployeeSector(e)
+      if sector and data.sectors[sector] then
+        local tier = wageTierForEmployee(e, sector)
+        local sectorRates = type(rates[sector]) == "table" and rates[sector] or {}
+        local wage = tonumber(sectorRates[tier]) or tonumber(sectorRates.skilled) or tonumber(sectorRates.unskilled) or 0
+        wage = math.floor(wage)
+        if wage > 0 then
+          local s = data.sectors[sector]
+          s.forecast_daily = s.forecast_daily + wage
+          s.forecast_annual = s.forecast_annual + (wage * FISCAL_YEAR_DAYS)
+          s.employees = s.employees + 1
+          s.workers[#s.workers + 1] = {
+            name = displayName(e),
+            citizen_id = e.citizen_id,
+            job = e.job_text or e.job or e.title or e.work_type or e.industry or "worker",
             tier = tier,
-            daily = daily,
-            annual = daily * FISCAL_YEAR_DAYS,
-            job = tostring(e.job_text or e.work_name or e.work_type or ""),
+            wage = wage,
+            annual = wage * FISCAL_YEAR_DAYS,
           }
+          data.forecast_daily = data.forecast_daily + wage
+          data.forecast_annual = data.forecast_annual + (wage * FISCAL_YEAR_DAYS)
         end
       end
     end
   end
 
-  local list = listFromMap(sectors)
-  local daily_total = 0
-  local annual_total = 0
-  local count = 0
-  for _, s in ipairs(list) do
-    daily_total = daily_total + (tonumber(s.daily) or 0)
-    annual_total = annual_total + (tonumber(s.annual) or 0)
-    count = count + (tonumber(s.count) or 0)
+  for _, s in ipairs(data.order) do
+    table.sort(s.workers, function(a, b) return (a.annual or 0) > (b.annual or 0) end)
   end
-
-  table.sort(workers, function(a, b)
-    return (tonumber(a.annual) or 0) > (tonumber(b.annual) or 0)
-  end)
-
-  return {
-    daily_total = daily_total,
-    annual_total = annual_total,
-    sectors = list,
-    workers = workers,
-    public_worker_count = count,
-    active_employee_count = active_count,
-    mapped_public_count = mapped_count,
-  }
 end
 
-local function fetchSnapshot()
-  local errors = {}
-
-  local okStatus, status = endpoint({ type = "status" }, 4)
-  if not okStatus or type(status) ~= "table" then
-    errors[#errors + 1] = "status=" .. tostring(status)
-    status = {}
-  end
-
-  local okSupply, supply = endpoint({ type = "supply" }, 4)
-  if not okSupply or type(supply) ~= "table" then
-    if type(status.supply) == "table" then
-      supply = status.supply
+local function finaliseData(data)
+  data.chart_total = 0
+  for _, s in ipairs(data.order) do
+    -- Public payroll forecast fills gaps between real payroll transactions.
+    -- Non-payroll categories only use real treasury outflows.
+    if s.key == "defence" or s.key == "research" or s.key == "logistics" then
+      s.chart_value = math.max(s.actual_annual, s.forecast_annual)
     else
-      errors[#errors + 1] = "supply=" .. tostring(supply)
-      supply = {}
+      s.chart_value = s.actual_annual
+    end
+    data.chart_total = data.chart_total + s.chart_value
+  end
+
+  table.sort(data.outflows, function(a, b) return timeOf(a) > timeOf(b) end)
+end
+
+local function fetchData()
+  last_diagnostics = {}
+  local data = blankData()
+
+  local okStatus, statusRes = endpoint("status", { type = "status" })
+  if okStatus then
+    data.status = statusRes
+    data.supply = statusRes.supply or {}
+  end
+
+  local okHist, histRes = requestTreasuryHistory()
+  if okHist then
+    analyseTransactions(data, histRes)
+  else
+    last_diagnostics.history = tostring(histRes)
+  end
+
+  local okRates, ratesRes = endpoint("get_worker_pay_rates", { type = "get_worker_pay_rates" })
+  local okEmp, empRes = endpoint("list_employee_mappings", { type = "list_employee_mappings" })
+  if okRates and okEmp then
+    analysePayrollForecast(data, empRes, ratesRes)
+  else
+    if not okRates then last_diagnostics.worker_pay_rates = tostring(ratesRes) end
+    if not okEmp then last_diagnostics.employee_mappings = tostring(empRes) end
+  end
+
+  finaliseData(data)
+  data.source = last_data_source
+
+  if not okStatus and not okHist and not okRates and not okEmp then
+    return false, "No usable bank data"
+  end
+  return true, data
+end
+
+-- =============================================================================
+-- TABS
+-- =============================================================================
+local function buildTabs(data)
+  local tabs = { { key = "overview", label = "OVERVIEW" } }
+  if not data then return tabs end
+
+  for _, cat in ipairs(CATEGORY_DEFS) do
+    local s = data.sectors[cat.key]
+    local mustShow = (cat.key == "defence" or cat.key == "research" or cat.key == "welfare")
+    if mustShow or (s and ((s.chart_value or 0) > 0 or (s.actual or 0) > 0 or (s.forecast_annual or 0) > 0)) then
+      tabs[#tabs + 1] = { key = cat.key, label = cat.short }
     end
   end
+  return tabs
+end
 
-  local okHist, hist = endpoint({
-    type = "treasury_history",
-    account_id = TREASURY_ACCOUNT,
-    limit = HISTORY_LIMIT,
-  }, 6)
-  if not okHist or type(hist) ~= "table" then
-    errors[#errors + 1] = "treasury_history=" .. tostring(hist)
-    hist = { history = {} }
+local function drawTabs(tabs)
+  tab_hits = {}
+  local x, y = 2, 2
+  local maxw = W - 2
+  for _, tab in ipairs(tabs or {}) do
+    local label = " " .. tostring(tab.label) .. " "
+    local tw = #label
+    if x + tw > maxw then
+      y = y + 1
+      x = 2
+    end
+    local selected = tab.key == active_tab
+    fill(x, y, tw, 1, selected and C.selected or C.tab)
+    at(x, y, label, selected and colors.white or colors.lightGray, selected and C.selected or C.tab)
+    tab_hits[#tab_hits + 1] = { key = tab.key, x1 = x, x2 = x + tw - 1, y1 = y, y2 = y }
+    x = x + tw + 1
   end
+  return y + 1
+end
 
-  local okRates, ratesRes = endpoint({ type = "get_worker_pay_rates" }, 4)
-  local rates = {}
-  if okRates and type(ratesRes) == "table" then
-    rates = ratesRes.rates or ratesRes
-  else
-    errors[#errors + 1] = "worker_pay_rates=" .. tostring(ratesRes)
+local function hitTab(mx, my)
+  for _, h in ipairs(tab_hits or {}) do
+    if mx >= h.x1 and mx <= h.x2 and my >= h.y1 and my <= h.y2 then return h.key end
   end
+  return nil
+end
 
-  local okEmp, empRes = endpoint({ type = "list_employee_mappings", include_inactive = false }, 6)
-  local employees = {}
-  if okEmp and type(empRes) == "table" then
-    employees = empRes.employees or {}
-  else
-    errors[#errors + 1] = "employee_mappings=" .. tostring(empRes)
-  end
-
-  local treasury = {
-    issued = tonumber(supply.in_circulation or supply.total_supply or (status.supply and status.supply.in_circulation)) or 0,
-    minted = tonumber(supply.total_minted or (status.supply and status.supply.total_minted)) or 0,
-    burned = tonumber(supply.total_burned or (status.supply and status.supply.total_burned)) or 0,
-    reserve = tonumber(supply.treasury_balance or supply.treasury_reserve or (status.supply and status.supply.treasury_balance)) or 0,
-    citizen_holdings = tonumber(supply.citizen_holdings or (status.supply and status.supply.citizen_holdings)) or 0,
-    company_holdings = tonumber(supply.company_holdings or (status.supply and status.supply.company_holdings)) or 0,
-  }
-  treasury.private_supply = treasury.issued - treasury.reserve
-  if treasury.private_supply < 0 then treasury.private_supply = 0 end
-  treasury.reserve_share = 0
-  if treasury.issued > 0 then treasury.reserve_share = (treasury.reserve / treasury.issued) * 100 end
-
-  local actual = analyseTreasuryHistory(hist)
-  local payroll = analysePublicPayroll(employees, rates)
-
-  local quality = "LIVE"
-  if #errors > 0 then quality = "PARTIAL" end
-
-  return {
-    time = nowMs(),
-    mc_day = currentMcDay(),
-    mc_date = mcDate(),
-    mc_time = mcTime(),
-    quality = quality,
-    errors = errors,
-    status = status,
-    treasury = treasury,
-    actual = actual,
-    payroll = payroll,
-    bank_version = status.version,
-    bank_label = status.label,
-  }
+local function nextTab(tabs, dir)
+  if not tabs or #tabs == 0 then active_tab = "overview"; return end
+  local idx = 1
+  for i, t in ipairs(tabs) do if t.key == active_tab then idx = i break end end
+  idx = idx + (dir or 1)
+  if idx < 1 then idx = #tabs end
+  if idx > #tabs then idx = 1 end
+  active_tab = tabs[idx].key
 end
 
 -- =============================================================================
--- DRAWING
+-- PIE CHART
 -- =============================================================================
-local function drawBars(x, y, w, rows, total, value_key, max_rows)
-  rows = rows or {}
-  value_key = value_key or "amount"
-  max_rows = max_rows or 8
-  if #rows == 0 then
-    at(x, y, "No data yet.", C.dim, C.bg)
-    return y + 1
-  end
-
-  for i = 1, math.min(max_rows, #rows) do
-    local r = rows[i]
-    local amount = tonumber(r[value_key]) or 0
-    local label = tostring(r.label or r.key or "?")
-    local colour = r.colour or r.color or C.good
-    at(x, y, short(label, 18), C.text, C.bg)
-    at(x + 19, y, money(amount), C.good, C.bg)
-    at(x + 33, y, pct(amount, total), C.dim, C.bg)
-    local bw = math.max(4, w - 2)
-    bar(x, y + 1, bw, amount, total, colour)
-    y = y + 2
-  end
-  return y
+local function atan2(y, x)
+  if math.atan2 then return math.atan2(y, x) end
+  if x > 0 then return math.atan(y / x) end
+  if x < 0 and y >= 0 then return math.atan(y / x) + math.pi end
+  if x < 0 and y < 0 then return math.atan(y / x) - math.pi end
+  if x == 0 and y > 0 then return math.pi / 2 end
+  if x == 0 and y < 0 then return -math.pi / 2 end
+  return 0
 end
 
-local function drawRecentTransactions(x, y, w, h, rows)
-  box(x, y, w, h, "RECENT TREASURY OUTFLOWS", C.label)
-  local maxRows = h - 3
-  rows = rows or {}
+local function sectorAtShare(slices, share)
+  local acc = 0
+  for _, s in ipairs(slices or {}) do
+    acc = acc + (tonumber(s.value) or 0)
+    if share <= acc then return s end
+  end
+  return slices and slices[#slices] or nil
+end
 
-  if #rows == 0 then
-    at(x + 2, y + 2, "No recent treasury outflows.", C.dim, C.bg)
+local function positiveSlices(data)
+  local slices = {}
+  if not data then return slices end
+  for _, s in ipairs(data.order or {}) do
+    if (s.chart_value or 0) > 0 then
+      slices[#slices + 1] = {
+        key = s.key,
+        label = s.label,
+        color = s.color,
+        value = s.chart_value,
+        actual = s.actual_annual,
+        forecast = s.forecast_annual,
+      }
+    end
+  end
+  table.sort(slices, function(a, b) return (a.value or 0) > (b.value or 0) end)
+  return slices
+end
+
+local function drawPie(cx, cy, rx, ry, slices, total)
+  total = tonumber(total) or 0
+  if total <= 0 or not slices or #slices == 0 then
+    at(cx - 8, cy, "No spend yet", C.warn, C.bg)
     return
   end
 
-  local rowY = y + 2
-  for i = 1, math.min(maxRows, #rows) do
-    local tx = rows[i]
-    local amount = tonumber(txField(tx, "amount") or 0) or 0
-    local typ = tostring(txField(tx, "type", "tx_type") or "?")
-    local memo = tostring(txField(tx, "memo", "description", "note") or "")
-    local to_id = tostring(txField(tx, "to", "to_id") or "")
-    local left = short(typ .. " -> " .. to_id, math.max(10, math.floor(w * 0.45)))
-    local right = money(amount)
-    at(x + 2, rowY, left, C.text, C.bg)
-    at(x + w - #right - 2, rowY, right, C.good, C.bg)
-    rowY = rowY + 1
-    if rowY <= y + h - 1 then
-      at(x + 4, rowY, short(memo, w - 6), C.dim, C.bg)
+  for yy = cy - ry, cy + ry do
+    for xx = cx - rx, cx + rx do
+      local dx = (xx - cx) / math.max(1, rx)
+      local dy = (yy - cy) / math.max(1, ry)
+      if (dx * dx) + (dy * dy) <= 1 then
+        local ang = atan2(dy, dx)
+        if ang < 0 then ang = ang + (2 * math.pi) end
+        local share = (ang / (2 * math.pi)) * total
+        local s = sectorAtShare(slices, share)
+        if s then
+          at(xx, yy, " ", colors.white, s.color)
+        end
+      end
+    end
+  end
+
+  -- small hollow centre, makes the chart look cleaner on monitors
+  local irx = math.max(1, math.floor(rx * 0.30))
+  local iry = math.max(1, math.floor(ry * 0.30))
+  for yy = cy - iry, cy + iry do
+    for xx = cx - irx, cx + irx do
+      local dx = (xx - cx) / math.max(1, irx)
+      local dy = (yy - cy) / math.max(1, iry)
+      if (dx * dx) + (dy * dy) <= 1 then at(xx, yy, " ", C.bg, C.bg) end
+    end
+  end
+end
+
+local function drawLegend(x, y, w, slices, total, maxRows)
+  maxRows = maxRows or 8
+  local row = 0
+  for _, s in ipairs(slices or {}) do
+    if row >= maxRows then break end
+    at(x, y + row, " ", colors.white, s.color)
+    at(x + 2, y + row, shortText(s.label, math.max(6, w - 22)), C.text, C.bg)
+    at(x + w - 20, y + row, pct(s.value, total), C.dim, C.bg)
+    at(x + w - 10, y + row, shortText(money(s.value), 10), C.good, C.bg)
+    row = row + 1
+  end
+end
+
+local function drawTinyBar(x, y, w, value, total, color)
+  total = tonumber(total) or 0
+  value = tonumber(value) or 0
+  local filled = 0
+  if total > 0 then filled = math.floor((value / total) * w + 0.5) end
+  filled = clamp(filled, 0, w)
+  fill(x, y, w, 1, colors.gray)
+  if filled > 0 then fill(x, y, filled, 1, color or C.good) end
+end
+
+-- =============================================================================
+-- DRAW SCREENS
+-- =============================================================================
+local function supplyValue(data, key)
+  if not data or type(data.supply) ~= "table" then return 0 end
+  return tonumber(data.supply[key]) or 0
+end
+
+local function drawRecentFeed(x, y, w, h, transactions, sectorKey)
+  box(x, y, w, h, sectorKey and "Recent " .. tostring(CATEGORY_LOOKUP[sectorKey] and CATEGORY_LOOKUP[sectorKey].label or sectorKey) or "Recent treasury outflows")
+  local rows = math.max(0, h - 2)
+  local printed = 0
+  for _, tx in ipairs(transactions or {}) do
+    if printed >= rows then break end
+    if (not sectorKey) or classifyTx(tx) == sectorKey then
+      local label = shortText(txField(tx, "memo", "description", "note") or txField(tx, "type", "tx_type") or "Treasury outflow", math.max(10, w - 18))
+      at(x + 2, y + 2 + printed, label, C.text, C.bg)
+      at(x + w - 14, y + 2 + printed, shortText(money(amountOf(tx)), 13), C.good, C.bg)
+      printed = printed + 1
+    end
+  end
+  if printed == 0 then
+    at(x + 2, y + 2, "No matching treasury outflow yet.", C.dim, C.bg)
+  end
+end
+
+local function drawOverview(data, startY)
+  local bodyY = startY + 1
+  local bottom = H - 1
+  local leftW = math.max(34, math.floor(W * 0.40))
+  local rightX = leftW + 2
+  local rightW = W - rightX
+
+  local treasury = supplyValue(data, "treasury_balance")
+  local issued = supplyValue(data, "in_circulation")
+  local private = supplyValue(data, "citizen_holdings") + supplyValue(data, "company_holdings") + supplyValue(data, "escrow_held")
+  local control = issued > 0 and (treasury / issued) or 0
+
+  box(2, bodyY, leftW - 2, 10, "State position")
+  kv(4, bodyY + 2, "Annual exposure", money(data.chart_total), C.good, leftW - 6)
+  kv(4, bodyY + 3, "Recent outflow", money(data.actual_total), C.warn, leftW - 6)
+  kv(4, bodyY + 4, "Daily actual avg", money(data.actual_daily), C.text, leftW - 6)
+  kv(4, bodyY + 5, "Payroll forecast/day", money(data.forecast_daily), C.text, leftW - 6)
+  kv(4, bodyY + 6, "Treasury reserve", money(treasury), C.good, leftW - 6)
+  kv(4, bodyY + 7, "Private supply", money(private), C.label, leftW - 6)
+  kv(4, bodyY + 8, "Treasury control", string.format("%.1f%%", control * 100), C.dim, leftW - 6)
+
+  box(2, bodyY + 11, leftW - 2, math.max(7, bottom - (bodyY + 11)), "Category bars")
+  local rowY = bodyY + 13
+  for _, s in ipairs(data.order) do
+    if rowY >= bottom - 1 then break end
+    if s.chart_value > 0 or s.key == "welfare" or s.key == "defence" or s.key == "research" then
+      at(4, rowY, shortText(s.label, 13), C.text, C.bg)
+      drawTinyBar(18, rowY, math.max(8, leftW - 33), s.chart_value, math.max(1, data.chart_total), s.color)
+      at(leftW - 13, rowY, shortText(money(s.chart_value), 12), C.good, C.bg)
       rowY = rowY + 1
     end
-    if rowY > y + h - 1 then break end
+  end
+
+  box(rightX, bodyY, rightW - 1, math.max(17, bottom - bodyY), "Annualised expenditure mix")
+  local slices = positiveSlices(data)
+  local pieRx = math.max(8, math.min(18, math.floor((rightW - 8) / 4)))
+  local pieRy = math.max(4, math.min(9, math.floor((bottom - bodyY - 6) / 2)))
+  local cx = rightX + math.floor(rightW * 0.30)
+  local cy = bodyY + 3 + pieRy
+  drawPie(cx, cy, pieRx, pieRy, slices, data.chart_total)
+  at(rightX + 2, bodyY + 2, "Total: " .. money(data.chart_total), C.good, C.bg)
+  at(rightX + 2, bodyY + 3, "Actual window: " .. tostring(data.observed_days) .. " MC day(s)", C.dim, C.bg)
+  local legendX = math.min(W - 34, cx + pieRx + 4)
+  drawLegend(legendX, bodyY + 5, math.max(28, W - legendX), slices, data.chart_total, math.max(5, bottom - bodyY - 7))
+
+  if bottom - bodyY > 22 then
+    drawRecentFeed(rightX + 2, bottom - 7, rightW - 4, 7, data.outflows)
   end
 end
 
-local function drawCompact(snap)
-  clear(C.bg)
-  topBar()
-  at(2, 3, snap.mc_date .. " " .. snap.mc_time, C.dim, C.bg)
+local function drawSectorTab(data, key, startY)
+  local s = data and data.sectors and data.sectors[key]
+  if not s then active_tab = "overview"; return drawOverview(data, startY) end
 
-  local t = snap.treasury or {}
-  at(2, 5, "Treasury reserve: " .. money(t.reserve), C.good, C.bg)
-  at(2, 6, "Issued supply:    " .. money(t.issued), C.text, C.bg)
-  at(2, 7, "Recent outflow:   " .. money(snap.actual.outflow_total), C.warn, C.bg)
-  at(2, 8, "Annual outflow:   " .. money(snap.actual.annualised_outflow), C.warn, C.bg)
-  at(2, 9, "Public payroll:   " .. money(snap.payroll.annual_total) .. "/year", C.good, C.bg)
-  at(2, 11, "Need a larger monitor for full breakdown.", C.dim, C.bg)
-  footer()
-end
+  local bodyY = startY + 1
+  local bottom = H - 1
+  local cat = CATEGORY_LOOKUP[key] or { label = key, color = C.label }
 
-local function drawScreen(snap)
-  clear(C.bg)
-  topBar()
+  box(2, bodyY, W - 2, 8, cat.label .. " spending")
+  at(4, bodyY + 2, "Annual exposure", C.dim, C.bg)
+  at(24, bodyY + 2, money(s.chart_value), C.good, C.bg)
+  at(4, bodyY + 3, "Actual recent", C.dim, C.bg)
+  at(24, bodyY + 3, money(s.actual) .. " across " .. tostring(data.observed_days) .. " MC day(s)", C.warn, C.bg)
+  at(4, bodyY + 4, "Actual annualised", C.dim, C.bg)
+  at(24, bodyY + 4, money(s.actual_annual), C.text, C.bg)
+  at(4, bodyY + 5, "Payroll forecast", C.dim, C.bg)
+  at(24, bodyY + 5, money(s.forecast_daily) .. "/day  |  " .. money(s.forecast_annual) .. "/year", C.label, C.bg)
+  at(4, bodyY + 6, "Share of budget", C.dim, C.bg)
+  at(24, bodyY + 6, pct(s.chart_value, data.chart_total), C.text, C.bg)
+  drawTinyBar(math.max(44, math.floor(W * 0.50)), bodyY + 3, math.max(10, W - math.max(44, math.floor(W * 0.50)) - 4), s.chart_value, math.max(1, data.chart_total), cat.color)
 
-  local w, h = getSize()
-  if not snap then
-    at(2, 3, "No data loaded yet.", C.warn, C.bg)
-    footer()
-    return
+  local midY = bodyY + 9
+  local leftW = math.floor(W * 0.48)
+  local rightX = leftW + 3
+
+  box(2, midY, leftW, bottom - midY, "Recent transactions")
+  local row = 0
+  local maxRows = math.max(0, bottom - midY - 2)
+  for _, tx in ipairs(s.transactions or {}) do
+    if row >= maxRows then break end
+    local label = shortText(txField(tx, "memo", "description", "note") or txField(tx, "type", "tx_type") or "Outflow", leftW - 18)
+    at(4, midY + 2 + row, label, C.text, C.bg)
+    at(2 + leftW - 13, midY + 2 + row, shortText(money(amountOf(tx)), 12), C.good, C.bg)
+    row = row + 1
   end
-
-  if w < 80 or h < 24 then
-    drawCompact(snap)
-    return
-  end
-
-  local clock = snap.mc_date .. " " .. snap.mc_time
-  at(2, 2, clock, C.dim, C.bg)
-  local right = "Bank " .. tostring(bank_id or "?") .. " | " .. tostring(snap.quality or "?") .. " | " .. ageText(last_refresh_ms)
-  at(math.max(2, w - #right), 2, right, snap.quality == "LIVE" and C.good or C.warn, C.bg)
-
-  local margin = 2
-  local gap = 2
-  local topY = 4
-  local topH = 8
-  local midY = topY + topH + 1
-  local midH = math.floor((h - midY - 2) * 0.52)
-  if midH < 10 then midH = 10 end
-  local botY = midY + midH + 1
-  local botH = h - botY - 1
-
-  local colW = math.floor((w - margin * 2 - gap * 2) / 3)
-  local col1 = margin
-  local col2 = col1 + colW + gap
-  local col3 = col2 + colW + gap
-
-  local t = snap.treasury or {}
-  local a = snap.actual or {}
-  local p = snap.payroll or {}
-
-  box(col1, topY, colW, topH, "TREASURY", C.treasury)
-  metric(col1 + 2, topY + 2, "Reserve", money(t.reserve), C.good)
-  metric(col1 + 2, topY + 3, "Issued supply", money(t.issued), C.text)
-  metric(col1 + 2, topY + 4, "Private supply", money(t.private_supply), C.text)
-  metric(col1 + 2, topY + 5, "Treasury control", string.format("%.2f%%", tonumber(t.reserve_share) or 0), C.dim)
-  metric(col1 + 2, topY + 6, "Bank version", short(tostring(snap.bank_version or "?"), colW - 24), C.dim)
-
-  box(col2, topY, colW, topH, "RECENT SPEND", C.warn)
-  metric(col2 + 2, topY + 2, "Outflow seen", money(a.outflow_total), C.warn)
-  metric(col2 + 2, topY + 3, "Annualised", money(a.annualised_outflow), C.warn)
-  metric(col2 + 2, topY + 4, "History window", tostring(a.observed_days or 1) .. " MC days", C.dim)
-  metric(col2 + 2, topY + 5, "Rows read", tostring(a.raw_count or 0) .. "/" .. tostring(a.total_seen or 0), C.dim)
-  metric(col2 + 2, topY + 6, "Inflow seen", money(a.inflow_total), C.good)
-
-  box(col3, topY, colW, topH, "PUBLIC PAYROLL", C.payroll)
-  metric(col3 + 2, topY + 2, "Daily payroll", money(p.daily_total), C.good)
-  metric(col3 + 2, topY + 3, "Annual payroll", money(p.annual_total), C.good)
-  metric(col3 + 2, topY + 4, "Public workers", tostring(p.public_worker_count or 0), C.text)
-  metric(col3 + 2, topY + 5, "Mapped workers", tostring(p.active_employee_count or 0), C.dim)
-  local burn = 0
-  if p.annual_total and t.reserve and p.annual_total > 0 then
-    burn = t.reserve / p.annual_total
-  end
-  metric(col3 + 2, topY + 6, "Reserve cover", burn > 0 and string.format("%.2f years", burn) or "n/a", C.dim)
-
-  box(col1, midY, colW, midH, "PAYROLL BY PUBLIC SECTOR", C.payroll)
-  at(col1 + 2, midY + 2, "Forecast from current worker mappings/rates.", C.dim, C.bg)
-  drawBars(col1 + 2, midY + 4, colW - 4, p.sectors, p.annual_total, "annual", math.floor((midH - 5) / 2))
-
-  box(col2, midY, colW, midH, "SPEND CATEGORIES", C.warn)
-  at(col2 + 2, midY + 2, "Actual treasury outflows in recent ledger.", C.dim, C.bg)
-  drawBars(col2 + 2, midY + 4, colW - 4, a.categories, a.outflow_total, "amount", math.floor((midH - 5) / 2))
-
-  box(col3, midY, colW, midH, "TOP PUBLIC WAGES", C.payroll)
-  local workers = p.workers or {}
-  if #workers == 0 then
-    at(col3 + 2, midY + 2, "No public workers mapped yet.", C.dim, C.bg)
-  else
-    local rowY = midY + 2
-    local maxRows = midH - 3
-    for i = 1, math.min(maxRows, #workers) do
-      local wr = workers[i]
-      local name = short(wr.name or wr.citizen_id or "worker", colW - 18)
-      local val = money(wr.annual)
-      at(col3 + 2, rowY, name, C.text, C.bg)
-      at(col3 + colW - #val - 2, rowY, val, C.good, C.bg)
-      rowY = rowY + 1
+  if row == 0 then
+    if key == "welfare" then
+      at(4, midY + 2, "No welfare/food-service treasury spend yet.", C.dim, C.bg)
+      at(4, midY + 3, "Food servicing will appear here once paid/subsidised via treasury.", C.dim, C.bg)
+    else
+      at(4, midY + 2, "No recent treasury spend in this tab.", C.dim, C.bg)
     end
   end
 
-  drawRecentTransactions(col1, botY, w - (margin * 2), botH, a.outflows)
-
-  if snap.errors and #snap.errors > 0 then
-    last_message = "Partial data: " .. short(table.concat(snap.errors, "; "), w - 18)
-    last_colour = C.warn
+  box(rightX, midY, W - rightX, bottom - midY, "Live payroll / notes")
+  row = 0
+  maxRows = math.max(0, bottom - midY - 2)
+  if #s.workers > 0 then
+    for _, wkr in ipairs(s.workers) do
+      if row >= maxRows then break end
+      local left = shortText(wkr.name .. "  " .. tostring(wkr.tier), W - rightX - 19)
+      at(rightX + 2, midY + 2 + row, left, C.text, C.bg)
+      at(W - 13, midY + 2 + row, shortText(money(wkr.wage) .. "/d", 12), C.label, C.bg)
+      row = row + 1
+    end
   else
-    last_message = "Live expenditure data | refresh " .. tostring(REFRESH_SECONDS) .. "s | R refresh | Q quit"
-    last_colour = C.dim
-  end
-
-  footer()
-end
-
--- =============================================================================
--- MAIN LOOP
--- =============================================================================
-local function refresh()
-  if not bank_id then
-    if not discoverBank() then
-      last_error = "Bank unavailable"
-      drawConnect("Bank unavailable. Retrying...", C.bad)
-      return false
+    if key == "defence" or key == "research" or key == "logistics" then
+      at(rightX + 2, midY + 2, "No mapped public workers for this sector yet.", C.dim, C.bg)
+      at(rightX + 2, midY + 3, "Uses bank employee mappings + government pay rates.", C.dim, C.bg)
+    else
+      at(rightX + 2, midY + 2, "This tab is based on real treasury outflows.", C.dim, C.bg)
+      at(rightX + 2, midY + 3, "Future spending appears automatically when ledger memos match.", C.dim, C.bg)
     end
   end
+end
 
-  last_message = "Refreshing expenditure data..."
+local function drawScreen(data, err)
+  cls()
+  topBar()
+  at(2, 3, mcTime(), C.dim, C.bg)
+  local tabs = buildTabs(data)
+  local tabBottom = drawTabs(tabs)
+
+  if err then
+    at(2, tabBottom + 2, "Unable to load expenditure data: " .. shortText(err, W - 4), C.bad, C.bg)
+    at(2, tabBottom + 4, "Diagnostics:", C.label, C.bg)
+    local y = tabBottom + 5
+    for k, v in pairs(last_diagnostics or {}) do
+      if y >= H - 1 then break end
+      at(4, y, tostring(k) .. ": " .. shortText(v, W - 8), C.dim, C.bg)
+      y = y + 1
+    end
+  elseif not data then
+    at(2, tabBottom + 2, "Awaiting data...", C.warn, C.bg)
+  elseif active_tab == "overview" then
+    drawOverview(data, tabBottom)
+  else
+    drawSectorTab(data, active_tab, tabBottom)
+  end
+
+  local age = "never"
+  if last_refresh_ms > 0 then age = tostring(math.floor((nowMs() - last_refresh_ms) / 1000)) .. "s ago" end
+  last_message = "Live refresh: " .. age .. " | touch tabs/cycle | R refresh | arrows tabs | Q quit | source " .. tostring(last_data_source)
   last_colour = C.dim
-  local snap = fetchSnapshot()
-  last_snapshot = snap
-  last_refresh_ms = nowMs()
-
-  if snap.quality == "LIVE" then
-    last_error = ""
-  else
-    last_error = table.concat(snap.errors or {}, "; ")
-  end
-
-  drawScreen(snap)
-  return true
+  statusBar()
 end
 
+-- =============================================================================
+-- MAIN
+-- =============================================================================
 local function main()
   useMonitorIfPresent()
 
   if not openModem() then
-    drawConnect("No modem found. Attach modem and reboot.", C.bad)
+    connectScreen("No modem found. Attach modem and reboot.", C.bad)
     return
   end
 
   while not discoverBank() do
-    drawConnect("Bank not found. Retrying...", C.bad)
+    connectScreen("Bank server not found. Retrying...", C.bad)
     sleep(3)
   end
 
+  local latest = nil
+  local latest_err = nil
+
+  local function refresh()
+    connectScreen("Loading live expenditure data...", C.label)
+    local ok, res = fetchData()
+    if ok then
+      latest = res
+      latest_err = nil
+      last_refresh_ms = nowMs()
+      local tabs = buildTabs(latest)
+      local exists = false
+      for _, t in ipairs(tabs) do if t.key == active_tab then exists = true end end
+      if not exists then active_tab = "overview" end
+    else
+      latest = nil
+      latest_err = tostring(res)
+    end
+    drawScreen(latest, latest_err)
+  end
+
   refresh()
-
   local timer = os.startTimer(REFRESH_SECONDS)
-  while true do
-    local ev, p1 = os.pullEvent()
 
+  while true do
+    local ev, p1, p2, p3 = os.pullEvent()
     if ev == "timer" and p1 == timer then
       refresh()
       timer = os.startTimer(REFRESH_SECONDS)
 
+    elseif ev == "monitor_touch" then
+      local mx, my = p2, p3
+      local tab = hitTab(mx, my)
+      if tab then active_tab = tab else nextTab(buildTabs(latest), 1) end
+      drawScreen(latest, latest_err)
+
+    elseif ev == "mouse_click" then
+      local mx, my = p2, p3
+      local tab = hitTab(mx, my)
+      if tab then active_tab = tab else nextTab(buildTabs(latest), 1) end
+      drawScreen(latest, latest_err)
+
     elseif ev == "key" then
       if p1 == keys.q then
-        break
+        cls()
+        at(2, 2, "Government Expenditure Monitor closed.", C.dim, C.bg)
+        term.redirect(native_term)
+        return
       elseif p1 == keys.r then
         refresh()
         timer = os.startTimer(REFRESH_SECONDS)
+      elseif p1 == keys.right or p1 == keys.down then
+        nextTab(buildTabs(latest), 1)
+        drawScreen(latest, latest_err)
+      elseif p1 == keys.left or p1 == keys.up then
+        nextTab(buildTabs(latest), -1)
+        drawScreen(latest, latest_err)
       end
-
-    elseif ev == "monitor_touch" then
-      refresh()
-      timer = os.startTimer(REFRESH_SECONDS)
-
-    elseif ev == "terminate" then
-      break
     end
   end
-
-  restoreTerminal()
-  print("Government Expenditure Monitor closed.")
 end
 
 local ok, err = pcall(main)
 if not ok then
-  restoreTerminal()
+  term.redirect(native_term)
+  term.setBackgroundColor(colors.black)
   term.setTextColor(colors.red)
-  print("GovernmentExpenditureMonitor crashed:")
+  term.clear()
+  term.setCursorPos(1, 1)
+  print("GovernmentExpenditureMonitor crashed")
   print(tostring(err))
 end
