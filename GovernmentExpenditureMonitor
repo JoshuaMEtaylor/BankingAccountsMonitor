@@ -43,7 +43,7 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION          = "1.2.4-BIGGER-BOTTOM-RIGHT"
+local VERSION          = "1.2.5-LOWER-PIE"
 local BANK_PROTOCOL    = "quid_bank"
 local TREASURY_ACCOUNT = "treasury:quid_bank"
 local DB_TIMEOUT       = 4
@@ -1251,11 +1251,11 @@ local function drawWatchDashboard(data, startY)
 
   -- Bigger main chart, placed more centrally on the screen.
   -- The monitor is large enough to give the donut more presence.
-  -- Bigger chart, shifted a bit toward the bottom-right.
+  -- Bigger chart, shifted further down to open more space above it.
   local rx = math.max(16, math.min(26, math.floor(chartW * 0.27)))
   local ry = math.max(8, math.min(13, math.floor((chartH - 4) / 2)))
   local cx = math.floor(W * 0.51)
-  local cy = chartY + math.floor(chartH / 2) + 2
+  local cy = chartY + math.floor(chartH / 2) + 4
   if cy - ry < chartY + 4 then cy = chartY + 4 + ry end
   if cy + ry > chartBottom - 1 then cy = chartBottom - 1 - ry end
 
