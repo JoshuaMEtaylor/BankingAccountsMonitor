@@ -61,7 +61,7 @@ for i = 2, #args do
   runtime_args[#runtime_args + 1] = args[i]
 end
 
-local VERSION         = "0.5.22-SELF-UPDATE"
+local VERSION         = "0.5.23-MONETARY-CLEANUP"
 local PROTOCOL        = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT      = 5
@@ -752,7 +752,7 @@ end
 -- PRICE / INFLATION ORACLE
 -- ServerSideAccounts v1.4.6+ exposes a zero-baseline wide sector price oracle.
 -- Prices rise easily under money-print/inflation pressure, but deflate slowly
--- and cannot fall below the sticky ATH floor.
+-- and deflate slowly after inflation shocks.
 -- =============================================================================
 local function sectorFromOracle(priceOracle, name)
   if type(priceOracle) ~= "table" or type(priceOracle.sectors) ~= "table" then return nil end
@@ -1533,7 +1533,6 @@ local function drawMonetaryCard(x, y, w, h, snap)
 
   local priceIdx = tonumber(wp.national_price_index or po.national_price_index)
   local wageIdx = tonumber(wp.wage_index or po.wage_index)
-  local stickyFloor = tonumber(wp.sticky_price_floor)
   local moneyPressure = tonumber(wp.money_pressure)
   local wagePressure = tonumber(wp.wage_cost_pressure)
   local totalPressure = tonumber(wp.total_inflation_pressure)
@@ -1543,13 +1542,12 @@ local function drawMonetaryCard(x, y, w, h, snap)
 
   metric(x + 2, y + 7, "Inflation rate", bankRate and fmtPct(bankRate, 2) or "Awaiting data", bankRate and colors.white or C.warn, 18)
   metric(x + 2, y + 8, "Price index", fmtIndex(priceIdx, 3), priceIdx and colors.white or C.warn, 18)
-  metric(x + 2, y + 9, "Sticky floor", fmtIndex(stickyFloor, 3), stickyFloor and colors.white or C.warn, 18)
-  metric(x + 2, y + 10, "Wage index", fmtIndex(wageIdx, 3), wageIdx and colors.white or C.warn, 18)
-  metric(x + 2, y + 11, "Wage target", fmtIndex(wageTarget, 3), wageTarget and colors.white or C.warn, 18)
-  metric(x + 2, y + 12, "Real wage", realWage and fmtPct(realWage * 100, 1) or "Awaiting data", realWage and (realWage < 1 and C.warn or C.good) or C.warn, 18)
-  metric(x + 2, y + 13, "Money pressure", moneyPressure and fmtPct(moneyPressure * 100, 2) or "Awaiting data", moneyPressure and colors.white or C.warn, 18)
-  metric(x + 2, y + 14, "Wage pressure", wagePressure and fmtPct(wagePressure * 100, 2) or "Awaiting data", wagePressure and wagePressure > 0 and C.warn or C.dim, 18)
-  metric(x + 2, y + 15, "Total pressure", totalPressure and fmtPct(totalPressure * 100, 2) or "Awaiting data", totalPressure and colors.white or C.warn, 18)
+  metric(x + 2, y + 9, "Wage index", fmtIndex(wageIdx, 3), wageIdx and colors.white or C.warn, 18)
+  metric(x + 2, y + 10, "Wage target", fmtIndex(wageTarget, 3), wageTarget and colors.white or C.warn, 18)
+  metric(x + 2, y + 11, "Real wage", realWage and fmtPct(realWage * 100, 1) or "Awaiting data", realWage and (realWage < 1 and C.warn or C.good) or C.warn, 18)
+  metric(x + 2, y + 12, "Money pressure", moneyPressure and fmtPct(moneyPressure * 100, 2) or "Awaiting data", moneyPressure and colors.white or C.warn, 18)
+  metric(x + 2, y + 13, "Wage pressure", wagePressure and fmtPct(wagePressure * 100, 2) or "Awaiting data", wagePressure and wagePressure > 0 and C.warn or C.dim, 18)
+  metric(x + 2, y + 14, "Total pressure", totalPressure and fmtPct(totalPressure * 100, 2) or "Awaiting data", totalPressure and colors.white or C.warn, 18)
 
   writeAt(x + 2, y + h - 1, shortText(po.status or "Live monetary + wage pressure", w - 4), C.good, C.bg)
 end
@@ -1578,7 +1576,6 @@ local function drawPriceOracleCard(x, y, w, h, snap)
   local floor = tonumber(food.price_pressure_floor or general.price_pressure_floor)
   local pressure = tonumber(food.monetary_pressure or general.monetary_pressure)
   local shock = tonumber(food.shock_pressure or general.shock_pressure)
-  local sticky = tonumber(food.sticky_floor_from_ath or general.sticky_floor_from_ath)
   local defCap = tonumber(food.max_daily_deflation or general.max_daily_deflation)
 
   metric(x + 2, y + 2, "Bank rate", fmtPct(po.inflation_percent, 2), po.inflation_percent and colors.white or C.warn, 16)
@@ -1586,7 +1583,6 @@ local function drawPriceOracleCard(x, y, w, h, snap)
   metric(x + 2, y + 4, "Admin floor", fmtPct(floor and (floor * 100) or nil, 1), floor and floor > 0 and C.warn or C.dim, 16)
   metric(x + 2, y + 5, "Print shock", fmtPct(shock and (shock * 100) or nil, 1), shock and shock > 0 and C.warn or C.dim, 16)
   metric(x + 2, y + 6, "Deflation cap", fmtPct(defCap and (defCap * 100) or nil, 1), defCap and colors.white or C.warn, 16)
-  metric(x + 2, y + 7, "ATH floor", sticky and (fmtPct(sticky * 100, 0) .. " of ATH") or "Awaiting data", sticky and colors.white or C.warn, 16)
   metric(x + 2, y + 8, "General/Food", fmtIndex(general.index, 2) .. " / " .. fmtIndex(food.index, 2), food.index and colors.white or C.warn, 16)
   metric(x + 2, y + 9, "Construct/Fuel", fmtIndex(construction.index, 2) .. " / " .. fmtIndex(fuel.index, 2), construction.index and colors.white or C.warn, 16)
 
