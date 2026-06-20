@@ -49,7 +49,7 @@ end
 -- =============================================================================
 -- CONFIG / STATE
 -- =============================================================================
-local VERSION = "0.6.4"
+local VERSION = "0.6.5"
 
 local BANK_PROTOCOL = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
@@ -2414,6 +2414,8 @@ local deals = {
   msg = "",
   msg_col = QB.dim,
   form = {
+    from_id = "",
+    from_label = "",
     to_id = "",
     title = "",
     amount = "",
@@ -2421,6 +2423,9 @@ local deals = {
     start = "",
     note = "",
   },
+  payer_accounts = {},
+  payer_selected = 1,
+  payer_dropdown = false,
   suggestions = {},
   suggest_selected = 1,
 }
@@ -2950,39 +2955,119 @@ local function dDetail(deal)
   end
 end
 
+
+local function dPayerLabel(p)
+  if not p then return "Personal" end
+  return tostring(p.label or p.account_id or "Personal")
+end
+
+local function dLoadPayerAccounts()
+  local list = {}
+
+  list[#list + 1] = {
+    account_id = bank.citizen_id,
+    label = bank.username,
+    kind = "personal",
+  }
+
+  if bank.server then
+    local ok, res = bankReq({
+      type = "list_my_companies",
+      username = bank.username,
+      password = bank.password,
+    })
+
+    if ok and type(res) == "table" and type(res.companies) == "table" then
+      for _, co in ipairs(res.companies) do
+        local id = tostring(co.company_id or "")
+        if id ~= "" then
+          local label = tostring(co.ticker or co.name or id)
+          if co.name and co.ticker then
+            label = tostring(co.ticker) .. " - " .. tostring(co.name)
+          end
+
+          list[#list + 1] = {
+            account_id = id,
+            label = label,
+            kind = "company",
+          }
+        end
+      end
+    end
+  end
+
+  deals.payer_accounts = list
+  if deals.payer_selected < 1 then deals.payer_selected = 1 end
+  if deals.payer_selected > #list then deals.payer_selected = #list end
+
+  local p = deals.payer_accounts[deals.payer_selected]
+  deals.form.from_id = p and p.account_id or bank.citizen_id
+  deals.form.from_label = p and p.label or bank.username
+
+  return list
+end
+
+local function dDrawPayerDropdown(x, y, w)
+  local buttons = {}
+  local rows = math.min(4, #deals.payer_accounts)
+
+  qFill(x, y, w, rows, QB.tab_bg)
+
+  for i = 1, rows do
+    local p = deals.payer_accounts[i]
+    local active = i == deals.payer_selected
+    local bg = active and QB.btn_pri or QB.tab_bg
+    local fg = active and QB.btn_fg or QB.tab_fg_i
+    qFill(x, y + i - 1, w, 1, bg)
+    qAt(x + 1, y + i - 1, dPayerLabel(p):sub(1, w - 2), fg, bg)
+    buttons[i] = { x1 = x, x2 = x + w - 1, y1 = y + i - 1, y2 = y + i - 1, index = i }
+  end
+
+  return buttons
+end
+
 local function dNewDeal()
   local focus = 1
   local sending = false
   local currentDateLabel, currentDate = dCurrentDateLabel()
+  dLoadPayerAccounts()
 
   local function draw()
     dTop("New Deal")
     qCard(2, 6, W - 2, H - 8)
 
-    qAt(4, 7, "Recipient", QB.label, QB.card)
-    qInput(4, 8, W - 6, deals.form.to_id, false, focus == 1)
+    qAt(4, 7, "Pay From", QB.label, QB.card)
+    local payer = deals.payer_accounts[deals.payer_selected]
+    local payerLabel = dPayerLabel(payer)
+    local bPayer = qBtn(15, 7, W - 17, payerLabel:sub(1, W - 19), deals.payer_dropdown and QB.btn_pri or QB.btn_sec, deals.payer_dropdown and QB.btn_fg or QB.card_fg)
 
-    qAt(4, 10, "Title", QB.label, QB.card)
-    qInput(4, 11, W - 6, deals.form.title, false, focus == 2)
+    qAt(4, 9, "Recipient", QB.label, QB.card)
+    qInput(4, 10, W - 6, deals.form.to_id, false, focus == 1)
 
-    qAt(4, 13, "Amount", QB.label, QB.card)
-    qInput(4, 14, W - 6, deals.form.amount, false, focus == 3)
+    qAt(4, 12, "Title", QB.label, QB.card)
+    qInput(4, 13, W - 6, deals.form.title, false, focus == 2)
 
-    qAt(4, 16, "Frequency", QB.label, QB.card)
+    qAt(4, 15, "Amount", QB.label, QB.card)
+    qInput(4, 16, W - 6, deals.form.amount, false, focus == 3)
+
+    qAt(4, 18, "Frequency", QB.label, QB.card)
     local freqLabel = tostring(deals.form.frequency or "monthly")
     freqLabel = freqLabel:sub(1,1):upper() .. freqLabel:sub(2)
-    local bFreq = qBtn(15, 16, math.max(10, W - 17), freqLabel, focus == 4 and QB.btn_pri or QB.btn_sec, focus == 4 and QB.btn_fg or QB.card_fg)
+    local bFreq = qBtn(15, 18, math.max(10, W - 17), freqLabel, focus == 4 and QB.btn_pri or QB.btn_sec, focus == 4 and QB.btn_fg or QB.card_fg)
 
     local half = math.floor((W - 8) / 2)
     local bSend = qBtn(4, H - 2, half, sending and "Sending..." or "Propose", sending and QB.btn_sec or QB.btn_pri, sending and QB.card_fg or QB.btn_fg)
     local bBack = qBtn(5 + half, H - 2, half, "Back", QB.btn_sec, QB.card_fg)
 
-    local suggestionButtons = {}
+    local payerButtons = {}
+    if deals.payer_dropdown then
+      payerButtons = dDrawPayerDropdown(15, 8, W - 17)
+    end
 
-    -- Draw suggestions last so they can overlap the form like a proper dropdown.
-    if focus == 1 and #deals.suggestions > 0 then
+    local suggestionButtons = {}
+    if focus == 1 and #deals.suggestions > 0 and not deals.payer_dropdown then
       local maxRows = math.min(4, #deals.suggestions)
-      local ddX, ddY, ddW = 4, 9, W - 6
+      local ddX, ddY, ddW = 4, 11, W - 6
       qFill(ddX, ddY, ddW, maxRows, QB.tab_bg)
 
       for i = 1, maxRows do
@@ -2997,10 +3082,19 @@ local function dNewDeal()
     end
 
     dStatus()
-    return bSend, bBack, bFreq, suggestionButtons
+    return bSend, bBack, bFreq, bPayer, payerButtons, suggestionButtons
   end
 
-  local bSend, bBack, bFreq, suggestionButtons = draw()
+  local bSend, bBack, bFreq, bPayer, payerButtons, suggestionButtons = draw()
+
+  local function applyPayer(idx)
+    if not deals.payer_accounts[idx] then return end
+    deals.payer_selected = idx
+    local p = deals.payer_accounts[idx]
+    deals.form.from_id = p.account_id
+    deals.form.from_label = p.label
+    deals.payer_dropdown = false
+  end
 
   local function applySuggestion(s)
     if type(s) ~= "table" then return end
@@ -3021,6 +3115,12 @@ local function dNewDeal()
     if not amount or amount <= 0 then dSet("Enter valid amount.", QB.err); return false end
     if not dConnect() then return false end
 
+    local payer = deals.payer_accounts[deals.payer_selected]
+    if not payer then
+      dSet("Choose who is paying.", QB.err)
+      return false
+    end
+
     sending = true
     dSet("Sending proposal...", QB.dim)
     draw()
@@ -3029,7 +3129,9 @@ local function dNewDeal()
       type = "propose_deal",
       username = bank.username,
       password = bank.password,
-      from_id = bank.citizen_id,
+      from_id = payer.account_id,
+      from_label = payer.label,
+      from_kind = payer.kind,
       to_id = deals.form.to_id,
       title = deals.form.title,
       amount = amount,
@@ -3046,9 +3148,11 @@ local function dNewDeal()
       qCard(2, 6, W - 2, H - 8)
       qCentre(9, "Proposal Sent", QB.ok, QB.card)
       qCentre(11, tostring(deals.form.title):sub(1, W - 8), QB.card_fg, QB.card)
+      qCentre(12, "From: " .. tostring(payer.label):sub(1, W - 14), QB.label, QB.card)
       qCentre(13, "To: " .. tostring(deals.form.to_id):sub(1, W - 8), QB.label, QB.card)
       dStatus()
       sleep(0.7)
+
       deals.form.to_id = ""
       deals.form.title = ""
       deals.form.amount = ""
@@ -3062,7 +3166,6 @@ local function dNewDeal()
       return true
     end
 
-    sending = false
     dSet("Send failed: " .. tostring(res), QB.err)
     return false
   end
@@ -3071,6 +3174,7 @@ local function dNewDeal()
     local ev, a, x, y = os.pullEvent()
 
     if ev == "char" then
+      deals.payer_dropdown = false
       if focus == 1 and #deals.form.to_id < 32 then
         deals.form.to_id = deals.form.to_id .. a
         dLoadSuggestions(deals.form.to_id)
@@ -3093,6 +3197,7 @@ local function dNewDeal()
 
       elseif a == keys.tab then
         focus = focus % 4 + 1
+        deals.payer_dropdown = false
 
       elseif a == keys.up and focus == 1 and #deals.suggestions > 0 then
         deals.suggest_selected = deals.suggest_selected - 1
@@ -3120,29 +3225,41 @@ local function dNewDeal()
     elseif ev == "mouse_click" then
       if hit(bBack, x, y) then return end
       if hit(bSend, x, y) then if send() then return end end
+
+      if hit(bPayer, x, y) then
+        deals.payer_dropdown = not deals.payer_dropdown
+      end
+
+      for _, pb in ipairs(payerButtons or {}) do
+        if hit(pb, x, y) then applyPayer(pb.index) end
+      end
+
       if hit(bFreq, x, y) then
+        deals.payer_dropdown = false
         deals.form.frequency = dFrequencyPicker(deals.form.frequency)
       end
 
       for _, sb in ipairs(suggestionButtons or {}) do
-        if hit(sb, x, y) then
-          applySuggestion(sb.suggestion)
-        end
+        if hit(sb, x, y) then applySuggestion(sb.suggestion) end
       end
 
-      if y == 8 then
+      if y == 10 then
         focus = 1
+        deals.payer_dropdown = false
         dLoadSuggestions(deals.form.to_id)
-      elseif y == 11 then
+      elseif y == 13 then
         focus = 2
-      elseif y == 14 then
-        focus = 3
+        deals.payer_dropdown = false
       elseif y == 16 then
+        focus = 3
+        deals.payer_dropdown = false
+      elseif y == 18 then
         focus = 4
+        deals.payer_dropdown = false
       end
     end
 
-    bSend, bBack, bFreq, suggestionButtons = draw()
+    bSend, bBack, bFreq, bPayer, payerButtons, suggestionButtons = draw()
   end
 end
 local function messagesApp()
