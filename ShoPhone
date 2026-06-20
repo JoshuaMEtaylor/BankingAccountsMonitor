@@ -49,7 +49,7 @@ end
 -- =============================================================================
 -- CONFIG / STATE
 -- =============================================================================
-local VERSION = "0.5.1"
+local VERSION = "0.5.2"
 
 local BANK_PROTOCOL = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
@@ -408,7 +408,7 @@ end
 
 local function qTopBar()
   qFill(1, 1, W, 1, QB.header)
-  qAt(2, 1, "ShoMail", QB.hdr_fg, QB.header)
+  qAt(2, 1, "QUID BANK OF PLENTY", QB.hdr_fg, QB.header)
   qAt(W - #VERSION, 1, VERSION, QB.dim, QB.header)
 end
 
@@ -2239,7 +2239,9 @@ local deals = {
     frequency = "monthly",
     start = "",
     note = "",
-  }
+  },
+  suggestions = {},
+  suggest_selected = 1,
 }
 
 local function dSet(msg, col)
@@ -2306,6 +2308,95 @@ local function dReq(payload, timeout)
   if not deals.server then return false, "No deal server connected" end
   return request(deals.server, DEAL_PROTOCOL, payload, timeout or TIMEOUT)
 end
+
+local function dCurrentDateLabel()
+  local ok, res = dReq({ type = "get_world_date" }, 3)
+  if ok and type(res) == "table" and type(res.world_date) == "table" then
+    local d = res.world_date
+    return "Y" .. tostring(d.year or 1) .. " M" .. tostring(d.month or 1) .. " D" .. tostring(d.day or 1), d
+  end
+  return "Current in-game day", nil
+end
+
+local function dLoadSuggestions(query)
+  query = tostring(query or "")
+  if #query < 1 then
+    deals.suggestions = {}
+    deals.suggest_selected = 1
+    return
+  end
+
+  if not dConnect() then return end
+
+  local ok, res = dReq({
+    type = "suggest_recipients",
+    username = bank.username,
+    password = bank.password,
+    citizen_id = bank.citizen_id,
+    query = query,
+    limit = 5,
+  }, 4)
+
+  if ok and type(res) == "table" and type(res.suggestions) == "table" then
+    deals.suggestions = res.suggestions
+    deals.suggest_selected = 1
+  else
+    deals.suggestions = {}
+    deals.suggest_selected = 1
+  end
+end
+
+local function dFrequencyPicker(current)
+  local options = { "daily", "weekly", "monthly", "yearly" }
+  local selected = 3
+
+  for i, v in ipairs(options) do
+    if tostring(current or ""):lower() == v then selected = i end
+  end
+
+  while true do
+    dTop("Frequency")
+    qCard(2, 6, W - 2, H - 8)
+
+    qAt(4, 7, "Select payment frequency", QB.label, QB.card)
+
+    local buttons = {}
+    local y = 9
+    for i, option in ipairs(options) do
+      local active = i == selected
+      local bg = active and QB.btn_pri or QB.btn_sec
+      local fg = active and QB.btn_fg or QB.card_fg
+      buttons[i] = qBtn(4, y, W - 6, option:sub(1,1):upper() .. option:sub(2), bg, fg)
+      y = y + 2
+    end
+
+    local bBack = qBtn(4, H - 2, W - 6, "Back", QB.btn_sec, QB.card_fg)
+    dStatus()
+
+    local ev, a, x, yy = os.pullEvent()
+
+    if ev == "mouse_click" then
+      if hit(bBack, x, yy) then return current end
+      for i, b in ipairs(buttons) do
+        if hit(b, x, yy) then return options[i] end
+      end
+
+    elseif ev == "key" then
+      if a == keys.up then
+        selected = selected - 1
+        if selected < 1 then selected = #options end
+      elseif a == keys.down then
+        selected = selected + 1
+        if selected > #options then selected = 1 end
+      elseif a == keys.enter then
+        return options[selected]
+      elseif a == keys.escape or a == keys.backspace then
+        return current
+      end
+    end
+  end
+end
+
 
 local function dList()
   if not dConnect() then
@@ -2571,32 +2662,59 @@ end
 
 local function dNewDeal()
   local focus = 1
+  local currentDateLabel, currentDate = dCurrentDateLabel()
 
   local function draw()
     dTop("New Deal")
-    qCard(2, 6, W - 2, H - 8)
+    qCard(2, 6, W - 2, H - 9)
 
     qAt(4, 7, "Recipient", QB.label, QB.card)
     qInput(4, 8, W - 6, deals.form.to_id, false, focus == 1)
 
-    qAt(4, 10, "Title", QB.label, QB.card)
-    qInput(4, 11, W - 6, deals.form.title, false, focus == 2)
+    local suggestionButtons = {}
+    if focus == 1 and #deals.suggestions > 0 then
+      local y = 9
+      local maxRows = math.min(3, #deals.suggestions)
+      qFill(4, y, W - 6, maxRows, QB.tab_bg)
 
-    qAt(4, 13, "Amount", QB.label, QB.card)
-    qInput(4, 14, W - 6, deals.form.amount, false, focus == 3)
+      for i = 1, maxRows do
+        local s = deals.suggestions[i]
+        local bg = i == deals.suggest_selected and QB.btn_pri or QB.tab_bg
+        local fg = i == deals.suggest_selected and QB.btn_fg or QB.tab_fg_i
+        local label = tostring(s.label or s.display_name or s.account_id or s.id or "?")
+        qFill(4, y + i - 1, W - 6, 1, bg)
+        qAt(5, y + i - 1, label:sub(1, W - 8), fg, bg)
+        suggestionButtons[i] = { x1 = 4, x2 = W - 3, y1 = y + i - 1, y2 = y + i - 1, suggestion = s }
+      end
+    end
 
-    qAt(4, 16, "Frequency", QB.label, QB.card)
-    qInput(4, 17, W - 6, deals.form.frequency, false, focus == 4)
+    qAt(4, 12, "Title", QB.label, QB.card)
+    qInput(4, 13, W - 6, deals.form.title, false, focus == 2)
+
+    qAt(4, 15, "Amount", QB.label, QB.card)
+    qInput(4, 16, W - 6, deals.form.amount, false, focus == 3)
+
+    qAt(4, 18, "Frequency", QB.label, QB.card)
+    local bFreq = qBtn(4, 19, W - 6, tostring(deals.form.frequency or "monthly"):sub(1,1):upper() .. tostring(deals.form.frequency or "monthly"):sub(2), focus == 4 and QB.btn_pri or QB.btn_sec, focus == 4 and QB.btn_fg or QB.card_fg)
+
+    qAt(4, 21, "Start: " .. currentDateLabel, QB.label, QB.card)
 
     local half = math.floor((W - 8) / 2)
     local bSend = qBtn(4, H - 2, half, "Propose", QB.btn_pri, QB.btn_fg)
     local bBack = qBtn(5 + half, H - 2, half, "Back", QB.btn_sec, QB.card_fg)
 
     dStatus()
-    return bSend, bBack
+    return bSend, bBack, bFreq, suggestionButtons
   end
 
-  local bSend, bBack = draw()
+  local bSend, bBack, bFreq, suggestionButtons = draw()
+
+  local function applySuggestion(s)
+    if type(s) ~= "table" then return end
+    deals.form.to_id = tostring(s.account_id or s.id or s.citizen_id or s.username or deals.form.to_id)
+    deals.suggestions = {}
+    deals.suggest_selected = 1
+  end
 
   local function send()
     local amount = tonumber(deals.form.amount)
@@ -2614,7 +2732,7 @@ local function dNewDeal()
       title = deals.form.title,
       amount = amount,
       frequency = deals.form.frequency,
-      start_date = deals.form.start,
+      start_date = currentDate,
       note = deals.form.note,
     }, 8)
 
@@ -2626,6 +2744,8 @@ local function dNewDeal()
       deals.form.frequency = "monthly"
       deals.form.start = ""
       deals.form.note = ""
+      deals.suggestions = {}
+      deals.suggest_selected = 1
       deals.mode = "sent"
       dList()
       return true
@@ -2639,21 +2759,48 @@ local function dNewDeal()
     local ev, a, x, y = os.pullEvent()
 
     if ev == "char" then
-      if focus == 1 and #deals.form.to_id < 32 then deals.form.to_id = deals.form.to_id .. a end
-      if focus == 2 and #deals.form.title < 32 then deals.form.title = deals.form.title .. a end
-      if focus == 3 and #deals.form.amount < 10 then deals.form.amount = deals.form.amount .. a end
-      if focus == 4 and #deals.form.frequency < 16 then deals.form.frequency = deals.form.frequency .. a end
+      if focus == 1 and #deals.form.to_id < 32 then
+        deals.form.to_id = deals.form.to_id .. a
+        dLoadSuggestions(deals.form.to_id)
+      elseif focus == 2 and #deals.form.title < 32 then
+        deals.form.title = deals.form.title .. a
+      elseif focus == 3 and #deals.form.amount < 10 then
+        deals.form.amount = deals.form.amount .. a
+      end
 
     elseif ev == "key" then
       if a == keys.backspace then
-        if focus == 1 then deals.form.to_id = deals.form.to_id:sub(1, -2) end
-        if focus == 2 then deals.form.title = deals.form.title:sub(1, -2) end
-        if focus == 3 then deals.form.amount = deals.form.amount:sub(1, -2) end
-        if focus == 4 then deals.form.frequency = deals.form.frequency:sub(1, -2) end
+        if focus == 1 then
+          deals.form.to_id = deals.form.to_id:sub(1, -2)
+          dLoadSuggestions(deals.form.to_id)
+        elseif focus == 2 then
+          deals.form.title = deals.form.title:sub(1, -2)
+        elseif focus == 3 then
+          deals.form.amount = deals.form.amount:sub(1, -2)
+        end
+
       elseif a == keys.tab then
         focus = focus % 4 + 1
+
+      elseif a == keys.up and focus == 1 and #deals.suggestions > 0 then
+        deals.suggest_selected = deals.suggest_selected - 1
+        if deals.suggest_selected < 1 then deals.suggest_selected = math.min(3, #deals.suggestions) end
+
+      elseif a == keys.down and focus == 1 and #deals.suggestions > 0 then
+        deals.suggest_selected = deals.suggest_selected + 1
+        if deals.suggest_selected > math.min(3, #deals.suggestions) then deals.suggest_selected = 1 end
+
       elseif a == keys.enter then
-        if focus < 4 then focus = focus + 1 else if send() then return end end
+        if focus == 1 and #deals.suggestions > 0 then
+          applySuggestion(deals.suggestions[deals.suggest_selected])
+        elseif focus == 4 then
+          deals.form.frequency = dFrequencyPicker(deals.form.frequency)
+        elseif focus < 4 then
+          focus = focus + 1
+        else
+          if send() then return end
+        end
+
       elseif a == keys.escape then
         return
       end
@@ -2661,13 +2808,31 @@ local function dNewDeal()
     elseif ev == "mouse_click" then
       if hit(bBack, x, y) then return end
       if hit(bSend, x, y) then if send() then return end end
-      if y == 8 then focus = 1 elseif y == 11 then focus = 2 elseif y == 14 then focus = 3 elseif y == 17 then focus = 4 end
+      if hit(bFreq, x, y) then
+        deals.form.frequency = dFrequencyPicker(deals.form.frequency)
+      end
+
+      for _, sb in ipairs(suggestionButtons or {}) do
+        if hit(sb, x, y) then
+          applySuggestion(sb.suggestion)
+        end
+      end
+
+      if y == 8 then
+        focus = 1
+        dLoadSuggestions(deals.form.to_id)
+      elseif y == 13 then
+        focus = 2
+      elseif y == 16 then
+        focus = 3
+      elseif y == 19 then
+        focus = 4
+      end
     end
 
-    bSend, bBack = draw()
+    bSend, bBack, bFreq, suggestionButtons = draw()
   end
 end
-
 local function messagesApp()
   if not bank.logged then
     if not bankLogin() then return end
