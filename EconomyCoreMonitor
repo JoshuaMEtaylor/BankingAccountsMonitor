@@ -15,7 +15,53 @@
 -- Read-only. No banking controls. No trade panel. Contract GDP plus bank-side service GDP over 365 Minecraft days + in-view MCT clock + tapered money-supply inflation.
 -- =============================================================================
 
-local VERSION         = "0.5.21-REAL-TX-MONETARY"
+local args = {...}
+
+-- =============================================================================
+-- SELF UPDATE
+-- =============================================================================
+if args[1] ~= "--updated" then
+  print("[ Economy Core Monitor ]")
+  print("Deleting old version...")
+  fs.delete("startup.lua")
+
+  print("Downloading latest from GitHub...")
+  local cache_bust = tostring(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
+  local update_url = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/EconomyCoreMonitor?cb=" .. cache_bust
+
+  shell.run("wget " .. update_url .. " startup.lua")
+
+  if not fs.exists("startup.lua") then
+    print("")
+    print("Download failed.")
+    print("Expected GitHub file: EconomyCoreMonitor")
+    print("")
+    print("Manual install:")
+    print("delete startup")
+    print("wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/EconomyCoreMonitor?cb=001 startup.lua")
+    print("startup.lua")
+    return
+  end
+
+  print("Relaunching...")
+  sleep(0.5)
+
+  -- Preserve optional arguments, especially forced bank ID, after the update.
+  local relaunch_args = { "startup.lua", "--updated" }
+  for i = 1, #args do
+    relaunch_args[#relaunch_args + 1] = tostring(args[i])
+  end
+  local unpackFn = table.unpack or unpack
+  shell.run(unpackFn(relaunch_args))
+  return
+end
+
+local runtime_args = {}
+for i = 2, #args do
+  runtime_args[#runtime_args + 1] = args[i]
+end
+
+local VERSION         = "0.5.22-SELF-UPDATE"
 local PROTOCOL        = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT      = 5
@@ -30,8 +76,7 @@ local INFLATION_BASE_FILE = "data/economy_monetary_inflation_base.db"
 local INFLATION_HALF_LIFE_MS = 24 * 60 * 60 * 1000 -- no new printing: inflation pressure halves every 24h
 local MAX_HISTORY     = 120
 
-local args = {...}
-local FORCED_BANK_ID = tonumber(args[1])
+local FORCED_BANK_ID = tonumber(runtime_args[1])
 
 -- Low-impact polling controls.
 -- The monitor still keeps the full original dashboard/features, but expensive
