@@ -12,10 +12,10 @@
 --   COMPANIES
 --   TRANSACTIONS PER DAY
 --
--- Read-only. No banking controls. No trade panel. Contract GDP over 365 Minecraft days + in-view MCT clock + tapered money-supply inflation.
+-- Read-only. No banking controls. No trade panel. Contract GDP plus bank-side service GDP over 365 Minecraft days + in-view MCT clock + tapered money-supply inflation.
 -- =============================================================================
 
-local VERSION         = "0.5.17-CORE-FINANCE-REVERT"
+local VERSION         = "0.5.19-SERVICE-GDP"
 local PROTOCOL        = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT      = 5
@@ -1147,20 +1147,43 @@ local function fallbackSnapshot()
   end
 
   local contractEco = fetchContractEconomy()
-  local gdp = nil
-  local outputStatus = "Waiting for ContractServer / fulfilled contracts"
-  if contractEco and contractEco.connected then
-    gdp = tonumber(contractEco.gdp_365d or contractEco.gdp_24h) or 0
-    outputStatus = contractEco.status or "GDP from fulfilled contracts"
+
+  -- GDP is now assembled from two output streams:
+  --   1. ContractServer fulfilled contracts.
+  --   2. Bank ledger service output, especially Dining Hall / restaurant meals.
+  -- The bank request explicitly excludes contract payouts so we do not double
+  -- count contracts already read from ContractServer.
+  local bankServiceGdp = 0
+  local bankHospitalityGdp = 0
+  local bankServiceEvents = 0
+  local bankGdpRes = nil
+  local okGdp, gdpRes = cachedDbRequest({
+    type = "economic_gdp",
+    days = GDP_PERIOD_MC_DAYS,
+    exclude_contracts = true,
+  }, 4, ECONOMIC_GDP_POLL_SECONDS)
+
+  if okGdp and type(gdpRes) == "table" then
+    bankGdpRes = gdpRes
+    bankServiceGdp = num(gdpRes.service_gdp or gdpRes.services_gdp or gdpRes.non_contract_gdp or gdpRes.gdp or gdpRes.private_gdp) or 0
+    bankHospitalityGdp = num(gdpRes.hospitality_gdp or gdpRes.meal_gdp) or 0
+    bankServiceEvents = num(gdpRes.service_events or gdpRes.hospitality_events or gdpRes.transaction_count) or 0
   else
-    local okGdp, gdpRes = cachedDbRequest({ type = "economic_gdp", days = 30 }, 4, ECONOMIC_GDP_POLL_SECONDS)
-    if okGdp and type(gdpRes) == "table" then
-      gdp = num(gdpRes.total or gdpRes.gdp or gdpRes.private_gdp)
-      outputStatus = "Private GDP fallback from bank ledger"
-    else
-      endpointErrors[#endpointErrors + 1] = "gdp=" .. shortText(tostring(gdpRes), 36)
-    end
+    endpointErrors[#endpointErrors + 1] = "service_gdp=" .. shortText(tostring(gdpRes), 36)
   end
+
+  local contractGdp = 0
+  local outputStatus = "Waiting for ContractServer / bank service GDP"
+  if contractEco and contractEco.connected then
+    contractGdp = tonumber(contractEco.gdp_365d or contractEco.gdp_24h) or 0
+    outputStatus = "GDP = fulfilled contracts + bank service output"
+  elseif bankServiceGdp > 0 then
+    outputStatus = "GDP = bank service output; ContractServer unavailable"
+  else
+    outputStatus = "Waiting for fulfilled contracts / restaurant service sales"
+  end
+
+  local gdp = contractGdp + bankServiceGdp
 
   local gdpCap = nil
   if gdp and population and population > 0 then gdpCap = gdp / population end
@@ -1204,6 +1227,11 @@ local function fallbackSnapshot()
       source = sourceText,
     },
     contracts = contractEco,
+    service_gdp = bankServiceGdp,
+    hospitality_gdp = bankHospitalityGdp,
+    contract_gdp = contractGdp,
+    bank_gdp = bankGdpRes,
+    service_events = bankServiceEvents,
     _raw_accounts = accounts,
     accounts_from_previous = accountsFromPrevious,
   }
@@ -1493,19 +1521,28 @@ local function drawScaleCard(x, y, w, h, snap)
   local contractLine = "Contracts O/C/F: " .. tostring(c.open or 0) .. "/" .. tostring(c.claimed or 0) .. "/" .. tostring(c.fulfilled or 0)
   writeAt(x + 2, y + 5, shortText(contractLine, w - 4), c.connected and C.good or C.warn, C.bg)
 
-  writeAt(x + 2, y + 7, "Top companies", colors.white, C.bg)
+  local svc = snap and snap.service_gdp or nil
+  local hosp = snap and snap.hospitality_gdp or nil
+  local conGdp = snap and snap.contract_gdp or nil
+  local serviceLine = "GDP split C/S: " .. fmtMoney(conGdp or 0) .. " / " .. fmtMoney(svc or 0)
+  writeAt(x + 2, y + 6, shortText(serviceLine, w - 4), (svc and svc > 0) and C.good or C.dim, C.bg)
+  if hosp and hosp > 0 then
+    writeAt(x + 2, y + 7, shortText("Restaurant/meals GDP: " .. fmtMoney(hosp), w - 4), colors.yellow, C.bg)
+  end
+
+  writeAt(x + 2, y + 9, "Top companies", colors.white, C.bg)
   local top = s.top_companies or {}
   if type(top) ~= "table" or #top == 0 then
-    writeAt(x + 2, y + 8, "No company account data", C.warn, C.bg)
+    writeAt(x + 2, y + 10, "No company account data", C.warn, C.bg)
   else
-    local maxRows = math.min(10, #top, math.max(1, h - 10))
+    local maxRows = math.min(10, #top, math.max(1, h - 12))
     for i = 1, maxRows do
       local company = top[i] or {}
       local name = shortText(company.name or company.id or ("Company " .. i), math.max(8, w - 18))
       local bal = fmtMoney(company.balance)
       local line = tostring(i) .. ". " .. name
-      writeAt(x + 2, y + 7 + i, shortText(line, w - 18), C.text, C.bg)
-      writeAt(x + w - #bal - 2, y + 7 + i, bal, colors.white, C.bg)
+      writeAt(x + 2, y + 9 + i, shortText(line, w - 18), C.text, C.bg)
+      writeAt(x + w - #bal - 2, y + 9 + i, bal, colors.white, C.bg)
     end
   end
 
@@ -1537,7 +1574,7 @@ local function drawFooter()
   local w, h = getSize()
   fill(1, h - 1, w, 2, C.bg)
   writeAt(1, h - 1, string.rep("-", w), C.dim, C.bg)
-  local text = "Refresh: " .. REFRESH_SECONDS .. "s   CORE FINANCE / CONTRACT GDP   Monitor: " .. (monitor and "attached" or "terminal") .. "   [Q] Quit"
+  local text = "Refresh: " .. REFRESH_SECONDS .. "s   CORE FINANCE / CONTRACT + SERVICE GDP   Monitor: " .. (monitor and "attached" or "terminal") .. "   [Q] Quit"
   writeAt(2, h, text, C.dim, C.bg)
   if last_error ~= "" then writeAt(math.max(2, w - #last_error - 2), h, last_error, C.bad, C.bg) end
 end
