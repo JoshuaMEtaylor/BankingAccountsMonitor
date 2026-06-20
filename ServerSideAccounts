@@ -22,7 +22,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.4.19-GOV-PAYROLL"
+local VERSION  = "1.4.21-PUBLIC-PAYROLL-COERCE"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -2301,38 +2301,75 @@ end
 -- ColonyBusinessIntegrator is the live source of truth for citizen -> employer mapping.
 -- This lets CompanyPayroll run on a separate terminal without a colony integrator
 -- or local mapping files.
+--
+-- Important: public workers do not need a registered company.  Defence,
+-- research, and state logistics mappings are accepted with treasury:quid_bank
+-- as their payer so the normal payroll terminal can pay them from the Treasury.
 handlers["sync_employee_mappings"] = function(sender_id, req)
   local incoming = req and (req.employees or req.mappings) or {}
   if type(incoming) ~= "table" then return false, "Missing employees table" end
+
+  local function isPublicIndustry(industry)
+    industry = lower(industry or "")
+    return industry == "defence" or industry == "research" or industry == "logistics"
+  end
 
   local now_ts = timestamp()
   local seen = {}
   local updated = 0
   local active = 0
+  local rejected = 0
+  local public = 0
+  local private = 0
 
   for _, e in ipairs(incoming) do
-    if type(e) == "table" and e.citizen_id and e.company_id then
+    if type(e) == "table" and e.citizen_id then
       local citizen_id = tostring(e.citizen_id)
-      local company_id = tostring(e.company_id)
-      if isActiveCitizenAccount(citizen_id) and accountExists(company_id) and companies[company_id] then
+      local industry = lower(e.industry or "general")
+      local company_id = tostring(e.company_id or "")
+
+      -- Public/state jobs are ALWAYS paid by the Treasury.
+      -- Do not preserve a generated industry company such as company:must for
+      -- research/defence/logistics workers. Those companies may exist for
+      -- accounting/sector display, but they are not the wage payer.
+      local company_name = e.company_name
+      if isPublicIndustry(industry) then
+        company_id = "treasury:quid_bank"
+        company_name = "Quid Treasury"
+      end
+
+      local validPayer = false
+      if company_id == "treasury:quid_bank" then
+        validPayer = accountExists("treasury:quid_bank")
+        company_name = company_name or "Quid Treasury"
+      elseif company_id ~= "" then
+        validPayer = accountExists(company_id) and companies[company_id] ~= nil
+        company_name = company_name or (companies[company_id] and (companies[company_id].name or companies[company_id].display_name)) or company_id
+      end
+
+      if isActiveCitizenAccount(citizen_id) and validPayer then
         local rec = employment_mappings[citizen_id] or {}
         rec.citizen_id = citizen_id
         rec.display_name = e.display_name or e.name or rec.display_name or citizen_id
         rec.job_text = e.job_text or e.title or e.job or rec.job_text or ""
-        rec.industry = e.industry or rec.industry or "general"
+        rec.industry = industry
         rec.company_id = company_id
-        rec.company_name = e.company_name or rec.company_name or company_id
+        rec.company_name = company_name or company_id
         rec.building_key = e.building_key or rec.building_key
         rec.work_type = e.work_type or rec.work_type
         rec.work_name = e.work_name or rec.work_name
         rec.work_location = e.work_location or rec.work_location
         rec.active = e.active ~= false
+        rec.pay_type = company_id == "treasury:quid_bank" and "government" or "company"
         rec.source = "ColonyBusinessIntegrator:" .. tostring(sender_id)
         rec.updated_at = now_ts
         employment_mappings[citizen_id] = rec
         seen[citizen_id] = true
         updated = updated + 1
         if rec.active then active = active + 1 end
+        if rec.pay_type == "government" then public = public + 1 else private = private + 1 end
+      else
+        rejected = rejected + 1
       end
     end
   end
@@ -2345,13 +2382,47 @@ handlers["sync_employee_mappings"] = function(sender_id, req)
     end
   end
 
-  saveEmployment()
-  audit("ACTION", "STATE", sender_id, "SYNC_EMPLOYEE_MAPPINGS", tostring(updated))
-  return true, { updated = updated, active = active, total = updated }
+  local okSave = saveEmployment()
+  audit("ACTION", "STATE", sender_id, "SYNC_EMPLOYEE_MAPPINGS", "updated=" .. tostring(updated) .. " public=" .. tostring(public) .. " private=" .. tostring(private) .. " rejected=" .. tostring(rejected))
+  if not okSave then return false, "Failed to save employment mappings" end
+  return true, { updated = updated, active = active, total = updated, public = public, private = private, rejected = rejected }
+end
+
+
+local function isPublicEmploymentIndustry(industry)
+  industry = lower(industry or "")
+  return industry == "defence" or industry == "research" or industry == "logistics"
+end
+
+local function coercePublicEmploymentMappings(reason)
+  local changed = 0
+  local now_ts = timestamp()
+  for citizen_id, rec in pairs(employment_mappings or {}) do
+    if type(rec) == "table" and rec.active ~= false and isPublicEmploymentIndustry(rec.industry) then
+      if rec.company_id ~= "treasury:quid_bank" or rec.pay_type ~= "government" or rec.company_name ~= "Quid Treasury" then
+        rec.original_company_id = rec.original_company_id or rec.company_id
+        rec.original_company_name = rec.original_company_name or rec.company_name
+        rec.company_id = "treasury:quid_bank"
+        rec.company_name = "Quid Treasury"
+        rec.pay_type = "government"
+        rec.public_payroll_coerced = true
+        rec.public_payroll_coerced_reason = reason or "public_industry"
+        rec.updated_at = now_ts
+        employment_mappings[citizen_id] = rec
+        changed = changed + 1
+      end
+    end
+  end
+  if changed > 0 then
+    saveEmployment()
+    audit("ACTION", "STATE", "db", "COERCE_PUBLIC_EMPLOYMENT", tostring(changed))
+  end
+  return changed
 end
 
 -- LIST_EMPLOYEE_MAPPINGS
 handlers["list_employee_mappings"] = function(sender_id, req)
+  local coerced = coercePublicEmploymentMappings("list_employee_mappings")
   local result = {}
   local active_only = not (req and req.include_inactive == true)
   for citizen_id, rec in pairs(employment_mappings) do
@@ -2365,8 +2436,17 @@ handlers["list_employee_mappings"] = function(sender_id, req)
   table.sort(result, function(a,b)
     return tostring(a.display_name or a.citizen_id or "") < tostring(b.display_name or b.citizen_id or "")
   end)
-  return true, { employees = result, count = #result }
+  return true, { employees = result, count = #result, public_coerced = coerced }
 end
+
+-- FIX_PUBLIC_EMPLOYEE_MAPPINGS
+-- One-shot admin helper for old databases where research/defence/logistics
+-- workers were mapped to generated companies. This rewrites them to Treasury.
+handlers["fix_public_employee_mappings"] = function(sender_id, req)
+  local changed = coercePublicEmploymentMappings("manual_fix")
+  return true, { changed = changed, message = "Public employment mappings coerced to treasury payroll" }
+end
+
 
 
 
