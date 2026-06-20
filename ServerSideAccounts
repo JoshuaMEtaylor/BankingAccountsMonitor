@@ -22,7 +22,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.4.22-WAGE-PRICE-PRESSURE"
+local VERSION  = "1.4.23-WAGE-PRICE-SYNTAX-FIX"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -1124,7 +1124,7 @@ end
 
 
 -- =============================================================================
-NATIONAL PRICE + WAGE PRESSURE ORACLE
+-- NATIONAL PRICE + WAGE PRESSURE ORACLE
 --
 -- The old sector CPI spread looked more precise than the simulation really is.
 -- We now use one national price index for all item/service quotes:
