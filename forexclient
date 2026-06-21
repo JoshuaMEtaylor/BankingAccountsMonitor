@@ -1,7 +1,7 @@
 -- =============================================================================
 -- FOREX CLIENT
 -- forexclient
--- v0.7.5-QUID-LOTS-MONITOR-MIRROR
+-- v0.7.6-DECIMAL-QUID-MONITOR-MIRROR
 --
 -- Purpose:
 --   Trading-terminal style client for the Oracle/Kraken EUR/USD forexserver.
@@ -67,7 +67,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION = "0.7.5-QUID-LOTS-MONITOR-MIRROR"
+local VERSION = "0.7.6-DECIMAL-QUID-MONITOR-MIRROR"
 local FX_PROTOCOL = "quid_fx"
 local BANK_PROTOCOL = "quid_bank"
 local BANK_TIMEOUT = 5
@@ -516,6 +516,16 @@ local function ceil(n)
   return i
 end
 
+local function round2(n)
+  n = tonumber(n) or 0
+  if n >= 0 then return math.floor(n * 100 + 0.5) / 100 end
+  return math.ceil(n * 100 - 0.5) / 100
+end
+
+local function qfmt(n)
+  return string.format("%.2f Q", round2(n))
+end
+
 local function lotStep()
   return tonumber(orders.lot_step or LOT_STEP) or LOT_STEP
 end
@@ -553,7 +563,7 @@ end
 
 local function marginForLots(lots)
   lots = tonumber(lots) or 0
-  return ceil((lots * lotNotionalUsd()) / quidUsdValue())
+  return round2((lots * lotNotionalUsd()) / quidUsdValue())
 end
 
 
@@ -565,7 +575,7 @@ end
 
 local function reserveMargin(amount, memo)
   if not bank_session.logged_in then return false, "Bank login required" end
-  amount = math.floor(tonumber(amount) or 0)
+  amount = round2(tonumber(amount) or 0)
   if amount <= 0 then return false, "Invalid margin" end
   if amount > math.floor(tonumber(bank_session.balance or 0)) then
     return false, "Insufficient balance for margin: need " .. tostring(amount) .. " Q"
@@ -581,7 +591,7 @@ local function reserveMargin(amount, memo)
   })
 
   if ok and type(res) == "table" then
-    bank_session.balance = math.max(0, (tonumber(bank_session.balance) or 0) - amount)
+    bank_session.balance = round2(math.max(0, (tonumber(bank_session.balance) or 0) - amount))
     return true, res
   end
   return false, res
@@ -589,7 +599,7 @@ end
 
 local function releaseMargin(amount, memo, orderId)
   if not bank_session.logged_in then return false, "Bank login required" end
-  amount = math.floor(tonumber(amount) or 0)
+  amount = round2(tonumber(amount) or 0)
   if amount < 0 then return false, "Invalid payout" end
   if amount == 0 then return true, { tx_id = nil, amount = 0 } end
 
@@ -723,7 +733,7 @@ local function openOrder(side)
     request_id = reqId,
   }, FX_PROTOCOL)
 
-  last_error = "Locked " .. tostring(margin) .. " Q margin. Sending " .. tostring(side) .. " order..."
+  last_error = "Locked " .. qfmt(margin) .. " margin. Sending " .. tostring(side) .. " order..."
 end
 
 local function closeSelectedOrder()
@@ -922,11 +932,11 @@ local function handleServerMessage(sender, msg)
         last_error = "Orders updated"
 
         if type(msg.order) == "table" and msg.order.status == "CLOSED" then
-          local payout = math.floor(tonumber(msg.order.payout_q) or 0)
+          local payout = round2(tonumber(msg.order.payout_q) or 0)
           local oid = tonumber(msg.order.id)
           local okRelease, rel = releaseMargin(payout, "Forex close order " .. tostring(oid), oid)
           if okRelease then
-            last_error = "Order " .. tostring(oid) .. " closed. Payout " .. tostring(payout) .. " Q"
+            last_error = "Order " .. tostring(oid) .. " closed. Payout " .. qfmt(payout)
           else
             last_error = "ORDER CLOSED BUT PAYOUT FAILED: " .. tostring(rel)
           end
@@ -1252,15 +1262,15 @@ local function drawOrdersPanel(x, y, w, h)
 
   -- Balance is intentionally not polled every redraw. It updates on login,
   -- order margin lock, and trade close settlement.
-  local bal = math.floor(tonumber(bank_session.balance or 0))
+  local bal = round2(tonumber(bank_session.balance or 0))
   local maxLots = maxLotsForBalance(bal)
-  at(x, y, "Balance: " .. tostring(bal) .. " Q  Max: " .. string.format("%.2f", maxLots) .. " lots", colors.yellow)
+  at(x, y, "Balance: " .. qfmt(bal) .. "  Max: " .. string.format("%.2f", maxLots) .. " lots", colors.yellow)
 
   cleanLotsText()
   local lots = currentLots() or 0
   local margin = marginForLots(lots)
   local afford = lots >= minLots() and lots <= maxLots and margin <= bal
-  local info = "Lots " .. tostring(lots_text) .. " | Margin " .. tostring(margin) .. " Q | 0.01 lot=" .. tostring(marginForLots(0.01)) .. " Q"
+  local info = "Lots " .. tostring(lots_text) .. " | Margin " .. qfmt(margin) .. " | 0.01 lot=" .. qfmt(marginForLots(0.01))
   at(x, y + 1, info, afford and colors.lightGray or colors.red)
 
   at(x, y + 2, "Lots", colors.lightGray)
@@ -1285,7 +1295,7 @@ local function drawOrdersPanel(x, y, w, h)
 
   local total = tonumber(orders.unrealized_pnl or 0) or 0
   local pnlCol = total > 0 and colors.lime or (total < 0 and colors.red or colors.lightGray)
-  at(x + math.max(50, w - 30), y, "Open P/L " .. tostring(math.floor(total + 0.5)) .. " Q", pnlCol)
+  at(x + math.max(50, w - 30), y, "Open P/L " .. qfmt(total), pnlCol)
   at(x + math.max(50, w - 30), y + 1, "Acct " .. tostring(bank_session.username or "?"):sub(1, 12), colors.lightGray)
 
   local headerY = btnY + btnH + 1
@@ -1310,7 +1320,7 @@ local function drawOrdersPanel(x, y, w, h)
     at(x + 14, rowY, string.format("%-6s", tostring(o.margin_q or "?")), colors.yellow, bg)
     at(x + 21, rowY, fmt(o.entry_price, 5), colors.white, bg)
     at(x + 31, rowY, fmt(o.live_price, 5), colors.white, bg)
-    at(x + 41, rowY, tostring(math.floor(pnl + 0.5)) .. "Q", pnlColRow, bg)
+    at(x + 41, rowY, qfmt(pnl), pnlColRow, bg)
     orderRowRects[#orderRowRects + 1] = { id = id, x1 = x, x2 = x + w - 1, y = rowY }
   end
 
@@ -1337,7 +1347,7 @@ local function drawMonitorDisplay()
   local q = last_tick and tostring(last_tick.quality or "unknown") or "OFFLINE"
   local total = tonumber(orders.unrealized_pnl or 0) or 0
   local pnlCol = total > 0 and colors.lime or (total < 0 and colors.red or colors.lightGray)
-  local bal = math.floor(tonumber(bank_session.balance or 0))
+  local bal = round2(tonumber(bank_session.balance or 0))
   local maxLots = maxLotsForBalance(bal)
   local lots = currentLots() or 0
   local margin = marginForLots(lots)
@@ -1348,11 +1358,11 @@ local function drawMonitorDisplay()
   at(48, 3, "Quality: " .. q, colourForQuality(q))
 
   at(2, 4, "Account: " .. tostring(bank_session.username or "not logged"), bank_session.logged_in and colors.lime or colors.red)
-  at(24, 4, "Balance: " .. tostring(bal) .. " Q", colors.yellow)
+  at(24, 4, "Balance: " .. qfmt(bal), colors.yellow)
   at(44, 4, "Max: " .. string.format("%.2f", maxLots) .. " lots", colors.lightGray)
-  at(64, 4, "Open P/L: " .. tostring(math.floor(total + 0.5)) .. " Q", pnlCol)
+  at(64, 4, "Open P/L: " .. qfmt(total), pnlCol)
 
-  at(2, 5, "Lots: " .. tostring(lots_text) .. " | Margin: " .. tostring(margin) .. " Q | 0.01 lot=" .. tostring(marginForLots(0.01)) .. " Q", colors.lightGray)
+  at(2, 5, "Lots: " .. tostring(lots_text) .. " | Margin: " .. qfmt(margin) .. " | 0.01 lot=" .. qfmt(marginForLots(0.01)), colors.lightGray)
 
   -- Right-side symbols panel, matching the terminal.
   local sideW = 18
