@@ -1,7 +1,7 @@
 -- =============================================================================
 -- FOREX CLIENT - EUR/USD CANDLEGRAPH
 -- forexclient
--- v0.5.0-EURUSD-5M-CANDLES
+-- v0.5.1-EURUSD-5M-CANDLES
 --
 -- Purpose:
 --   Display/test client for forexserver v0.5.0 Oracle/Kraken anchor.
@@ -17,43 +17,58 @@
 local args = {...}
 
 -- =============================================================================
--- SELF UPDATE
+-- SAFE SELF UPDATE
 -- =============================================================================
 if args[1] ~= "--updated" then
   print("[ Forex Client ]")
-  print("Deleting old version...")
-  fs.delete("startup.lua")
-
   print("Downloading latest from GitHub...")
+
   local cb = tostring(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
   local url = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/forexclient?cb=" .. cb
-  shell.run("wget " .. url .. " startup.lua")
 
-  if not fs.exists("startup.lua") then
+  local tmp = "startup.new"
+  local bak = "startup.old"
+  fs.delete(tmp)
+
+  shell.run("wget " .. url .. " " .. tmp)
+
+  if not fs.exists(tmp) then
     print("")
-    print("Download failed.")
+    print("Download failed. Keeping current startup.lua untouched.")
     print("Expected GitHub file: forexclient")
-    print("")
-    print("Manual install:")
-    print("delete startup")
-    print("wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/forexclient?cb=050 startup.lua")
-    print("startup.lua --updated")
     return
   end
 
-  print("Relaunching...")
+  local f = fs.open(tmp, "r")
+  local body = f and f.readAll() or ""
+  if f then f.close() end
+
+  if not body or body == "" or #body < 100 then
+    fs.delete(tmp)
+    print("")
+    print("Downloaded file looked empty/bad. Keeping current startup.lua untouched.")
+    return
+  end
+
+  fs.delete(bak)
+  if fs.exists("startup.lua") then fs.move("startup.lua", bak) end
+  fs.move(tmp, "startup.lua")
+
+  print("Update installed. Relaunching...")
   sleep(0.5)
-  local relaunch = { "startup.lua", "--updated" }
-  for i = 1, #args do relaunch[#relaunch + 1] = tostring(args[i]) end
-  local unpackFn = table.unpack or unpack
-  shell.run(unpackFn(relaunch))
+
+  if #args >= 2 then
+    shell.run("startup.lua", "--updated", tostring(args[2]))
+  else
+    shell.run("startup.lua", "--updated")
+  end
   return
 end
 
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION = "0.5.0-EURUSD-5M-CANDLES"
+local VERSION = "0.5.1-EURUSD-5M-CANDLES"
 local FX_PROTOCOL = "quid_fx"
 
 -- Optional: pass server id as second argument, e.g. startup.lua --updated 12
