@@ -1,24 +1,79 @@
 -- =============================================================================
 -- FOREX CLIENT
 -- forexclient
--- v0.6.2-EURUSD-5M-JOINED-CANDLES-UPDATER
+-- v0.6.3-EURUSD-5M-PROPER-CANDLES-UPDATER
 --
 -- Purpose:
 --   Trading-terminal style client for the Oracle/Kraken EUR/USD forexserver.
 --
 -- This build:
---   - NO self updater
+--   - safe self updater using startup.new/startup.old
 --   - requests server-side candle history at boot so the chart does not start
 --     from a single fresh candle
---   - renders actual candlesticks rather than hash bars
+--   - renders proper joined candlesticks
+--   - neutral/no-change candles draw flat instead of fake red/green bodies
 --   - keeps updating the active candle from live server ticks
 -- =============================================================================
 
 local args = {...}
 
-local VERSION = "0.6.2-EURUSD-5M-JOINED-CANDLES-UPDATER"
+-- =============================================================================
+-- SAFE SELF UPDATE
+-- =============================================================================
+-- Normal run:
+--   startup
+--   startup <server_id>
+--
+-- Manual test / bypass updater:
+--   startup --updated
+--   startup --updated <server_id>
+--
+-- Downloads to startup.new first. Only replaces startup.lua after the new file
+-- exists and is non-empty, so a failed download cannot delete the running script.
+if args[1] ~= "--updated" then
+  print("[ Forex Client ]")
+  print("Checking GitHub update...")
+
+  local tmp = "startup.new"
+  local old = "startup.old"
+  fs.delete(tmp)
+
+  local cb = tostring(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
+  local url = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/forexclient?cb=" .. cb
+  shell.run("wget " .. url .. " " .. tmp)
+
+  local okDownload = false
+  if fs.exists(tmp) then
+    local f = fs.open(tmp, "r")
+    local body = f and f.readAll() or ""
+    if f then f.close() end
+    okDownload = body and #body > 50
+  end
+
+  if not okDownload then
+    fs.delete(tmp)
+    print("Update failed or empty. Keeping existing startup.lua.")
+    print("Run startup --updated to bypass updater for manual testing.")
+    return
+  end
+
+  fs.delete(old)
+  if fs.exists("startup.lua") then fs.move("startup.lua", old) end
+  fs.move(tmp, "startup.lua")
+
+  print("Updated. Relaunching...")
+  sleep(0.5)
+
+  local relaunch = { "startup.lua", "--updated" }
+  for i = 1, #args do relaunch[#relaunch + 1] = tostring(args[i]) end
+  local unpackFn = table.unpack or unpack
+  shell.run(unpackFn(relaunch))
+  return
+end
+
+local VERSION = "0.6.3-EURUSD-5M-PROPER-CANDLES-UPDATER"
 local FX_PROTOCOL = "quid_fx"
-local server_id = tonumber(args[1])
+local server_id = tonumber(args[2])
 
 local SAMPLE_SECONDS = 0.10
 local DRAW_SECONDS = 0.25
@@ -30,11 +85,16 @@ local CANDLE_SECONDS = 300
 local MAX_CANDLES = 576
 local TEXT_SCALE = 0.5
 
--- Fixed EUR/USD chart range.
--- This stops every new candle from becoming the chart high/low just because the
--- visible candle window is narrow.
-local CHART_MIN_PRICE = 0.90000
-local CHART_MAX_PRICE = 1.90000
+-- Chart scaling.
+-- A full 0.90000-1.90000 axis is too wide for a ComputerCraft candle chart;
+-- normal EUR/USD movement becomes invisible. Instead we use a proper trading
+-- terminal style window: centre around visible price action, enforce a minimum
+-- range so every tiny move does not become an ATH/ATL, and keep 0.9/1.9 as hard
+-- safety rails.
+local HARD_MIN_PRICE = 0.90000
+local HARD_MAX_PRICE = 1.90000
+local MIN_VISIBLE_RANGE = 0.01000 -- 100 pips total; enough to avoid fake ATH scaling.
+local PRICE_EPS = 0.000005       -- half a pip at 5dp; treated as neutral/doji.
 
 local CANDLES_FILE = "data/forex_client_eurusd_5m_candles.db"
 local STATE_FILE = "data/forex_client_state.db"
@@ -427,19 +487,64 @@ local function drawTradingCandles(x, y, w, h)
     return
   end
 
-  -- Fixed global price range, not autoscaled to the visible candle window.
-  -- Autoscaling made every tiny candle look like an ATH/ATL. This keeps the
-  -- chart anchored like a proper terminal axis.
-  local lo = CHART_MIN_PRICE
-  local hi = CHART_MAX_PRICE
-  if not lo or not hi or hi <= lo then
-    lo = 0.90000
-    hi = 1.90000
+  -- Build a visual copy where each candle opens from the previous candle close.
+  -- This also fixes older server history if it had disconnected candle opens.
+  local visual = {}
+  local lo, hi = nil, nil
+  for i, c in ipairs(list) do
+    local rawOpen = tonumber(c.open)
+    local close = tonumber(c.close)
+    local high = tonumber(c.high)
+    local low = tonumber(c.low)
+
+    if rawOpen and close and high and low then
+      local open = rawOpen
+      if i > 1 and visual[i - 1] and visual[i - 1].close then
+        open = visual[i - 1].close
+      end
+
+      high = math.max(high, open, close)
+      low = math.min(low, open, close)
+
+      visual[#visual + 1] = {
+        bucket = c.bucket,
+        open = open,
+        high = high,
+        low = low,
+        close = close,
+        samples = c.samples,
+      }
+
+      lo = lo and math.min(lo, low) or low
+      hi = hi and math.max(hi, high) or high
+    end
   end
 
+  if #visual == 0 or not lo or not hi then return end
+
+  -- Proper terminal scaling: centre around visible action but keep a minimum
+  -- range. This avoids the old "every candle is the ATH" autoscale problem
+  -- without flattening the whole market into the bottom of a 0.9-1.9 chart.
+  local range = hi - lo
+  local mid = (hi + lo) / 2
+  local targetRange = math.max(range * 1.35, MIN_VISIBLE_RANGE)
+  local chartLo = mid - (targetRange / 2)
+  local chartHi = mid + (targetRange / 2)
+
+  if chartLo < HARD_MIN_PRICE then
+    chartHi = chartHi + (HARD_MIN_PRICE - chartLo)
+    chartLo = HARD_MIN_PRICE
+  end
+  if chartHi > HARD_MAX_PRICE then
+    chartLo = chartLo - (chartHi - HARD_MAX_PRICE)
+    chartHi = HARD_MAX_PRICE
+  end
+  if chartLo < HARD_MIN_PRICE then chartLo = HARD_MIN_PRICE end
+  if chartHi <= chartLo then chartHi = chartLo + MIN_VISIBLE_RANGE end
+
   local function py(price)
-    local p = tonumber(price) or lo
-    local t = (p - lo) / (hi - lo)
+    local p = tonumber(price) or chartLo
+    local t = (p - chartLo) / (chartHi - chartLo)
     if t < 0 then t = 0 end
     if t > 1 then t = 1 end
     return y + h - 1 - math.floor(t * (h - 1) + 0.5)
@@ -455,12 +560,12 @@ local function drawTradingCandles(x, y, w, h)
     putChar(xx, botY, ".", colors.gray, colors.black)
   end
 
-  at(x + chartW + 1, topY, fmt(hi, 5), colors.lightGray)
-  at(x + chartW + 1, midY, fmt((hi + lo) / 2, 5), colors.lightGray)
-  at(x + chartW + 1, botY, fmt(lo, 5), colors.lightGray)
+  at(x + chartW + 1, topY, fmt(chartHi, 5), colors.lightGray)
+  at(x + chartW + 1, midY, fmt((chartHi + chartLo) / 2, 5), colors.lightGray)
+  at(x + chartW + 1, botY, fmt(chartLo, 5), colors.lightGray)
 
-  local startX = x + chartW - (#list * span) + 1
-  for i, c in ipairs(list) do
+  local startX = x + chartW - (#visual * span) + 1
+  for i, c in ipairs(visual) do
     local baseX = startX + (i - 1) * span
     local wickX = baseX + math.floor(candleWidth / 2)
 
@@ -468,28 +573,43 @@ local function drawTradingCandles(x, y, w, h)
     local high = tonumber(c.high)
     local low = tonumber(c.low)
     local close = tonumber(c.close)
+
     if open and high and low and close then
-      local up = close >= open
-      local bodyCol = up and colors.green or colors.red
-      local wickCol = colors.lightGray
+      local delta = close - open
+      local neutral = math.abs(delta) <= PRICE_EPS
+      local up = delta > PRICE_EPS
+      local bodyCol = neutral and colors.lightGray or (up and colors.green or colors.red)
+      local wickCol = neutral and colors.gray or colors.lightGray
+
       local yh = py(high)
       local yl = py(low)
       local yo = py(open)
       local yc = py(close)
       local bodyTop = math.min(yo, yc)
       local bodyBot = math.max(yo, yc)
-      if bodyTop == bodyBot then
-        bodyTop = math.max(y, bodyTop - 1)
-        bodyBot = math.min(y + h - 1, bodyBot + 1)
-      end
 
+      -- Wick. If high/low map to one row, this becomes a tiny tick.
       for yy = yh, yl do
         putChar(wickX, yy, "|", wickCol, colors.black)
       end
 
-      for xx = baseX, baseX + candleWidth - 1 do
-        for yy = bodyTop, bodyBot do
-          putBlock(xx, yy, bodyCol)
+      if neutral then
+        -- Flat/doji candle: no fake red/green body.
+        local yy = py(close)
+        for xx = baseX, baseX + candleWidth - 1 do
+          putChar(xx, yy, "-", bodyCol, colors.black)
+        end
+      elseif bodyTop == bodyBot then
+        -- Movement exists but is smaller than one terminal row at this zoom.
+        -- Draw a one-row body, not a fake oversized block.
+        for xx = baseX, baseX + candleWidth - 1 do
+          putBlock(xx, bodyTop, bodyCol)
+        end
+      else
+        for xx = baseX, baseX + candleWidth - 1 do
+          for yy = bodyTop, bodyBot do
+            putBlock(xx, yy, bodyCol)
+          end
         end
       end
     end
@@ -519,7 +639,7 @@ local function draw()
   at(42, 4, ageText(last_tick_ms) .. " ago", colors.white)
 
   at(2, 6, "Source: Oracle relay -> Kraken EUR/USD -> CC forexserver", colors.gray)
-  at(2, 7, "Range: " .. fmt(CHART_MIN_PRICE, 5) .. " - " .. fmt(CHART_MAX_PRICE, 5) .. " | poll " .. tostring(SAMPLE_SECONDS) .. "s | response " .. tostring(last_response_ms or 0) .. "ms | candles " .. tostring(last_history_count), colors.gray)
+  at(2, 7, "Scale: centred min-range " .. fmt(MIN_VISIBLE_RANGE, 5) .. " within hard rails " .. fmt(HARD_MIN_PRICE, 1) .. "-" .. fmt(HARD_MAX_PRICE, 1) .. " | poll " .. tostring(SAMPLE_SECONDS) .. "s | response " .. tostring(last_response_ms or 0) .. "ms | candles " .. tostring(last_history_count), colors.gray)
 
   local chartTop = 9
   local chartH = math.max(10, H - chartTop - 5)
