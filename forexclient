@@ -1,7 +1,7 @@
 -- =============================================================================
 -- FOREX CLIENT
 -- forexclient
--- v0.8.2-EDITABLE-LOTS-FIELD
+-- v0.8.3-NO-CLIENT-REFUND-CRASH
 --
 -- Purpose:
 --   Trading-terminal style client for the Oracle/Kraken EUR/USD forexserver.
@@ -67,7 +67,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION = "0.8.2-EDITABLE-LOTS-FIELD"
+local VERSION = "0.8.3-NO-CLIENT-REFUND-CRASH"
 local FX_PROTOCOL = "quid_fx"
 local BANK_PROTOCOL = "quid_bank"
 local BANK_TIMEOUT = 5
@@ -980,17 +980,12 @@ local function handleServerMessage(sender, msg)
       end
     else
       local errText = tostring(msg.error or msg.response or "Server returned failure")
-      if type(msg.request_id) == "string" and msg.request_id:find("^open_") and pending_reserves[msg.request_id] then
-        local r = pending_reserves[msg.request_id]
-        local okRefund, refundRes = releaseMargin(r.amount, "Refund failed forex open", nil)
-        pending_reserves[msg.request_id] = nil
-        if okRefund then
-          last_error = "Open failed, margin refunded: " .. errText
-        else
-          last_error = "Open failed and refund failed: " .. tostring(refundRes) .. " / " .. errText
-        end
-      else
-        last_error = errText
+      -- Leveraged funding is now server/bank authoritative. The client does not
+      -- reserve or refund margin locally anymore, so failed opens just display
+      -- the server/bank error.
+      last_error = errText
+      if type(msg.request_id) == "string" and msg.request_id:find("^open_") then
+        refreshBankBalanceNow()
       end
     end
   end
