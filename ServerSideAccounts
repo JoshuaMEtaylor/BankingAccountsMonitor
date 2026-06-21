@@ -22,7 +22,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.4.28-FOREX-MARGIN-ESCROW"
+local VERSION  = "1.4.29-DECIMAL-QUID-FOREX"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -186,6 +186,16 @@ local function lower(s)
   return string.lower(tostring(s or ""))
 end
 
+local function round2(n)
+  n = tonumber(n) or 0
+  if n >= 0 then return math.floor(n * 100 + 0.5) / 100 end
+  return math.ceil(n * 100 - 0.5) / 100
+end
+
+local function money2(n)
+  return string.format("%.2f", round2(n))
+end
+
 local function countTable(t)
   local n = 0
   if type(t) ~= "table" then return 0 end
@@ -346,9 +356,10 @@ local function compactLedgerIfNeeded(force)
 end
 
 local function writeTx(tx_id, tx_type, from_id, to_id, amount, memo, status)
-  local line = string.format("%s | %d | %-12s | %-25s | %-25s | %d | %s | %s",
+  amount = round2(amount)
+  local line = string.format("%s | %d | %-12s | %-25s | %-25s | %s | %s | %s",
     tx_id, timestamp(), tx_type, tostring(from_id), tostring(to_id),
-    amount, tostring(memo), tostring(status))
+    money2(amount), tostring(memo), tostring(status))
 
   -- Try compaction before appending if the ledger is already large.
   compactLedgerIfNeeded(false)
@@ -773,7 +784,7 @@ local function clearPendingTx()
 end
 
 local function transfer(from_id, to_id, amount, tx_type, memo, actor, allow_overdraft)
-  amount = tonumber(amount)
+  amount = round2(tonumber(amount))
   tx_type = tx_type or "TRANSFER"
 
   if not amount or amount <= 0 then return false, "Invalid amount" end
@@ -818,18 +829,18 @@ local function transfer(from_id, to_id, amount, tx_type, memo, actor, allow_over
   end
 
   -- Apply debit/credit to authoritative balances.
-  if from_id ~= "SYSTEM" then balances[from_id] = from_before - amount end
-  if to_id   ~= "SYSTEM" then balances[to_id]   = to_before + amount end
+  if from_id ~= "SYSTEM" then balances[from_id] = round2(from_before - amount) end
+  if to_id   ~= "SYSTEM" then balances[to_id]   = round2(to_before + amount) end
 
   if tx_type == "MINT" then
-    monetary_state.total_minted = minted_before + amount
+    monetary_state.total_minted = round2(minted_before + amount)
     if recordMoneyPrintShock then
       local issued_before = minted_before - burned_before
       local issued_after = monetary_state.total_minted - burned_before
       pcall(recordMoneyPrintShock, amount, issued_before, issued_after, tx_id)
     end
   elseif tx_type == "BURN" then
-    monetary_state.total_burned = burned_before + amount
+    monetary_state.total_burned = round2(burned_before + amount)
   end
   monetary_state.migrated = true
 
@@ -2152,7 +2163,7 @@ local function processUnprocessedMintLedgerShocks()
   local skipped = 0
   for _, line in ipairs(readLines(FILE.ledger)) do
     local tx_id, ts, tx_type, from_id, to_id, amount, memo, status =
-      line:match("(TX%-%d+)%s*|%s*(%d+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*(%-?%d+)%s*|%s*([^|]+)%s*|%s*(.+)")
+      line:match("(TX%-%d+)%s*|%s*(%d+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*(%-?[%d%.]+)%s*|%s*([^|]+)%s*|%s*(.+)")
     if tx_id then
       tx_type = trim(tx_type)
       status = trim(status)
@@ -2329,7 +2340,7 @@ local function calculatePrivateGDP(window_ms)
 
   for _, line in ipairs(readLines(FILE.ledger)) do
     local tx_id, ts, tx_type, from_id, to_id, amount, memo, status =
-      line:match("(TX%-%d+)%s*|%s*(%d+)%s*|%s*(%S+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*(%-?%d+)%s*|%s*([^|]+)%s*|%s*(.+)")
+      line:match("(TX%-%d+)%s*|%s*(%d+)%s*|%s*(%S+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*(%-?[%d%.]+)%s*|%s*([^|]+)%s*|%s*(.+)")
     if tx_id then
       ts = tonumber(ts) or 0
       amount = tonumber(amount) or 0
@@ -2556,7 +2567,7 @@ handlers["forex_reserve"] = function(sender_id, req)
     return false, "Unauthorised"
   end
 
-  local amount = math.floor(tonumber(req.amount) or 0)
+  local amount = round2(tonumber(req.amount) or 0)
   if amount <= 0 then return false, "Invalid forex margin amount" end
 
   local escrow = "market:escrow"
@@ -2579,7 +2590,7 @@ handlers["forex_release"] = function(sender_id, req)
     return false, "Unauthorised"
   end
 
-  local amount = math.floor(tonumber(req.amount) or 0)
+  local amount = round2(tonumber(req.amount) or 0)
   if amount < 0 then return false, "Invalid forex payout amount" end
   if amount == 0 then
     return true, { tx_id = nil, amount = 0, from = "market:escrow", to = target, type = "FOREX_MARGIN_RELEASE", status = "settled", memo = req.memo or "Forex closed at full loss" }
@@ -2605,7 +2616,7 @@ handlers["ledger_history"] = function(sender_id, req)
   local results = {}
   for _, line in ipairs(lines) do
     local tx_id, ts, tx_type, from_id, to_id, amount, memo, status =
-      line:match("(TX%-%d+)%s*|%s*(%d+)%s*|%s*(%S+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*(%d+)%s*|%s*([^|]+)%s*|%s*(.+)")
+      line:match("(TX%-%d+)%s*|%s*(%d+)%s*|%s*(%S+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*(%-?[%d%.]+)%s*|%s*([^|]+)%s*|%s*(.+)")
     if tx_id then
       from_id = from_id:match("^%s*(.-)%s*$")
       to_id   = to_id:match("^%s*(.-)%s*$")
@@ -2651,7 +2662,7 @@ handlers["treasury_history"] = function(sender_id, req)
 
   for _, line in ipairs(lines) do
     local tx_id, ts, tx_type, from_id, to_id, amount, memo, status =
-      line:match("(TX%-%d+)%s*|%s*(%d+)%s*|%s*(%S+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*(%d+)%s*|%s*([^|]+)%s*|%s*(.+)")
+      line:match("(TX%-%d+)%s*|%s*(%d+)%s*|%s*(%S+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*(%-?[%d%.]+)%s*|%s*([^|]+)%s*|%s*(.+)")
 
     if tx_id then
       from_id = from_id:match("^%s*(.-)%s*$")
@@ -2999,7 +3010,7 @@ handlers["payroll_source_for_citizen"] = function(sender_id, req)
   for i = #lines, 1, -1 do
     local line = lines[i]
     local tx_id, ts, tx_type, from_id, to_id, amount, memo, status =
-      line:match("(TX%-%d+)%s*|%s*(%d+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*(%d+)%s*|%s*([^|]+)%s*|%s*(.+)")
+      line:match("(TX%-%d+)%s*|%s*(%d+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*(%-?[%d%.]+)%s*|%s*([^|]+)%s*|%s*(.+)")
 
     if tx_id then
       checked = checked + 1
@@ -3046,7 +3057,7 @@ handlers["list_company_payroll_payees"] = function(sender_id, req)
   for i = #lines, 1, -1 do
     local line = lines[i]
     local tx_id, ts, tx_type, from_id, to_id, amount, memo, status =
-      line:match("(TX%-%d+)%s*|%s*(%d+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*(%d+)%s*|%s*([^|]+)%s*|%s*(.+)")
+      line:match("(TX%-%d+)%s*|%s*(%d+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*(%-?[%d%.]+)%s*|%s*([^|]+)%s*|%s*(.+)")
 
     if tx_id then
       checked = checked + 1
@@ -4211,7 +4222,7 @@ local function migrateBalancesFromLedgerIfNeeded()
 
   for _, line in ipairs(readLines(FILE.ledger)) do
     local tx_id, ts, tx_type, from_id, to_id, amount, memo, status =
-      line:match("(TX%-%d+)%s*|%s*(%d+)%s*|%s*(%S+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*(%d+)%s*|%s*([^|]+)%s*|%s*(.+)")
+      line:match("(TX%-%d+)%s*|%s*(%d+)%s*|%s*(%S+)%s*|%s*([^|]+)%s*|%s*([^|]+)%s*|%s*(%-?[%d%.]+)%s*|%s*([^|]+)%s*|%s*(.+)")
     if tx_id then
       tx_type = trim(tx_type)
       from_id = trim(from_id)
