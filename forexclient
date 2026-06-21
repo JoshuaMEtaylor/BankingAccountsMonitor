@@ -1,7 +1,7 @@
 -- =============================================================================
 -- FOREX CLIENT
 -- forexclient
--- v0.6.0-EURUSD-5M-TERMINAL-CANDLES
+-- v0.6.2-EURUSD-5M-JOINED-CANDLES-UPDATER
 --
 -- Purpose:
 --   Trading-terminal style client for the Oracle/Kraken EUR/USD forexserver.
@@ -16,7 +16,7 @@
 
 local args = {...}
 
-local VERSION = "0.6.0-EURUSD-5M-TERMINAL-CANDLES"
+local VERSION = "0.6.2-EURUSD-5M-JOINED-CANDLES-UPDATER"
 local FX_PROTOCOL = "quid_fx"
 local server_id = tonumber(args[1])
 
@@ -29,6 +29,12 @@ local TIMEFRAME = "5m"
 local CANDLE_SECONDS = 300
 local MAX_CANDLES = 576
 local TEXT_SCALE = 0.5
+
+-- Fixed EUR/USD chart range.
+-- This stops every new candle from becoming the chart high/low just because the
+-- visible candle window is narrow.
+local CHART_MIN_PRICE = 0.90000
+local CHART_MAX_PRICE = 1.90000
 
 local CANDLES_FILE = "data/forex_client_eurusd_5m_candles.db"
 local STATE_FILE = "data/forex_client_state.db"
@@ -277,11 +283,14 @@ local function updateCandle(price, tickTime)
   local c = candles[#candles]
 
   if not c or c.bucket ~= bucket then
+    -- Trading-terminal behaviour: new candle opens at previous candle close.
+    local openPrice = price
+    if c and tonumber(c.close) then openPrice = tonumber(c.close) end
     c = {
       bucket = bucket,
-      open = price,
-      high = price,
-      low = price,
+      open = openPrice,
+      high = math.max(openPrice, price),
+      low = math.min(openPrice, price),
       close = price,
       samples = 1,
       updated = ms,
@@ -324,18 +333,30 @@ end
 local function replaceCandlesFromServer(list)
   if type(list) ~= "table" then return end
   candles = {}
+  local prevClose = nil
   for i = 1, #list do
     local c = list[i]
     if type(c) == "table" then
-      candles[#candles + 1] = {
-        bucket = tonumber(c.bucket),
-        open = tonumber(c.open),
-        high = tonumber(c.high),
-        low = tonumber(c.low),
-        close = tonumber(c.close),
-        samples = tonumber(c.samples) or 0,
-        updated = tonumber(c.updated) or tonumber(c.bucket) or 0,
-      }
+      local open = tonumber(c.open)
+      local high = tonumber(c.high)
+      local low = tonumber(c.low)
+      local close = tonumber(c.close)
+      if close then
+        if prevClose then open = prevClose end
+        open = open or close
+        high = math.max(high or open, open, close)
+        low = math.min(low or open, open, close)
+        candles[#candles + 1] = {
+          bucket = tonumber(c.bucket),
+          open = open,
+          high = high,
+          low = low,
+          close = close,
+          samples = tonumber(c.samples) or 0,
+          updated = tonumber(c.updated) or tonumber(c.bucket) or 0,
+        }
+        prevClose = close
+      end
     end
   end
   trimCandles()
@@ -406,19 +427,14 @@ local function drawTradingCandles(x, y, w, h)
     return
   end
 
-  local lo, hi = nil, nil
-  for _, c in ipairs(list) do
-    local l = tonumber(c.low)
-    local hh = tonumber(c.high)
-    if l and hh then
-      lo = lo and math.min(lo, l) or l
-      hi = hi and math.max(hi, hh) or hh
-    end
-  end
-  if not lo or not hi then return end
-  if hi == lo then
-    hi = hi + 0.00005
-    lo = lo - 0.00005
+  -- Fixed global price range, not autoscaled to the visible candle window.
+  -- Autoscaling made every tiny candle look like an ATH/ATL. This keeps the
+  -- chart anchored like a proper terminal axis.
+  local lo = CHART_MIN_PRICE
+  local hi = CHART_MAX_PRICE
+  if not lo or not hi or hi <= lo then
+    lo = 0.90000
+    hi = 1.90000
   end
 
   local function py(price)
@@ -503,7 +519,7 @@ local function draw()
   at(42, 4, ageText(last_tick_ms) .. " ago", colors.white)
 
   at(2, 6, "Source: Oracle relay -> Kraken EUR/USD -> CC forexserver", colors.gray)
-  at(2, 7, "Client poll " .. tostring(SAMPLE_SECONDS) .. "s | response " .. tostring(last_response_ms or 0) .. "ms | loaded candles " .. tostring(last_history_count), colors.gray)
+  at(2, 7, "Range: " .. fmt(CHART_MIN_PRICE, 5) .. " - " .. fmt(CHART_MAX_PRICE, 5) .. " | poll " .. tostring(SAMPLE_SECONDS) .. "s | response " .. tostring(last_response_ms or 0) .. "ms | candles " .. tostring(last_history_count), colors.gray)
 
   local chartTop = 9
   local chartH = math.max(10, H - chartTop - 5)
