@@ -1,7 +1,7 @@
 -- =============================================================================
 -- FOREX CLIENT
 -- forexclient
--- v0.7.3-TERMINAL-CONTROL-MONITOR-DISPLAY
+-- v0.7.4-PROPER-LOTS-TERMINAL-CONTROL
 --
 -- Purpose:
 --   Trading-terminal style client for the Oracle/Kraken EUR/USD forexserver.
@@ -67,7 +67,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION = "0.7.3-TERMINAL-CONTROL-MONITOR-DISPLAY"
+local VERSION = "0.7.4-PROPER-LOTS-TERMINAL-CONTROL"
 local FX_PROTOCOL = "quid_fx"
 local BANK_PROTOCOL = "quid_bank"
 local BANK_TIMEOUT = 5
@@ -94,9 +94,16 @@ local SYMBOLS = {
 local active_tf = "5m"
 local active_symbol = "EURUSD"
 local MAX_CANDLES = 576
-local DEFAULT_LOTS = 1
-local LOT_MARGIN_Q = 100
-local LOT_UNITS = 10000
+-- FX sizing.
+-- 1.00 lot = 100,000 USD notional.
+-- 0.01 lot = 1,000 USD notional.
+-- 1 Quid = 3.40 USD.
+local QUID_USD_VALUE = 3.40
+local LOT_NOTIONAL_USD = 100000
+local LOT_UNITS = LOT_NOTIONAL_USD
+local DEFAULT_LOTS = 0.01
+local MIN_LOTS = 0.01
+local LOT_STEP = 0.01
 
 -- Chart scaling:
 -- centred around current visible action, with hard rails and a minimum visible
@@ -150,13 +157,16 @@ local orders = {
   unrealized_pnl = 0,
   open_count = 0,
   default_lots = DEFAULT_LOTS,
-  lot_margin_q = LOT_MARGIN_Q,
+  min_lots = MIN_LOTS,
+  lot_step = LOT_STEP,
+  lot_notional_usd = LOT_NOTIONAL_USD,
+  quid_usd_value = QUID_USD_VALUE,
   lot_units = LOT_UNITS,
 }
 local selected_order_id = nil
 local last_orders_ms = 0
 local order_request_count = 0
-local lots_text = "1"
+local lots_text = "0.01"
 local lots_focused = false
 local pending_reserves = {}
 local lotInputRect = nil
@@ -498,19 +508,54 @@ local function accountPayload()
 end
 
 
+local function ceil(n)
+  n = tonumber(n) or 0
+  if math.ceil then return math.ceil(n) end
+  local i = math.floor(n)
+  if n > i then return i + 1 end
+  return i
+end
+
+local function lotStep()
+  return tonumber(orders.lot_step or LOT_STEP) or LOT_STEP
+end
+
+local function lotNotionalUsd()
+  return tonumber(orders.lot_notional_usd or orders.lot_units or LOT_NOTIONAL_USD) or LOT_NOTIONAL_USD
+end
+
+local function quidUsdValue()
+  return tonumber(orders.quid_usd_value or QUID_USD_VALUE) or QUID_USD_VALUE
+end
+
+local function minLots()
+  return tonumber(orders.min_lots or MIN_LOTS) or MIN_LOTS
+end
+
+local function maxLotsForBalance(balance_q)
+  balance_q = tonumber(balance_q) or 0
+  local rawLots = (balance_q * quidUsdValue()) / lotNotionalUsd()
+  local step = lotStep()
+  return math.floor((rawLots / step) + 0.0000001) * step
+end
+
 local function currentLots()
   local n = tonumber(lots_text)
   if not n or n <= 0 then return nil end
-  -- Keep it sane for the terminal. Decimals are allowed, but only 2dp.
+
+  local step = lotStep()
+  n = math.floor((n / step) + 0.0000001) * step
   n = math.floor(n * 100 + 0.5) / 100
+
+  if n < minLots() then return nil end
   return n
 end
 
 local function marginForLots(lots)
   lots = tonumber(lots) or 0
-  local lotMargin = tonumber(orders.lot_margin_q or LOT_MARGIN_Q) or LOT_MARGIN_Q
-  return math.floor((lots * lotMargin) + 0.5)
+  return ceil((lots * lotNotionalUsd()) / quidUsdValue())
 end
+
 
 local function refreshBankBalanceNow()
   local ok, res = refreshBankBalance()
@@ -569,9 +614,24 @@ local function cleanLotsText()
   if first then
     v = v:sub(1, first) .. v:sub(first + 1):gsub("%.", "")
   end
-  if v == "" then v = "1" end
+
+  if v == "" or v == "." then v = "0.01" end
+
+  local n = tonumber(v)
+  if n then
+    if n < minLots() then
+      v = string.format("%.2f", minLots())
+    else
+      local step = lotStep()
+      n = math.floor((n / step) + 0.0000001) * step
+      n = math.floor(n * 100 + 0.5) / 100
+      v = string.format("%.2f", n)
+    end
+  end
+
   lots_text = v
 end
+
 
 local function broadcastPing()
   discover_count = discover_count + 1
@@ -853,7 +913,10 @@ local function handleServerMessage(sender, msg)
         if not orders.active_orders then orders.active_orders = {} end
         if not orders.closed_orders then orders.closed_orders = {} end
         orders.default_lots = tonumber(orders.default_lots) or DEFAULT_LOTS
-        orders.lot_margin_q = tonumber(orders.lot_margin_q) or LOT_MARGIN_Q
+        orders.min_lots = tonumber(orders.min_lots) or MIN_LOTS
+        orders.lot_step = tonumber(orders.lot_step) or LOT_STEP
+        orders.lot_notional_usd = tonumber(orders.lot_notional_usd) or LOT_NOTIONAL_USD
+        orders.quid_usd_value = tonumber(orders.quid_usd_value) or QUID_USD_VALUE
         orders.lot_units = tonumber(orders.lot_units) or LOT_UNITS
         last_orders_ms = nowMs()
         last_error = "Orders updated"
@@ -1190,30 +1253,32 @@ local function drawOrdersPanel(x, y, w, h)
   -- Balance is intentionally not polled every redraw. It updates on login,
   -- order margin lock, and trade close settlement.
   local bal = math.floor(tonumber(bank_session.balance or 0))
-  at(x, y, "Balance: " .. tostring(bal) .. " Q", colors.yellow)
+  local balUsd = bal * quidUsdValue()
+  local maxLots = maxLotsForBalance(bal)
+  at(x, y, "Balance: " .. tostring(bal) .. " Q  $" .. string.format("%.0f", balUsd) .. "  Max: " .. string.format("%.2f", maxLots) .. " lots", colors.yellow)
 
   cleanLotsText()
   local lots = currentLots() or 0
   local margin = marginForLots(lots)
-  local afford = margin <= bal
-  local info = "Lots: " .. tostring(lots_text) .. "  Margin: " .. tostring(margin) .. " Q  1 lot=" .. tostring(orders.lot_margin_q or LOT_MARGIN_Q) .. " Q"
-  at(x + 22, y, info, afford and colors.lightGray or colors.red)
+  local afford = lots >= minLots() and lots <= maxLots and margin <= bal
+  local info = "Lots " .. tostring(lots_text) .. " | Margin " .. tostring(margin) .. " Q | 1 lot=$" .. tostring(lotNotionalUsd())
+  at(x, y + 1, info, afford and colors.lightGray or colors.red)
 
-  at(x, y + 1, "Lots", colors.lightGray)
+  at(x, y + 2, "Lots", colors.lightGray)
   local inputW = 10
-  fill(x + 6, y + 1, inputW, 1, lots_focused and colors.white or colors.gray)
-  at(x + 7, y + 1, tostring(lots_text):sub(1, inputW - 2), colors.black, lots_focused and colors.white or colors.gray)
-  lotInputRect = { x1 = x + 6, x2 = x + 6 + inputW - 1, y = y + 1 }
+  fill(x + 6, y + 2, inputW, 1, lots_focused and colors.white or colors.gray)
+  at(x + 7, y + 2, tostring(lots_text):sub(1, inputW - 2), colors.black, lots_focused and colors.white or colors.gray)
+  lotInputRect = { x1 = x + 6, x2 = x + 6 + inputW - 1, y = y + 2 }
   if lots_focused then
-    term.setCursorPos(x + 7 + math.min(#lots_text, inputW - 2), y + 1)
+    term.setCursorPos(x + 7 + math.min(#lots_text, inputW - 2), y + 2)
     term.setCursorBlink(true)
   end
 
   local buyW = math.max(12, math.floor(w * 0.18))
   local sellW = math.max(12, math.floor(w * 0.18))
   local closeW = math.max(10, math.floor(w * 0.12))
-  local btnH = math.min(3, math.max(1, h - 6))
-  local btnY = y + 2
+  local btnH = math.min(3, math.max(1, h - 7))
+  local btnY = y + 3
 
   drawBigButton(x, btnY, buyW, btnH, "BUY", "BUY", afford and colors.green or colors.gray, colors.white)
   drawBigButton(x + buyW + 2, btnY, sellW, btnH, "SELL", "SELL", afford and colors.red or colors.gray, colors.white)
@@ -1221,14 +1286,14 @@ local function drawOrdersPanel(x, y, w, h)
 
   local total = tonumber(orders.unrealized_pnl or 0) or 0
   local pnlCol = total > 0 and colors.lime or (total < 0 and colors.red or colors.lightGray)
-  at(x + math.max(50, w - 30), y, "Open P/L " .. money(total, 2), pnlCol)
+  at(x + math.max(50, w - 30), y, "Open P/L " .. tostring(math.floor(total + 0.5)) .. " Q", pnlCol)
   at(x + math.max(50, w - 30), y + 1, "Acct " .. tostring(bank_session.username or "?"):sub(1, 12), colors.lightGray)
 
   local headerY = btnY + btnH + 1
   at(x, headerY, "ID  Side Lots Margin Entry    Live     P/L", colors.gray)
 
   local openOrders = orders.active_orders or {}
-  local maxRows = math.max(1, h - btnH - 4)
+  local maxRows = math.max(1, h - btnH - 5)
   for i = 1, math.min(#openOrders, maxRows) do
     local o = openOrders[i]
     local rowY = headerY + i
@@ -1246,7 +1311,7 @@ local function drawOrdersPanel(x, y, w, h)
     at(x + 14, rowY, string.format("%-6s", tostring(o.margin_q or "?")), colors.yellow, bg)
     at(x + 21, rowY, fmt(o.entry_price, 5), colors.white, bg)
     at(x + 31, rowY, fmt(o.live_price, 5), colors.white, bg)
-    at(x + 41, rowY, money(pnl, 2), pnlColRow, bg)
+    at(x + 41, rowY, tostring(math.floor(pnl + 0.5)) .. "Q", pnlColRow, bg)
     orderRowRects[#orderRowRects + 1] = { id = id, x1 = x, x2 = x + w - 1, y = rowY }
   end
 
@@ -1409,7 +1474,7 @@ local function main()
         if ev[2] == keys.backspace then
           lots_text = tostring(lots_text or "")
           lots_text = lots_text:sub(1, -2)
-          if lots_text == "" then lots_text = "1" end
+          if lots_text == "" then lots_text = "0.01" end
           draw()
         elseif ev[2] == keys.enter then
           lots_focused = false
