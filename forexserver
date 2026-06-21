@@ -1,7 +1,7 @@
 -- =============================================================================
 -- FOREX SERVER
 -- forexserver
--- v0.6.1-ORACLE-KRAKEN-5M-HISTORY-UPDATER
+-- v0.6.2-ORACLE-KRAKEN-5M-HISTORY-UPDATER
 --
 -- Purpose:
 --   Pull the live EUR/USD number from the Oracle relay node and keep a proper
@@ -59,7 +59,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION = "0.6.1-ORACLE-KRAKEN-5M-HISTORY-UPDATER"
+local VERSION = "0.6.2-ORACLE-KRAKEN-5M-HISTORY-UPDATER"
 local PROTOCOL = "quid_fx"
 
 local ORACLE_LATEST_URL = "http://145.241.202.103:8000/latest"
