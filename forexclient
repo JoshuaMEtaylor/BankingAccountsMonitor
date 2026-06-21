@@ -1,18 +1,17 @@
 -- =============================================================================
 -- FOREX CLIENT
 -- forexclient
--- v0.6.3-EURUSD-5M-PROPER-CANDLES-UPDATER
+-- v0.6.4-EURUSD-TF-TABS-UPDATER
 --
 -- Purpose:
 --   Trading-terminal style client for the Oracle/Kraken EUR/USD forexserver.
 --
 -- This build:
 --   - safe self updater using startup.new/startup.old
---   - requests server-side candle history at boot so the chart does not start
---     from a single fresh candle
---   - renders proper joined candlesticks
---   - neutral/no-change candles draw flat instead of fake red/green bodies
---   - keeps updating the active candle from live server ticks
+--   - removes the old top info block
+--   - adds clickable timeframe tabs: 1m, 5m, 15m
+--   - requests server-side candle history for each timeframe
+--   - renders joined candles with neutral/no-change candles flat
 -- =============================================================================
 
 local args = {...}
@@ -27,9 +26,6 @@ local args = {...}
 -- Manual test / bypass updater:
 --   startup --updated
 --   startup --updated <server_id>
---
--- Downloads to startup.new first. Only replaces startup.lua after the new file
--- exists and is non-empty, so a failed download cannot delete the running script.
 if args[1] ~= "--updated" then
   print("[ Forex Client ]")
   print("Checking GitHub update...")
@@ -71,7 +67,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION = "0.6.3-EURUSD-5M-PROPER-CANDLES-UPDATER"
+local VERSION = "0.6.4-EURUSD-TF-TABS-UPDATER"
 local FX_PROTOCOL = "quid_fx"
 local server_id = tonumber(args[2])
 
@@ -79,35 +75,43 @@ local SAMPLE_SECONDS = 0.10
 local DRAW_SECONDS = 0.25
 local SAVE_SECONDS = 30
 local RESPONSE_TIMEOUT_MS = 2000
-
-local TIMEFRAME = "5m"
-local CANDLE_SECONDS = 300
-local MAX_CANDLES = 576
 local TEXT_SCALE = 0.5
 
--- Chart scaling.
--- A full 0.90000-1.90000 axis is too wide for a ComputerCraft candle chart;
--- normal EUR/USD movement becomes invisible. Instead we use a proper trading
--- terminal style window: centre around visible price action, enforce a minimum
--- range so every tiny move does not become an ATH/ATL, and keep 0.9/1.9 as hard
--- safety rails.
+local TF_ORDER = { "1m", "5m", "15m" }
+local TIMEFRAMES = {
+  ["1m"] = { seconds = 60, label = "1m" },
+  ["5m"] = { seconds = 300, label = "5m" },
+  ["15m"] = { seconds = 900, label = "15m" },
+}
+
+local active_tf = "5m"
+local MAX_CANDLES = 576
+
+-- Chart scaling:
+-- centred around current visible action, with hard rails and a minimum visible
+-- range so the chart looks alive without every tiny move becoming an ATH.
 local HARD_MIN_PRICE = 0.90000
 local HARD_MAX_PRICE = 1.90000
-local MIN_VISIBLE_RANGE = 0.01000 -- 100 pips total; enough to avoid fake ATH scaling.
-local PRICE_EPS = 0.000005       -- half a pip at 5dp; treated as neutral/doji.
+local MIN_VISIBLE_RANGE = 0.01000
+local PRICE_EPS = 0.000005
 
-local CANDLES_FILE = "data/forex_client_eurusd_5m_candles.db"
 local STATE_FILE = "data/forex_client_state.db"
+local CANDLES_FILE = "data/forex_client_candle_sets.db"
 
 local native = term.current()
 local monitor = nil
 local modem_name = nil
 local W, H = term.getSize()
 
-local candles = {}
+local candleSets = {
+  ["1m"] = {},
+  ["5m"] = {},
+  ["15m"] = {},
+}
+
 local state = {
   created_version = VERSION,
-  timeframe = TIMEFRAME,
+  active_tf = active_tf,
 }
 
 local last_tick = nil
@@ -119,6 +123,7 @@ local last_request_ms = 0
 local last_response_ms = 0
 local last_history_ms = 0
 local last_history_count = 0
+
 local pending_request = false
 local pending_since_ms = 0
 local request_count = 0
@@ -133,9 +138,21 @@ local draw_timer = nil
 local save_timer = nil
 local discover_timer = nil
 
+local tabRects = {}
+
 local function nowMs()
   if os.epoch then return os.epoch("utc") end
   return math.floor(os.time() * 1000)
+end
+
+local function activeSeconds()
+  local cfg = TIMEFRAMES[active_tf] or TIMEFRAMES["5m"]
+  return cfg.seconds
+end
+
+local function activeCandles()
+  if type(candleSets[active_tf]) ~= "table" then candleSets[active_tf] = {} end
+  return candleSets[active_tf]
 end
 
 local function ensureDir(path)
@@ -164,22 +181,33 @@ local function writeTable(path, data)
   return true
 end
 
+local function trimSet(tf)
+  local list = candleSets[tf]
+  if type(list) ~= "table" then return end
+  while #list > MAX_CANDLES do table.remove(list, 1) end
+end
+
 local function loadState()
   local s = readTable(STATE_FILE)
   if type(s) == "table" then state = s end
-  state.created_version = state.created_version or VERSION
-  state.timeframe = TIMEFRAME
+  if TIMEFRAMES[state.active_tf] then active_tf = state.active_tf end
 
-  local c = readTable(CANDLES_FILE)
-  if type(c) == "table" then candles = c end
-  while #candles > MAX_CANDLES do table.remove(candles, 1) end
+  local sets = readTable(CANDLES_FILE)
+  if type(sets) == "table" then
+    for _, tf in ipairs(TF_ORDER) do
+      if type(sets[tf]) == "table" then candleSets[tf] = sets[tf] end
+      trimSet(tf)
+    end
+  end
 end
 
 local function saveState()
   state.saved_at = nowMs()
   state.server_id = server_id
+  state.active_tf = active_tf
+  state.created_version = VERSION
   writeTable(STATE_FILE, state)
-  writeTable(CANDLES_FILE, candles)
+  writeTable(CANDLES_FILE, candleSets)
 end
 
 local function fmt(n, dp)
@@ -276,6 +304,7 @@ local function openModem()
       end
     end
   end
+
   for _, name in ipairs(peripheral.getNames()) do
     if peripheral.getType(name) == "modem" then
       rednet.open(name)
@@ -283,16 +312,31 @@ local function openModem()
       return true
     end
   end
-  return false
-end
 
-local function trimCandles()
-  while #candles > MAX_CANDLES do table.remove(candles, 1) end
+  return false
 end
 
 local function broadcastPing()
   discover_count = discover_count + 1
   rednet.broadcast({ type = "ping", client = "forexclient", version = VERSION }, FX_PROTOCOL)
+end
+
+local function requestHistory(tf)
+  if not server_id then return end
+  tf = tostring(tf or active_tf)
+  if not TIMEFRAMES[tf] then tf = active_tf end
+
+  rednet.send(server_id, {
+    type = "get_usd_history",
+    timeframe = tf,
+    client = "forexclient",
+    version = VERSION,
+  }, FX_PROTOCOL)
+end
+
+local function requestAllHistories()
+  if not server_id then return end
+  for _, tf in ipairs(TF_ORDER) do requestHistory(tf) end
 end
 
 local function sendTickRequest()
@@ -324,26 +368,23 @@ local function sendTickRequest()
   }, FX_PROTOCOL)
 end
 
-local function requestHistory()
-  if not server_id then return end
-  rednet.send(server_id, {
-    type = "get_usd_history",
-    timeframe = TIMEFRAME,
-    client = "forexclient",
-    version = VERSION,
-  }, FX_PROTOCOL)
-end
-
-local function updateCandle(price, tickTime)
+local function updateCandleSet(tf, price, tickTime)
   price = tonumber(price)
   if not price or price <= 0 then return end
+  if not TIMEFRAMES[tf] then return end
 
+  local list = candleSets[tf]
+  if type(list) ~= "table" then
+    list = {}
+    candleSets[tf] = list
+  end
+
+  local seconds = TIMEFRAMES[tf].seconds
   local ms = tonumber(tickTime) or nowMs()
-  local bucket = math.floor(ms / (CANDLE_SECONDS * 1000)) * (CANDLE_SECONDS * 1000)
-  local c = candles[#candles]
+  local bucket = math.floor(ms / (seconds * 1000)) * (seconds * 1000)
+  local c = list[#list]
 
   if not c or c.bucket ~= bucket then
-    -- Trading-terminal behaviour: new candle opens at previous candle close.
     local openPrice = price
     if c and tonumber(c.close) then openPrice = tonumber(c.close) end
     c = {
@@ -355,7 +396,7 @@ local function updateCandle(price, tickTime)
       samples = 1,
       updated = ms,
     }
-    candles[#candles + 1] = c
+    list[#list + 1] = c
   else
     if price > c.high then c.high = price end
     if price < c.low then c.low = price end
@@ -364,7 +405,7 @@ local function updateCandle(price, tickTime)
     c.updated = ms
   end
 
-  trimCandles()
+  trimSet(tf)
 end
 
 local function absorbTick(tick)
@@ -386,14 +427,19 @@ local function absorbTick(tick)
   last_tick_ms = nowMs()
   last_server_seen_ms = nowMs()
 
-  updateCandle(price, tick.time or nowMs())
+  for _, tf in ipairs(TF_ORDER) do
+    updateCandleSet(tf, price, tick.time or nowMs())
+  end
+
   last_error = "OK"
 end
 
-local function replaceCandlesFromServer(list)
-  if type(list) ~= "table" then return end
-  candles = {}
+local function replaceCandlesFromServer(tf, list)
+  if not TIMEFRAMES[tf] or type(list) ~= "table" then return end
+
+  local out = {}
   local prevClose = nil
+
   for i = 1, #list do
     local c = list[i]
     if type(c) == "table" then
@@ -401,12 +447,14 @@ local function replaceCandlesFromServer(list)
       local high = tonumber(c.high)
       local low = tonumber(c.low)
       local close = tonumber(c.close)
+
       if close then
         if prevClose then open = prevClose end
         open = open or close
         high = math.max(high or open, open, close)
         low = math.min(low or open, open, close)
-        candles[#candles + 1] = {
+
+        out[#out + 1] = {
           bucket = tonumber(c.bucket),
           open = open,
           high = high,
@@ -415,13 +463,16 @@ local function replaceCandlesFromServer(list)
           samples = tonumber(c.samples) or 0,
           updated = tonumber(c.updated) or tonumber(c.bucket) or 0,
         }
+
         prevClose = close
       end
     end
   end
-  trimCandles()
+
+  candleSets[tf] = out
+  trimSet(tf)
   last_history_ms = nowMs()
-  last_history_count = #candles
+  if tf == active_tf then last_history_count = #out end
 end
 
 local function handleServerMessage(sender, msg)
@@ -432,7 +483,7 @@ local function handleServerMessage(sender, msg)
     state.server_id = sender
     last_server_seen_ms = nowMs()
     last_error = "Found forexserver " .. tostring(sender)
-    requestHistory()
+    requestAllHistories()
     return
   end
 
@@ -447,9 +498,11 @@ local function handleServerMessage(sender, msg)
 
     if msg.success == true and type(msg.response) == "table" then
       if type(msg.response.candles) == "table" then
-        replaceCandlesFromServer(msg.response.candles)
+        local tf = tostring(msg.response.timeframe or active_tf)
+        if not TIMEFRAMES[tf] then tf = active_tf end
+        replaceCandlesFromServer(tf, msg.response.candles)
         if type(msg.response.latest) == "table" then absorbTick(msg.response.latest) end
-        last_error = "Loaded " .. tostring(#candles) .. " candles from server"
+        last_error = "Loaded " .. tostring(#candleSets[tf]) .. " " .. tf .. " candles"
       else
         absorbTick(msg.response)
       end
@@ -460,9 +513,10 @@ local function handleServerMessage(sender, msg)
 end
 
 local function visibleCandles(maxCandles)
+  local list = activeCandles()
   local out = {}
-  local start = math.max(1, #candles - maxCandles + 1)
-  for i = start, #candles do out[#out + 1] = candles[i] end
+  local start = math.max(1, #list - maxCandles + 1)
+  for i = start, #list do out[#out + 1] = list[i] end
   return out
 end
 
@@ -483,14 +537,13 @@ local function drawTradingCandles(x, y, w, h)
   local list = visibleCandles(maxCandles)
 
   if #list == 0 then
-    at(x + 2, y + math.floor(h / 2), "Awaiting server candle history...", colors.gray)
+    at(x + 2, y + math.floor(h / 2), "Awaiting " .. active_tf .. " server candle history...", colors.gray)
     return
   end
 
-  -- Build a visual copy where each candle opens from the previous candle close.
-  -- This also fixes older server history if it had disconnected candle opens.
   local visual = {}
   local lo, hi = nil, nil
+
   for i, c in ipairs(list) do
     local rawOpen = tonumber(c.open)
     local close = tonumber(c.close)
@@ -522,9 +575,6 @@ local function drawTradingCandles(x, y, w, h)
 
   if #visual == 0 or not lo or not hi then return end
 
-  -- Proper terminal scaling: centre around visible action but keep a minimum
-  -- range. This avoids the old "every candle is the ATH" autoscale problem
-  -- without flattening the whole market into the bottom of a 0.9-1.9 chart.
   local range = hi - lo
   local mid = (hi + lo) / 2
   local targetRange = math.max(range * 1.35, MIN_VISIBLE_RANGE)
@@ -565,6 +615,7 @@ local function drawTradingCandles(x, y, w, h)
   at(x + chartW + 1, botY, fmt(chartLo, 5), colors.lightGray)
 
   local startX = x + chartW - (#visual * span) + 1
+
   for i, c in ipairs(visual) do
     local baseX = startX + (i - 1) * span
     local wickX = baseX + math.floor(candleWidth / 2)
@@ -588,20 +639,16 @@ local function drawTradingCandles(x, y, w, h)
       local bodyTop = math.min(yo, yc)
       local bodyBot = math.max(yo, yc)
 
-      -- Wick. If high/low map to one row, this becomes a tiny tick.
       for yy = yh, yl do
         putChar(wickX, yy, "|", wickCol, colors.black)
       end
 
       if neutral then
-        -- Flat/doji candle: no fake red/green body.
         local yy = py(close)
         for xx = baseX, baseX + candleWidth - 1 do
           putChar(xx, yy, "-", bodyCol, colors.black)
         end
       elseif bodyTop == bodyBot then
-        -- Movement exists but is smaller than one terminal row at this zoom.
-        -- Draw a one-row body, not a fake oversized block.
         for xx = baseX, baseX + candleWidth - 1 do
           putBlock(xx, bodyTop, bodyCol)
         end
@@ -616,43 +663,76 @@ local function drawTradingCandles(x, y, w, h)
   end
 end
 
+local function drawTabs(y)
+  tabRects = {}
+
+  local x = 2
+  for _, tf in ipairs(TF_ORDER) do
+    local label = " " .. tf .. " "
+    local isActive = (tf == active_tf)
+    local bg = isActive and colors.blue or colors.gray
+    local fg = isActive and colors.white or colors.black
+
+    at(x, y, label, fg, bg)
+    tabRects[#tabRects + 1] = { tf = tf, x1 = x, x2 = x + #label - 1, y = y }
+    x = x + #label + 1
+  end
+
+  at(x + 1, y, "EUR/USD", colors.yellow, colors.black)
+end
+
+local function switchTimeframe(tf)
+  if not TIMEFRAMES[tf] then return end
+  if active_tf == tf then
+    requestHistory(tf)
+    return
+  end
+
+  active_tf = tf
+  state.active_tf = tf
+  last_history_count = #(candleSets[tf] or {})
+  requestHistory(tf)
+  draw()
+end
+
+local function handleClick(x, y)
+  for _, r in ipairs(tabRects) do
+    if y == r.y and x >= r.x1 and x <= r.x2 then
+      switchTimeframe(r.tf)
+      return true
+    end
+  end
+  return false
+end
+
 local function draw()
   W, H = term.getSize()
   cls()
 
   fill(1, 1, W, 1, colors.blue)
-  at(2, 1, "EUR/USD TERMINAL  |  " .. TIMEFRAME .. " candles", colors.white, colors.blue)
+  at(2, 1, "EUR/USD TERMINAL", colors.white, colors.blue)
   at(math.max(1, W - #VERSION), 1, VERSION, colors.lightGray, colors.blue)
 
-  local price = last_tick and tonumber(last_tick._client_price or last_tick.pair_price)
-  local q = last_tick and tostring(last_tick.quality or "unknown") or "OFFLINE"
-  local priceCol = colors.white
-  if last_tick and last_tick._client_moved then priceCol = colors.lime end
+  drawTabs(3)
 
-  at(2, 3, "Live EUR/USD", colors.yellow)
-  at(2, 4, fmt(price, 5), priceCol)
-  at(18, 3, "Quality", colors.lightGray)
-  at(18, 4, q, colourForQuality(q))
-  at(30, 3, "Server", colors.lightGray)
-  at(30, 4, tostring(server_id or "searching"), server_id and colors.lime or colors.orange)
-  at(42, 3, "Last tick", colors.lightGray)
-  at(42, 4, ageText(last_tick_ms) .. " ago", colors.white)
-
-  at(2, 6, "Source: Oracle relay -> Kraken EUR/USD -> CC forexserver", colors.gray)
-  at(2, 7, "Scale: centred min-range " .. fmt(MIN_VISIBLE_RANGE, 5) .. " within hard rails " .. fmt(HARD_MIN_PRICE, 1) .. "-" .. fmt(HARD_MAX_PRICE, 1) .. " | poll " .. tostring(SAMPLE_SECONDS) .. "s | response " .. tostring(last_response_ms or 0) .. "ms | candles " .. tostring(last_history_count), colors.gray)
-
-  local chartTop = 9
+  local chartTop = 5
   local chartH = math.max(10, H - chartTop - 5)
   drawTradingCandles(2, chartTop, W - 3, chartH)
 
-  local c = candles[#candles]
+  local list = activeCandles()
+  local c = list[#list]
   if c then
-    local up = (tonumber(c.close) or 0) >= (tonumber(c.open) or 0)
-    local col = up and colors.green or colors.red
-    at(2, H - 4, "Current " .. TIMEFRAME .. " candle", colors.yellow)
-    at(2, H - 3, "O:" .. fmt(c.open, 5) .. "  H:" .. fmt(c.high, 5) .. "  L:" .. fmt(c.low, 5) .. "  C:" .. fmt(c.close, 5), col)
+    local delta = (tonumber(c.close) or 0) - (tonumber(c.open) or 0)
+    local neutral = math.abs(delta) <= PRICE_EPS
+    local col = neutral and colors.lightGray or (delta > 0 and colors.green or colors.red)
+    at(2, H - 4, active_tf .. " candle  O:" .. fmt(c.open, 5) .. "  H:" .. fmt(c.high, 5) .. "  L:" .. fmt(c.low, 5) .. "  C:" .. fmt(c.close, 5), col)
+  else
+    at(2, H - 4, "No " .. active_tf .. " candles loaded yet", colors.orange)
   end
 
+  local price = last_tick and tonumber(last_tick._client_price or last_tick.pair_price)
+  local q = last_tick and tostring(last_tick.quality or "unknown") or "OFFLINE"
+  at(2, H - 3, "Live " .. fmt(price, 5) .. " | " .. q .. " | server " .. tostring(server_id or "searching") .. " | tick " .. ageText(last_tick_ms) .. " ago | candles " .. tostring(#list), colourForQuality(q))
   at(2, H - 2, "Samples " .. tostring(sample_count) .. " | Changes " .. tostring(change_count) .. " | Timeouts " .. tostring(timeout_count) .. " | History age " .. ageText(last_history_ms), colors.lightGray)
   at(2, H - 1, "Status: " .. clampText(last_error, math.max(10, W - 10)), last_error == "OK" and colors.lime or colors.orange)
 end
@@ -670,7 +750,7 @@ local function main()
   end
 
   if state.server_id and not server_id then server_id = tonumber(state.server_id) end
-  if server_id then requestHistory() else broadcastPing() end
+  if server_id then requestAllHistories() else broadcastPing() end
 
   sample_timer = os.startTimer(SAMPLE_SECONDS)
   draw_timer = os.startTimer(DRAW_SECONDS)
@@ -684,19 +764,21 @@ local function main()
 
     if ev[1] == "timer" then
       local id = ev[2]
+
       if id == sample_timer then
         sendTickRequest()
         sample_timer = os.startTimer(SAMPLE_SECONDS)
+
       elseif id == draw_timer then
         draw()
         draw_timer = os.startTimer(DRAW_SECONDS)
+
       elseif id == save_timer then
         saveState()
         save_timer = os.startTimer(SAVE_SECONDS)
+
       elseif id == discover_timer then
-        if not server_id then
-          broadcastPing()
-        end
+        if not server_id then broadcastPing() end
         discover_timer = os.startTimer(3)
       end
 
@@ -705,6 +787,12 @@ local function main()
       if protocol == FX_PROTOCOL or protocol == nil then
         handleServerMessage(sender, msg)
       end
+
+    elseif ev[1] == "mouse_click" then
+      handleClick(ev[3], ev[4])
+
+    elseif ev[1] == "monitor_touch" then
+      handleClick(ev[3], ev[4])
 
     elseif ev[1] == "term_resize" or ev[1] == "monitor_resize" then
       draw()
