@@ -1,0 +1,297 @@
+-- =============================================================================
+-- FOREX CLIENT
+-- forexclient
+-- Display/test client for forexserver / quid_fx.
+-- v0.4.0-LIVE-USD-FMP
+-- =============================================================================
+
+local args = {...}
+
+-- =============================================================================
+-- SELF UPDATE
+-- =============================================================================
+if args[1] ~= "--updated" then
+  print("[ Forex Client ]")
+  print("Deleting old version...")
+  fs.delete("startup.lua")
+
+  print("Downloading latest from GitHub...")
+  local cb = tostring(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
+  local url = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/forexclient?cb=" .. cb
+  shell.run("wget " .. url .. " startup.lua")
+
+  if not fs.exists("startup.lua") then
+    print("")
+    print("Download failed.")
+    print("Expected GitHub file: forexclient")
+    print("")
+    print("Manual install:")
+    print("delete startup")
+    print("wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/forexclient?cb=040 startup.lua")
+    print("startup.lua")
+    return
+  end
+
+  print("Relaunching...")
+  sleep(0.5)
+  local relaunch = { "startup.lua", "--updated" }
+  for i = 1, #args do relaunch[#relaunch + 1] = tostring(args[i]) end
+  local unpackFn = table.unpack or unpack
+  shell.run(unpackFn(relaunch))
+  return
+end
+
+local VERSION = "0.4.0-LIVE-USD-FMP"
+local FX_PROTOCOL = "quid_fx"
+local REFRESH_SECONDS = 5
+local TEXT_SCALE = 0.5
+
+local native = term.current()
+local monitor = nil
+local modem_name = nil
+local server_id = tonumber(args[2])
+local last_snapshot = nil
+local last_history = {}
+local last_error = ""
+
+local function nowMs()
+  if os.epoch then return os.epoch("utc") end
+  return math.floor(os.time() * 1000)
+end
+
+local function money(n, dp)
+  n = tonumber(n) or 0
+  dp = dp or 4
+  return string.format("$%." .. tostring(dp) .. "f", n)
+end
+
+local function pct(n, dp)
+  n = tonumber(n) or 0
+  return string.format("%." .. tostring(dp or 2) .. "f%%", n * 100)
+end
+
+local function q(n)
+  n = tonumber(n) or 0
+  local sign = ""
+  if n < 0 then sign = "-"; n = math.abs(n) end
+  local s = tostring(math.floor(n + 0.5))
+  local out = ""
+  while #s > 3 do out = "," .. s:sub(-3) .. out; s = s:sub(1, -4) end
+  return sign .. s .. out .. " Q"
+end
+
+local function cls()
+  term.setCursorBlink(false)
+  term.setBackgroundColor(colors.black)
+  term.setTextColor(colors.white)
+  term.clear()
+  term.setCursorPos(1, 1)
+end
+
+local function at(x, y, text, col)
+  local w, h = term.getSize()
+  if y < 1 or y > h or x > w then return end
+  term.setCursorPos(math.max(1, x), y)
+  term.setBackgroundColor(colors.black)
+  term.setTextColor(col or colors.white)
+  term.write(tostring(text or ""):sub(1, math.max(0, w - x + 1)))
+end
+
+local function setupDisplay()
+  monitor = peripheral.find and peripheral.find("monitor") or nil
+  if monitor then
+    pcall(function() monitor.setTextScale(TEXT_SCALE) end)
+    term.redirect(monitor)
+  end
+  cls()
+end
+
+local function openModem()
+  for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.getType(name) == "modem" then
+      local m = peripheral.wrap(name)
+      if m and m.isWireless and m.isWireless() then
+        rednet.open(name)
+        modem_name = name
+        return true
+      end
+    end
+  end
+  for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.getType(name) == "modem" then
+      rednet.open(name)
+      modem_name = name
+      return true
+    end
+  end
+  return false
+end
+
+local function discoverServer()
+  if server_id then return true end
+
+  -- Listen for server broadcasts first.
+  local deadline = os.clock() + 6
+  while true do
+    local rem = deadline - os.clock()
+    if rem <= 0 then break end
+    local sender, msg = rednet.receive(FX_PROTOCOL, rem)
+    if sender and type(msg) == "table" and msg.type == "quid_fx_tick" then
+      server_id = sender
+      return true
+    end
+  end
+
+  -- Active ping fallback.
+  rednet.broadcast({ type = "ping" }, FX_PROTOCOL)
+  deadline = os.clock() + 3
+  while true do
+    local rem = deadline - os.clock()
+    if rem <= 0 then break end
+    local sender, msg = rednet.receive(FX_PROTOCOL, rem)
+    if sender and type(msg) == "table" then
+      if msg.success ~= nil then server_id = sender; return true end
+      if msg.type == "quid_fx_tick" then server_id = sender; return true end
+    end
+  end
+
+  return false
+end
+
+local function requestSnapshot()
+  if not server_id and not discoverServer() then return false, "Forex server not found" end
+  rednet.send(server_id, { type = "get_quid_strength" }, FX_PROTOCOL)
+  local deadline = os.clock() + 5
+  while true do
+    local rem = deadline - os.clock()
+    if rem <= 0 then return false, "No response from forex server" end
+    local sender, msg = rednet.receive(FX_PROTOCOL, rem)
+    if sender == server_id and type(msg) == "table" and msg.success ~= nil then
+      return msg.success == true, msg.response
+    elseif sender == server_id and type(msg) == "table" and msg.type == "quid_fx_tick" then
+      last_snapshot = {
+        quality = msg.quality,
+        market_state = msg.market_state,
+        quid_strength_index = msg.quid_strength_index,
+        reference_qusd = msg.reference_qusd,
+        q_usd = msg.q_usd,
+        usd_index = msg.usd_index,
+        usd_strength_index = msg.usd_strength_index,
+        market = { quality = msg.market_quality },
+        base_qusd = msg.base_qusd,
+      }
+    end
+  end
+end
+
+local function requestHistory()
+  if not server_id then return false, "No forex server" end
+  rednet.send(server_id, { type = "history" }, FX_PROTOCOL)
+  local deadline = os.clock() + 4
+  while true do
+    local rem = deadline - os.clock()
+    if rem <= 0 then return false, "No history response" end
+    local sender, msg = rednet.receive(FX_PROTOCOL, rem)
+    if sender == server_id and type(msg) == "table" and msg.success ~= nil then
+      if msg.success == true and type(msg.response) == "table" and type(msg.response.ticks) == "table" then
+        last_history = msg.response.ticks
+        return true
+      end
+      return false, tostring(msg.response)
+    end
+  end
+end
+
+local function sparkline()
+  local ticks = last_history or {}
+  if #ticks < 2 then return "Awaiting chart" end
+  local start = math.max(1, #ticks - 48)
+  local vals, lo, hi = {}, nil, nil
+  for i = start, #ticks do
+    local v = tonumber(ticks[i].qusd or ticks[i].reference_qusd or ticks[i].strength)
+    if v then
+      vals[#vals + 1] = v
+      lo = lo and math.min(lo, v) or v
+      hi = hi and math.max(hi, v) or v
+    end
+  end
+  if #vals < 2 then return "Awaiting chart" end
+  local chars = { "_", ".", "-", "=", "+", "*", "#" }
+  local out = ""
+  for _, v in ipairs(vals) do
+    local idx = 1
+    if hi and lo and hi > lo then idx = math.floor(((v - lo) / (hi - lo)) * (#chars - 1)) + 1 end
+    if idx < 1 then idx = 1 end
+    if idx > #chars then idx = #chars end
+    out = out .. chars[idx]
+  end
+  return out
+end
+
+local function draw()
+  cls()
+  at(2, 1, "QUID FOREX DISPLAY", colors.cyan)
+  at(2, 2, "v" .. VERSION, colors.gray)
+  at(2, 4, "Modem:  " .. tostring(modem_name or "none"), modem_name and colors.lime or colors.red)
+  at(2, 5, "Server: " .. tostring(server_id or "not found"), server_id and colors.lime or colors.red)
+
+  local s = last_snapshot
+  if not s then
+    at(2, 8, "Awaiting forex data...", colors.orange)
+    if last_error ~= "" then at(2, 10, last_error, colors.red) end
+    return
+  end
+
+  local liveQusd = tonumber(s.q_usd or s.final_qusd or s.reference_qusd) or 0
+  at(2, 8,  "LIVE Q/USD", colors.yellow)
+  at(2, 9,  money(liveQusd, 4), colors.lime)
+  at(2, 10, "Chart: " .. sparkline(), colors.gray)
+
+  at(2, 12, "Quid strength: " .. string.format("%.5f", tonumber(s.quid_strength_index) or 0), colors.white)
+  at(2, 13, "USD index:     " .. string.format("%.4f", tonumber(s.usd_index) or 0), colors.yellow)
+  at(2, 14, "USD strength:  x" .. string.format("%.5f", tonumber(s.usd_strength_index) or 1), colors.yellow)
+  at(2, 15, "Ref Q/USD:     " .. money(s.reference_qusd, 4), colors.lightGray)
+  at(2, 16, "Quality:       " .. tostring(s.quality or "unknown"), s.quality == "LIVE" and colors.lime or colors.orange)
+  at(2, 17, "Market:        " .. tostring(s.market_state or "unknown"), colors.white)
+
+  if type(s.market) == "table" then
+    at(2, 18, "USD data:      " .. tostring(s.market.quality or "unknown"), s.market.quality == "LIVE" and colors.lime or colors.orange)
+    at(2, 19, "Source:        " .. tostring(s.market.source or "FMP"), colors.gray)
+  end
+
+  if type(s.inputs) == "table" then
+    at(2, 21, "Issued: " .. q(s.inputs.issued_supply) .. "  CPI x" .. string.format("%.3f", tonumber(s.inputs.price_index) or 1), colors.lightGray)
+    at(2, 22, "Treasury " .. pct(s.inputs.treasury_share, 1) .. "  Float " .. pct(s.inputs.private_float, 1) .. "  GDP/c " .. q(s.inputs.gdp_per_capita), colors.cyan)
+  end
+
+  if last_error ~= "" then at(2, 24, last_error, colors.orange) end
+end
+
+local function main()
+  if os.getComputerLabel() ~= "ForexClient" then pcall(os.setComputerLabel, "ForexClient") end
+  setupDisplay()
+  if not openModem() then
+    last_error = "No modem found"
+    draw()
+    return
+  end
+
+  while true do
+    local ok, res = requestSnapshot()
+    if ok and type(res) == "table" then
+      last_snapshot = res
+      requestHistory()
+      last_error = ""
+    elseif not ok then
+      last_error = tostring(res)
+    end
+    draw()
+    sleep(REFRESH_SECONDS)
+  end
+end
+
+local ok, err = pcall(main)
+if not ok then
+  term.redirect(native)
+  print("Forex client error: " .. tostring(err))
+end
