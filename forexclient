@@ -1,7 +1,7 @@
 -- =============================================================================
 -- FOREX CLIENT
 -- forexclient
--- v0.8.0-TREASURY-LEVERAGE-TRADER
+-- v0.8.1-LOTS-ONLY-TREASURY-TRADER
 --
 -- Purpose:
 --   Trading-terminal style client for the Oracle/Kraken EUR/USD forexserver.
@@ -67,7 +67,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION = "0.8.0-TREASURY-LEVERAGE-TRADER"
+local VERSION = "0.8.1-LOTS-ONLY-TREASURY-TRADER"
 local FX_PROTOCOL = "quid_fx"
 local BANK_PROTOCOL = "quid_bank"
 local BANK_TIMEOUT = 5
@@ -176,11 +176,8 @@ local selected_order_id = nil
 local last_orders_ms = 0
 local order_request_count = 0
 local lots_text = "0.01"
-local leverage_text = "10"
 local lots_focused = false
-local leverage_focused = false
 local lotInputRect = nil
-local leverageInputRect = nil
 
 local bank_id = nil
 local bank_session = {
@@ -554,21 +551,8 @@ local function minLots()
 end
 
 local function maxLeverage()
-  return tonumber(orders.max_leverage or MAX_LEVERAGE) or MAX_LEVERAGE
-end
-
-local function defaultLeverage()
-  return tonumber(orders.default_leverage or DEFAULT_LEVERAGE) or DEFAULT_LEVERAGE
-end
-
-local function currentLeverage()
-  local n = tonumber(leverage_text)
-  if not n then return nil end
-  n = math.floor(n + 0.0001)
-  if n < 1 then return nil end
-  local mx = maxLeverage()
-  if n > mx then n = mx end
-  return n
+  -- Internal treasury backing limit. Trader does not choose this; they choose lots.
+  return tonumber(orders.treasury_max_leverage or orders.max_leverage or MAX_LEVERAGE) or MAX_LEVERAGE
 end
 
 local function spreadFeeForLots(lots)
@@ -577,36 +561,24 @@ local function spreadFeeForLots(lots)
   return round2(feeUsd / quidUsdValue())
 end
 
-local function userMarginForLots(lots, leverage)
+local function userMarginForLots(lots)
   lots = tonumber(lots) or 0
-  leverage = tonumber(leverage) or 1
-  if leverage < 1 then leverage = 1 end
-  return round2((lots * lotNotionalUsd()) / quidUsdValue() / leverage)
+  return round2((lots * lotNotionalUsd()) / quidUsdValue() / maxLeverage())
 end
 
-local function requiredForLots(lots, leverage)
-  return round2(userMarginForLots(lots, leverage) + spreadFeeForLots(lots))
+local function requiredForLots(lots)
+  return round2(userMarginForLots(lots) + spreadFeeForLots(lots))
 end
 
-local function maxLotsForBalanceWithLeverage(balance_q, leverage)
+local function maxLotsForBalanceWithTreasury(balance_q)
   balance_q = tonumber(balance_q) or 0
-  leverage = tonumber(leverage) or 1
-  local perLot = requiredForLots(1, leverage)
+  local perLot = requiredForLots(1)
   if perLot <= 0 then return 0 end
   local raw = balance_q / perLot
   local step = lotStep()
   return math.floor((raw / step) + 0.0000001) * step
 end
 
-local function cleanLeverageText()
-  local v = tostring(leverage_text or "")
-  v = v:gsub("[^0-9]", "")
-  if v == "" then v = tostring(defaultLeverage()) end
-  local n = tonumber(v) or defaultLeverage()
-  if n < 1 then n = 1 end
-  if n > maxLeverage() then n = maxLeverage() end
-  leverage_text = tostring(math.floor(n))
-end
 
 local function maxLotsForBalance(balance_q)
   balance_q = tonumber(balance_q) or 0
@@ -754,23 +726,17 @@ local function openOrder(side)
   end
 
   cleanLotsText()
-  cleanLeverageText()
 
   local lots = currentLots()
-  local leverage = currentLeverage()
   if not lots then
     last_error = "Enter a valid lot amount"
     return
   end
-  if not leverage then
-    last_error = "Enter valid leverage"
-    return
-  end
 
-  local required = requiredForLots(lots, leverage)
+  local required = requiredForLots(lots)
   local bal = round2(tonumber(bank_session.balance or 0))
   if required > bal + 0.001 then
-    last_error = "Not enough Quid. Need " .. qfmt(required) .. " for " .. tostring(lots) .. " lots @" .. tostring(leverage) .. "x"
+    last_error = "Not enough Quid. Need " .. qfmt(required) .. " for " .. tostring(lots) .. " lots"
     return
   end
 
@@ -781,7 +747,6 @@ local function openOrder(side)
     symbol = active_symbol,
     side = side,
     lots = lots,
-    leverage = leverage,
     account_id = bank_session.citizen_id,
     username = bank_session.username,
     password = bank_session._password,
@@ -791,7 +756,7 @@ local function openOrder(side)
     request_id = reqId,
   }, FX_PROTOCOL)
 
-  last_error = "Sending " .. tostring(side) .. " " .. tostring(lots) .. " lots @" .. tostring(leverage) .. "x..."
+  last_error = "Sending " .. tostring(side) .. " " .. tostring(lots) .. " lots..."
 end
 
 local function closeSelectedOrder()
@@ -986,8 +951,7 @@ local function handleServerMessage(sender, msg)
         orders.lot_notional_usd = tonumber(orders.lot_notional_usd) or LOT_NOTIONAL_USD
         orders.quid_usd_value = tonumber(orders.quid_usd_value) or QUID_USD_VALUE
         orders.lot_units = tonumber(orders.lot_units) or LOT_UNITS
-        orders.default_leverage = tonumber(orders.default_leverage) or DEFAULT_LEVERAGE
-        orders.max_leverage = tonumber(orders.max_leverage) or MAX_LEVERAGE
+        orders.treasury_max_leverage = tonumber(orders.treasury_max_leverage or orders.max_leverage) or MAX_LEVERAGE
         orders.spread_pips = tonumber(orders.spread_pips) or SPREAD_PIPS
         orders.maintenance_margin_rate = tonumber(orders.maintenance_margin_rate) or MAINTENANCE_MARGIN_RATE
         last_orders_ms = nowMs()
@@ -1262,20 +1226,10 @@ local function handleClick(x, y)
 
   if lotInputRect and y == lotInputRect.y and x >= lotInputRect.x1 and x <= lotInputRect.x2 then
     lots_focused = true
-    leverage_focused = false
     draw()
     return true
   else
     lots_focused = false
-  end
-
-  if leverageInputRect and y == leverageInputRect.y and x >= leverageInputRect.x1 and x <= leverageInputRect.x2 then
-    leverage_focused = true
-    lots_focused = false
-    draw()
-    return true
-  else
-    leverage_focused = false
   end
 
   for _, r in ipairs(buttonRects) do
@@ -1327,19 +1281,16 @@ local function drawOrdersPanel(x, y, w, h)
   buttonRects = {}
   orderRowRects = {}
   lotInputRect = nil
-  leverageInputRect = nil
   fill(x, y, w, h, colors.black)
 
   local bal = round2(tonumber(bank_session.balance or 0))
   cleanLotsText()
-  cleanLeverageText()
 
   local lots = currentLots() or 0
-  local leverage = currentLeverage() or defaultLeverage()
-  local maxLots = maxLotsForBalanceWithLeverage(bal, leverage)
-  local userMargin = userMarginForLots(lots, leverage)
+  local maxLots = maxLotsForBalanceWithTreasury(bal)
+  local userMargin = userMarginForLots(lots)
   local spreadFee = spreadFeeForLots(lots)
-  local required = requiredForLots(lots, leverage)
+  local required = requiredForLots(lots)
   local afford = lots >= minLots() and lots <= maxLots and required <= bal + 0.001
 
   local used = round2(tonumber(orders.used_margin_q or 0))
@@ -1352,24 +1303,15 @@ local function drawOrdersPanel(x, y, w, h)
   at(x, y + 1, "Used " .. qfmt(used) .. " | Open P/L " .. qfmt(floating) .. " | MarginLvl " .. tostring(level) .. "%", floating >= 0 and colors.lime or colors.red)
 
   at(x, y + 2, "Lots", colors.lightGray)
-  local inputW = 8
+  local inputW = 10
   fill(x + 6, y + 2, inputW, 1, lots_focused and colors.white or colors.gray)
   at(x + 7, y + 2, tostring(lots_text):sub(1, inputW - 2), colors.black, lots_focused and colors.white or colors.gray)
   lotInputRect = { x1 = x + 6, x2 = x + 6 + inputW - 1, y = y + 2 }
 
-  at(x + 17, y + 2, "Lev", colors.lightGray)
-  local levW = 6
-  fill(x + 21, y + 2, levW, 1, leverage_focused and colors.white or colors.gray)
-  at(x + 22, y + 2, tostring(leverage_text):sub(1, levW - 2), colors.black, leverage_focused and colors.white or colors.gray)
-  leverageInputRect = { x1 = x + 21, x2 = x + 21 + levW - 1, y = y + 2 }
-
-  at(x + 30, y + 2, "Max " .. string.format("%.2f", maxLots) .. " | Req " .. qfmt(required) .. " | Fee " .. qfmt(spreadFee), afford and colors.lightGray or colors.red)
+  at(x + 20, y + 2, "Max " .. string.format("%.2f", maxLots) .. " lots | Margin " .. qfmt(userMargin) .. " | 2-pip fee " .. qfmt(spreadFee) .. " | Req " .. qfmt(required), afford and colors.lightGray or colors.red)
 
   if lots_focused then
     term.setCursorPos(x + 7 + math.min(#lots_text, inputW - 2), y + 2)
-    term.setCursorBlink(true)
-  elseif leverage_focused then
-    term.setCursorPos(x + 22 + math.min(#leverage_text, levW - 2), y + 2)
     term.setCursorBlink(true)
   end
 
@@ -1384,7 +1326,7 @@ local function drawOrdersPanel(x, y, w, h)
   drawBigButton(x + buyW + sellW + 4, btnY, closeW, btnH, "CLOSE", "CLOSE", colors.gray, colors.white)
 
   local headerY = btnY + btnH + 1
-  at(x, headerY, "ID Side Lots Lev Margin Fee Entry    Live     P/L   M%", colors.gray)
+  at(x, headerY, "ID Side Lots Margin Fee Entry    Live     P/L   M%", colors.gray)
 
   local openOrders = orders.active_orders or {}
   local maxRows = math.max(1, h - btnH - 6)
@@ -1401,19 +1343,18 @@ local function drawOrdersPanel(x, y, w, h)
 
     at(x, rowY, string.format("%-2s", tostring(id or "?")), colors.white, bg)
     at(x + 3, rowY, string.format("%-4s", side), sideCol, bg)
-    at(x + 8, rowY, string.format("%-4s", tostring(o.lots or "?")), colors.lightGray, bg)
-    at(x + 13, rowY, string.format("%-3s", tostring(o.leverage or "?")), colors.yellow, bg)
-    at(x + 17, rowY, string.format("%-6s", tostring(o.user_margin_q or o.margin_q or "?")), colors.yellow, bg)
-    at(x + 24, rowY, string.format("%-5s", tostring(o.spread_fee_q or "?")), colors.orange, bg)
-    at(x + 30, rowY, fmt(o.entry_price, 5), colors.white, bg)
-    at(x + 40, rowY, fmt(o.live_price, 5), colors.white, bg)
-    at(x + 50, rowY, qfmt(pnl), pnlColRow, bg)
-    at(x + 61, rowY, tostring(o.margin_level or 0) .. "%", (tonumber(o.margin_level or 0) < 100) and colors.red or colors.lightGray, bg)
+    at(x + 8, rowY, string.format("%-5s", tostring(o.lots or "?")), colors.lightGray, bg)
+    at(x + 14, rowY, string.format("%-7s", tostring(o.user_margin_q or o.margin_q or "?")), colors.yellow, bg)
+    at(x + 22, rowY, string.format("%-6s", tostring(o.spread_fee_q or "?")), colors.orange, bg)
+    at(x + 29, rowY, fmt(o.entry_price, 5), colors.white, bg)
+    at(x + 39, rowY, fmt(o.live_price, 5), colors.white, bg)
+    at(x + 49, rowY, qfmt(pnl), pnlColRow, bg)
+    at(x + 60, rowY, tostring(o.margin_level or 0) .. "%", (tonumber(o.margin_level or 0) < 100) and colors.red or colors.lightGray, bg)
     orderRowRects[#orderRowRects + 1] = { id = id, x1 = x, x2 = x + w - 1, y = rowY }
   end
 
   if #openOrders == 0 then
-    at(x, headerY + 2, "Enter lots + leverage, then BUY/SELL. Max leverage " .. tostring(maxLeverage()) .. "x.", colors.gray)
+    at(x, headerY + 2, "Enter lots, then BUY/SELL. Treasury backs leverage automatically.", colors.gray)
   end
 end
 
@@ -1436,10 +1377,9 @@ local function drawMonitorDisplay()
   local total = tonumber(orders.unrealized_pnl or 0) or 0
   local pnlCol = total > 0 and colors.lime or (total < 0 and colors.red or colors.lightGray)
   local bal = round2(tonumber(bank_session.balance or 0))
-  local maxLots = maxLotsForBalance(bal)
+  local maxLots = maxLotsForBalanceWithTreasury(bal)
   local lots = currentLots() or 0
-  local leverage = currentLeverage() or defaultLeverage()
-  local margin = requiredForLots(lots, leverage)
+  local margin = requiredForLots(lots)
 
   at(2, 3, "Symbol: EUR/USD", colors.yellow)
   at(20, 3, "TF: " .. tostring(active_tf), colors.white)
@@ -1451,7 +1391,7 @@ local function drawMonitorDisplay()
   at(44, 4, "Max: " .. string.format("%.2f", maxLots) .. " lots", colors.lightGray)
   at(64, 4, "Open P/L: " .. qfmt(total), pnlCol)
 
-  at(2, 5, "Lots: " .. tostring(lots_text) .. " | Lev: " .. tostring(leverage) .. "x | Required: " .. qfmt(margin) .. " | Fee: " .. qfmt(spreadFeeForLots(lots)), colors.lightGray)
+  at(2, 5, "Lots: " .. tostring(lots_text) .. " | Required: " .. qfmt(margin) .. " | 2-pip fee: " .. qfmt(spreadFeeForLots(lots)), colors.lightGray)
 
   -- Right-side symbols panel, matching the terminal.
   local sideW = 18
@@ -1579,17 +1519,11 @@ local function main()
       -- Monitor is display-only. All control stays on the computer terminal.
 
     elseif ev[1] == "char" then
-      local ch = tostring(ev[2] or "")
       if lots_focused then
+        local ch = tostring(ev[2] or "")
         if ch:match("[0-9%.]") and #lots_text < 8 then
           lots_text = tostring(lots_text or "") .. ch
           cleanLotsText()
-          draw()
-        end
-      elseif leverage_focused then
-        if ch:match("[0-9]") and #leverage_text < 3 then
-          leverage_text = tostring(leverage_text or "") .. ch
-          cleanLeverageText()
           draw()
         end
       end
@@ -1604,17 +1538,6 @@ local function main()
         elseif ev[2] == keys.enter then
           lots_focused = false
           cleanLotsText()
-          draw()
-        end
-      elseif leverage_focused then
-        if ev[2] == keys.backspace then
-          leverage_text = tostring(leverage_text or "")
-          leverage_text = leverage_text:sub(1, -2)
-          if leverage_text == "" then leverage_text = tostring(defaultLeverage()) end
-          draw()
-        elseif ev[2] == keys.enter then
-          leverage_focused = false
-          cleanLeverageText()
           draw()
         end
       end
