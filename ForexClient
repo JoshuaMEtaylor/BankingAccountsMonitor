@@ -1,0 +1,102 @@
+-- =============================================================================
+-- QUID STRENGTH CLIENT TEST
+-- Minimal display/test client for QuidStrengthServer.
+-- Install on any ComputerCraft terminal with a modem and run as startup.lua.
+-- =============================================================================
+
+local FX_PROTOCOL = "quid_fx"
+local fx_id = nil
+
+local function openModem()
+  for _, n in ipairs(peripheral.getNames()) do
+    if peripheral.getType(n) == "modem" then rednet.open(n); return true end
+  end
+  return false
+end
+
+local function discover()
+  rednet.broadcast({ type = "ping" }, FX_PROTOCOL)
+  local deadline = os.clock() + 5
+  while os.clock() < deadline do
+    local sender, msg = rednet.receive(FX_PROTOCOL, math.max(0.1, deadline - os.clock()))
+    if sender and type(msg) == "table" then
+      if msg.type == "quid_fx_online" then fx_id = sender; return true end
+      if msg.success == true and type(msg.response) == "table" then fx_id = sender; return true end
+    end
+  end
+  return false
+end
+
+local function req(r)
+  if not fx_id then return false, "no fx server" end
+  rednet.send(fx_id, r, FX_PROTOCOL)
+  local deadline = os.clock() + 5
+  while os.clock() < deadline do
+    local sender, msg = rednet.receive(FX_PROTOCOL, math.max(0.1, deadline - os.clock()))
+    if sender == fx_id and type(msg) == "table" and msg.success ~= nil then
+      return msg.success == true, msg.response
+    end
+  end
+  return false, "timeout"
+end
+
+local function fmt(n, dp)
+  n = tonumber(n)
+  if not n then return "--" end
+  return string.format("%." .. tostring(dp or 2) .. "f", n)
+end
+
+local function pct(n)
+  n = tonumber(n)
+  if not n then return "--" end
+  return string.format("%.2f%%", n * 100)
+end
+
+local function draw(s)
+  term.setBackgroundColor(colors.black)
+  term.setTextColor(colors.white)
+  term.clear()
+  term.setCursorPos(1,1)
+  print("QUID FX CLIENT TEST")
+  print("Server: " .. tostring(fx_id or "none"))
+  print("")
+  if type(s) ~= "table" then
+    term.setTextColor(colors.red)
+    print("No snapshot")
+    return
+  end
+  local i = s.inputs or {}
+  local d = s.drivers or {}
+  term.setTextColor(colors.lime)
+  print("Quid strength: x" .. fmt(s.quid_strength_index, 4))
+  term.setTextColor(colors.cyan)
+  print("Reference Q/USD: $" .. fmt(s.reference_qusd, 4))
+  term.setTextColor(colors.lightGray)
+  print("Base Q/USD: $" .. fmt(s.base_qusd, 2))
+  print("Formula: QUSD = base * quid / usd")
+  print("")
+  print("Price index: x" .. fmt(i.price_index, 3))
+  print("Issued supply: " .. fmt(i.issued_supply, 0) .. " Q")
+  print("Treasury share: " .. pct(i.treasury_share))
+  print("Private float: " .. pct(i.private_float))
+  print("Real wage: " .. pct(i.real_wage_ratio))
+  print("GDP/capita: " .. fmt(i.gdp_per_capita, 1) .. " Q")
+  print("")
+  print("Drivers:")
+  print("PP x" .. fmt(d.purchasing_power_factor, 3) .. "  Print x" .. fmt(d.print_shock_factor, 3))
+  print("Pressure x" .. fmt(d.pressure_factor, 3) .. "  Output x" .. fmt(d.output_factor, 3))
+  print("Treasury x" .. fmt(d.treasury_factor, 3) .. "  Float x" .. fmt(d.private_float_factor, 3))
+end
+
+if not openModem() then print("No modem"); return end
+while not fx_id do
+  term.clear(); term.setCursorPos(1,1); print("Discovering quid_fx server...")
+  discover()
+  if not fx_id then sleep(2) end
+end
+
+while true do
+  local ok, res = req({ type = "get_quid_strength" })
+  if ok then draw(res) else draw(nil); print(tostring(res)) end
+  sleep(5)
+end
