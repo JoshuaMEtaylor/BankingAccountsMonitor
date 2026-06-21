@@ -12,7 +12,7 @@
 --   COMPANIES
 --   TRANSACTIONS TODAY
 --
--- Read-only. No banking controls. No trade panel. Contract GDP plus bank-side service GDP over 365 Minecraft days + in-view MCT clock + tapered money-supply inflation.
+-- Read-only. No banking controls. No trade panel. Contract GDP plus bank-side service/financial GDP over 365 Minecraft days + in-view MCT clock + tapered money-supply inflation.
 -- =============================================================================
 
 local args = {...}
@@ -61,7 +61,7 @@ for i = 2, #args do
   runtime_args[#runtime_args + 1] = args[i]
 end
 
-local VERSION         = "0.5.24-PRICE-LED-WAGES"
+local VERSION         = "0.5.25-FX-SPREAD-GDP"
 local PROTOCOL        = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT      = 5
@@ -1096,6 +1096,7 @@ local function normaliseNationalStats(raw)
       admin_transactions_today = num(txToday.admin),
       payroll_transactions_today = num(txToday.payroll),
       service_transactions_today = num(txToday.service),
+      financial_transactions_today = num(txToday.financial),
       transaction_value_today = num(txToday.value),
       tx_today_status = txStatus,
       top_companies = scaleRaw.top_companies or scaleRaw.company_top10 or raw.top_companies or {},
@@ -1212,14 +1213,16 @@ local function fallbackSnapshot()
 
   local contractEco = fetchContractEconomy()
 
-  -- GDP is now assembled from two output streams:
-  --   1. ContractServer fulfilled contracts.
-  --   2. Bank ledger service output, especially Dining Hall / restaurant meals.
+  -- GDP is assembled from ContractServer fulfilled contracts plus bank ledger
+  -- non-contract output. Bank-side output includes restaurant/service output and
+  -- financial service revenue from leveraged FX spread fees. Trader P/L is not GDP.
   -- The bank request explicitly excludes contract payouts so we do not double
   -- count contracts already read from ContractServer.
   local bankServiceGdp = 0
   local bankHospitalityGdp = 0
+  local bankFinancialGdp = 0
   local bankServiceEvents = 0
+  local bankFinancialEvents = 0
   local bankGdpRes = nil
   local okGdp, gdpRes = cachedDbRequest({
     type = "economic_gdp",
@@ -1229,22 +1232,26 @@ local function fallbackSnapshot()
 
   if okGdp and type(gdpRes) == "table" then
     bankGdpRes = gdpRes
-    bankServiceGdp = num(gdpRes.service_gdp or gdpRes.services_gdp or gdpRes.non_contract_gdp or gdpRes.gdp or gdpRes.private_gdp) or 0
+    -- Prefer non_contract_gdp so every bank-side output stream is included:
+    -- dining/service output plus financial spread-fee output.
+    bankServiceGdp = num(gdpRes.non_contract_gdp or gdpRes.service_gdp or gdpRes.services_gdp or gdpRes.gdp or gdpRes.private_gdp) or 0
     bankHospitalityGdp = num(gdpRes.hospitality_gdp or gdpRes.meal_gdp) or 0
+    bankFinancialGdp = num(gdpRes.financial_gdp or gdpRes.finance_gdp or gdpRes.forex_spread_fee_gdp) or 0
     bankServiceEvents = num(gdpRes.service_events or gdpRes.hospitality_events or gdpRes.transaction_count) or 0
+    bankFinancialEvents = num(gdpRes.financial_events or gdpRes.forex_spread_fee_events) or 0
   else
     endpointErrors[#endpointErrors + 1] = "service_gdp=" .. shortText(tostring(gdpRes), 36)
   end
 
   local contractGdp = 0
-  local outputStatus = "Waiting for ContractServer / bank service GDP"
+  local outputStatus = "Waiting for ContractServer / bank output GDP"
   if contractEco and contractEco.connected then
     contractGdp = tonumber(contractEco.gdp_365d or contractEco.gdp_24h) or 0
-    outputStatus = "GDP = fulfilled contracts + bank service output"
+    outputStatus = "GDP = fulfilled contracts + bank service/financial output"
   elseif bankServiceGdp > 0 then
-    outputStatus = "GDP = bank service output; ContractServer unavailable"
+    outputStatus = "GDP = bank service/financial output; ContractServer unavailable"
   else
-    outputStatus = "Waiting for fulfilled contracts / restaurant service sales"
+    outputStatus = "Waiting for fulfilled contracts / service or FX fee output"
   end
 
   local gdp = contractGdp + bankServiceGdp
@@ -1290,6 +1297,7 @@ local function fallbackSnapshot()
       admin_transactions_today = num(txToday.admin),
       payroll_transactions_today = num(txToday.payroll),
       service_transactions_today = num(txToday.service),
+      financial_transactions_today = num(txToday.financial),
       transaction_value_today = num(txToday.value),
       tx_today_status = txStatus,
       top_companies = topCompaniesFromAccounts(accounts),
@@ -1299,9 +1307,11 @@ local function fallbackSnapshot()
     contracts = contractEco,
     service_gdp = bankServiceGdp,
     hospitality_gdp = bankHospitalityGdp,
+    financial_gdp = bankFinancialGdp,
     contract_gdp = contractGdp,
     bank_gdp = bankGdpRes,
     service_events = bankServiceEvents,
+    financial_events = bankFinancialEvents,
     _raw_accounts = accounts,
     accounts_from_previous = accountsFromPrevious,
   }
@@ -1617,7 +1627,7 @@ local function drawScaleCard(x, y, w, h, snap)
   metric(x + 2, y + 2, "Population", tostring(s.population or "Awaiting data"), s.population and colors.white or C.warn)
   metric(x + 2, y + 3, "Companies", tostring(s.companies or "Awaiting data"), s.companies and colors.white or C.warn)
   metric(x + 2, y + 4, "TX today", s.transactions_today ~= nil and tostring(s.transactions_today) or "Awaiting data", s.transactions_today ~= nil and colors.white or C.warn)
-  local txBreak = "E/A/P/S: " .. tostring(s.economic_transactions_today or 0) .. "/" .. tostring(s.admin_transactions_today or 0) .. "/" .. tostring(s.payroll_transactions_today or 0) .. "/" .. tostring(s.service_transactions_today or 0)
+  local txBreak = "E/A/P/S/F: " .. tostring(s.economic_transactions_today or 0) .. "/" .. tostring(s.admin_transactions_today or 0) .. "/" .. tostring(s.payroll_transactions_today or 0) .. "/" .. tostring(s.service_transactions_today or 0) .. "/" .. tostring(s.financial_transactions_today or 0)
   writeAt(x + 2, y + 5, shortText(txBreak, w - 4), C.text, C.bg)
 
   local c = snap and snap.contracts or {}
@@ -1626,26 +1636,36 @@ local function drawScaleCard(x, y, w, h, snap)
 
   local svc = snap and snap.service_gdp or nil
   local hosp = snap and snap.hospitality_gdp or nil
+  local fin = snap and snap.financial_gdp or nil
   local conGdp = snap and snap.contract_gdp or nil
-  local serviceLine = "GDP split C/S: " .. fmtMoney(conGdp or 0) .. " / " .. fmtMoney(svc or 0)
+  local serviceLine = "GDP C/B/F: " .. fmtMoney(conGdp or 0) .. " / " .. fmtMoney(svc or 0) .. " / " .. fmtMoney(fin or 0)
   writeAt(x + 2, y + 7, shortText(serviceLine, w - 4), (svc and svc > 0) and C.good or C.dim, C.bg)
-  if hosp and hosp > 0 then
-    writeAt(x + 2, y + 8, shortText("Restaurant/meals GDP: " .. fmtMoney(hosp), w - 4), colors.yellow, C.bg)
+
+  local detailY = y + 8
+  if fin and fin > 0 then
+    writeAt(x + 2, detailY, shortText("FX spread-fee GDP: " .. fmtMoney(fin), w - 4), colors.yellow, C.bg)
+    detailY = detailY + 1
+  end
+  if hosp and hosp > 0 and detailY <= y + 9 then
+    writeAt(x + 2, detailY, shortText("Restaurant/meals GDP: " .. fmtMoney(hosp), w - 4), colors.yellow, C.bg)
+    detailY = detailY + 1
   end
 
-  writeAt(x + 2, y + 10, "Top companies", colors.white, C.bg)
+  local topHeaderY = math.max(y + 10, detailY + 1)
+  writeAt(x + 2, topHeaderY, "Top companies", colors.white, C.bg)
   local top = s.top_companies or {}
   if type(top) ~= "table" or #top == 0 then
-    writeAt(x + 2, y + 11, "No company account data", C.warn, C.bg)
+    writeAt(x + 2, topHeaderY + 1, "No company account data", C.warn, C.bg)
   else
-    local maxRows = math.min(10, #top, math.max(1, h - 13))
+    local maxRows = math.min(10, #top, math.max(1, y + h - topHeaderY - 2))
     for i = 1, maxRows do
       local company = top[i] or {}
       local name = shortText(company.name or company.id or ("Company " .. i), math.max(8, w - 18))
       local bal = fmtMoney(company.balance)
       local line = tostring(i) .. ". " .. name
-      writeAt(x + 2, y + 10 + i, shortText(line, w - 18), C.text, C.bg)
-      writeAt(x + w - #bal - 2, y + 10 + i, bal, colors.white, C.bg)
+      local rowY = topHeaderY + i
+      writeAt(x + 2, rowY, shortText(line, w - 18), C.text, C.bg)
+      writeAt(x + w - #bal - 2, rowY, bal, colors.white, C.bg)
     end
   end
 
