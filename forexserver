@@ -1,7 +1,7 @@
 -- =============================================================================
 -- FOREX SERVER
 -- forexserver
--- v0.6.2-ORACLE-KRAKEN-5M-HISTORY-UPDATER
+-- v0.6.3-ORACLE-KRAKEN-MULTI-TF-UPDATER
 --
 -- Purpose:
 --   Pull the live EUR/USD number from the Oracle relay node and keep a proper
@@ -59,7 +59,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION = "0.6.2-ORACLE-KRAKEN-5M-HISTORY-UPDATER"
+local VERSION = "0.6.3-ORACLE-KRAKEN-MULTI-TF-UPDATER"
 local PROTOCOL = "quid_fx"
 
 local ORACLE_LATEST_URL = "http://145.241.202.103:8000/latest"
@@ -71,8 +71,9 @@ local SAVE_SECONDS = 10
 local STALE_AFTER_MS = 5000
 
 local TIMEFRAMES = {
-  ["1m"] = { seconds = 60,  max = 1440 }, -- 24h
-  ["5m"] = { seconds = 300, max = 576  }, -- 48h
+  ["1m"]  = { seconds = 60,  max = 1440 }, -- 24h
+  ["5m"]  = { seconds = 300, max = 576  }, -- 48h
+  ["15m"] = { seconds = 900, max = 384  }, -- 4 days
 }
 
 local STATE_FILE = "data/forex_server_state.db"
@@ -91,6 +92,7 @@ local state = {
 local candles = {
   ["1m"] = {},
   ["5m"] = {},
+  ["15m"] = {},
 }
 
 local last_tick = nil
@@ -153,6 +155,7 @@ local function loadState()
   if type(c) == "table" then
     if type(c["1m"]) == "table" then candles["1m"] = c["1m"] end
     if type(c["5m"]) == "table" then candles["5m"] = c["5m"] end
+    if type(c["15m"]) == "table" then candles["15m"] = c["15m"] end
   end
 end
 
@@ -396,6 +399,7 @@ local function pushPrice(price)
 
   updateCandleSet("1m", price, ms)
   updateCandleSet("5m", price, ms)
+  updateCandleSet("15m", price, ms)
 
   last_tick = {
     ok = true,
@@ -530,6 +534,7 @@ local function handleRequest(sender, msg)
         stored = {
           ["1m"] = #candles["1m"],
           ["5m"] = #candles["5m"],
+          ["15m"] = #candles["15m"],
         },
         version = VERSION,
       },
@@ -576,14 +581,14 @@ local function draw()
 
   at(2,14, "Polling:      every " .. tostring(POLL_SECONDS) .. "s", colors.yellow)
   at(2,15, "Samples:      " .. tostring(sample_count) .. "  Changes: " .. tostring(change_count) .. "  Fails: " .. tostring(failure_count), colors.lightGray)
-  at(2,16, "Stored candles 1m/5m: " .. tostring(#candles["1m"]) .. " / " .. tostring(#candles["5m"]), colors.lightGray)
+  at(2,16, "Stored candles 1m/5m/15m: " .. tostring(#candles["1m"]) .. " / " .. tostring(#candles["5m"]) .. " / " .. tostring(#candles["15m"]), colors.lightGray)
   at(2,17, "Last success: " .. ageText(last_success_ms) .. " ago  Response: " .. tostring(last_response_ms or 0) .. "ms", colors.lightGray)
 
   at(2,19, "Recent 5m closes", colors.white)
   drawSparkline(candles["5m"], 2, 20, math.max(10, W - 4), "close", colors.lime)
 
   at(2, H - 2, "Status: " .. clampText(last_error, math.max(10, W - 10)), last_error == "OK" and colors.lime or colors.orange)
-  at(2, H - 1, "Server stores persistent candle history so clients can boot with existing chart data.", colors.gray)
+  at(2, H - 1, "Server stores persistent 1m/5m/15m candle history for tabbed clients.", colors.gray)
 end
 
 local function main()
