@@ -1,9 +1,49 @@
 -- =============================================================================
--- QUID STRENGTH CLIENT TEST
--- Minimal display/test client for QuidStrengthServer.
+-- FOREX CLIENT
+-- Minimal display/test client for forexserver.
 -- Install on any ComputerCraft terminal with a modem and run as startup.lua.
 -- =============================================================================
 
+-- =============================================================================
+-- SELF UPDATE
+-- =============================================================================
+local args = {...}
+if args[1] ~= "--updated" then
+  print("[ Forex Client ]")
+  print("Deleting old version...")
+  fs.delete("startup.lua")
+
+  print("Downloading latest from GitHub...")
+  local cache_bust = tostring(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
+  local update_url = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/forexclient?cb=" .. cache_bust
+
+  shell.run("wget " .. update_url .. " startup.lua")
+
+  if not fs.exists("startup.lua") then
+    print("")
+    print("Download failed.")
+    print("Expected GitHub file: forexclient")
+    print("")
+    print("Manual install:")
+    print("delete startup")
+    print("wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/forexclient?cb=001 startup.lua")
+    print("startup.lua")
+    return
+  end
+
+  print("Relaunching...")
+  sleep(0.5)
+
+  local relaunch_args = { "startup.lua", "--updated" }
+  for i = 1, #args do
+    relaunch_args[#relaunch_args + 1] = tostring(args[i])
+  end
+  local unpackFn = table.unpack or unpack
+  shell.run(unpackFn(relaunch_args))
+  return
+end
+
+local VERSION = "0.1.1-FOREXCLIENT-SELF-UPDATING"
 local FX_PROTOCOL = "quid_fx"
 local fx_id = nil
 
@@ -57,7 +97,7 @@ local function draw(s)
   term.setTextColor(colors.white)
   term.clear()
   term.setCursorPos(1,1)
-  print("QUID FX CLIENT TEST")
+  print("FOREX CLIENT TEST")
   print("Server: " .. tostring(fx_id or "none"))
   print("")
   if type(s) ~= "table" then
