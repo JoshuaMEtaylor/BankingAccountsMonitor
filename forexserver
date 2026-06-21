@@ -1,7 +1,7 @@
 -- =============================================================================
 -- FOREX SERVER
 -- forexserver
--- v0.6.0-ORACLE-KRAKEN-5M-HISTORY
+-- v0.6.1-ORACLE-KRAKEN-5M-HISTORY-UPDATER
 --
 -- Purpose:
 --   Pull the live EUR/USD number from the Oracle relay node and keep a proper
@@ -9,13 +9,57 @@
 --   chart instead of starting from a single candle.
 --
 -- This build:
---   - NO self updater (manual install for stability)
+--   - safe self updater using startup.new/startup.old
 --   - polls Oracle /latest every 0.1s
 --   - stores persistent 1m and 5m candle history on the server
 --   - serves live tick + history to forex clients over rednet
 -- =============================================================================
 
-local VERSION = "0.6.0-ORACLE-KRAKEN-5M-HISTORY"
+local args = {...}
+
+-- =============================================================================
+-- SAFE SELF UPDATE
+-- =============================================================================
+-- Downloads to startup.new first. Only replaces startup.lua after the new file
+-- exists and is non-empty, so a failed download cannot delete the running script.
+if args[1] ~= "--updated" then
+  print("[ Forex Server ]")
+  print("Checking GitHub update...")
+
+  local tmp = "startup.new"
+  local old = "startup.old"
+  fs.delete(tmp)
+
+  local cb = tostring(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
+  local url = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/forexserver?cb=" .. cb
+  shell.run("wget " .. url .. " " .. tmp)
+
+  local okDownload = false
+  if fs.exists(tmp) then
+    local f = fs.open(tmp, "r")
+    local body = f and f.readAll() or ""
+    if f then f.close() end
+    okDownload = body and #body > 50
+  end
+
+  if not okDownload then
+    fs.delete(tmp)
+    print("Update failed or empty. Keeping existing startup.lua.")
+    print("Run with startup.lua --updated to bypass updater for manual testing.")
+    return
+  end
+
+  fs.delete(old)
+  if fs.exists("startup.lua") then fs.move("startup.lua", old) end
+  fs.move(tmp, "startup.lua")
+
+  print("Updated. Relaunching...")
+  sleep(0.5)
+  shell.run("startup.lua", "--updated")
+  return
+end
+
+local VERSION = "0.6.1-ORACLE-KRAKEN-5M-HISTORY-UPDATER"
 local PROTOCOL = "quid_fx"
 
 local ORACLE_LATEST_URL = "http://145.241.202.103:8000/latest"
@@ -271,11 +315,15 @@ local function updateCandleSet(tf, price, ms)
   local c = list[#list]
 
   if not c or c.bucket ~= bucket then
+    -- Trading-terminal behaviour: a new candle opens at the previous candle's
+    -- close, not halfway through the next movement. This keeps candles joined.
+    local openPrice = price
+    if c and tonumber(c.close) then openPrice = tonumber(c.close) end
     c = {
       bucket = bucket,
-      open = price,
-      high = price,
-      low = price,
+      open = openPrice,
+      high = math.max(openPrice, price),
+      low = math.min(openPrice, price),
       close = price,
       samples = 1,
       updated = ms,
