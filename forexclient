@@ -1,7 +1,7 @@
 -- =============================================================================
 -- FOREX CLIENT
 -- forexclient
--- v0.7.0-EURUSD-METATRADER-LITE
+-- v0.7.2-MARGIN-LOT-METATRADER
 --
 -- Purpose:
 --   Trading-terminal style client for the Oracle/Kraken EUR/USD forexserver.
@@ -67,8 +67,10 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION = "0.7.0-EURUSD-METATRADER-LITE"
+local VERSION = "0.7.2-MARGIN-LOT-METATRADER"
 local FX_PROTOCOL = "quid_fx"
+local BANK_PROTOCOL = "quid_bank"
+local BANK_TIMEOUT = 5
 local server_id = tonumber(args[2])
 
 local SAMPLE_SECONDS = 0.10
@@ -92,7 +94,9 @@ local SYMBOLS = {
 local active_tf = "5m"
 local active_symbol = "EURUSD"
 local MAX_CANDLES = 576
-local DEFAULT_UNITS = 10000
+local DEFAULT_LOTS = 1
+local LOT_MARGIN_Q = 100
+local LOT_UNITS = 10000
 
 -- Chart scaling:
 -- centred around current visible action, with hard rails and a minimum visible
@@ -145,11 +149,28 @@ local orders = {
   closed_orders = {},
   unrealized_pnl = 0,
   open_count = 0,
-  default_units = DEFAULT_UNITS,
+  default_lots = DEFAULT_LOTS,
+  lot_margin_q = LOT_MARGIN_Q,
+  lot_units = LOT_UNITS,
 }
 local selected_order_id = nil
 local last_orders_ms = 0
 local order_request_count = 0
+local lots_text = "1"
+local lots_focused = false
+local pending_reserves = {}
+local lotInputRect = nil
+
+local bank_id = nil
+local bank_session = {
+  logged_in = false,
+  citizen_id = nil,
+  display_name = nil,
+  username = nil,
+  _password = nil,
+  balance = 0,
+  title = nil,
+}
 
 local sample_timer = nil
 local draw_timer = nil
@@ -219,6 +240,8 @@ local function loadState()
   if TIMEFRAMES[state.active_tf] then active_tf = state.active_tf end
   if SYMBOLS[state.active_symbol] then active_symbol = state.active_symbol end
 
+  if state.bank_id and not bank_id then bank_id = tonumber(state.bank_id) end
+
   local sets = readTable(CANDLES_FILE)
   if type(sets) == "table" then
     for _, tf in ipairs(TF_ORDER) do
@@ -231,6 +254,8 @@ end
 local function saveState()
   state.saved_at = nowMs()
   state.server_id = server_id
+  state.bank_id = bank_id
+  state.bank_username = bank_session.username
   state.active_tf = active_tf
   state.active_symbol = active_symbol
   state.created_version = VERSION
@@ -352,6 +377,200 @@ local function openModem()
   return false
 end
 
+local function discoverBank()
+  if bank_id then return true end
+
+  for attempt = 1, 6 do
+    rednet.broadcast({ type = "ping", client = "forexclient", version = VERSION }, BANK_PROTOCOL)
+    local sender, msg = rednet.receive(BANK_PROTOCOL, 3)
+    if sender and type(msg) == "table" then
+      -- The bank server replies success/response to ping.
+      if msg.success ~= nil or msg.type == "treasury_online" then
+        bank_id = sender
+        state.bank_id = sender
+        return true
+      end
+    end
+  end
+
+  return false
+end
+
+local function bankRequest(req)
+  if not bank_id then return false, "Bank server not connected" end
+  rednet.send(bank_id, req, BANK_PROTOCOL)
+  local sender, msg = rednet.receive(BANK_PROTOCOL, BANK_TIMEOUT)
+  if sender ~= bank_id or type(msg) ~= "table" then
+    return false, "No response from bank"
+  end
+  return msg.success == true, msg.response or msg.error
+end
+
+local function refreshBankBalance()
+  if not bank_session.logged_in then return false, "Not logged in" end
+  local ok, res = bankRequest({
+    type = "balance",
+    username = bank_session.username,
+    password = bank_session._password,
+  })
+
+  if ok and type(res) == "table" then
+    bank_session.balance = tonumber(res.balance) or bank_session.balance or 0
+    return true, res
+  end
+
+  return false, res
+end
+
+local function drawLoginFrame(msg, col)
+  W, H = term.getSize()
+  cls()
+  fill(1, 1, W, 1, colors.blue)
+  at(2, 1, "EUR/USD METATRADER LITE - BANK LOGIN", colors.white, colors.blue)
+  at(math.max(1, W - #VERSION), 1, VERSION, colors.lightGray, colors.blue)
+
+  at(3, 3, "This terminal must be linked to a Quid Bank account before trading.", colors.lightGray)
+  at(3, 5, "Bank server: " .. tostring(bank_id or "searching"), bank_id and colors.lime or colors.orange)
+  if msg and msg ~= "" then at(3, 7, msg, col or colors.orange) end
+end
+
+local function loginToBank()
+  while true do
+    drawLoginFrame("Connecting to Quid Bank...", colors.orange)
+
+    if not discoverBank() then
+      drawLoginFrame("Could not find Quid Bank. Check bank server/modems.", colors.red)
+      sleep(3)
+    else
+      drawLoginFrame("Enter bank username and password.", colors.lime)
+
+      at(3, 9, "Username:", colors.yellow)
+      at(3, 10, "> ", colors.white)
+      term.setCursorBlink(true)
+      local username = read()
+
+      at(3, 12, "Password:", colors.yellow)
+      at(3, 13, "> ", colors.white)
+      local password = read("*")
+      term.setCursorBlink(false)
+
+      if tostring(username or "") ~= "" and tostring(password or "") ~= "" then
+        drawLoginFrame("Authenticating...", colors.orange)
+
+        local ok, res = bankRequest({
+          type = "login",
+          username = username,
+          password = password,
+        })
+
+        if ok and type(res) == "table" then
+          bank_session.logged_in = true
+          bank_session.citizen_id = res.citizen_id
+          bank_session.display_name = res.display_name
+          bank_session.username = username
+          bank_session._password = password
+          bank_session.balance = tonumber(res.balance) or 0
+          bank_session.title = res.title or "Account Holder"
+
+          state.bank_username = username
+          saveState()
+
+          drawLoginFrame("Linked account: " .. tostring(bank_session.citizen_id), colors.lime)
+          sleep(0.5)
+          return true
+        else
+          drawLoginFrame("Login failed: " .. tostring(res or "unknown"), colors.red)
+          sleep(2)
+        end
+      end
+    end
+  end
+end
+
+local function accountPayload()
+  return {
+    account_id = bank_session.citizen_id,
+    username = bank_session.username,
+    display_name = bank_session.display_name,
+  }
+end
+
+
+local function currentLots()
+  local n = tonumber(lots_text)
+  if not n or n <= 0 then return nil end
+  -- Keep it sane for the terminal. Decimals are allowed, but only 2dp.
+  n = math.floor(n * 100 + 0.5) / 100
+  return n
+end
+
+local function marginForLots(lots)
+  lots = tonumber(lots) or 0
+  local lotMargin = tonumber(orders.lot_margin_q or LOT_MARGIN_Q) or LOT_MARGIN_Q
+  return math.floor((lots * lotMargin) + 0.5)
+end
+
+local function refreshBankBalanceNow()
+  local ok, res = refreshBankBalance()
+  if not ok then last_error = "Balance refresh failed: " .. tostring(res) end
+  return ok, res
+end
+
+local function reserveMargin(amount, memo)
+  if not bank_session.logged_in then return false, "Bank login required" end
+  amount = math.floor(tonumber(amount) or 0)
+  if amount <= 0 then return false, "Invalid margin" end
+  if amount > math.floor(tonumber(bank_session.balance or 0)) then
+    return false, "Insufficient balance for margin: need " .. tostring(amount) .. " Q"
+  end
+
+  local ok, res = bankRequest({
+    type = "forex_reserve",
+    username = bank_session.username,
+    password = bank_session._password,
+    account_id = bank_session.citizen_id,
+    amount = amount,
+    memo = memo or "Forex margin lock",
+  })
+
+  if ok and type(res) == "table" then
+    bank_session.balance = math.max(0, (tonumber(bank_session.balance) or 0) - amount)
+    return true, res
+  end
+  return false, res
+end
+
+local function releaseMargin(amount, memo, orderId)
+  if not bank_session.logged_in then return false, "Bank login required" end
+  amount = math.floor(tonumber(amount) or 0)
+  if amount < 0 then return false, "Invalid payout" end
+  if amount == 0 then return true, { tx_id = nil, amount = 0 } end
+
+  local ok, res = bankRequest({
+    type = "forex_release",
+    username = bank_session.username,
+    password = bank_session._password,
+    account_id = bank_session.citizen_id,
+    amount = amount,
+    order_id = orderId,
+    memo = memo or "Forex margin release",
+  })
+
+  if ok then refreshBankBalanceNow() end
+  return ok, res
+end
+
+local function cleanLotsText()
+  local v = tostring(lots_text or "")
+  v = v:gsub("[^0-9%.]", "")
+  local first = v:find("%.")
+  if first then
+    v = v:sub(1, first) .. v:sub(first + 1):gsub("%.", "")
+  end
+  if v == "" then v = "1" end
+  lots_text = v
+end
+
 local function broadcastPing()
   discover_count = discover_count + 1
   rednet.broadcast({ type = "ping", client = "forexclient", version = VERSION }, FX_PROTOCOL)
@@ -381,6 +600,8 @@ local function requestOrders()
   rednet.send(server_id, {
     type = "get_orders",
     symbol = active_symbol,
+    account_id = bank_session.citizen_id,
+    username = bank_session.username,
     client = "forexclient",
     version = VERSION,
     request_id = "orders_" .. tostring(order_request_count),
@@ -389,15 +610,58 @@ end
 
 local function openOrder(side)
   if not server_id then return end
+  if not bank_session.logged_in or not bank_session.citizen_id then
+    last_error = "Bank login required"
+    return
+  end
+
+  cleanLotsText()
+  local lots = currentLots()
+  if not lots then
+    last_error = "Enter a valid lot amount"
+    return
+  end
+
+  local margin = marginForLots(lots)
+  if margin <= 0 then
+    last_error = "Invalid margin"
+    return
+  end
+
+  if margin > math.floor(tonumber(bank_session.balance or 0)) then
+    last_error = "Not enough Quid. Need " .. tostring(margin) .. " Q for " .. tostring(lots) .. " lots"
+    return
+  end
+
+  local reserveOk, reserveRes = reserveMargin(margin, "Forex " .. tostring(side) .. " margin " .. tostring(lots) .. " lots")
+  if not reserveOk then
+    last_error = "Margin lock failed: " .. tostring(reserveRes)
+    return
+  end
+
+  local reqId = "open_" .. tostring(nowMs())
+  pending_reserves[reqId] = {
+    amount = margin,
+    lots = lots,
+    tx_id = type(reserveRes) == "table" and reserveRes.tx_id or nil,
+  }
+
   rednet.send(server_id, {
     type = "open_order",
     symbol = active_symbol,
     side = side,
-    units = orders.default_units or DEFAULT_UNITS,
+    lots = lots,
+    margin_q = margin,
+    reserved_tx_id = pending_reserves[reqId].tx_id,
+    account_id = bank_session.citizen_id,
+    username = bank_session.username,
+    display_name = bank_session.display_name,
     client = "forexclient",
     version = VERSION,
-    request_id = "open_" .. tostring(nowMs()),
+    request_id = reqId,
   }, FX_PROTOCOL)
+
+  last_error = "Locked " .. tostring(margin) .. " Q margin. Sending " .. tostring(side) .. " order..."
 end
 
 local function closeSelectedOrder()
@@ -410,13 +674,17 @@ local function closeSelectedOrder()
     last_error = "No selected order to close"
     return
   end
+
   rednet.send(server_id, {
     type = "close_order",
     order_id = id,
+    account_id = bank_session.citizen_id,
+    username = bank_session.username,
     client = "forexclient",
     version = VERSION,
     request_id = "close_" .. tostring(nowMs()),
   }, FX_PROTOCOL)
+  last_error = "Closing order " .. tostring(id) .. "..."
 end
 
 local function sendTickRequest()
@@ -582,9 +850,27 @@ local function handleServerMessage(sender, msg)
         orders = msg.response
         if not orders.active_orders then orders.active_orders = {} end
         if not orders.closed_orders then orders.closed_orders = {} end
-        orders.default_units = tonumber(orders.default_units) or DEFAULT_UNITS
+        orders.default_lots = tonumber(orders.default_lots) or DEFAULT_LOTS
+        orders.lot_margin_q = tonumber(orders.lot_margin_q) or LOT_MARGIN_Q
+        orders.lot_units = tonumber(orders.lot_units) or LOT_UNITS
         last_orders_ms = nowMs()
         last_error = "Orders updated"
+
+        if type(msg.order) == "table" and msg.order.status == "CLOSED" then
+          local payout = math.floor(tonumber(msg.order.payout_q) or 0)
+          local oid = tonumber(msg.order.id)
+          local okRelease, rel = releaseMargin(payout, "Forex close order " .. tostring(oid), oid)
+          if okRelease then
+            last_error = "Order " .. tostring(oid) .. " closed. Payout " .. tostring(payout) .. " Q"
+          else
+            last_error = "ORDER CLOSED BUT PAYOUT FAILED: " .. tostring(rel)
+          end
+        end
+
+        if type(msg.request_id) == "string" and msg.request_id:find("^open_") then
+          pending_reserves[msg.request_id] = nil
+        end
+
       elseif type(msg.response.candles) == "table" then
         local tf = tostring(msg.response.timeframe or active_tf)
         if not TIMEFRAMES[tf] then tf = active_tf end
@@ -595,7 +881,19 @@ local function handleServerMessage(sender, msg)
         absorbTick(msg.response)
       end
     else
-      last_error = tostring(msg.error or msg.response or "Server returned failure")
+      local errText = tostring(msg.error or msg.response or "Server returned failure")
+      if type(msg.request_id) == "string" and msg.request_id:find("^open_") and pending_reserves[msg.request_id] then
+        local r = pending_reserves[msg.request_id]
+        local okRefund, refundRes = releaseMargin(r.amount, "Refund failed forex open", nil)
+        pending_reserves[msg.request_id] = nil
+        if okRefund then
+          last_error = "Open failed, margin refunded: " .. errText
+        else
+          last_error = "Open failed and refund failed: " .. tostring(refundRes) .. " / " .. errText
+        end
+      else
+        last_error = errText
+      end
     end
   end
 end
@@ -777,9 +1075,21 @@ local function drawSymbolPanel(x, y, w, h)
     local s = SYMBOLS[sid]
     local label = " " .. (s and s.display or sid) .. " "
     local active = sid == active_symbol
-    at(x, yy, label:sub(1, w), active and colors.white or colors.lightGray, active and colors.blue or colors.black)
-    symbolRects[#symbolRects + 1] = { symbol = sid, x1 = x, x2 = x + math.min(#label, w) - 1, y = yy }
+    local bg = active and colors.blue or colors.black
+    local fg = active and colors.white or colors.lightGray
+
+    fill(x, yy, w, 1, bg)
+    at(x + 1, yy, label:sub(1, math.max(1, w - 1)), fg, bg)
+    symbolRects[#symbolRects + 1] = { symbol = sid, x1 = x, x2 = x + w - 1, y = yy }
     yy = yy + 2
+  end
+
+  at(x, y + h - 3, "ACCOUNT", colors.yellow)
+  if bank_session.logged_in then
+    at(x, y + h - 2, tostring(bank_session.username or "?"):sub(1, w), colors.lime)
+    at(x, y + h - 1, tostring(math.floor(tonumber(bank_session.balance or 0))) .. " Q", colors.lightGray)
+  else
+    at(x, y + h - 2, "Not logged", colors.red)
   end
 end
 
@@ -816,6 +1126,14 @@ local function handleClick(x, y)
     end
   end
 
+  if lotInputRect and y == lotInputRect.y and x >= lotInputRect.x1 and x <= lotInputRect.x2 then
+    lots_focused = true
+    draw()
+    return true
+  else
+    lots_focused = false
+  end
+
   for _, r in ipairs(buttonRects) do
     if y >= r.y1 and y <= r.y2 and x >= r.x1 and x <= r.x2 then
       if r.action == "BUY" then openOrder("BUY") end
@@ -843,47 +1161,95 @@ local function drawButton(x, y, label, action, bg, fg)
   return x + #label + 1
 end
 
+local function drawBigButton(x, y, w, h, label, action, bg, fg)
+  bg = bg or colors.gray
+  fg = fg or colors.white
+  fill(x, y, w, h, bg)
+
+  local midY = y + math.floor(h / 2)
+  local tx = x + math.max(0, math.floor((w - #label) / 2))
+  at(tx, midY, label, fg, bg)
+
+  buttonRects[#buttonRects + 1] = {
+    action = action,
+    x1 = x,
+    x2 = x + w - 1,
+    y1 = y,
+    y2 = y + h - 1,
+  }
+end
+
 local function drawOrdersPanel(x, y, w, h)
   buttonRects = {}
   orderRowRects = {}
+  lotInputRect = nil
   fill(x, y, w, h, colors.black)
 
-  at(x, y, "TERMINAL", colors.yellow)
-  local bx = x + 11
-  bx = drawButton(bx, y, "BUY", "BUY", colors.green, colors.white)
-  bx = drawButton(bx, y, "SELL", "SELL", colors.red, colors.white)
-  bx = drawButton(bx, y, "CLOSE", "CLOSE", colors.gray, colors.white)
+  -- Balance is intentionally not polled every redraw. It updates on login,
+  -- order margin lock, and trade close settlement.
+  local bal = math.floor(tonumber(bank_session.balance or 0))
+  at(x, y, "Balance: " .. tostring(bal) .. " Q", colors.yellow)
+
+  cleanLotsText()
+  local lots = currentLots() or 0
+  local margin = marginForLots(lots)
+  local afford = margin <= bal
+  local info = "Lots: " .. tostring(lots_text) .. "  Margin: " .. tostring(margin) .. " Q  1 lot=" .. tostring(orders.lot_margin_q or LOT_MARGIN_Q) .. " Q"
+  at(x + 22, y, info, afford and colors.lightGray or colors.red)
+
+  at(x, y + 1, "Lots", colors.lightGray)
+  local inputW = 10
+  fill(x + 6, y + 1, inputW, 1, lots_focused and colors.white or colors.gray)
+  at(x + 7, y + 1, tostring(lots_text):sub(1, inputW - 2), colors.black, lots_focused and colors.white or colors.gray)
+  lotInputRect = { x1 = x + 6, x2 = x + 6 + inputW - 1, y = y + 1 }
+  if lots_focused then
+    term.setCursorPos(x + 7 + math.min(#lots_text, inputW - 2), y + 1)
+    term.setCursorBlink(true)
+  end
+
+  local buyW = math.max(12, math.floor(w * 0.18))
+  local sellW = math.max(12, math.floor(w * 0.18))
+  local closeW = math.max(10, math.floor(w * 0.12))
+  local btnH = math.min(3, math.max(1, h - 6))
+  local btnY = y + 2
+
+  drawBigButton(x, btnY, buyW, btnH, "BUY", "BUY", afford and colors.green or colors.gray, colors.white)
+  drawBigButton(x + buyW + 2, btnY, sellW, btnH, "SELL", "SELL", afford and colors.red or colors.gray, colors.white)
+  drawBigButton(x + buyW + sellW + 4, btnY, closeW, btnH, "CLOSE", "CLOSE", colors.gray, colors.white)
 
   local total = tonumber(orders.unrealized_pnl or 0) or 0
   local pnlCol = total > 0 and colors.lime or (total < 0 and colors.red or colors.lightGray)
-  at(x + math.max(35, w - 28), y, "Open P/L " .. money(total, 2), pnlCol)
+  at(x + math.max(50, w - 30), y, "Open P/L " .. money(total, 2), pnlCol)
+  at(x + math.max(50, w - 30), y + 1, "Acct " .. tostring(bank_session.username or "?"):sub(1, 12), colors.lightGray)
 
-  at(x, y + 1, "ID  Side  Units   Entry    Live     P/L", colors.gray)
+  local headerY = btnY + btnH + 1
+  at(x, headerY, "ID  Side Lots Margin Entry    Live     P/L", colors.gray)
 
   local openOrders = orders.active_orders or {}
-  local maxRows = math.max(1, h - 3)
+  local maxRows = math.max(1, h - btnH - 4)
   for i = 1, math.min(#openOrders, maxRows) do
     local o = openOrders[i]
-    local rowY = y + 1 + i
+    local rowY = headerY + i
     local id = tonumber(o.id)
     local selected = selected_order_id and id == tonumber(selected_order_id)
     local side = tostring(o.side or "?")
     local sideCol = side == "BUY" and colors.green or colors.red
-    local pnl = tonumber(o.unrealized_pnl or o.pnl or 0) or 0
+    local pnl = tonumber(o.unrealized_pnl_q or o.unrealized_pnl or o.pnl or 0) or 0
     local pnlColRow = pnl > 0 and colors.lime or (pnl < 0 and colors.red or colors.lightGray)
     local bg = selected and colors.blue or colors.black
 
     at(x, rowY, string.format("%-3s", tostring(id or "?")), colors.white, bg)
     at(x + 4, rowY, string.format("%-4s", side), sideCol, bg)
-    at(x + 10, rowY, string.format("%-7s", tostring(o.units or "?")), colors.lightGray, bg)
-    at(x + 18, rowY, fmt(o.entry_price, 5), colors.white, bg)
-    at(x + 28, rowY, fmt(o.live_price, 5), colors.white, bg)
-    at(x + 38, rowY, money(pnl, 2), pnlColRow, bg)
+    at(x + 9, rowY, string.format("%-4s", tostring(o.lots or "?")), colors.lightGray, bg)
+    at(x + 14, rowY, string.format("%-6s", tostring(o.margin_q or "?")), colors.yellow, bg)
+    at(x + 21, rowY, fmt(o.entry_price, 5), colors.white, bg)
+    at(x + 31, rowY, fmt(o.live_price, 5), colors.white, bg)
+    at(x + 41, rowY, money(pnl, 2), pnlColRow, bg)
     orderRowRects[#orderRowRects + 1] = { id = id, x1 = x, x2 = x + w - 1, y = rowY }
   end
 
   if #openOrders == 0 then
-    at(x, y + 3, "No active orders. Use BUY/SELL above.", colors.gray)
+    at(x, headerY + 2, "No active orders. Enter lots, then BUY/SELL.", colors.gray)
   end
 end
 
@@ -892,13 +1258,13 @@ function draw()
   cls()
 
   fill(1, 1, W, 1, colors.blue)
-  at(2, 1, "EUR/USD METATRADER LITE", colors.white, colors.blue)
+  at(2, 1, "QUID FX METATRADER", colors.white, colors.blue)
   at(math.max(1, W - #VERSION), 1, VERSION, colors.lightGray, colors.blue)
 
   drawTabs(3)
 
-  local sideW = 13
-  local ordersH = math.min(9, math.max(6, math.floor(H * 0.23)))
+  local sideW = 16
+  local ordersH = math.min(12, math.max(8, math.floor(H * 0.28)))
   local chartTop = 5
   local chartH = math.max(8, H - chartTop - ordersH - 1)
   local chartW = W - sideW - 4
@@ -924,6 +1290,8 @@ local function main()
     draw()
     return
   end
+
+  loginToBank()
 
   if state.server_id and not server_id then server_id = tonumber(state.server_id) end
   if server_id then requestAllHistories(); requestOrders() else broadcastPing() end
@@ -974,6 +1342,30 @@ local function main()
 
     elseif ev[1] == "monitor_touch" then
       handleClick(ev[3], ev[4])
+
+    elseif ev[1] == "char" then
+      if lots_focused then
+        local ch = tostring(ev[2] or "")
+        if ch:match("[0-9%.]") and #lots_text < 8 then
+          lots_text = tostring(lots_text or "") .. ch
+          cleanLotsText()
+          draw()
+        end
+      end
+
+    elseif ev[1] == "key" then
+      if lots_focused then
+        if ev[2] == keys.backspace then
+          lots_text = tostring(lots_text or "")
+          lots_text = lots_text:sub(1, -2)
+          if lots_text == "" then lots_text = "1" end
+          draw()
+        elseif ev[2] == keys.enter then
+          lots_focused = false
+          cleanLotsText()
+          draw()
+        end
+      end
 
     elseif ev[1] == "term_resize" or ev[1] == "monitor_resize" then
       draw()
