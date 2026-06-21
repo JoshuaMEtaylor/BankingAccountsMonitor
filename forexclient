@@ -1,7 +1,7 @@
 -- =============================================================================
 -- FOREX CLIENT
 -- forexclient
--- v0.6.4-EURUSD-TF-TABS-UPDATER
+-- v0.6.5-EURUSD-TF-TABS-DRAWFIX
 --
 -- Purpose:
 --   Trading-terminal style client for the Oracle/Kraken EUR/USD forexserver.
@@ -67,7 +67,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION = "0.6.4-EURUSD-TF-TABS-UPDATER"
+local VERSION = "0.6.5-EURUSD-TF-TABS-DRAWFIX"
 local FX_PROTOCOL = "quid_fx"
 local server_id = tonumber(args[2])
 
@@ -139,6 +139,10 @@ local save_timer = nil
 local discover_timer = nil
 
 local tabRects = {}
+
+-- Forward declaration. switchTimeframe calls draw(), and Lua needs this local
+-- declared before that function is defined.
+local draw = nil
 
 local function nowMs()
   if os.epoch then return os.epoch("utc") end
@@ -705,7 +709,7 @@ local function handleClick(x, y)
   return false
 end
 
-local function draw()
+function draw()
   W, H = term.getSize()
   cls()
 
