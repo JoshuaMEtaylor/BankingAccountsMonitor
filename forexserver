@@ -1,7 +1,7 @@
 -- =============================================================================
 -- FOREX SERVER
 -- forexserver
--- v0.7.2-MARGIN-LOT-TRADE-ENGINE
+-- v0.7.3-PROPER-LOTS-PERSISTENT-TRADES
 --
 -- Purpose:
 --   Pull the live EUR/USD number from the Oracle relay node and keep a proper
@@ -59,7 +59,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION = "0.7.2-MARGIN-LOT-TRADE-ENGINE"
+local VERSION = "0.7.3-PROPER-LOTS-PERSISTENT-TRADES"
 local PROTOCOL = "quid_fx"
 
 local ORACLE_LATEST_URL = "http://145.241.202.103:8000/latest"
@@ -82,9 +82,17 @@ local ORDERS_FILE = "data/forex_server_orders.db"
 
 -- Paper-trading engine. Not yet wired into Quid bank settlement.
 -- Units represent EUR notional. P/L is quote-currency USD-style paper P/L.
-local LOT_UNITS = 10000
-local DEFAULT_LOTS = 1
-local LOT_MARGIN_Q = 100
+-- FX sizing.
+-- 1.00 lot = 100,000 USD notional.
+-- 0.01 lot = 1,000 USD notional.
+-- 1 Quid = 3.40 USD, so required margin in Q is:
+--   lots * 100000 / 3.40
+local QUID_USD_VALUE = 3.40
+local LOT_NOTIONAL_USD = 100000
+local LOT_UNITS = LOT_NOTIONAL_USD
+local DEFAULT_LOTS = 0.01
+local MIN_LOTS = 0.01
+local LOT_STEP = 0.01
 local ORDER_HISTORY_MAX = 100
 
 local modem_name = nil
@@ -528,12 +536,47 @@ local function safeTick()
 end
 
 
-local function orderPnl(order, price)
+
+local function ceil(n)
+  n = tonumber(n) or 0
+  if math.ceil then return math.ceil(n) end
+  local i = math.floor(n)
+  if n > i then return i + 1 end
+  return i
+end
+
+local function normalizeLots(lots)
+  lots = tonumber(lots) or DEFAULT_LOTS
+  lots = math.floor((lots / LOT_STEP) + 0.0000001) * LOT_STEP
+  lots = math.floor(lots * 100 + 0.5) / 100
+  if lots < MIN_LOTS then return nil end
+  return lots
+end
+
+local function notionalUsdForLots(lots)
+  lots = tonumber(lots) or 0
+  return lots * LOT_NOTIONAL_USD
+end
+
+local function marginRequiredQ(lots)
+  local usd = notionalUsdForLots(lots)
+  return ceil(usd / QUID_USD_VALUE)
+end
+
+local function maxLotsForBalanceQ(balance_q)
+  balance_q = tonumber(balance_q) or 0
+  local usd = balance_q * QUID_USD_VALUE
+  local rawLots = usd / LOT_NOTIONAL_USD
+  return math.floor((rawLots / LOT_STEP) + 0.0000001) * LOT_STEP
+end
+
+local function orderPnlUsd(order, price)
   price = tonumber(price or (last_tick and last_tick.pair_price))
   if type(order) ~= "table" or not price then return 0 end
 
   local entry = tonumber(order.entry_price) or price
-  local units = tonumber(order.units) or LOT_UNITS
+  local lots = tonumber(order.lots)
+  local units = lots and (lots * LOT_NOTIONAL_USD) or (tonumber(order.units) or (DEFAULT_LOTS * LOT_NOTIONAL_USD))
   local side = tostring(order.side or "BUY"):upper()
 
   if side == "SELL" then
@@ -542,17 +585,32 @@ local function orderPnl(order, price)
   return (price - entry) * units
 end
 
+local function orderPnl(order, price)
+  return orderPnlUsd(order, price) / QUID_USD_VALUE
+end
+
 local function decoratedOrder(order, price)
   if type(order) ~= "table" then return nil end
   local o = {}
   for k, v in pairs(order) do o[k] = v end
-  o.live_price = tonumber(price or (last_tick and last_tick.pair_price))
-  o.unrealized_pnl = orderPnl(order, o.live_price)
-  o.unrealized_pnl_q = o.unrealized_pnl
-  o.pnl = o.unrealized_pnl
-  o.margin_q = tonumber(o.margin_q) or 0
-  o.lots = tonumber(o.lots) or 0
-  o.payout_q_if_closed = math.max(0, o.margin_q + o.unrealized_pnl_q)
+
+  local lots = normalizeLots(o.lots) or 0
+  local live = tonumber(price or (last_tick and last_tick.pair_price))
+
+  o.live_price = live
+  o.lots = lots
+  o.units = lots * LOT_NOTIONAL_USD
+  o.notional_usd = lots * LOT_NOTIONAL_USD
+  o.quid_usd_value = QUID_USD_VALUE
+  o.margin_required_q = marginRequiredQ(lots)
+
+  o.unrealized_pnl_usd = orderPnlUsd(order, live)
+  o.unrealized_pnl_q = orderPnl(order, live)
+  o.unrealized_pnl = o.unrealized_pnl_q
+  o.pnl = o.unrealized_pnl_q
+
+  o.margin_q = tonumber(o.margin_q) or tonumber(o.margin_required_q) or 0
+  o.payout_q_if_closed = math.max(0, math.floor((o.margin_q + o.unrealized_pnl_q) + 0.5))
   return o
 end
 
@@ -601,8 +659,11 @@ local function ordersSnapshot(account_id)
     closed_count = #closed_orders,
     unrealized_pnl = total,
     default_lots = DEFAULT_LOTS,
+    min_lots = MIN_LOTS,
+    lot_step = LOT_STEP,
+    lot_notional_usd = LOT_NOTIONAL_USD,
     lot_units = LOT_UNITS,
-    lot_margin_q = LOT_MARGIN_Q,
+    quid_usd_value = QUID_USD_VALUE,
     version = VERSION,
   }
 end
@@ -618,11 +679,14 @@ local function openTrade(side, lots, margin_q, reserved_tx_id, owner)
     return false, "Invalid side: " .. tostring(side)
   end
 
-  lots = tonumber(lots) or DEFAULT_LOTS
-  if lots <= 0 then return false, "Invalid lots" end
+  lots = normalizeLots(lots)
+  if not lots then return false, "Invalid lots. Minimum is " .. tostring(MIN_LOTS) end
 
+  local requiredMargin = marginRequiredQ(lots)
   margin_q = math.floor(tonumber(margin_q) or 0)
-  if margin_q <= 0 then return false, "Missing reserved margin" end
+  if margin_q < requiredMargin then
+    return false, "Reserved margin too low. Need " .. tostring(requiredMargin) .. " Q for " .. tostring(lots) .. " lots"
+  end
 
   owner = type(owner) == "table" and owner or {}
   local account_id = tostring(owner.account_id or "")
@@ -642,7 +706,10 @@ local function openTrade(side, lots, margin_q, reserved_tx_id, owner)
     display_symbol = "EUR/USD",
     side = side,
     lots = lots,
-    units = lots * LOT_UNITS,
+    units = lots * LOT_NOTIONAL_USD,
+    notional_usd = lots * LOT_NOTIONAL_USD,
+    quid_usd_value = QUID_USD_VALUE,
+    margin_required_q = requiredMargin,
     margin_q = margin_q,
     reserved_tx_id = reserved_tx_id,
     entry_price = price,
@@ -670,7 +737,8 @@ local function closeTrade(orderId, account_id, payout_tx_id)
         return false, "Order belongs to a different bank account"
       end
 
-      local rawPnl = orderPnl(o, price)
+      local rawPnlUsd = orderPnlUsd(o, price)
+      local rawPnl = rawPnlUsd / QUID_USD_VALUE
       local margin = math.floor(tonumber(o.margin_q) or 0)
       local realised = rawPnl
       if realised < -margin then realised = -margin end
@@ -683,9 +751,11 @@ local function closeTrade(orderId, account_id, payout_tx_id)
       closed.status = "CLOSED"
       closed.close_price = price
       closed.closed_at = nowMs()
+      closed.raw_pnl_usd = rawPnlUsd
       closed.raw_pnl_q = rawPnl
       closed.realized_pnl = realised
       closed.realized_pnl_q = realised
+      closed.realized_pnl_usd = realised * QUID_USD_VALUE
       closed.pnl = realised
       closed.payout_q = payout
       closed.payout_tx_id = payout_tx_id
@@ -712,7 +782,8 @@ local function closeAllTrades(account_id)
   for i = 1, #active_orders do
     local o = active_orders[i]
     if account_id == "" or tostring(o.account_id or "") == account_id then
-      local rawPnl = orderPnl(o, price)
+      local rawPnlUsd = orderPnlUsd(o, price)
+      local rawPnl = rawPnlUsd / QUID_USD_VALUE
       local margin = math.floor(tonumber(o.margin_q) or 0)
       local realised = rawPnl
       if realised < -margin then realised = -margin end
@@ -723,9 +794,11 @@ local function closeAllTrades(account_id)
       closed.status = "CLOSED"
       closed.close_price = price
       closed.closed_at = nowMs()
+      closed.raw_pnl_usd = rawPnlUsd
       closed.raw_pnl_q = rawPnl
       closed.realized_pnl = realised
       closed.realized_pnl_q = realised
+      closed.realized_pnl_usd = realised * QUID_USD_VALUE
       closed.pnl = realised
       closed.payout_q = payout
 
