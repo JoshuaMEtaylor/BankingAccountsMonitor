@@ -1,7 +1,7 @@
 -- =============================================================================
 -- FOREX CLIENT
 -- forexclient
--- v0.8.3-NO-CLIENT-REFUND-CRASH
+-- v0.8.4-QUID-LOTS-CLEAR-REJECTS
 --
 -- Purpose:
 --   Trading-terminal style client for the Oracle/Kraken EUR/USD forexserver.
@@ -67,7 +67,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION = "0.8.3-NO-CLIENT-REFUND-CRASH"
+local VERSION = "0.8.4-QUID-LOTS-CLEAR-REJECTS"
 local FX_PROTOCOL = "quid_fx"
 local BANK_PROTOCOL = "quid_bank"
 local BANK_TIMEOUT = 5
@@ -94,13 +94,12 @@ local SYMBOLS = {
 local active_tf = "5m"
 local active_symbol = "EURUSD"
 local MAX_CANDLES = 576
--- FX sizing.
--- 1.00 lot = 100,000 USD notional.
--- 0.01 lot = 1,000 USD notional.
--- 1 Quid = 3.40 USD.
-local QUID_USD_VALUE = 3.40
-local LOT_NOTIONAL_USD = 100000
-local LOT_UNITS = LOT_NOTIONAL_USD
+-- Treasury FX sizing.
+-- 1.00 lot = 100,000 Q notional.
+-- 0.01 lot = 1,000 Q notional.
+-- 2 pips on 1.00 lot = 20 Q.
+local LOT_NOTIONAL_Q = 100000
+local LOT_UNITS = LOT_NOTIONAL_Q
 local DEFAULT_LOTS = 0.01
 local MIN_LOTS = 0.01
 local LOT_STEP = 0.01
@@ -164,9 +163,8 @@ local orders = {
   default_lots = DEFAULT_LOTS,
   min_lots = MIN_LOTS,
   lot_step = LOT_STEP,
-  lot_notional_usd = LOT_NOTIONAL_USD,
-  quid_usd_value = QUID_USD_VALUE,
-  lot_units = LOT_UNITS,
+  lot_notional_q = LOT_NOTIONAL_Q,
+    lot_units = LOT_UNITS,
   default_leverage = DEFAULT_LEVERAGE,
   max_leverage = MAX_LEVERAGE,
   spread_pips = SPREAD_PIPS,
@@ -538,12 +536,8 @@ local function lotStep()
   return tonumber(orders.lot_step or LOT_STEP) or LOT_STEP
 end
 
-local function lotNotionalUsd()
-  return tonumber(orders.lot_notional_usd or orders.lot_units or LOT_NOTIONAL_USD) or LOT_NOTIONAL_USD
-end
-
-local function quidUsdValue()
-  return tonumber(orders.quid_usd_value or QUID_USD_VALUE) or QUID_USD_VALUE
+local function lotNotionalQ()
+  return tonumber(orders.lot_notional_q or orders.lot_units or LOT_NOTIONAL_Q) or LOT_NOTIONAL_Q
 end
 
 local function minLots()
@@ -557,13 +551,12 @@ end
 
 local function spreadFeeForLots(lots)
   lots = tonumber(lots) or 0
-  local feeUsd = lots * lotNotionalUsd() * (SPREAD_PIPS * PIP_SIZE)
-  return round2(feeUsd / quidUsdValue())
+  return round2(lots * lotNotionalQ() * (SPREAD_PIPS * PIP_SIZE))
 end
 
 local function userMarginForLots(lots)
   lots = tonumber(lots) or 0
-  return round2((lots * lotNotionalUsd()) / quidUsdValue() / maxLeverage())
+  return round2((lots * lotNotionalQ()) / maxLeverage())
 end
 
 local function requiredForLots(lots)
@@ -582,7 +575,7 @@ end
 
 local function maxLotsForBalance(balance_q)
   balance_q = tonumber(balance_q) or 0
-  local rawLots = (balance_q * quidUsdValue()) / lotNotionalUsd()
+  local rawLots = balance_q / lotNotionalQ()
   local step = lotStep()
   return math.floor((rawLots / step) + 0.0000001) * step
 end
@@ -601,7 +594,7 @@ end
 
 local function marginForLots(lots)
   lots = tonumber(lots) or 0
-  return round2((lots * lotNotionalUsd()) / quidUsdValue())
+  return round2((lots * lotNotionalQ()) / 1)
 end
 
 
@@ -734,9 +727,12 @@ local function openOrder(side)
   end
 
   local required = requiredForLots(lots)
+  local margin = userMarginForLots(lots)
+  local fee = spreadFeeForLots(lots)
   local bal = round2(tonumber(bank_session.balance or 0))
+  local maxLots = maxLotsForBalanceWithTreasury(bal)
   if required > bal + 0.001 then
-    last_error = "Not enough Quid. Need " .. qfmt(required) .. " for " .. tostring(lots) .. " lots"
+    last_error = "Trade rejected: " .. tostring(lots) .. " lots requires " .. qfmt(required) .. " (margin " .. qfmt(margin) .. " + 2-pip fee " .. qfmt(fee) .. "), balance " .. qfmt(bal) .. ". Max now " .. string.format("%.2f", maxLots) .. " lots."
     return
   end
 
@@ -948,9 +944,8 @@ local function handleServerMessage(sender, msg)
         orders.default_lots = tonumber(orders.default_lots) or DEFAULT_LOTS
         orders.min_lots = tonumber(orders.min_lots) or MIN_LOTS
         orders.lot_step = tonumber(orders.lot_step) or LOT_STEP
-        orders.lot_notional_usd = tonumber(orders.lot_notional_usd) or LOT_NOTIONAL_USD
-        orders.quid_usd_value = tonumber(orders.quid_usd_value) or QUID_USD_VALUE
-        orders.lot_units = tonumber(orders.lot_units) or LOT_UNITS
+        orders.lot_notional_q = tonumber(orders.lot_notional_q) or LOT_NOTIONAL_Q
+                orders.lot_units = tonumber(orders.lot_units) or LOT_UNITS
         orders.treasury_max_leverage = tonumber(orders.treasury_max_leverage or orders.max_leverage) or MAX_LEVERAGE
         orders.spread_pips = tonumber(orders.spread_pips) or SPREAD_PIPS
         orders.maintenance_margin_rate = tonumber(orders.maintenance_margin_rate) or MAINTENANCE_MARGIN_RATE
@@ -980,12 +975,13 @@ local function handleServerMessage(sender, msg)
       end
     else
       local errText = tostring(msg.error or msg.response or "Server returned failure")
-      -- Leveraged funding is now server/bank authoritative. The client does not
-      -- reserve or refund margin locally anymore, so failed opens just display
-      -- the server/bank error.
-      last_error = errText
+      -- Leveraged funding is server/bank authoritative. Failed opens should
+      -- always tell the user why the order was rejected.
       if type(msg.request_id) == "string" and msg.request_id:find("^open_") then
         refreshBankBalanceNow()
+        last_error = "Trade rejected: " .. errText
+      else
+        last_error = errText
       end
     end
   end
