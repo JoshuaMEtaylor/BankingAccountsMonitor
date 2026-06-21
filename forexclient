@@ -1,7 +1,7 @@
 -- =============================================================================
 -- FOREX CLIENT
 -- forexclient
--- v0.7.2-MARGIN-LOT-METATRADER
+-- v0.7.3-TERMINAL-CONTROL-MONITOR-DISPLAY
 --
 -- Purpose:
 --   Trading-terminal style client for the Oracle/Kraken EUR/USD forexserver.
@@ -67,7 +67,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION = "0.7.2-MARGIN-LOT-METATRADER"
+local VERSION = "0.7.3-TERMINAL-CONTROL-MONITOR-DISPLAY"
 local FX_PROTOCOL = "quid_fx"
 local BANK_PROTOCOL = "quid_bank"
 local BANK_TIMEOUT = 5
@@ -346,11 +346,13 @@ local function putBlock(x, y, bg)
 end
 
 local function setupDisplay()
+  -- Control always stays on the computer terminal.
+  -- Monitors are display-only mirrors/extra chart space.
   monitor = peripheral.find and peripheral.find("monitor") or nil
   if monitor then
     pcall(function() monitor.setTextScale(TEXT_SCALE) end)
-    term.redirect(monitor)
   end
+  term.redirect(native)
   cls()
 end
 
@@ -911,7 +913,7 @@ local function drawTradingCandles(x, y, w, h)
 
   local axisW = 10
   local chartW = w - axisW - 1
-  if chartW < 12 or h < 8 then
+  if chartW < 12 or h < 5 then
     at(x, y, "Window too small for chart", colors.orange)
     return
   end
@@ -1253,29 +1255,78 @@ local function drawOrdersPanel(x, y, w, h)
   end
 end
 
+
+local function drawMonitorDisplay()
+  if not monitor then return end
+
+  term.redirect(monitor)
+  W, H = term.getSize()
+  term.setCursorBlink(false)
+  cls()
+
+  fill(1, 1, W, 1, colors.blue)
+  at(2, 1, "EUR/USD DISPLAY ONLY  |  " .. tostring(active_tf), colors.white, colors.blue)
+  at(math.max(1, W - 13), 1, "MONITOR", colors.lightGray, colors.blue)
+
+  local price = last_tick and tonumber(last_tick._client_price or last_tick.pair_price)
+  local q = last_tick and tostring(last_tick.quality or "unknown") or "OFFLINE"
+  local total = tonumber(orders.unrealized_pnl or 0) or 0
+  local pnlCol = total > 0 and colors.lime or (total < 0 and colors.red or colors.lightGray)
+
+  at(2, 3, "Live: " .. fmt(price, 5), colors.yellow)
+  at(18, 3, "Quality: " .. q, colourForQuality(q))
+  at(34, 3, "Open P/L: " .. money(total, 2), pnlCol)
+
+  local chartTop = 5
+  local chartH = math.max(8, H - chartTop - 3)
+  drawTradingCandles(2, chartTop, W - 3, chartH)
+
+  local list = activeCandles()
+  local c = list[#list]
+  if c then
+    local delta = (tonumber(c.close) or 0) - (tonumber(c.open) or 0)
+    local neutral = math.abs(delta) <= PRICE_EPS
+    local col = neutral and colors.lightGray or (delta > 0 and colors.green or colors.red)
+    at(2, H - 1, active_tf .. "  O:" .. fmt(c.open, 5) .. " H:" .. fmt(c.high, 5) .. " L:" .. fmt(c.low, 5) .. " C:" .. fmt(c.close, 5), col)
+  else
+    at(2, H - 1, "Waiting for candle history...", colors.orange)
+  end
+
+  term.redirect(native)
+  W, H = term.getSize()
+end
+
 function draw()
+  -- Extra monitor is updated first so the terminal cursor/input state is left
+  -- exactly where the control UI needs it.
+  drawMonitorDisplay()
+
+  term.redirect(native)
   W, H = term.getSize()
   cls()
 
   fill(1, 1, W, 1, colors.blue)
-  at(2, 1, "QUID FX METATRADER", colors.white, colors.blue)
+  at(2, 1, "QUID FX TERMINAL", colors.white, colors.blue)
   at(math.max(1, W - #VERSION), 1, VERSION, colors.lightGray, colors.blue)
 
   drawTabs(3)
 
   local sideW = 16
-  local ordersH = math.min(12, math.max(8, math.floor(H * 0.28)))
+  local ordersH = math.min(12, math.max(7, math.floor(H * 0.38)))
   local chartTop = 5
-  local chartH = math.max(8, H - chartTop - ordersH - 1)
+  local chartH = math.max(5, H - chartTop - ordersH - 1)
   local chartW = W - sideW - 4
   if chartW < 20 then chartW = W - 3; sideW = 0 end
 
+  -- Compact chart on the terminal for control context.
   drawTradingCandles(2, chartTop, chartW, chartH)
 
+  -- Symbols stay on the right side of the terminal.
   if sideW > 0 then
     drawSymbolPanel(W - sideW + 1, 3, sideW, chartH + 2)
   end
 
+  -- Full order controls stay on the terminal.
   drawOrdersPanel(2, H - ordersH + 1, W - 3, ordersH)
 end
 
@@ -1341,7 +1392,7 @@ local function main()
       handleClick(ev[3], ev[4])
 
     elseif ev[1] == "monitor_touch" then
-      handleClick(ev[3], ev[4])
+      -- Monitor is display-only. All control stays on the computer terminal.
 
     elseif ev[1] == "char" then
       if lots_focused then
