@@ -1,7 +1,7 @@
 -- =============================================================================
 -- FOREX SERVER
 -- forexserver
--- v0.7.3-PROPER-LOTS-PERSISTENT-TRADES
+-- v0.7.4-DECIMAL-QUID-PERSISTENT-TRADES
 --
 -- Purpose:
 --   Pull the live EUR/USD number from the Oracle relay node and keep a proper
@@ -59,7 +59,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION = "0.7.3-PROPER-LOTS-PERSISTENT-TRADES"
+local VERSION = "0.7.4-DECIMAL-QUID-PERSISTENT-TRADES"
 local PROTOCOL = "quid_fx"
 
 local ORACLE_LATEST_URL = "http://145.241.202.103:8000/latest"
@@ -545,6 +545,12 @@ local function ceil(n)
   return i
 end
 
+local function round2(n)
+  n = tonumber(n) or 0
+  if n >= 0 then return math.floor(n * 100 + 0.5) / 100 end
+  return math.ceil(n * 100 - 0.5) / 100
+end
+
 local function normalizeLots(lots)
   lots = tonumber(lots) or DEFAULT_LOTS
   lots = math.floor((lots / LOT_STEP) + 0.0000001) * LOT_STEP
@@ -560,7 +566,7 @@ end
 
 local function marginRequiredQ(lots)
   local usd = notionalUsdForLots(lots)
-  return ceil(usd / QUID_USD_VALUE)
+  return round2(usd / QUID_USD_VALUE)
 end
 
 local function maxLotsForBalanceQ(balance_q)
@@ -609,8 +615,8 @@ local function decoratedOrder(order, price)
   o.unrealized_pnl = o.unrealized_pnl_q
   o.pnl = o.unrealized_pnl_q
 
-  o.margin_q = tonumber(o.margin_q) or tonumber(o.margin_required_q) or 0
-  o.payout_q_if_closed = math.max(0, math.floor((o.margin_q + o.unrealized_pnl_q) + 0.5))
+  o.margin_q = round2(tonumber(o.margin_q) or tonumber(o.margin_required_q) or 0)
+  o.payout_q_if_closed = round2(math.max(0, o.margin_q + o.unrealized_pnl_q))
   return o
 end
 
@@ -683,8 +689,8 @@ local function openTrade(side, lots, margin_q, reserved_tx_id, owner)
   if not lots then return false, "Invalid lots. Minimum is " .. tostring(MIN_LOTS) end
 
   local requiredMargin = marginRequiredQ(lots)
-  margin_q = math.floor(tonumber(margin_q) or 0)
-  if margin_q < requiredMargin then
+  margin_q = round2(tonumber(margin_q) or 0)
+  if margin_q + 0.001 < requiredMargin then
     return false, "Reserved margin too low. Need " .. tostring(requiredMargin) .. " Q for " .. tostring(lots) .. " lots"
   end
 
@@ -739,10 +745,10 @@ local function closeTrade(orderId, account_id, payout_tx_id)
 
       local rawPnlUsd = orderPnlUsd(o, price)
       local rawPnl = rawPnlUsd / QUID_USD_VALUE
-      local margin = math.floor(tonumber(o.margin_q) or 0)
+      local margin = round2(tonumber(o.margin_q) or 0)
       local realised = rawPnl
       if realised < -margin then realised = -margin end
-      local payout = math.max(0, math.floor(margin + realised + 0.5))
+      local payout = round2(math.max(0, margin + realised))
 
       table.remove(active_orders, i)
 
@@ -754,9 +760,9 @@ local function closeTrade(orderId, account_id, payout_tx_id)
       closed.raw_pnl_usd = rawPnlUsd
       closed.raw_pnl_q = rawPnl
       closed.realized_pnl = realised
-      closed.realized_pnl_q = realised
+      closed.realized_pnl_q = round2(realised)
       closed.realized_pnl_usd = realised * QUID_USD_VALUE
-      closed.pnl = realised
+      closed.pnl = round2(realised)
       closed.payout_q = payout
       closed.payout_tx_id = payout_tx_id
 
@@ -784,10 +790,10 @@ local function closeAllTrades(account_id)
     if account_id == "" or tostring(o.account_id or "") == account_id then
       local rawPnlUsd = orderPnlUsd(o, price)
       local rawPnl = rawPnlUsd / QUID_USD_VALUE
-      local margin = math.floor(tonumber(o.margin_q) or 0)
+      local margin = round2(tonumber(o.margin_q) or 0)
       local realised = rawPnl
       if realised < -margin then realised = -margin end
-      local payout = math.max(0, math.floor(margin + realised + 0.5))
+      local payout = round2(math.max(0, margin + realised))
 
       local closed = {}
       for k, v in pairs(o) do closed[k] = v end
@@ -797,9 +803,9 @@ local function closeAllTrades(account_id)
       closed.raw_pnl_usd = rawPnlUsd
       closed.raw_pnl_q = rawPnl
       closed.realized_pnl = realised
-      closed.realized_pnl_q = realised
+      closed.realized_pnl_q = round2(realised)
       closed.realized_pnl_usd = realised * QUID_USD_VALUE
-      closed.pnl = realised
+      closed.pnl = round2(realised)
       closed.payout_q = payout
 
       closed_orders[#closed_orders + 1] = closed
