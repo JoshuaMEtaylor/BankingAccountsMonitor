@@ -2,11 +2,12 @@
 -- FOREX SERVER
 -- forexserver
 --
--- Server-side Quid strength oracle.
--- Finds ServerSideAccounts safely, reads only safe narrow endpoints, and serves
--- a compact Quid Strength Index for display terminals.
+-- Server-side Quid/USD forex oracle.
+-- Finds ServerSideAccounts safely, calculates Quid strength from safe narrow
+-- endpoints, pulls live USD FX quotes from Financial Modeling Prep, and serves
+-- a compact Q/USD tick plus history for display terminals.
 --
--- v0.3.1-REAL-BANK-SCAN-RENAMED
+-- v0.4.0-LIVE-USD-FMP
 -- IMPORTANT:
 --   This version does NOT call bank status, get_inflation_state, tick_inflation,
 --   or get_price_indices. Those wide endpoints can include nested/repeated
@@ -46,7 +47,7 @@ if args[1] ~= "--updated" then
     print("")
     print("Manual install:")
     print("delete startup")
-    print("wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/forexserver?cb=031 startup.lua")
+    print("wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/forexserver?cb=040 startup.lua")
     print("startup.lua")
     return
   end
@@ -67,7 +68,7 @@ for i = 2, #args do runtime_args[#runtime_args + 1] = args[i] end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION = "0.3.1-REAL-BANK-SCAN-RENAMED"
+local VERSION = "0.4.0-LIVE-USD-FMP"
 
 local FX_PROTOCOL             = "quid_fx"
 local BANK_PROTOCOL           = "quid_bank"
@@ -75,7 +76,17 @@ local BANK_DISCOVERY_PROTOCOL = "quid_bank_discovery"
 local CONTRACT_PROTOCOL       = "quid_contracts"
 
 local BASE_QUSD = 3.40
-local REFRESH_SECONDS = 8
+
+-- Live USD market feed. This key is intentionally embedded because this is a
+-- private server toy economy and the user explicitly asked for the key in file.
+local FMP_API_KEY = "9wBJwVF79t5ClL87RJlctqNfPA1W9J9b"
+local FMP_BATCH_FOREX_URL = "https://financialmodelingprep.com/stable/batch-forex-quotes?apikey=" .. FMP_API_KEY
+local FMP_QUOTE_URL_PREFIX = "https://financialmodelingprep.com/stable/quote?symbol="
+local FMP_QUOTE_URL_SUFFIX = "&apikey=" .. FMP_API_KEY
+local REQUIRED_USD_PAIRS = { "EURUSD", "USDJPY", "GBPUSD", "USDCAD", "USDSEK", "USDCHF" }
+local USD_STALE_AFTER_SECONDS = 90
+
+local REFRESH_SECONDS = 12
 local BROADCAST_SECONDS = 5
 local DB_TIMEOUT = 5
 local CONTRACT_TIMEOUT = 3
@@ -234,6 +245,7 @@ local function loadState()
   state.last_issued_supply = tonumber(state.last_issued_supply) or nil
   state.print_shock_pressure = tonumber(state.print_shock_pressure) or 0
   state.last_refresh_ms = tonumber(state.last_refresh_ms) or nowMs()
+  state.last_market = type(state.last_market) == "table" and state.last_market or nil
 end
 
 local function saveState()
@@ -244,6 +256,7 @@ local function saveState()
     last_issued_supply = tonumber(state.last_issued_supply) or 0,
     print_shock_pressure = tonumber(state.print_shock_pressure) or 0,
     last_refresh_ms = tonumber(state.last_refresh_ms) or nowMs(),
+    last_market = state.last_market,
     updated = nowMs(),
   }
   return writeTable(STATE_FILE, flat)
@@ -266,7 +279,11 @@ local function pushHistory(snap)
     time = tonumber(snap.time) or nowMs(),
     day = tonumber(snap.mc_day) or mcDay(),
     strength = tonumber(snap.quid_strength_index) or 1,
-    qusd = tonumber(snap.reference_qusd) or BASE_QUSD,
+    qusd = tonumber(snap.q_usd or snap.final_qusd or snap.reference_qusd) or BASE_QUSD,
+    reference_qusd = tonumber(snap.reference_qusd) or BASE_QUSD,
+    usd_index = tonumber(snap.usd_index) or nil,
+    usd_strength = tonumber(snap.usd_strength_index) or nil,
+    market_quality = snap.market and snap.market.quality or nil,
     issued = snap.inputs and tonumber(snap.inputs.issued_supply) or nil,
     price = snap.inputs and tonumber(snap.inputs.price_index) or nil,
   }
@@ -429,6 +446,187 @@ local function contractReq(req, timeout)
       return msg.success == true, msg.response
     end
   end
+end
+
+
+-- =============================================================================
+-- LIVE USD MARKET DATA
+-- =============================================================================
+local function upper(s)
+  return string.upper(tostring(s or ""))
+end
+
+local function normalSymbol(s)
+  s = upper(s)
+  s = s:gsub("FOREX:", "")
+  s = s:gsub("FX:", "")
+  s = s:gsub("/", "")
+  s = s:gsub("-", "")
+  s = s:gsub("_", "")
+  return s
+end
+
+local function tableHasPair(pairs, symbol)
+  return tonumber(pairs and pairs[symbol]) and tonumber(pairs[symbol]) > 0
+end
+
+local function priceFromQuote(q)
+  if type(q) ~= "table" then return nil end
+  local direct = tonumber(q.price or q.rate or q.close or q.last or q.c or q.value)
+  if direct and direct > 0 then return direct end
+  local bid = tonumber(q.bid or q.bidPrice)
+  local ask = tonumber(q.ask or q.askPrice)
+  if bid and ask and bid > 0 and ask > 0 then return (bid + ask) / 2 end
+  if bid and bid > 0 then return bid end
+  if ask and ask > 0 then return ask end
+  return nil
+end
+
+local function httpJson(url)
+  if not http or not http.get then return nil, "ComputerCraft HTTP API is disabled/unavailable" end
+  local ok, res = pcall(function()
+    return http.get(url, { ["User-Agent"] = "ComputerCraft-QuidFX/0.4" })
+  end)
+  if not ok or not res then return nil, "HTTP request failed: " .. tostring(res) end
+
+  local text = res.readAll()
+  res.close()
+  if not text or text == "" then return nil, "empty HTTP response" end
+
+  local okJson, data = pcall(textutils.unserializeJSON, text)
+  if not okJson or type(data) ~= "table" then
+    return nil, "bad JSON: " .. tostring(data)
+  end
+  return data, nil
+end
+
+local function collectPairsFromJson(data, outPairs)
+  outPairs = outPairs or {}
+  if type(data) ~= "table" then return outPairs end
+
+  -- FMP normally returns an array of quote records, but this also accepts
+  -- wrapped records just in case their response shape changes.
+  local list = data
+  if type(data[1]) ~= "table" then
+    if type(data.data) == "table" then list = data.data
+    elseif type(data.response) == "table" then list = data.response
+    elseif data.symbol then list = { data }
+    else list = {} end
+  end
+
+  for _, qrec in pairs(list) do
+    if type(qrec) == "table" then
+      local sym = normalSymbol(qrec.symbol or qrec.ticker or qrec.currency or qrec.name or "")
+      local price = priceFromQuote(qrec)
+      if sym ~= "" and price and price > 0 then
+        for _, need in ipairs(REQUIRED_USD_PAIRS) do
+          if sym == need then outPairs[need] = price end
+        end
+      end
+    end
+  end
+  return outPairs
+end
+
+local function fetchOneForexQuote(symbol)
+  local url = FMP_QUOTE_URL_PREFIX .. symbol .. FMP_QUOTE_URL_SUFFIX
+  local data, err = httpJson(url)
+  if not data then return nil, err end
+  local pairs = collectPairsFromJson(data, {})
+  return pairs[symbol], nil
+end
+
+local function missingPairs(pairs)
+  local miss = {}
+  for _, symbol in ipairs(REQUIRED_USD_PAIRS) do
+    if not tableHasPair(pairs, symbol) then miss[#miss + 1] = symbol end
+  end
+  return miss
+end
+
+local function syntheticUsdIndex(pairs)
+  if type(pairs) ~= "table" then return nil end
+  for _, symbol in ipairs(REQUIRED_USD_PAIRS) do
+    if not tableHasPair(pairs, symbol) then return nil end
+  end
+
+  -- DXY-style geometric basket. This gives the dollar a real market-derived
+  -- strength number rather than a hand-made CPI/news multiplier.
+  return 50.14348112
+    * (pairs.EURUSD ^ -0.576)
+    * (pairs.USDJPY ^  0.136)
+    * (pairs.GBPUSD ^ -0.119)
+    * (pairs.USDCAD ^  0.091)
+    * (pairs.USDSEK ^  0.042)
+    * (pairs.USDCHF ^  0.036)
+end
+
+local function fetchUsdMarket()
+  local errors = {}
+  local pairsNow = {}
+  local source = "FMP batch-forex-quotes"
+
+  local batch, batchErr = httpJson(FMP_BATCH_FOREX_URL)
+  if batch then
+    collectPairsFromJson(batch, pairsNow)
+  else
+    errors[#errors + 1] = "batch: " .. tostring(batchErr)
+  end
+
+  -- Fallback to individual quote calls. This costs more requests, but it gives
+  -- the script a chance to work if the batch endpoint is restricted on the key.
+  local miss = missingPairs(pairsNow)
+  if #miss > 0 then
+    source = "FMP individual forex quotes"
+    for _, symbol in ipairs(miss) do
+      local price, err = fetchOneForexQuote(symbol)
+      if price and price > 0 then
+        pairsNow[symbol] = price
+      else
+        errors[#errors + 1] = symbol .. ": " .. tostring(err)
+      end
+    end
+  end
+
+  miss = missingPairs(pairsNow)
+  local idx = syntheticUsdIndex(pairsNow)
+  if idx and #miss == 0 then
+    local market = {
+      quality = "LIVE",
+      source = source,
+      time = nowMs(),
+      usd_index = idx,
+      pairs = pairsNow,
+      missing = {},
+      errors = errors,
+    }
+    state.last_market = market
+    saveState()
+    return market
+  end
+
+  -- No fake movement. If live API fails, use last valid tick only as stale data
+  -- and clearly label it STALE/OFFLINE for the client.
+  if type(state.last_market) == "table" and tonumber(state.last_market.usd_index) then
+    local age = math.max(0, (nowMs() - (tonumber(state.last_market.time) or nowMs())) / 1000)
+    local stale = wireSafeCopy(state.last_market)
+    stale.quality = "STALE"
+    stale.source = tostring(stale.source or "FMP") .. " / stale cache"
+    stale.stale_age_seconds = age
+    stale.missing = miss
+    stale.errors = errors
+    return stale
+  end
+
+  return {
+    quality = "OFFLINE",
+    source = "FMP unavailable",
+    time = nowMs(),
+    usd_index = nil,
+    pairs = pairsNow,
+    missing = miss,
+    errors = errors,
+  }
 end
 
 -- =============================================================================
@@ -634,7 +832,7 @@ end
 -- =============================================================================
 -- STRENGTH MODEL
 -- =============================================================================
-local function ensureBaseline(raw)
+local function ensureBaseline(raw, market)
   if type(state.baseline) == "table" then return end
 
   local issued = math.max(1, tonumber(raw.issued_supply) or 1)
@@ -642,17 +840,20 @@ local function ensureBaseline(raw)
   local gdpCap = tonumber(raw.gdp_per_capita) or 0
   if gdpCap <= 0 then gdpCap = 1 end
 
+  local usdIndex = tonumber(market and market.usd_index) or tonumber(state.last_market and state.last_market.usd_index) or 100
+
   state.baseline = {
     created = nowMs(),
     day = mcDay(),
     base_qusd = BASE_QUSD,
+    baseline_usd_index = usdIndex,
     issued_supply = issued,
     price_index = price,
     gdp_per_capita = gdpCap,
     treasury_share = clamp(tonumber(raw.treasury_share) or 0.70, 0.01, 1),
     private_float = clamp(tonumber(raw.private_float) or 0.25, 0.01, 1),
     tx_today = math.max(1, tonumber(raw.tx_today) or 1),
-    note = "Foundation state for Quid FX. 1 Q = $3.40 at this baseline.",
+    note = "Foundation state for Quid FX. 1 Q = $3.40 and live USD index is stored at this baseline.",
   }
   state.last_issued_supply = issued
   state.print_shock_pressure = tonumber(state.print_shock_pressure) or 0
@@ -692,8 +893,8 @@ local function factorClamped(v, lo, hi)
   return clamp(tonumber(v) or 1, lo, hi)
 end
 
-local function calculateStrength(raw)
-  ensureBaseline(raw)
+local function calculateStrength(raw, market)
+  ensureBaseline(raw, market)
   local b = state.baseline or {}
   local printShockPressure, supplyGrowth = updatePrintShock(raw)
 
@@ -747,11 +948,23 @@ local function calculateStrength(raw)
 
   strength = factorClamped(strength, 0.02, 5.00)
 
-  local qusd = BASE_QUSD * strength
+  local referenceQusd = BASE_QUSD * strength
+  local baselineUsd = tonumber((state.baseline or {}).baseline_usd_index) or tonumber(market and market.usd_index) or 100
+  if baselineUsd <= 0 then baselineUsd = 100 end
+
+  local usdIndex = tonumber(market and market.usd_index) or tonumber(state.last_market and state.last_market.usd_index) or baselineUsd
+  local usdStrength = safeDiv(usdIndex, baselineUsd, 1) or 1
+  if usdStrength <= 0 then usdStrength = 1 end
+
+  local finalQusd = referenceQusd / usdStrength
 
   local errors = raw.errors or {}
+  local marketQuality = tostring((market and market.quality) or "OFFLINE")
   local quality = "LIVE"
   if #errors > 0 then quality = "PARTIAL" end
+  if marketQuality == "STALE" and quality == "LIVE" then quality = "STALE" end
+  if marketQuality == "PARTIAL" and quality == "LIVE" then quality = "PARTIAL" end
+  if marketQuality == "OFFLINE" then quality = "PARTIAL" end
   if not bank_id then quality = "OFFLINE" end
 
   local marketState = "STABLE"
@@ -773,8 +986,21 @@ local function calculateStrength(raw)
     contract_id = contract_id,
     base_qusd = BASE_QUSD,
     quid_strength_index = strength,
-    reference_qusd = qusd,
-    formula_hint = "final_QUSD = base_qusd * quid_strength_index / usd_strength_index",
+    reference_qusd = referenceQusd,
+    q_usd = finalQusd,
+    final_qusd = finalQusd,
+    usd_index = usdIndex,
+    usd_strength_index = usdStrength,
+    formula_hint = "QUSD = base_qusd * quid_strength_index / usd_strength_index",
+    market = {
+      quality = marketQuality,
+      source = tostring(market and market.source or "unknown"),
+      time = tonumber(market and market.time) or nowMs(),
+      stale_age_seconds = tonumber(market and market.stale_age_seconds) or 0,
+      missing = type(market and market.missing) == "table" and market.missing or {},
+      pairs = type(market and market.pairs) == "table" and market.pairs or {},
+      errors = type(market and market.errors) == "table" and market.errors or {},
+    },
     inputs = {
       issued_supply = tonumber(raw.issued_supply) or 0,
       treasury_balance = tonumber(raw.treasury_balance) or 0,
@@ -825,7 +1051,8 @@ local function refreshSnapshot()
     return false, last_error
   end
 
-  local snap = wireSafeCopy(calculateStrength(raw))
+  local market = fetchUsdMarket()
+  local snap = wireSafeCopy(calculateStrength(raw, market))
   last_snapshot = snap
   last_error = (#(snap.errors or {}) > 0) and table.concat(snap.errors, "; "):sub(1, 100) or ""
   pushHistory(snap)
@@ -842,7 +1069,7 @@ local function sparkline()
   local vals = {}
   local lo, hi = nil, nil
   for i = start, #ticks do
-    local v = tonumber(ticks[i].strength) or 1
+    local v = tonumber(ticks[i].qusd or ticks[i].strength) or 1
     vals[#vals + 1] = v
     lo = lo and math.min(lo, v) or v
     hi = hi and math.max(hi, v) or v
@@ -875,16 +1102,18 @@ local function draw()
   end
 
   at(2, 8,  "Quality:       " .. tostring(snap.quality) .. " / " .. tostring(snap.market_state), snap.quality == "LIVE" and colors.lime or colors.orange)
-  at(2, 9,  "Quid strength: " .. string.format("%.5f", snap.quid_strength_index), colors.white)
-  at(2, 10, "Ref Q/USD:     " .. money(snap.reference_qusd, 4), colors.lime)
-  at(2, 11, "Base Q/USD:    " .. money(snap.base_qusd, 2), colors.lightGray)
-  at(2, 13, "Issued:        " .. q(snap.inputs.issued_supply), colors.white)
-  at(2, 14, "Treasury:      " .. q(snap.inputs.treasury_balance) .. "  " .. pct(snap.inputs.treasury_share, 1), colors.white)
-  at(2, 15, "Private float: " .. q(snap.inputs.private_supply) .. "  " .. pct(snap.inputs.private_float, 1), colors.white)
-  at(2, 16, "Price index:   x" .. string.format("%.3f", snap.inputs.price_index), colors.lightGray)
-  at(2, 17, "GDP/capita:    " .. q(snap.inputs.gdp_per_capita), colors.cyan)
-  at(2, 18, "Print shock:   " .. string.format("%.4f", snap.drivers.print_shock_pressure), snap.drivers.print_shock_pressure > 0.15 and colors.orange or colors.gray)
-  at(2, 20, "History: " .. sparkline(), colors.gray)
+  at(2, 9,  "LIVE Q/USD:    " .. money(snap.q_usd or snap.final_qusd, 4), colors.lime)
+  at(2, 10, "Ref Q/USD:     " .. money(snap.reference_qusd, 4), colors.lightGray)
+  at(2, 11, "USD index:     " .. string.format("%.4f", tonumber(snap.usd_index) or 0) .. "  x" .. string.format("%.5f", tonumber(snap.usd_strength_index) or 1), colors.yellow)
+  at(2, 12, "USD source:    " .. tostring(snap.market and snap.market.source or "unknown"), colors.gray)
+  at(2, 13, "Quid strength: " .. string.format("%.5f", snap.quid_strength_index), colors.white)
+  at(2, 15, "Issued:        " .. q(snap.inputs.issued_supply), colors.white)
+  at(2, 16, "Treasury:      " .. q(snap.inputs.treasury_balance) .. "  " .. pct(snap.inputs.treasury_share, 1), colors.white)
+  at(2, 17, "Private float: " .. q(snap.inputs.private_supply) .. "  " .. pct(snap.inputs.private_float, 1), colors.white)
+  at(2, 18, "Price index:   x" .. string.format("%.3f", snap.inputs.price_index), colors.lightGray)
+  at(2, 19, "GDP/capita:    " .. q(snap.inputs.gdp_per_capita), colors.cyan)
+  at(2, 20, "Print shock:   " .. string.format("%.4f", snap.drivers.print_shock_pressure), snap.drivers.print_shock_pressure > 0.15 and colors.orange or colors.gray)
+  at(2, 22, "Q/USD chart: " .. sparkline(), colors.gray)
   if last_error ~= "" then at(2, 22, "Note: " .. last_error, colors.orange) end
 end
 
@@ -919,6 +1148,8 @@ local function handleFxRequest(req)
     state.baseline = nil
     state.last_issued_supply = nil
     state.print_shock_pressure = 0
+    -- Keep last_market if present so a reset can immediately baseline against
+    -- the last known live USD index.
     saveState()
     local ok, snap = refreshSnapshot()
     return ok, snap or last_error
@@ -947,6 +1178,10 @@ local function broadcastTick()
     market_state = last_snapshot.market_state,
     quid_strength_index = last_snapshot.quid_strength_index,
     reference_qusd = last_snapshot.reference_qusd,
+    q_usd = last_snapshot.q_usd or last_snapshot.final_qusd,
+    usd_index = last_snapshot.usd_index,
+    usd_strength_index = last_snapshot.usd_strength_index,
+    market_quality = last_snapshot.market and last_snapshot.market.quality or nil,
     base_qusd = BASE_QUSD,
   }
   pcall(function() rednet.broadcast(msg, FX_PROTOCOL) end)
