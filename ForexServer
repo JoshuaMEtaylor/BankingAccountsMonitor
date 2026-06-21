@@ -2,44 +2,42 @@
 -- FOREX SERVER
 -- forexserver
 --
--- Read-only FX/economic oracle for the Quid.
+-- Server-side Quid strength oracle.
+-- Finds ServerSideAccounts safely, reads only safe narrow endpoints, and serves
+-- a compact Quid Strength Index for display terminals.
 --
--- Purpose:
---   Pulls live internal economy data from ServerSideAccounts + optional
---   ContractServer, converts it into a single dynamic Quid Strength Index,
---   then broadcasts that index for a separate display/market terminal.
+-- v0.3.1-REAL-BANK-SCAN-RENAMED
+-- IMPORTANT:
+--   This version does NOT call bank status, get_inflation_state, tick_inflation,
+--   or get_price_indices. Those wide endpoints can include nested/repeated
+--   tables in the current bank and can crash rednet serialization.
 --
--- This script DOES NOT trade, mint, burn, grant, or move money.
--- It only reads the economy and publishes a calculated strength figure.
+-- Safe bank endpoints used:
+--   supply
+--   list_accounts
+--   transaction_stats
+--   economic_gdp
+--   quote_item_price
+--   quote_service_price
 --
--- Protocol served: quid_fx
--- Bank protocol:    quid_bank
--- Contract protocol: quid_contracts
---
--- Display terminal should request:
---   rednet.send(fxServerId, { type = "get_quid_strength" }, "quid_fx")
---
--- Returned response includes:
---   base_qusd             -- foundation value, default 3.40
---   quid_strength_index   -- dynamic Quid side multiplier
---   reference_qusd        -- base_qusd * quid_strength_index, before USD index
---   formula_hint          -- display should do base_qusd * quid_strength_index / usd_strength_index
+-- Served protocol: quid_fx
+-- Bank protocol:   quid_bank
 -- =============================================================================
+
+local args = {...}
 
 -- =============================================================================
 -- SELF UPDATE
 -- =============================================================================
-local args = {...}
 if args[1] ~= "--updated" then
   print("[ Forex Server ]")
   print("Deleting old version...")
   fs.delete("startup.lua")
 
   print("Downloading latest from GitHub...")
-  local cache_bust = tostring(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
-  local update_url = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/forexserver?cb=" .. cache_bust
-
-  shell.run("wget " .. update_url .. " startup.lua")
+  local cb = tostring(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
+  local url = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/forexserver?cb=" .. cb
+  shell.run("wget " .. url .. " startup.lua")
 
   if not fs.exists("startup.lua") then
     print("")
@@ -48,7 +46,7 @@ if args[1] ~= "--updated" then
     print("")
     print("Manual install:")
     print("delete startup")
-    print("wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/forexserver?cb=001 startup.lua")
+    print("wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/forexserver?cb=031 startup.lua")
     print("startup.lua")
     return
   end
@@ -56,77 +54,55 @@ if args[1] ~= "--updated" then
   print("Relaunching...")
   sleep(0.5)
 
-  -- Preserve optional future args after update, matching the style used by the other terminals.
-  local relaunch_args = { "startup.lua", "--updated" }
-  for i = 1, #args do
-    relaunch_args[#relaunch_args + 1] = tostring(args[i])
-  end
+  local relaunch = { "startup.lua", "--updated" }
+  for i = 1, #args do relaunch[#relaunch + 1] = tostring(args[i]) end
   local unpackFn = table.unpack or unpack
-  shell.run(unpackFn(relaunch_args))
+  shell.run(unpackFn(relaunch))
   return
 end
+
+local runtime_args = {}
+for i = 2, #args do runtime_args[#runtime_args + 1] = args[i] end
 
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION = "0.1.1-FOREXSERVER-SELF-UPDATING"
+local VERSION = "0.3.1-REAL-BANK-SCAN-RENAMED"
 
-local FX_PROTOCOL       = "quid_fx"
-local BANK_PROTOCOL     = "quid_bank"
-local CONTRACT_PROTOCOL = "quid_contracts"
-
-local DB_TIMEOUT       = 4
-local CONTRACT_TIMEOUT = 4
-local REFRESH_SECONDS  = 8
-local BROADCAST_SECONDS = 5
-
-local GDP_PERIOD_MC_DAYS = 365
-local MINECRAFT_DAY_MS   = 20 * 60 * 1000
-local GDP_PERIOD_MS      = GDP_PERIOD_MC_DAYS * MINECRAFT_DAY_MS
+local FX_PROTOCOL             = "quid_fx"
+local BANK_PROTOCOL           = "quid_bank"
+local BANK_DISCOVERY_PROTOCOL = "quid_bank_discovery"
+local CONTRACT_PROTOCOL       = "quid_contracts"
 
 local BASE_QUSD = 3.40
+local REFRESH_SECONDS = 8
+local BROADCAST_SECONDS = 5
+local DB_TIMEOUT = 5
+local CONTRACT_TIMEOUT = 3
+local GDP_DAYS = 365
 
-local STATE_FILE   = "data/quid_strength_state.db"
-local HISTORY_FILE = "data/quid_strength_history.db"
-local MAX_HISTORY  = 240
+local FORCED_BANK_ID = tonumber(runtime_args[1])
 
--- How hard sudden monetary expansion hits Quid FX confidence.
--- 1.00 = mild. 2.50 = visible currency crisis on big printing.
-local PRINT_SHOCK_SEVERITY = 2.50
+local STATE_FILE = "data/forexserver_state.db"
+local HISTORY_FILE = "data/forexserver_history.db"
+local MAX_HISTORY = 240
 
--- Print shock decays over time, but it is not erased instantly. CPI/price_index
--- should carry longer term consequences once the economy catches up.
-local PRINT_SHOCK_HALF_LIFE_SECONDS = 600 -- 10 minutes real time
+-- If true, the server may call get_price_indices. Keep false until the bank has
+-- a safe/flat forex snapshot endpoint.
+local ALLOW_UNSAFE_FULL_PRICE_ENDPOINTS = false
 
--- Weight limits stop tiny early-economy baselines from causing absurd numbers.
-local MIN_STRENGTH = 0.05
-local MAX_STRENGTH = 5.00
-
--- =============================================================================
--- RUNTIME
--- =============================================================================
+local modem_name = nil
 local bank_id = nil
 local contract_id = nil
-local modem_name = nil
-
-local state = {
-  baseline = nil,
-  last_snapshot = nil,
-  last_issued_supply = nil,
-  last_refresh_ms = nil,
-  print_shock_pressure = 0,
-}
-
-local history = {}
-local last_error = "Booting"
-local last_quality = "BOOT"
+local last_error = ""
 local last_snapshot = nil
-local last_refresh = 0
 local last_broadcast = 0
-local request_count = 0
+local last_refresh = 0
+local state = {}
+local history = {}
 
 -- =============================================================================
--- BASIC HELPERS
+-- HELPERS
 -- =============================================================================
 local function nowMs()
   if os.epoch then return os.epoch("utc") end
@@ -140,13 +116,7 @@ local function mcDay()
     ok, d = pcall(os.day)
     if ok and tonumber(d) then return math.floor(tonumber(d)) end
   end
-  return math.floor(nowMs() / MINECRAFT_DAY_MS)
-end
-
-local function num(v, fallback)
-  local n = tonumber(v)
-  if n == nil then return fallback end
-  return n
+  return math.floor(nowMs() / 1200000)
 end
 
 local function clamp(v, lo, hi)
@@ -167,42 +137,41 @@ local function pow(a, b)
   a = tonumber(a) or 0
   b = tonumber(b) or 0
   if a <= 0 then return 1 end
-  if math.pow then return math.pow(a, b) end
   return a ^ b
 end
 
-local function countTable(t)
-  local c = 0
-  if type(t) ~= "table" then return 0 end
-  for _ in pairs(t) do c = c + 1 end
-  return c
+local function round(n, dp)
+  n = tonumber(n) or 0
+  local m = 10 ^ (dp or 0)
+  return math.floor(n * m + 0.5) / m
 end
 
-local function fmt(n, dp)
-  n = tonumber(n)
-  if not n then return "--" end
+local function pct(n, dp)
+  n = tonumber(n) or 0
+  return string.format("%." .. tostring(dp or 2) .. "f%%", n * 100)
+end
+
+local function money(n, dp)
+  n = tonumber(n) or 0
   dp = dp or 2
-  return string.format("%." .. tostring(dp) .. "f", n)
+  return string.format("$%." .. tostring(dp) .. "f", n)
 end
 
-local function fmtPct(decimal, dp)
-  decimal = tonumber(decimal)
-  if not decimal then return "--" end
-  return string.format("%." .. tostring(dp or 2) .. "f%%", decimal * 100)
-end
-
-local function fmtMoney(n)
-  n = tonumber(n)
-  if not n then return "--" end
+local function q(n)
+  n = tonumber(n) or 0
   local sign = ""
   if n < 0 then sign = "-"; n = math.abs(n) end
   local s = tostring(math.floor(n + 0.5))
   local out = ""
-  while #s > 3 do
-    out = "," .. s:sub(-3) .. out
-    s = s:sub(1, -4)
-  end
+  while #s > 3 do out = "," .. s:sub(-3) .. out; s = s:sub(1, -4) end
   return sign .. s .. out .. " Q"
+end
+
+local function countTable(t)
+  local n = 0
+  if type(t) ~= "table" then return 0 end
+  for _ in pairs(t) do n = n + 1 end
+  return n
 end
 
 local function ensureDir(path)
@@ -210,7 +179,7 @@ local function ensureDir(path)
   if dir and dir ~= "" and not fs.exists(dir) then fs.makeDir(dir) end
 end
 
-local function readFile(path)
+local function readTable(path)
   if not fs.exists(path) then return nil end
   local f = fs.open(path, "r")
   if not f then return nil end
@@ -218,65 +187,97 @@ local function readFile(path)
   f.close()
   if not text or text == "" then return nil end
   local ok, data = pcall(textutils.unserialize, text)
-  if ok then return data end
+  if ok and type(data) == "table" then return data end
   return nil
 end
 
-local function writeFile(path, data)
+local function wireSafeCopy(value, visiting)
+  local tv = type(value)
+  if tv ~= "table" then
+    if tv == "function" or tv == "thread" or tv == "userdata" then return tostring(value) end
+    return value
+  end
+
+  visiting = visiting or {}
+  if visiting[value] then return "[cycle/repeated-table]" end
+  visiting[value] = true
+
+  local out = {}
+  for k, v in pairs(value) do
+    local key = k
+    local tk = type(key)
+    if tk == "table" or tk == "function" or tk == "thread" or tk == "userdata" then
+      key = tostring(key)
+    end
+    out[key] = wireSafeCopy(v, visiting)
+  end
+
+  visiting[value] = nil
+  return out
+end
+
+local function writeTable(path, data)
   ensureDir(path)
+  local safe = wireSafeCopy(data or {})
+  local okSer, text = pcall(textutils.serialize, safe)
+  if not okSer then return false, tostring(text) end
   local f = fs.open(path, "w")
-  if not f then return false end
-  f.write(textutils.serialize(data))
+  if not f then return false, "open failed" end
+  f.write(text)
   f.close()
   return true
 end
 
 local function loadState()
-  local s = readFile(STATE_FILE)
-  if type(s) == "table" then state = s end
+  state = readTable(STATE_FILE) or {}
+  state.baseline = type(state.baseline) == "table" and state.baseline or nil
+  state.last_issued_supply = tonumber(state.last_issued_supply) or nil
   state.print_shock_pressure = tonumber(state.print_shock_pressure) or 0
+  state.last_refresh_ms = tonumber(state.last_refresh_ms) or nowMs()
 end
 
 local function saveState()
-  writeFile(STATE_FILE, state)
+  -- Keep this deliberately flat/small. Never store raw snapshots here.
+  local flat = {
+    version = VERSION,
+    baseline = state.baseline,
+    last_issued_supply = tonumber(state.last_issued_supply) or 0,
+    print_shock_pressure = tonumber(state.print_shock_pressure) or 0,
+    last_refresh_ms = tonumber(state.last_refresh_ms) or nowMs(),
+    updated = nowMs(),
+  }
+  return writeTable(STATE_FILE, flat)
 end
 
 local function loadHistory()
-  local h = readFile(HISTORY_FILE)
-  if type(h) == "table" then history = h else history = {} end
+  local h = readTable(HISTORY_FILE)
+  history = type(h) == "table" and h or { ticks = {} }
+  history.ticks = type(history.ticks) == "table" and history.ticks or {}
 end
 
 local function saveHistory()
-  writeFile(HISTORY_FILE, history)
+  writeTable(HISTORY_FILE, history)
 end
 
 local function pushHistory(snap)
   if type(snap) ~= "table" then return end
-  history[#history + 1] = {
-    time = snap.time,
-    day = snap.mc_day,
-    quid_strength_index = snap.quid_strength_index,
-    reference_qusd = snap.reference_qusd,
-    price_index = snap.inputs and snap.inputs.price_index,
-    issued_supply = snap.inputs and snap.inputs.issued_supply,
-    print_shock_pressure = snap.inputs and snap.inputs.print_shock_pressure,
-    quality = snap.quality,
+  history.ticks = history.ticks or {}
+  history.ticks[#history.ticks + 1] = {
+    time = tonumber(snap.time) or nowMs(),
+    day = tonumber(snap.mc_day) or mcDay(),
+    strength = tonumber(snap.quid_strength_index) or 1,
+    qusd = tonumber(snap.reference_qusd) or BASE_QUSD,
+    issued = snap.inputs and tonumber(snap.inputs.issued_supply) or nil,
+    price = snap.inputs and tonumber(snap.inputs.price_index) or nil,
   }
-  while #history > MAX_HISTORY do table.remove(history, 1) end
+  while #history.ticks > MAX_HISTORY do table.remove(history.ticks, 1) end
   saveHistory()
 end
 
-local function shortHistory(maxN)
-  maxN = tonumber(maxN) or 80
-  local out = {}
-  local start = math.max(1, #history - maxN + 1)
-  for i = start, #history do out[#out + 1] = history[i] end
-  return out
+local function setText(col)
+  if col then term.setTextColor(col) end
 end
 
--- =============================================================================
--- TERMINAL DRAWING
--- =============================================================================
 local function cls()
   term.setCursorBlink(false)
   term.setBackgroundColor(colors.black)
@@ -285,607 +286,452 @@ local function cls()
   term.setCursorPos(1, 1)
 end
 
-local function at(x, y, text, fg, bg)
-  local W, H = term.getSize()
-  if y < 1 or y > H or x > W then return end
-  if x < 1 then x = 1 end
-  term.setCursorPos(x, y)
-  term.setTextColor(fg or colors.white)
-  term.setBackgroundColor(bg or colors.black)
-  local maxW = W - x + 1
-  if maxW > 0 then term.write(tostring(text or ""):sub(1, maxW)) end
-end
-
-local function fill(x, y, w, h, bg)
-  local W, H = term.getSize()
-  if w <= 0 or h <= 0 then return end
-  term.setBackgroundColor(bg or colors.black)
-  local row = string.rep(" ", math.max(0, w))
-  for yy = y, y + h - 1 do
-    if yy >= 1 and yy <= H then
-      term.setCursorPos(math.max(1, x), yy)
-      term.write(row:sub(1, math.max(0, W - x + 1)))
-    end
-  end
-end
-
-local function draw()
-  local W, H = term.getSize()
-  cls()
-  fill(1, 1, W, 1, colors.blue)
-  at(2, 1, "FOREX SERVER", colors.white, colors.blue)
-  at(math.max(1, W - #VERSION), 1, VERSION, colors.lightGray, colors.blue)
-
-  at(2, 3, "Bank:       " .. tostring(bank_id or "not connected"), bank_id and colors.lime or colors.red)
-  at(2, 4, "Contracts:  " .. tostring(contract_id or "optional/not connected"), contract_id and colors.lime or colors.gray)
-  at(2, 5, "Protocol:   " .. FX_PROTOCOL, colors.cyan)
-  at(2, 6, "Quality:    " .. tostring(last_quality), last_quality == "LIVE" and colors.lime or (last_quality == "PARTIAL" and colors.orange or colors.red))
-  at(2, 7, "Last error: " .. tostring(last_error):sub(1, W - 14), last_error == "OK" and colors.lime or colors.orange)
-
-  local s = last_snapshot or {}
-  local inp = s.inputs or {}
-  local drv = s.drivers or {}
-
-  at(2, 9,  "Base Q/USD:       $" .. fmt(s.base_qusd or BASE_QUSD, 2), colors.white)
-  at(2, 10, "Quid strength:    x" .. fmt(s.quid_strength_index, 4), colors.lime)
-  at(2, 11, "Reference Q/USD:  $" .. fmt(s.reference_qusd, 4), colors.cyan)
-  at(2, 12, "Formula:          QUSD = base * quid_strength / usd_strength", colors.gray)
-
-  at(2, 14, "Issued supply:    " .. fmtMoney(inp.issued_supply), colors.lightGray)
-  at(2, 15, "Private supply:   " .. fmtMoney(inp.private_supply), colors.lightGray)
-  at(2, 16, "Treasury share:   " .. fmtPct(inp.treasury_share, 2), colors.lightGray)
-  at(2, 17, "Price index:      x" .. fmt(inp.price_index, 3), colors.lightGray)
-  at(2, 18, "Inflation rate:   " .. fmtPct(inp.inflation_rate, 2), (tonumber(inp.inflation_rate) or 0) <= 0 and colors.lime or colors.orange)
-  at(2, 19, "Real wage:        " .. fmtPct(inp.real_wage_ratio, 2), (tonumber(inp.real_wage_ratio) or 0) >= 1 and colors.lime or colors.orange)
-  at(2, 20, "GDP/capita:       " .. fmtMoney(inp.gdp_per_capita), colors.lightGray)
-
-  local x2 = math.floor(W / 2) + 2
-  at(x2, 14, "Drivers", colors.white)
-  at(x2, 15, "Purchasing power  x" .. fmt(drv.purchasing_power_factor, 4), colors.lightGray)
-  at(x2, 16, "Print shock       x" .. fmt(drv.print_shock_factor, 4), (tonumber(drv.print_shock_factor) or 1) < 0.95 and colors.red or colors.gray)
-  at(x2, 17, "Pressure          x" .. fmt(drv.pressure_factor, 4), colors.lightGray)
-  at(x2, 18, "Wages             x" .. fmt(drv.wage_factor, 4), colors.lightGray)
-  at(x2, 19, "Output            x" .. fmt(drv.output_factor, 4), colors.lightGray)
-  at(x2, 20, "Treasury          x" .. fmt(drv.treasury_factor, 4), colors.lightGray)
-  at(x2, 21, "Private float     x" .. fmt(drv.private_float_factor, 4), colors.lightGray)
-  at(x2, 22, "Stability         x" .. fmt(drv.stability_factor, 4), colors.lightGray)
-  at(x2, 23, "Inequality        x" .. fmt(drv.inequality_factor, 4), colors.lightGray)
-
-  at(2, H - 2, "Requests: " .. tostring(request_count) .. " | Baseline file: " .. STATE_FILE, colors.gray)
-  at(2, H - 1, "Delete " .. STATE_FILE .. " to reset the foundation baseline.", colors.gray)
+local function at(x, y, text, col)
+  local w, h = term.getSize()
+  if y < 1 or y > h or x > w then return end
+  term.setCursorPos(math.max(1, x), y)
+  term.setBackgroundColor(colors.black)
+  term.setTextColor(col or colors.white)
+  term.write(tostring(text or ""):sub(1, math.max(0, w - x + 1)))
 end
 
 -- =============================================================================
 -- NETWORK
 -- =============================================================================
 local function openModem()
-  for _, n in ipairs(peripheral.getNames()) do
-    if peripheral.getType(n) == "modem" then
-      local m = peripheral.wrap(n)
+  for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.getType(name) == "modem" then
+      local m = peripheral.wrap(name)
       if m and m.isWireless and m.isWireless() then
-        rednet.open(n)
-        modem_name = n
+        rednet.open(name)
+        modem_name = name
         return true
       end
     end
   end
-  for _, n in ipairs(peripheral.getNames()) do
-    if peripheral.getType(n) == "modem" then
-      rednet.open(n)
-      modem_name = n
+  for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.getType(name) == "modem" then
+      rednet.open(name)
+      modem_name = name
       return true
     end
   end
   return false
 end
 
+local function isBankBroadcast(msg)
+  return type(msg) == "table" and msg.type == "treasury_online"
+end
+
 local function discoverBank()
-  -- First listen for normal bank heartbeat.
-  local deadline = os.clock() + 3
-  while os.clock() < deadline do
-    local sender, msg = rednet.receive(BANK_PROTOCOL, math.max(0.1, deadline - os.clock()))
-    if sender and type(msg) == "table" and msg.type == "treasury_online" then
+  if FORCED_BANK_ID then bank_id = FORCED_BANK_ID; return true end
+
+  bank_id = nil
+  last_error = "Finding ServerSideAccounts bank..."
+
+  -- 1) Passive discovery first: ServerSideAccounts broadcasts treasury_online
+  -- on quid_bank and quid_bank_discovery in serverLoop/main. This does not
+  -- request any nested table from the bank and cannot trigger its status/oracle
+  -- serialization issue.
+  local deadline = os.clock() + 6
+  while true do
+    local rem = deadline - os.clock()
+    if rem <= 0 then break end
+    local sender, msg, protocol = rednet.receive(nil, rem)
+    if sender and isBankBroadcast(msg) and (protocol == BANK_PROTOCOL or protocol == BANK_DISCOVERY_PROTOCOL) then
       bank_id = sender
+      last_error = ""
       return true
     end
   end
 
-  -- Then broadcast a harmless status request. ServerSideAccounts replies using
-  -- the standard { success=true, response=... } wrapper.
-  rednet.broadcast({ type = "status" }, BANK_PROTOCOL)
-  deadline = os.clock() + 4
-  while os.clock() < deadline do
-    local sender, msg = rednet.receive(BANK_PROTOCOL, math.max(0.1, deadline - os.clock()))
-    if sender and type(msg) == "table" then
-      if msg.type == "treasury_online" then
-        bank_id = sender
-        return true
-      end
-      if msg.success == true and type(msg.response) == "table" then
-        bank_id = sender
-        return true
+  -- 2) Active fallback: do NOT ping and do NOT status. The current
+  -- ServerSideAccounts has no ping handler in the uploaded script, while status
+  -- can contain nested inflation/oracle structures. A broadcast supply request
+  -- is flat and is defined in ServerSideAccounts as deriveMonetarySupply().
+  for _ = 1, 4 do
+    pcall(function() rednet.broadcast({ type = "supply" }, BANK_PROTOCOL) end)
+    deadline = os.clock() + 3
+    while true do
+      local rem = deadline - os.clock()
+      if rem <= 0 then break end
+      local sender, msg, protocol = rednet.receive(BANK_PROTOCOL, rem)
+      if sender and type(msg) == "table" then
+        if isBankBroadcast(msg) then
+          bank_id = sender
+          last_error = ""
+          return true
+        end
+        if msg.success == true and type(msg.response) == "table" then
+          local r = msg.response
+          if r.in_circulation ~= nil or r.total_minted ~= nil or r.treasury_balance ~= nil then
+            bank_id = sender
+            last_error = ""
+            return true
+          end
+        end
       end
     end
   end
+
+  last_error = "ServerSideAccounts bank not found on quid_bank/quid_bank_discovery"
   return false
 end
 
 local function discoverContractServer()
-  -- Contract server is optional. We only use it to add fulfilled-contract GDP.
-  local deadline = os.clock() + 2
-  while os.clock() < deadline do
-    local sender, msg = rednet.receive(CONTRACT_PROTOCOL, math.max(0.1, deadline - os.clock()))
-    if sender and type(msg) == "table" and msg.type == "contract_server_online" then
-      contract_id = sender
-      return true
-    end
-  end
-
-  rednet.broadcast({ type = "status" }, CONTRACT_PROTOCOL)
-  deadline = os.clock() + 3
-  while os.clock() < deadline do
-    local sender, msg = rednet.receive(CONTRACT_PROTOCOL, math.max(0.1, deadline - os.clock()))
+  contract_id = nil
+  pcall(function() rednet.broadcast({ type = "ping" }, CONTRACT_PROTOCOL) end)
+  local deadline = os.clock() + CONTRACT_TIMEOUT
+  while true do
+    local rem = deadline - os.clock()
+    if rem <= 0 then return false end
+    local sender, msg = rednet.receive(CONTRACT_PROTOCOL, rem)
     if sender and type(msg) == "table" then
-      if msg.type == "contract_server_online" then
-        contract_id = sender
-        return true
-      end
-      if msg.success == true and type(msg.response) == "table" then
+      if msg.type == "contract_server_online" or msg.success ~= nil then
         contract_id = sender
         return true
       end
     end
   end
-  return false
 end
 
 local function bankReq(req, timeout)
   timeout = timeout or DB_TIMEOUT
-  if not bank_id then return false, "No bank server" end
-  rednet.send(bank_id, req, BANK_PROTOCOL)
+  if not bank_id then
+    if not discoverBank() then return false, "No bank server" end
+  end
+
+  local okSend, err = pcall(function() rednet.send(bank_id, req, BANK_PROTOCOL) end)
+  if not okSend then return false, "send failed: " .. tostring(err) end
+
   local deadline = os.clock() + timeout
-  while os.clock() < deadline do
-    local sender, msg = rednet.receive(BANK_PROTOCOL, math.max(0.1, deadline - os.clock()))
+  while true do
+    local rem = deadline - os.clock()
+    if rem <= 0 then return false, "No response from bank" end
+    local sender, msg = rednet.receive(BANK_PROTOCOL, rem)
     if sender == bank_id and type(msg) == "table" and msg.success ~= nil then
       return msg.success == true, msg.response
     end
-    if sender and type(msg) == "table" and msg.type == "treasury_online" and not bank_id then
-      bank_id = sender
-    end
   end
-  return false, "No response from bank"
 end
 
 local function contractReq(req, timeout)
   timeout = timeout or CONTRACT_TIMEOUT
   if not contract_id then return false, "No contract server" end
-  rednet.send(contract_id, req, CONTRACT_PROTOCOL)
+  local okSend, err = pcall(function() rednet.send(contract_id, req, CONTRACT_PROTOCOL) end)
+  if not okSend then return false, "send failed: " .. tostring(err) end
   local deadline = os.clock() + timeout
-  while os.clock() < deadline do
-    local sender, msg = rednet.receive(CONTRACT_PROTOCOL, math.max(0.1, deadline - os.clock()))
+  while true do
+    local rem = deadline - os.clock()
+    if rem <= 0 then return false, "No response from contracts" end
+    local sender, msg = rednet.receive(CONTRACT_PROTOCOL, rem)
     if sender == contract_id and type(msg) == "table" and msg.success ~= nil then
       return msg.success == true, msg.response
     end
   end
-  return false, "No response from contract server"
-end
-
--- =============================================================================
--- CONTRACT GDP
--- =============================================================================
-local function contractMinecraftDay(c)
-  if type(c) ~= "table" then return nil end
-  return tonumber(c.fulfilled_day or c.paid_day or c.closed_day or c.updated_day or c.created_day or c.day)
-end
-
-local function analyseContracts(contracts, status)
-  local now = nowMs()
-  local currentDay = mcDay()
-  local gdp = 0
-  local events = 0
-  local fulfilledValue = 0
-
-  contracts = type(contracts) == "table" and contracts or {}
-  for _, c in ipairs(contracts) do
-    if type(c) == "table" then
-      local reward = tonumber(c.reward or c.value or c.amount) or 0
-      local st = tostring(c.status or "")
-      if st == "fulfilled" or st == "paid" or st == "closed" then
-        fulfilledValue = fulfilledValue + reward
-        local cday = contractMinecraftDay(c)
-        local t = tonumber(c.fulfilled_at or c.paid_at or c.closed_at or c.updated or c.created)
-        local within = false
-        if cday ~= nil then
-          local age = currentDay - math.floor(cday)
-          within = age >= 0 and age < GDP_PERIOD_MC_DAYS
-        elseif t then
-          within = (now - t) <= GDP_PERIOD_MS
-        else
-          within = true
-        end
-        if within then
-          gdp = gdp + reward
-          events = events + 1
-        end
-      end
-    end
-  end
-
-  return {
-    connected = contract_id ~= nil,
-    gdp_365d = gdp,
-    gdp_events = events,
-    fulfilled_value = fulfilledValue,
-    total = tonumber(status and status.total) or #contracts,
-    open = tonumber(status and status.open) or 0,
-    claimed = tonumber(status and status.claimed) or 0,
-    fulfilled = tonumber(status and status.fulfilled) or 0,
-    cancelled = tonumber(status and status.cancelled) or 0,
-  }
-end
-
-local function fetchContractGDP(errors)
-  if not contract_id then discoverContractServer() end
-  if not contract_id then return { connected = false, gdp_365d = 0, gdp_events = 0 } end
-
-  local okStatus, status = contractReq({ type = "status" }, 2)
-  if not okStatus or type(status) ~= "table" then
-    errors[#errors + 1] = "contracts status: " .. tostring(status)
-    contract_id = nil
-    return { connected = false, gdp_365d = 0, gdp_events = 0 }
-  end
-
-  local okList, list = contractReq({ type = "list_contracts", status = "all" }, 5)
-  if not okList or type(list) ~= "table" then
-    errors[#errors + 1] = "contracts list: " .. tostring(list)
-    return analyseContracts({}, status)
-  end
-
-  return analyseContracts(list.contracts or {}, status)
 end
 
 -- =============================================================================
 -- DATA EXTRACTION
 -- =============================================================================
-local function sectorFromOracle(oracle, name)
-  if type(oracle) ~= "table" or type(oracle.sectors) ~= "table" then return nil end
-  return oracle.sectors[name]
-end
+local function accountScale(accounts)
+  local citizens, companies, citizenWealth, companyWealth = 0, 0, 0, 0
+  local nonTreasuryPrivate = 0
+  local rich = {}
 
-local function extractOracleValues(oracle, status)
-  local out = {}
-  local wp = type(oracle) == "table" and oracle.wage_price or nil
-  local inf = type(oracle) == "table" and oracle.inflation or nil
-  local statusPrice = type(status) == "table" and status.price_indices or nil
-  local statusInf = type(status) == "table" and status.inflation or nil
-
-  out.price_index =
-    num(oracle and oracle.national_price_index) or
-    num(wp and wp.national_price_index) or
-    num(statusPrice and statusPrice.national_price_index) or
-    num(statusInf and statusInf.national_price_index) or
-    num(statusInf and statusInf.price_index) or
-    1
-
-  out.wage_index =
-    num(oracle and oracle.wage_index) or
-    num(wp and wp.wage_index) or
-    num(statusPrice and statusPrice.wage_index) or
-    1
-
-  out.inflation_rate =
-    num(inf and inf.inflation_rate) or
-    num(statusInf and statusInf.inflation_rate) or
-    0
-
-  out.total_pressure =
-    num(wp and wp.total_inflation_pressure) or
-    num(statusPrice and statusPrice.total_inflation_pressure) or
-    0
-
-  out.wage_cost_pressure =
-    num(wp and wp.wage_cost_pressure) or
-    num(statusPrice and statusPrice.wage_cost_pressure) or
-    0
-
-  local general = sectorFromOracle(oracle, "general") or {}
-  local food = sectorFromOracle(oracle, "food") or {}
-  out.money_pressure =
-    num(general.monetary_pressure) or
-    num(food.monetary_pressure) or
-    num(wp and wp.monetary_pressure) or
-    0
-
-  out.shock_pressure =
-    num(general.shock_pressure) or
-    num(food.shock_pressure) or
-    num(statusPrice and statusPrice.shock_pressure) or
-    0
-
-  out.real_wage_ratio = safeDiv(out.wage_index, out.price_index, 1)
-  return out
-end
-
-local function deriveInequality(accounts)
-  if type(accounts) ~= "table" then
-    return { top_share = 0, total_positive = 0, observations = 0 }
-  end
-
-  local balances = {}
-  local total = 0
-  for _, acc in ipairs(accounts) do
-    if type(acc) == "table" and acc.status ~= "suspended" and acc.account_id ~= "treasury:quid_bank" then
+  for _, acc in ipairs(accounts or {}) do
+    if type(acc) == "table" and acc.status ~= "dead" and acc.status ~= "suspended" then
       local bal = tonumber(acc.balance) or 0
-      if bal > 0 then
-        balances[#balances + 1] = bal
-        total = total + bal
+      local typ = tostring(acc.type or "")
+      if acc.account_id ~= "treasury:quid_bank" then
+        nonTreasuryPrivate = nonTreasuryPrivate + bal
+      end
+      if typ == "citizen" then
+        citizens = citizens + 1
+        citizenWealth = citizenWealth + bal
+        rich[#rich + 1] = bal
+      elseif typ == "company" then
+        companies = companies + 1
+        companyWealth = companyWealth + bal
       end
     end
   end
 
-  table.sort(balances, function(a, b) return a > b end)
-  if total <= 0 or #balances == 0 then
-    return { top_share = 0, total_positive = 0, observations = 0 }
-  end
-
-  local topN = math.max(1, math.ceil(#balances * 0.01))
-  local top = 0
-  for i = 1, math.min(topN, #balances) do top = top + balances[i] end
+  table.sort(rich, function(a, b) return a > b end)
+  local top1 = 0
+  if #rich > 0 and citizenWealth ~= 0 then top1 = rich[1] / citizenWealth end
 
   return {
-    top_share = top / total,
-    total_positive = total,
-    observations = #balances,
+    citizens = citizens,
+    companies = companies,
+    citizen_wealth = citizenWealth,
+    company_wealth = companyWealth,
+    private_account_total = nonTreasuryPrivate,
+    top1_share = top1,
   }
 end
 
-local function fetchRawEconomy()
+local function fetchPriceProxy(errors)
+  local out = {
+    price_index = 1,
+    wage_index = 1,
+    real_wage_ratio = 1,
+    money_pressure = 0,
+    shock_pressure = 0,
+    total_pressure = 0,
+    inflation_rate = 0,
+    wage_cost_pressure = 0,
+    source = "quote endpoints",
+  }
+
+  -- Safe quote endpoint. It returns flat price metadata from the national price
+  -- oracle without returning the full nested oracle table.
+  local okMeal, meal = bankReq({ type = "quote_service_price", service = "dining_meal", tier = "normal" }, 5)
+  if okMeal and type(meal) == "table" then
+    out.price_index = tonumber(meal.sector_index) or out.price_index
+    out.money_pressure = tonumber(meal.monetary_pressure) or out.money_pressure
+    out.shock_pressure = tonumber(meal.shock_pressure) or out.shock_pressure
+    out.inflation_rate = tonumber(meal.bank_inflation_rate) or out.inflation_rate
+  else
+    errors[#errors + 1] = "meal quote: " .. tostring(meal)
+  end
+
+  local okIron, iron = bankReq({ type = "quote_item_price", item = "iron_ingot", count = 8, sector = "tools" }, 5)
+  if okIron and type(iron) == "table" then
+    out.price_index = math.max(out.price_index, tonumber(iron.sector_index) or 1)
+    out.money_pressure = math.max(out.money_pressure, tonumber(iron.monetary_pressure) or 0)
+    out.shock_pressure = math.max(out.shock_pressure, tonumber(iron.shock_pressure) or 0)
+    out.inflation_rate = tonumber(iron.bank_inflation_rate) or out.inflation_rate
+  else
+    errors[#errors + 1] = "iron quote: " .. tostring(iron)
+  end
+
+  -- Keep this disabled until ServerSideAccounts has a dedicated flat forex
+  -- snapshot endpoint. The wide endpoints can crash rednet serialization.
+  if ALLOW_UNSAFE_FULL_PRICE_ENDPOINTS then
+    local okFull, full = bankReq({ type = "get_price_indices" }, 5)
+    if okFull and type(full) == "table" then
+      local wp = type(full.wage_price) == "table" and full.wage_price or {}
+      out.price_index = tonumber(full.national_price_index) or tonumber(wp.national_price_index) or out.price_index
+      out.wage_index = tonumber(full.wage_index) or tonumber(wp.wage_index) or out.wage_index
+      out.real_wage_ratio = safeDiv(out.wage_index, out.price_index, out.real_wage_ratio)
+      out.wage_cost_pressure = tonumber(wp.wage_cost_pressure) or out.wage_cost_pressure
+      out.total_pressure = tonumber(wp.total_inflation_pressure) or out.total_pressure
+      out.source = "get_price_indices"
+    else
+      errors[#errors + 1] = "full price endpoint: " .. tostring(full)
+    end
+  end
+
+  if out.price_index < 1 then out.price_index = 1 end
+  -- Wage proxy: if we only know prices, assume wages lag behind price inflation.
+  -- This is conservative and avoids calling unsafe wage-price endpoints.
+  out.real_wage_ratio = clamp(safeDiv(out.wage_index, out.price_index, 1), 0.1, 2)
+  out.total_pressure = math.max(tonumber(out.total_pressure) or 0, (tonumber(out.money_pressure) or 0) + (tonumber(out.shock_pressure) or 0))
+  return out
+end
+
+local function fetchContractGdp(errors)
+  if not contract_id then return 0, 0 end
+  local ok, res = contractReq({ type = "status" }, 3)
+  if not ok or type(res) ~= "table" then
+    errors[#errors + 1] = "contract status: " .. tostring(res)
+    return 0, 0
+  end
+  local gdp = tonumber(res.gdp or res.total_gdp or res.fulfilled_value or res.paid_value) or 0
+  local count = tonumber(res.fulfilled or res.paid or res.contracts_fulfilled) or 0
+  return gdp, count
+end
+
+local function rawEconomy()
   local errors = {}
 
-  if not bank_id then discoverBank() end
-  if not bank_id then return nil, "Bank server not found" end
+  if not bank_id and not discoverBank() then return nil, "Bank server not found" end
 
-  local okStatus, status = bankReq({ type = "status" }, 3)
-  if not okStatus or type(status) ~= "table" then
-    errors[#errors + 1] = "status: " .. tostring(status)
-    status = {}
-  end
-
-  local okSupply, supply = bankReq({ type = "supply" }, 3)
+  local okSupply, supply = bankReq({ type = "supply" }, 5)
   if not okSupply or type(supply) ~= "table" then
     errors[#errors + 1] = "supply: " .. tostring(supply)
-    supply = type(status.supply) == "table" and status.supply or {}
+    supply = {}
   end
 
-  local okOracle, oracle = bankReq({ type = "get_price_indices" }, 5)
-  if not okOracle or type(oracle) ~= "table" then
-    errors[#errors + 1] = "price oracle: " .. tostring(oracle)
-    oracle = {}
+  local okAcc, accRes = bankReq({ type = "list_accounts" }, 6)
+  if not okAcc or type(accRes) ~= "table" then
+    errors[#errors + 1] = "accounts: " .. tostring(accRes)
+    accRes = { accounts = {} }
+  end
+  local accounts = type(accRes.accounts) == "table" and accRes.accounts or {}
+  local scale = accountScale(accounts)
+
+  local okTx, txRes = bankReq({ type = "transaction_stats" }, 5)
+  if not okTx or type(txRes) ~= "table" then
+    errors[#errors + 1] = "tx: " .. tostring(txRes)
+    txRes = {}
   end
 
-  local okInf, inf = bankReq({ type = "get_inflation_state" }, 3)
-  if okInf and type(inf) == "table" then
-    if not oracle.inflation and type(inf.state) == "table" then oracle.inflation = inf.state end
-    if not oracle.wage_price and type(inf.wage_price) == "table" then oracle.wage_price = inf.wage_price end
+  local okGdp, gdpRes = bankReq({ type = "economic_gdp", days = GDP_DAYS, exclude_contracts = true }, 6)
+  if not okGdp or type(gdpRes) ~= "table" then
+    errors[#errors + 1] = "gdp: " .. tostring(gdpRes)
+    gdpRes = {}
   end
 
-  local okGdp, gdp = bankReq({ type = "economic_gdp", days = GDP_PERIOD_MC_DAYS, exclude_contracts = true }, 5)
-  if not okGdp or type(gdp) ~= "table" then
-    errors[#errors + 1] = "bank GDP: " .. tostring(gdp)
-    gdp = {}
-  end
+  local price = fetchPriceProxy(errors)
+  local contractGdp, contractCount = fetchContractGdp(errors)
 
-  local okTx, tx = bankReq({ type = "transaction_stats" }, 3)
-  if not okTx or type(tx) ~= "table" then
-    errors[#errors + 1] = "tx stats: " .. tostring(tx)
-    tx = type(status.transaction_stats) == "table" and status.transaction_stats or {}
-  end
+  local issued = tonumber(supply.in_circulation or supply.issued_supply or supply.total_supply) or 0
+  local treasury = tonumber(supply.treasury_balance) or 0
+  local citizenHoldings = tonumber(supply.citizen_holdings) or scale.citizen_wealth or 0
+  local companyHoldings = tonumber(supply.company_holdings) or scale.company_wealth or 0
+  local escrowHeld = tonumber(supply.escrow_held) or 0
+  local privateSupply = citizenHoldings + companyHoldings + escrowHeld
 
-  local okAcc, acc = bankReq({ type = "list_accounts" }, 5)
-  if not okAcc or type(acc) ~= "table" then
-    errors[#errors + 1] = "accounts: " .. tostring(acc)
-    acc = { accounts = {} }
-  end
+  local population = tonumber(gdpRes.population) or tonumber(scale.citizens) or 0
+  local bankGdp = tonumber(gdpRes.private_gdp or gdpRes.gdp or gdpRes.service_gdp or gdpRes.economic_gdp) or 0
+  local gdp = bankGdp + contractGdp
+  local gdpCap = tonumber(gdpRes.gdp_per_capita) or safeDiv(gdp, population, 0) or 0
 
-  local contract = fetchContractGDP(errors)
-
-  local issued = num(supply.in_circulation)
-  if not issued then
-    issued = (num(supply.total_minted, 0) or 0) - (num(supply.total_burned, 0) or 0)
-  end
-  issued = issued or 0
-
-  local treasury = num(supply.treasury_balance, 0) or 0
-  local private = num(supply.private_supply)
-  if not private then
-    private = (num(supply.citizen_holdings, 0) or 0) + (num(supply.company_holdings, 0) or 0) + (num(supply.escrow_held, 0) or 0)
-  end
-  if (not private or private <= 0) and issued > 0 then private = math.max(0, issued - treasury) end
-  private = private or 0
-
-  local oracleValues = extractOracleValues(oracle, status)
-  local today = type(tx.today) == "table" and tx.today or {}
-  local inequality = deriveInequality(acc.accounts or {})
-
-  local bankServiceGdp = num(gdp.non_contract_gdp or gdp.service_gdp or gdp.gdp or gdp.private_gdp, 0) or 0
-  local contractGdp = num(contract.gdp_365d, 0) or 0
-  local totalGdp = bankServiceGdp + contractGdp
-
-  local population = num(status.citizen_count) or num(gdp.population) or 0
-  local companies = num(status.company_count) or 0
-  local gdpPerCapita = 0
-  if population and population > 0 then gdpPerCapita = totalGdp / population end
-
-  local quality = "LIVE"
-  if #errors > 0 then quality = "PARTIAL" end
+  local today = type(txRes.today) == "table" and txRes.today or {}
+  local week = type(txRes.last_7_days) == "table" and txRes.last_7_days or {}
 
   return {
     time = nowMs(),
     mc_day = mcDay(),
-    quality = quality,
-    errors = errors,
-    status = status,
-    supply = supply,
-    oracle = oracle,
+    issued_supply = issued,
+    total_minted = tonumber(supply.total_minted) or 0,
+    total_burned = tonumber(supply.total_burned) or 0,
+    treasury_balance = treasury,
+    citizen_holdings = citizenHoldings,
+    company_holdings = companyHoldings,
+    escrow_held = escrowHeld,
+    private_supply = privateSupply,
+    treasury_share = safeDiv(treasury, issued, 0),
+    private_float = safeDiv(privateSupply, issued, 0),
+    price_index = tonumber(price.price_index) or 1,
+    inflation_rate = tonumber(price.inflation_rate) or 0,
+    money_pressure = tonumber(price.money_pressure) or 0,
+    shock_pressure = tonumber(price.shock_pressure) or 0,
+    total_pressure = tonumber(price.total_pressure) or 0,
+    wage_index = tonumber(price.wage_index) or 1,
+    real_wage_ratio = tonumber(price.real_wage_ratio) or 1,
+    wage_cost_pressure = tonumber(price.wage_cost_pressure) or 0,
+    price_source = price.source,
+    population = population,
+    companies = tonumber(scale.companies) or 0,
     gdp = gdp,
-    tx = tx,
-    accounts = acc.accounts or {},
-    contract = contract,
-    inputs = {
-      issued_supply = issued,
-      treasury_balance = treasury,
-      private_supply = private,
-      treasury_share = safeDiv(treasury, issued, 0),
-      private_float = safeDiv(private, issued, 0),
-      price_index = oracleValues.price_index,
-      wage_index = oracleValues.wage_index,
-      real_wage_ratio = oracleValues.real_wage_ratio,
-      inflation_rate = oracleValues.inflation_rate,
-      total_pressure = oracleValues.total_pressure,
-      money_pressure = oracleValues.money_pressure,
-      shock_pressure = oracleValues.shock_pressure,
-      wage_cost_pressure = oracleValues.wage_cost_pressure,
-      bank_service_gdp = bankServiceGdp,
-      contract_gdp = contractGdp,
-      gdp = totalGdp,
-      gdp_per_capita = gdpPerCapita,
-      population = population,
-      companies = companies,
-      tx_today = num(today.total, 0) or 0,
-      economic_tx_today = num(today.economic, 0) or 0,
-      tx_value_today = num(today.value, 0) or 0,
-      inequality_top_share = inequality.top_share,
-      inequality_total_positive = inequality.total_positive,
-      inequality_observations = inequality.observations,
-    },
+    bank_gdp = bankGdp,
+    contract_gdp = contractGdp,
+    contract_count = contractCount,
+    gdp_per_capita = gdpCap,
+    tx_today = tonumber(today.total) or 0,
+    tx_value_today = tonumber(today.value) or 0,
+    tx_economic_today = tonumber(today.economic) or 0,
+    tx_week = tonumber(week.total) or 0,
+    top1_share = tonumber(scale.top1_share) or 0,
+    account_count = #accounts,
+    errors = errors,
   }
 end
 
 -- =============================================================================
--- BASELINE + STRENGTH FORMULA
+-- STRENGTH MODEL
 -- =============================================================================
 local function ensureBaseline(raw)
   if type(state.baseline) == "table" then return end
-  local i = raw.inputs or {}
+
+  local issued = math.max(1, tonumber(raw.issued_supply) or 1)
+  local price = math.max(1, tonumber(raw.price_index) or 1)
+  local gdpCap = tonumber(raw.gdp_per_capita) or 0
+  if gdpCap <= 0 then gdpCap = 1 end
+
   state.baseline = {
+    created = nowMs(),
+    day = mcDay(),
     base_qusd = BASE_QUSD,
-    created_time = raw.time or nowMs(),
-    created_day = raw.mc_day or mcDay(),
-    price_index = math.max(0.0001, num(i.price_index, 1) or 1),
-    issued_supply = math.max(1, num(i.issued_supply, 1) or 1),
-    treasury_share = math.max(0.0001, num(i.treasury_share, 0.70) or 0.70),
-    private_float = math.max(0.0001, num(i.private_float, 0.25) or 0.25),
-    gdp_per_capita = math.max(1, num(i.gdp_per_capita, 1) or 1),
-    economic_tx_today = math.max(1, num(i.economic_tx_today, 1) or 1),
-    tx_value_today = math.max(1, num(i.tx_value_today, 1) or 1),
-    wage_index = math.max(0.0001, num(i.wage_index, 1) or 1),
-    inequality_top_share = math.max(0.0001, num(i.inequality_top_share, 0.35) or 0.35),
-    note = "Foundation baseline. Delete data/quid_strength_state.db to rebase the Quid Strength Index.",
+    issued_supply = issued,
+    price_index = price,
+    gdp_per_capita = gdpCap,
+    treasury_share = clamp(tonumber(raw.treasury_share) or 0.70, 0.01, 1),
+    private_float = clamp(tonumber(raw.private_float) or 0.25, 0.01, 1),
+    tx_today = math.max(1, tonumber(raw.tx_today) or 1),
+    note = "Foundation state for Quid FX. 1 Q = $3.40 at this baseline.",
   }
-  state.last_issued_supply = num(i.issued_supply, 0) or 0
-  state.last_refresh_ms = raw.time or nowMs()
+  state.last_issued_supply = issued
+  state.print_shock_pressure = tonumber(state.print_shock_pressure) or 0
+  state.last_refresh_ms = nowMs()
   saveState()
 end
 
 local function updatePrintShock(raw)
-  local i = raw.inputs or {}
-  local current = math.max(0, num(i.issued_supply, 0) or 0)
-  local previous = num(state.last_issued_supply, current) or current
-  local now = raw.time or nowMs()
-  local last = num(state.last_refresh_ms, now) or now
-  local elapsedSeconds = math.max(0, (now - last) / 1000)
+  local now = nowMs()
+  local issued = math.max(0, tonumber(raw.issued_supply) or 0)
+  local lastIssued = tonumber(state.last_issued_supply) or issued
+  local oldPressure = tonumber(state.print_shock_pressure) or 0
+  local lastMs = tonumber(state.last_refresh_ms) or now
 
-  local shock = num(state.print_shock_pressure, 0) or 0
-  if elapsedSeconds > 0 and PRINT_SHOCK_HALF_LIFE_SECONDS > 0 then
-    local decay = pow(0.5, elapsedSeconds / PRINT_SHOCK_HALF_LIFE_SECONDS)
-    shock = shock * decay
+  -- Time decay. Roughly: frequent refresh = slow fade, not instant amnesia.
+  local elapsedSeconds = math.max(0, (now - lastMs) / 1000)
+  local decay = 0.985 ^ math.max(1, elapsedSeconds / REFRESH_SECONDS)
+  local pressure = oldPressure * decay
+  local newGrowth = 0
+
+  if lastIssued > 0 and issued > lastIssued then
+    newGrowth = (issued - lastIssued) / lastIssued
+    local distribution = 0.75 + (clamp(tonumber(raw.private_float) or 0, 0, 1) * 1.25)
+    pressure = pressure + (newGrowth * 2.50 * distribution)
   end
 
-  local growth = 0
-  if previous and previous > 0 and current > previous then
-    growth = (current - previous) / previous
-  elseif (not previous or previous <= 0) and current > 0 then
-    growth = 1
-  end
-
-  -- Private money is more dangerous than money parked in the treasury, but all
-  -- new supply still damages confidence.
-  local privateFloat = clamp(num(i.private_float, 0) or 0, 0, 1)
-  local distributionMultiplier = 0.75 + (privateFloat * 1.25)
-  local added = growth * PRINT_SHOCK_SEVERITY * distributionMultiplier
-  shock = shock + added
-
-  state.print_shock_pressure = shock
-  state.last_issued_supply = current
+  pressure = clamp(pressure, 0, 10)
+  state.print_shock_pressure = pressure
+  state.last_issued_supply = issued
   state.last_refresh_ms = now
   saveState()
 
-  return {
-    supply_growth = growth,
-    distribution_multiplier = distributionMultiplier,
-    added_print_shock = added,
-    print_shock_pressure = shock,
-  }
+  return pressure, newGrowth
 end
 
-local function calcStrength(raw)
+local function factorClamped(v, lo, hi)
+  return clamp(tonumber(v) or 1, lo, hi)
+end
+
+local function calculateStrength(raw)
   ensureBaseline(raw)
   local b = state.baseline or {}
-  local i = raw.inputs or {}
-  local shockInfo = updatePrintShock(raw)
+  local printShockPressure, supplyGrowth = updatePrintShock(raw)
 
-  local priceIndex = math.max(0.0001, num(i.price_index, 1) or 1)
-  local basePriceIndex = math.max(0.0001, num(b.price_index, 1) or 1)
+  local priceIndex = math.max(0.01, tonumber(raw.price_index) or 1)
+  local purchasingPower = 1 / priceIndex
 
-  local purchasingPower = clamp(basePriceIndex / priceIndex, 0.05, 5.00)
+  local printShockFactor = 1 / (1 + printShockPressure)
 
-  local printShockFactor = 1 / (1 + math.max(0, shockInfo.print_shock_pressure or 0))
-  printShockFactor = clamp(printShockFactor, 0.05, 1.10)
+  local pressure = math.max(0, tonumber(raw.total_pressure) or 0)
+  local moneyPressure = math.max(0, tonumber(raw.money_pressure) or 0)
+  local bankShock = math.max(0, tonumber(raw.shock_pressure) or 0)
+  local pressureFactor = 1 / (1 + (pressure * 3.0) + (moneyPressure * 2.0) + (bankShock * 1.0))
 
-  local totalPressure = math.max(0, num(i.total_pressure, 0) or 0)
-  local moneyPressure = math.max(0, num(i.money_pressure, 0) or 0)
-  local oracleShock = math.max(0, num(i.shock_pressure, 0) or 0)
-  local pressureFactor = 1 / (1 + (totalPressure * 5.0) + (moneyPressure * 8.0) + (oracleShock * 4.0))
-  pressureFactor = clamp(pressureFactor, 0.60, 1.05)
+  local realWage = clamp(tonumber(raw.real_wage_ratio) or 1, 0.10, 2)
+  local wageGap = math.max(0, 1 - realWage)
+  local wageFactor = 1 / (1 + (wageGap * 0.18) + ((tonumber(raw.wage_cost_pressure) or 0) * 4))
 
-  local realWageRatio = num(i.real_wage_ratio, 1) or 1
-  local realWageGap = math.max(0, 1 - realWageRatio)
-  local wageCostPressure = math.max(0, num(i.wage_cost_pressure, 0) or 0)
-  local wageFactor = 1 / (1 + (realWageGap * 0.35) + (wageCostPressure * 5.0))
-  wageFactor = clamp(wageFactor, 0.75, 1.05)
+  local baseGdpCap = math.max(1, tonumber(b.gdp_per_capita) or 1)
+  local currGdpCap = math.max(0, tonumber(raw.gdp_per_capita) or 0)
+  local outputFactor = factorClamped(pow(math.max(0.05, currGdpCap / baseGdpCap), 0.10), 0.82, 1.22)
 
-  local gdpPc = math.max(0.0001, num(i.gdp_per_capita, 0) or 0)
-  local baseGdpPc = math.max(1, num(b.gdp_per_capita, 1) or 1)
-  local outputFactor = pow(gdpPc / baseGdpPc, 0.12)
-  outputFactor = clamp(outputFactor, 0.80, 1.25)
+  local baseTreasury = clamp(tonumber(b.treasury_share) or 0.70, 0.01, 1)
+  local treasuryShare = clamp(tonumber(raw.treasury_share) or 0, 0.001, 1)
+  local treasuryFactor = factorClamped(pow(treasuryShare / baseTreasury, 0.08), 0.90, 1.12)
 
-  local treasuryShare = math.max(0.0001, num(i.treasury_share, 0.0001) or 0.0001)
-  local baseTreasuryShare = math.max(0.0001, num(b.treasury_share, 0.70) or 0.70)
-  local treasuryFactor = pow(treasuryShare / baseTreasuryShare, 0.08)
-  treasuryFactor = clamp(treasuryFactor, 0.85, 1.15)
+  local basePrivate = clamp(tonumber(b.private_float) or 0.25, 0.01, 1)
+  local privateFloat = clamp(tonumber(raw.private_float) or 0.25, 0.001, 1)
+  local privateFloatFactor = factorClamped(pow(basePrivate / privateFloat, 0.06), 0.90, 1.10)
 
-  local privateFloat = math.max(0.0001, num(i.private_float, 0.0001) or 0.0001)
-  local basePrivateFloat = math.max(0.0001, num(b.private_float, 0.25) or 0.25)
-  local privateFloatFactor = pow(basePrivateFloat / privateFloat, 0.08)
-  privateFloatFactor = clamp(privateFloatFactor, 0.85, 1.15)
+  local baseTx = math.max(1, tonumber(b.tx_today) or 1)
+  local txNow = math.max(0, tonumber(raw.tx_today) or 0)
+  local activityFactor = factorClamped(pow(math.max(0.10, txNow / baseTx), 0.025), 0.96, 1.05)
 
-  local econTx = math.max(0, num(i.economic_tx_today, 0) or 0)
-  local baseEconTx = math.max(1, num(b.economic_tx_today, 1) or 1)
-  local activityFactor = pow((econTx + 1) / (baseEconTx + 1), 0.04)
-  activityFactor = clamp(activityFactor, 0.92, 1.08)
+  local inflationRate = tonumber(raw.inflation_rate) or 0
+  local stabilityFactor = factorClamped(1 / (1 + math.abs(inflationRate) * 0.55), 0.88, 1.03)
+  local deflationRecovery = 1 + math.min(0.04, math.max(0, -inflationRate) * 0.35)
 
-  local inflationRate = num(i.inflation_rate, 0) or 0
-  local stabilityFactor = 1 - math.min(0.12, math.abs(inflationRate) * 0.60)
-  stabilityFactor = clamp(stabilityFactor, 0.88, 1.00)
-
-  local deflationRecoveryFactor = 1 + math.min(0.035, math.max(0, -inflationRate) * 0.35)
-  deflationRecoveryFactor = clamp(deflationRecoveryFactor, 1.00, 1.035)
-
-  local topShare = math.max(0, num(i.inequality_top_share, 0) or 0)
-  local baseTopShare = math.max(0, num(b.inequality_top_share, 0) or 0)
-  local excessConcentration = math.max(0, topShare - baseTopShare)
-  local inequalityFactor = 1 / (1 + excessConcentration * 0.10)
-  inequalityFactor = clamp(inequalityFactor, 0.90, 1.02)
+  local inequalityPenalty = 1 / (1 + math.max(0, (tonumber(raw.top1_share) or 0) - 0.55) * 0.08)
 
   local strength = purchasingPower
     * printShockFactor
@@ -896,187 +742,247 @@ local function calcStrength(raw)
     * privateFloatFactor
     * activityFactor
     * stabilityFactor
-    * deflationRecoveryFactor
-    * inequalityFactor
+    * deflationRecovery
+    * inequalityPenalty
 
-  strength = clamp(strength, MIN_STRENGTH, MAX_STRENGTH)
+  strength = factorClamped(strength, 0.02, 5.00)
 
-  local baseQusd = num(b.base_qusd, BASE_QUSD) or BASE_QUSD
-  local referenceQusd = baseQusd * strength
+  local qusd = BASE_QUSD * strength
 
-  local drivers = {
-    purchasing_power_factor = purchasingPower,
-    print_shock_factor = printShockFactor,
-    pressure_factor = pressureFactor,
-    wage_factor = wageFactor,
-    output_factor = outputFactor,
-    treasury_factor = treasuryFactor,
-    private_float_factor = privateFloatFactor,
-    activity_factor = activityFactor,
-    stability_factor = stabilityFactor,
-    deflation_recovery_factor = deflationRecoveryFactor,
-    inequality_factor = inequalityFactor,
-  }
+  local errors = raw.errors or {}
+  local quality = "LIVE"
+  if #errors > 0 then quality = "PARTIAL" end
+  if not bank_id then quality = "OFFLINE" end
 
-  raw.base_qusd = baseQusd
-  raw.quid_strength_index = strength
-  raw.reference_qusd = referenceQusd
-  raw.drivers = drivers
-  raw.inputs.print_shock_pressure = shockInfo.print_shock_pressure
-  raw.inputs.supply_growth_since_last_tick = shockInfo.supply_growth
-  raw.inputs.print_shock_added_this_tick = shockInfo.added_print_shock
-  raw.inputs.print_shock_distribution_multiplier = shockInfo.distribution_multiplier
-  raw.baseline = b
-  raw.history = shortHistory(80)
-  raw.formula_hint = "QUSD = base_qusd * quid_strength_index / usd_strength_index"
-  raw.server = {
-    id = os.getComputerID(),
-    label = os.getComputerLabel(),
+  local marketState = "STABLE"
+  if supplyGrowth > 0.20 or printShockPressure > 0.75 then marketState = "MONETARY SHOCK"
+  elseif strength < 0.70 then marketState = "QUID WEAK"
+  elseif strength > 1.10 then marketState = "QUID STRONG"
+  elseif inflationRate < -0.003 then marketState = "DEFLATION RECOVERY"
+  elseif inflationRate > 0.003 then marketState = "INFLATION PRESSURE"
+  end
+
+  return {
+    type = "quid_fx_snapshot",
     version = VERSION,
-    protocol = FX_PROTOCOL,
+    quality = quality,
+    market_state = marketState,
+    time = nowMs(),
+    mc_day = mcDay(),
     bank_id = bank_id,
     contract_id = contract_id,
+    base_qusd = BASE_QUSD,
+    quid_strength_index = strength,
+    reference_qusd = qusd,
+    formula_hint = "final_QUSD = base_qusd * quid_strength_index / usd_strength_index",
+    inputs = {
+      issued_supply = tonumber(raw.issued_supply) or 0,
+      treasury_balance = tonumber(raw.treasury_balance) or 0,
+      private_supply = tonumber(raw.private_supply) or 0,
+      treasury_share = tonumber(raw.treasury_share) or 0,
+      private_float = tonumber(raw.private_float) or 0,
+      price_index = priceIndex,
+      inflation_rate = inflationRate,
+      money_pressure = tonumber(raw.money_pressure) or 0,
+      bank_shock_pressure = tonumber(raw.shock_pressure) or 0,
+      total_pressure = tonumber(raw.total_pressure) or 0,
+      wage_index = tonumber(raw.wage_index) or 1,
+      real_wage_ratio = realWage,
+      wage_cost_pressure = tonumber(raw.wage_cost_pressure) or 0,
+      gdp = tonumber(raw.gdp) or 0,
+      gdp_per_capita = tonumber(raw.gdp_per_capita) or 0,
+      population = tonumber(raw.population) or 0,
+      companies = tonumber(raw.companies) or 0,
+      tx_today = tonumber(raw.tx_today) or 0,
+      tx_value_today = tonumber(raw.tx_value_today) or 0,
+      top1_share = tonumber(raw.top1_share) or 0,
+      price_source = tostring(raw.price_source or "unknown"),
+    },
+    drivers = {
+      purchasing_power = purchasingPower,
+      print_shock = printShockFactor,
+      print_shock_pressure = printShockPressure,
+      supply_growth_tick = supplyGrowth,
+      pressure = pressureFactor,
+      wage = wageFactor,
+      output = outputFactor,
+      treasury = treasuryFactor,
+      private_float = privateFloatFactor,
+      activity = activityFactor,
+      stability = stabilityFactor,
+      deflation_recovery = deflationRecovery,
+      inequality = inequalityPenalty,
+    },
+    baseline = state.baseline,
+    errors = errors,
   }
-
-  return raw
 end
 
 local function refreshSnapshot()
-  local raw, err = fetchRawEconomy()
+  local raw, err = rawEconomy()
   if not raw then
-    last_error = tostring(err or "Unknown refresh error")
-    last_quality = "OFFLINE"
+    last_error = tostring(err or "refresh failed")
     return false, last_error
   end
 
-  local ok, snapOrErr = pcall(calcStrength, raw)
-  if not ok then
-    last_error = "Strength calculation failed: " .. tostring(snapOrErr)
-    last_quality = "ERROR"
-    return false, last_error
-  end
-
-  last_snapshot = snapOrErr
-  state.last_snapshot = last_snapshot
-  last_quality = last_snapshot.quality or "LIVE"
-  if type(last_snapshot.errors) == "table" and #last_snapshot.errors > 0 then
-    last_error = table.concat(last_snapshot.errors, "; ")
-  else
-    last_error = "OK"
-  end
-
-  saveState()
-  pushHistory(last_snapshot)
-  return true, last_snapshot
+  local snap = wireSafeCopy(calculateStrength(raw))
+  last_snapshot = snap
+  last_error = (#(snap.errors or {}) > 0) and table.concat(snap.errors, "; "):sub(1, 100) or ""
+  pushHistory(snap)
+  return true, snap
 end
 
 -- =============================================================================
--- FX PROTOCOL SERVER
+-- DISPLAY
 -- =============================================================================
-local function responseSnapshot()
-  if not last_snapshot then return nil, "No snapshot yet" end
-  return last_snapshot
+local function sparkline()
+  local ticks = history.ticks or {}
+  if #ticks < 2 then return "Awaiting history" end
+  local start = math.max(1, #ticks - 40)
+  local vals = {}
+  local lo, hi = nil, nil
+  for i = start, #ticks do
+    local v = tonumber(ticks[i].strength) or 1
+    vals[#vals + 1] = v
+    lo = lo and math.min(lo, v) or v
+    hi = hi and math.max(hi, v) or v
+  end
+  local chars = { "_", ".", "-", "=", "+", "*", "#" }
+  local out = ""
+  for _, v in ipairs(vals) do
+    local idx = 1
+    if hi and lo and hi > lo then idx = math.floor(((v - lo) / (hi - lo)) * (#chars - 1)) + 1 end
+    if idx < 1 then idx = 1 end
+    if idx > #chars then idx = #chars end
+    out = out .. chars[idx]
+  end
+  return out
 end
 
-local function handleFxRequest(sender, req)
+local function draw()
+  cls()
+  local snap = last_snapshot
+  at(2, 1, "FOREX SERVER", colors.cyan)
+  at(2, 2, "v" .. VERSION, colors.gray)
+  at(2, 4, "Modem: " .. tostring(modem_name or "none"), modem_name and colors.lime or colors.red)
+  at(2, 5, "Bank:  " .. tostring(bank_id or "not found"), bank_id and colors.lime or colors.red)
+  at(2, 6, "FX protocol: " .. FX_PROTOCOL, colors.lightGray)
+
+  if not snap then
+    at(2, 8, "Awaiting first snapshot...", colors.orange)
+    if last_error ~= "" then at(2, 10, last_error, colors.red) end
+    return
+  end
+
+  at(2, 8,  "Quality:       " .. tostring(snap.quality) .. " / " .. tostring(snap.market_state), snap.quality == "LIVE" and colors.lime or colors.orange)
+  at(2, 9,  "Quid strength: " .. string.format("%.5f", snap.quid_strength_index), colors.white)
+  at(2, 10, "Ref Q/USD:     " .. money(snap.reference_qusd, 4), colors.lime)
+  at(2, 11, "Base Q/USD:    " .. money(snap.base_qusd, 2), colors.lightGray)
+  at(2, 13, "Issued:        " .. q(snap.inputs.issued_supply), colors.white)
+  at(2, 14, "Treasury:      " .. q(snap.inputs.treasury_balance) .. "  " .. pct(snap.inputs.treasury_share, 1), colors.white)
+  at(2, 15, "Private float: " .. q(snap.inputs.private_supply) .. "  " .. pct(snap.inputs.private_float, 1), colors.white)
+  at(2, 16, "Price index:   x" .. string.format("%.3f", snap.inputs.price_index), colors.lightGray)
+  at(2, 17, "GDP/capita:    " .. q(snap.inputs.gdp_per_capita), colors.cyan)
+  at(2, 18, "Print shock:   " .. string.format("%.4f", snap.drivers.print_shock_pressure), snap.drivers.print_shock_pressure > 0.15 and colors.orange or colors.gray)
+  at(2, 20, "History: " .. sparkline(), colors.gray)
+  if last_error ~= "" then at(2, 22, "Note: " .. last_error, colors.orange) end
+end
+
+-- =============================================================================
+-- FX SERVER API
+-- =============================================================================
+local function compactHistory()
+  local out = {}
+  local ticks = history.ticks or {}
+  local start = math.max(1, #ticks - 80)
+  for i = start, #ticks do out[#out + 1] = ticks[i] end
+  return out
+end
+
+local function handleFxRequest(req)
   if type(req) ~= "table" then return false, "Invalid request" end
-  local typ = tostring(req.type or "")
+  local typ = req.type or "get_quid_strength"
 
   if typ == "ping" then
-    return true, { type = "quid_fx_online", id = os.getComputerID(), version = VERSION, time = nowMs() }
-  end
-
-  if typ == "status" then
-    return true, {
-      type = "quid_fx_status",
-      id = os.getComputerID(),
-      version = VERSION,
-      time = nowMs(),
-      bank_id = bank_id,
-      contract_id = contract_id,
-      quality = last_quality,
-      last_error = last_error,
-      has_snapshot = last_snapshot ~= nil,
-    }
-  end
-
-  if typ == "get_quid_strength" or typ == "quote" or typ == "snapshot" then
-    local snap, err = responseSnapshot()
-    if not snap then return false, err end
-    return true, snap
-  end
-
-  if typ == "history" then
-    return true, { history = shortHistory(req.limit or 120), count = #history, time = nowMs() }
-  end
-
-  if typ == "reset_baseline" then
-    -- Private-server convenience. This does not touch the bank; it only rebases
-    -- this oracle's local strength baseline.
+    return true, { message = "Forex server online", version = VERSION, id = os.getComputerID(), time = nowMs() }
+  elseif typ == "get_quid_strength" or typ == "snapshot" or typ == "status" then
+    if not last_snapshot then refreshSnapshot() end
+    return last_snapshot ~= nil, last_snapshot or last_error
+  elseif typ == "history" then
+    return true, { version = VERSION, ticks = compactHistory(), count = #(history.ticks or {}) }
+  elseif typ == "reconnect" then
+    discoverBank()
+    discoverContractServer()
+    local ok, snap = refreshSnapshot()
+    return ok, snap or last_error
+  elseif typ == "reset_baseline" then
     state.baseline = nil
-    state.print_shock_pressure = 0
     state.last_issued_supply = nil
-    state.last_refresh_ms = nil
+    state.print_shock_pressure = 0
     saveState()
     local ok, snap = refreshSnapshot()
-    return ok, snap
+    return ok, snap or last_error
   end
 
-  return false, "Unknown quid_fx request type: " .. typ
+  return false, "Unknown forex request type: " .. tostring(typ)
+end
+
+local function sendSafe(to, payload, protocol)
+  local safePayload = wireSafeCopy(payload)
+  local okSer, serErr = pcall(textutils.serialize, safePayload)
+  if not okSer then
+    safePayload = { success = false, response = "Forex response not serializable after wireSafeCopy: " .. tostring(serErr), time = nowMs(), server = os.getComputerID() }
+  end
+  return pcall(function() rednet.send(to, safePayload, protocol) end)
 end
 
 local function broadcastTick()
   if not last_snapshot then return end
-  rednet.broadcast({
+  local msg = {
     type = "quid_fx_tick",
-    id = os.getComputerID(),
     version = VERSION,
     time = nowMs(),
-    snapshot = last_snapshot,
-  }, FX_PROTOCOL)
+    server = os.getComputerID(),
+    quality = last_snapshot.quality,
+    market_state = last_snapshot.market_state,
+    quid_strength_index = last_snapshot.quid_strength_index,
+    reference_qusd = last_snapshot.reference_qusd,
+    base_qusd = BASE_QUSD,
+  }
+  pcall(function() rednet.broadcast(msg, FX_PROTOCOL) end)
 end
 
 local function serverLoop()
   while true do
-    local nowClock = os.clock()
-
-    if (nowClock - last_refresh) >= REFRESH_SECONDS then
+    local now = os.clock()
+    if (now - last_refresh) >= REFRESH_SECONDS then
       refreshSnapshot()
-      last_refresh = nowClock
       draw()
+      last_refresh = now
     end
 
-    if (nowClock - last_broadcast) >= BROADCAST_SECONDS then
+    if (now - last_broadcast) >= BROADCAST_SECONDS then
       broadcastTick()
-      rednet.broadcast({ type = "quid_fx_online", id = os.getComputerID(), version = VERSION, time = nowMs() }, FX_PROTOCOL)
-      last_broadcast = nowClock
+      last_broadcast = now
     end
 
     local sender, msg = rednet.receive(FX_PROTOCOL, 0.5)
-    if sender then
-      request_count = request_count + 1
-      local ok, success, res = pcall(handleFxRequest, sender, msg)
-      if not ok then
-        rednet.send(sender, { success = false, response = "FX handler error: " .. tostring(success), time = nowMs(), server = os.getComputerID() }, FX_PROTOCOL)
-      else
-        rednet.send(sender, { success = success == true, response = res, time = nowMs(), server = os.getComputerID() }, FX_PROTOCOL)
-      end
-      if request_count % 3 == 0 then draw() end
+    if sender and type(msg) == "table" then
+      local ok, res = handleFxRequest(msg)
+      sendSafe(sender, { success = ok, response = res, time = nowMs(), server = os.getComputerID() }, FX_PROTOCOL)
     end
   end
 end
 
 -- =============================================================================
--- ENTRY POINT
+-- MAIN
 -- =============================================================================
 local function main()
-  if not os.getComputerLabel() or os.getComputerLabel() == "" then
-    os.setComputerLabel("ForexServer")
-  end
-
   cls()
   at(2, 2, "FOREX SERVER", colors.cyan)
   at(2, 4, "Opening modem...", colors.lightGray)
+
+  if os.getComputerLabel() ~= "ForexServer" then pcall(os.setComputerLabel, "ForexServer") end
 
   if not openModem() then
     at(2, 6, "FATAL: No modem found.", colors.red)
@@ -1087,13 +993,18 @@ local function main()
   loadHistory()
 
   at(2, 5, "Modem: " .. tostring(modem_name), colors.lime)
-  at(2, 6, "Discovering bank...", colors.lightGray)
+  at(2, 6, "Finding bank via heartbeat...", colors.lightGray)
+
   discoverBank()
   discoverContractServer()
-
   refreshSnapshot()
   draw()
+  last_refresh = os.clock()
   serverLoop()
 end
 
-main()
+local ok, err = pcall(main)
+if not ok then
+  term.setTextColor(colors.red)
+  print("Runtime error: " .. tostring(err))
+end
