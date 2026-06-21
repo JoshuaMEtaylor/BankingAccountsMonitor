@@ -22,7 +22,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.4.27-PRICE-LED-WAGE-SPIRAL"
+local VERSION  = "1.4.28-FOREX-MARGIN-ESCROW"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -2541,6 +2541,56 @@ handlers["transfer"] = function(sender_id, req)
   end
 
   return transfer(from_id, to_id, amount, "TRANSFER", memo, citizen_id)
+end
+
+
+-- FOREX_MARGIN_LOCK
+-- Authenticated user moves margin from their bank account into market escrow.
+-- Used by the forex terminal when opening a non-leveraged order.
+handlers["forex_reserve"] = function(sender_id, req)
+  local ok, citizen_id, citizen = authenticateUser(req.username, req.password)
+  if not ok then return false, citizen_id end
+
+  local target = req.account_id or citizen_id
+  if target ~= citizen_id and not isTrustedManagement(sender_id) then
+    return false, "Unauthorised"
+  end
+
+  local amount = math.floor(tonumber(req.amount) or 0)
+  if amount <= 0 then return false, "Invalid forex margin amount" end
+
+  local escrow = "market:escrow"
+  ensureAccountRecord(escrow, "escrow", "Market Escrow", "SYSTEM")
+
+  local memo = req.memo or ("Forex margin lock " .. tostring(req.order_ref or ""))
+  return transfer(target, escrow, amount, "FOREX_MARGIN_LOCK", memo, citizen_id)
+end
+
+-- FOREX_MARGIN_RELEASE
+-- Authenticated user receives margin plus/minus realised P/L back from market escrow.
+-- The forex terminal calculates the close result and asks the bank to release the
+-- final payout. This keeps order funds tied up while the order is open.
+handlers["forex_release"] = function(sender_id, req)
+  local ok, citizen_id, citizen = authenticateUser(req.username, req.password)
+  if not ok then return false, citizen_id end
+
+  local target = req.account_id or citizen_id
+  if target ~= citizen_id and not isTrustedManagement(sender_id) then
+    return false, "Unauthorised"
+  end
+
+  local amount = math.floor(tonumber(req.amount) or 0)
+  if amount < 0 then return false, "Invalid forex payout amount" end
+  if amount == 0 then
+    return true, { tx_id = nil, amount = 0, from = "market:escrow", to = target, type = "FOREX_MARGIN_RELEASE", status = "settled", memo = req.memo or "Forex closed at full loss" }
+  end
+
+  local escrow = "market:escrow"
+  ensureAccountRecord(escrow, "escrow", "Market Escrow", "SYSTEM")
+  if not accountExists(target) then return false, "Account not found" end
+
+  local memo = req.memo or ("Forex margin release " .. tostring(req.order_id or ""))
+  return transfer(escrow, target, amount, "FOREX_MARGIN_RELEASE", memo, "FOREX:" .. tostring(sender_id), true)
 end
 
 -- LEDGER_HISTORY
