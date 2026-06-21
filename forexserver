@@ -1,108 +1,53 @@
 -- =============================================================================
--- FOREX SERVER - ORACLE KRAKEN USD ANCHOR
+-- FOREX SERVER
 -- forexserver
--- v0.5.0-ORACLE-KRAKEN-ANCHOR
+-- v0.6.0-ORACLE-KRAKEN-5M-HISTORY
 --
 -- Purpose:
---   ComputerCraft-side forex server for the Quid economy.
+--   Pull the live EUR/USD number from the Oracle relay node and keep a proper
+--   server-side history of candles so clients can boot with an already-built
+--   chart instead of starting from a single candle.
 --
---   This version strips out FMP/TwelveData/API-provider polling entirely.
---   It reads ONE clean live EUR/USD number from the Oracle node:
---
---      http://145.241.202.103:8000/latest
---
---   Oracle is responsible for:
---      Kraken EUR/USD stream -> latest price storage -> /latest endpoint
---
---   ComputerCraft is responsible for:
---      pulling /latest at the requested rate
---      storing samples locally
---      presenting the live number
---      providing rednet responses to client terminals
---
--- Formula retained:
---   usd_strength_index = baseline_EURUSD / live_EURUSD
---   final later: QUSD = 3.40 * quid_strength_index / usd_strength_index
+-- This build:
+--   - NO self updater (manual install for stability)
+--   - polls Oracle /latest every 0.1s
+--   - stores persistent 1m and 5m candle history on the server
+--   - serves live tick + history to forex clients over rednet
 -- =============================================================================
 
-local args = {...}
-
--- =============================================================================
--- SELF UPDATE
--- =============================================================================
--- NOTE:
---   Keep this enabled only if your GitHub 'forexserver' file has already been
---   replaced with this version. Otherwise it will download the old version again.
-if args[1] ~= "--updated" then
-  print("[ forexserver ]")
-  print("Deleting old version...")
-  fs.delete("startup.lua")
-
-  print("Downloading latest from GitHub...")
-  local cb = tostring(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
-  local url = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/forexserver?cb=" .. cb
-  shell.run("wget " .. url .. " startup.lua")
-
-  if not fs.exists("startup.lua") then
-    print("")
-    print("Download failed.")
-    print("Expected GitHub file: forexserver")
-    print("")
-    print("Manual install:")
-    print("delete startup")
-    print("wget https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/forexserver?cb=050 startup.lua")
-    print("startup.lua")
-    return
-  end
-
-  print("Relaunching...")
-  sleep(0.5)
-  shell.run("startup.lua", "--updated")
-  return
-end
-
--- =============================================================================
--- CONFIG
--- =============================================================================
-local VERSION = "0.5.0-ORACLE-KRAKEN-ANCHOR"
+local VERSION = "0.6.0-ORACLE-KRAKEN-5M-HISTORY"
 local PROTOCOL = "quid_fx"
 
--- Oracle node public endpoint.
 local ORACLE_LATEST_URL = "http://145.241.202.103:8000/latest"
 local ORACLE_HEALTH_URL = "http://145.241.202.103:8000/health"
 
--- User target: sample the Oracle stored latest price every 0.1s.
--- If a request takes longer than 0.1s, the server will skip stacking duplicate
--- in-flight requests and immediately resume as soon as the next tick is possible.
 local POLL_SECONDS = 0.10
 local DRAW_SECONDS = 0.50
+local SAVE_SECONDS = 10
 local STALE_AFTER_MS = 5000
 
--- Keep enough local samples for CC-side graphing without bloating disk writes.
--- 1200 samples = roughly 2 minutes at 0.1s if network keeps up.
-local MAX_SAMPLES = 1200
-local MAX_CANDLES = 300
-local CANDLE_SECONDS = 1
+local TIMEFRAMES = {
+  ["1m"] = { seconds = 60,  max = 1440 }, -- 24h
+  ["5m"] = { seconds = 300, max = 576  }, -- 48h
+}
 
-local STATE_FILE = "data/forex_usd_state.db"
-local SAMPLES_FILE = "data/forex_usd_samples.db"
-local CANDLES_FILE = "data/forex_usd_candles.db"
+local STATE_FILE = "data/forex_server_state.db"
+local CANDLES_FILE = "data/forex_server_candles.db"
 
--- =============================================================================
--- RUNTIME
--- =============================================================================
 local modem_name = nil
 local W, H = term.getSize()
 
 local state = {
+  created_version = VERSION,
   baseline_pair = "EUR/USD",
   baseline_eurusd = nil,
   baseline_time = nil,
-  created_version = VERSION,
 }
 
-local samples = {}
-local candles = {}
+local candles = {
+  ["1m"] = {},
+  ["5m"] = {},
+}
 
 local last_tick = nil
 local last_price = nil
@@ -110,8 +55,8 @@ local last_error = "Booting..."
 local last_success_ms = 0
 local last_request_ms = 0
 local last_response_ms = 0
-
 local pending_http = false
+
 local sample_count = 0
 local change_count = 0
 local failure_count = 0
@@ -121,9 +66,6 @@ local poll_timer = nil
 local draw_timer = nil
 local save_timer = nil
 
--- =============================================================================
--- HELPERS
--- =============================================================================
 local function nowMs()
   if os.epoch then return os.epoch("utc") end
   return math.floor(os.time() * 1000)
@@ -157,26 +99,29 @@ end
 
 local function loadState()
   local s = readTable(STATE_FILE)
-  if type(s) == "table" then state = s end
-  state.baseline_pair = state.baseline_pair or "EUR/USD"
+  if type(s) == "table" then
+    state = s
+  end
   state.created_version = state.created_version or VERSION
-
-  local smp = readTable(SAMPLES_FILE)
-  if type(smp) == "table" then samples = smp end
+  state.baseline_pair = state.baseline_pair or "EUR/USD"
 
   local c = readTable(CANDLES_FILE)
-  if type(c) == "table" then candles = c end
+  if type(c) == "table" then
+    if type(c["1m"]) == "table" then candles["1m"] = c["1m"] end
+    if type(c["5m"]) == "table" then candles["5m"] = c["5m"] end
+  end
 end
 
 local function saveState()
   state.saved_at = nowMs()
   writeTable(STATE_FILE, state)
+  writeTable(CANDLES_FILE, candles)
 end
 
-local function saveRuntime()
-  writeTable(SAMPLES_FILE, samples)
-  writeTable(CANDLES_FILE, candles)
-  saveState()
+local function fmt(n, dp)
+  n = tonumber(n)
+  if n == nil then return "n/a" end
+  return string.format("%." .. tostring(dp or 5) .. "f", n)
 end
 
 local function clampText(s, n)
@@ -187,17 +132,12 @@ local function clampText(s, n)
   return s
 end
 
-local function fmt(n, dp)
-  n = tonumber(n)
-  if n == nil then return "n/a" end
-  return string.format("%." .. tostring(dp or 4) .. "f", n)
-end
-
 local function ageText(ms)
   if not ms or ms <= 0 then return "n/a" end
   local age = nowMs() - ms
   if age < 1000 then return tostring(age) .. "ms" end
-  return string.format("%.1fs", age / 1000)
+  if age < 60000 then return string.format("%.1fs", age / 1000) end
+  return string.format("%.1fm", age / 60000)
 end
 
 local function quality()
@@ -247,9 +187,8 @@ end
 
 local function fill(x, y, w, h, bg)
   W, H = term.getSize()
-  if w <= 0 or h <= 0 then return end
   term.setBackgroundColor(bg or colors.black)
-  local row = string.rep(" ", w)
+  local row = string.rep(" ", math.max(0, w))
   for yy = y, y + h - 1 do
     if yy >= 1 and yy <= H then
       term.setCursorPos(math.max(1, x), yy)
@@ -259,8 +198,8 @@ local function fill(x, y, w, h, bg)
 end
 
 local function drawSparkline(list, x, y, w, key, fg)
-  if type(list) ~= "table" or #list < 2 or w <= 2 then
-    at(x, y, "awaiting samples", colors.gray)
+  if type(list) ~= "table" or #list < 2 then
+    at(x, y, "awaiting history", colors.gray)
     return
   end
 
@@ -276,9 +215,12 @@ local function drawSparkline(list, x, y, w, key, fg)
     end
   end
 
-  if #vals < 2 then at(x, y, "awaiting samples", colors.gray); return end
-  if hi == lo then hi = lo + 0.000001 end
+  if #vals < 2 then
+    at(x, y, "awaiting history", colors.gray)
+    return
+  end
 
+  if hi == lo then hi = lo + 0.000001 end
   local chars = {"_", ".", ":", "-", "=", "+", "*", "#"}
   local out = ""
   for _, v in ipairs(vals) do
@@ -288,13 +230,68 @@ local function drawSparkline(list, x, y, w, key, fg)
     if idx > #chars then idx = #chars end
     out = out .. chars[idx]
   end
-
   at(x, y, out:sub(-w), fg or colors.cyan)
 end
 
--- =============================================================================
--- ORACLE PRICE FETCH
--- =============================================================================
+local function copyCandles(list)
+  local out = {}
+  if type(list) ~= "table" then return out end
+  for i = 1, #list do
+    local c = list[i]
+    out[i] = {
+      bucket = c.bucket,
+      open = c.open,
+      high = c.high,
+      low = c.low,
+      close = c.close,
+      samples = c.samples,
+      updated = c.updated,
+    }
+  end
+  return out
+end
+
+local function trimCandles(tf)
+  local cfg = TIMEFRAMES[tf]
+  local list = candles[tf]
+  if not cfg or type(list) ~= "table" then return end
+  while #list > cfg.max do table.remove(list, 1) end
+end
+
+local function updateCandleSet(tf, price, ms)
+  local cfg = TIMEFRAMES[tf]
+  if not cfg then return end
+  local list = candles[tf]
+  if type(list) ~= "table" then
+    list = {}
+    candles[tf] = list
+  end
+
+  local bucket = math.floor(ms / (cfg.seconds * 1000)) * (cfg.seconds * 1000)
+  local c = list[#list]
+
+  if not c or c.bucket ~= bucket then
+    c = {
+      bucket = bucket,
+      open = price,
+      high = price,
+      low = price,
+      close = price,
+      samples = 1,
+      updated = ms,
+    }
+    list[#list + 1] = c
+  else
+    if price > c.high then c.high = price end
+    if price < c.low then c.low = price end
+    c.close = price
+    c.samples = (c.samples or 0) + 1
+    c.updated = ms
+  end
+
+  trimCandles(tf)
+end
+
 local function parseOraclePrice(body)
   body = tostring(body or ""):gsub("%s+", "")
   local p = tonumber(body)
@@ -327,61 +324,34 @@ local function requestOracleLatest()
   end
 end
 
-local function updateCandle(tick)
-  if type(tick) ~= "table" or not tick.price then return end
-
-  local bucket = math.floor((tick.time or nowMs()) / (CANDLE_SECONDS * 1000)) * (CANDLE_SECONDS * 1000)
-  local c = candles[#candles]
-
-  if not c or c.bucket ~= bucket then
-    c = {
-      bucket = bucket,
-      open = tick.price,
-      high = tick.price,
-      low = tick.price,
-      close = tick.price,
-      samples = 1,
-      changed = tick.changed == true,
-    }
-    candles[#candles + 1] = c
-  else
-    c.high = math.max(c.high, tick.price)
-    c.low = math.min(c.low, tick.price)
-    c.close = tick.price
-    c.samples = (c.samples or 0) + 1
-    c.changed = c.changed or tick.changed == true
-  end
-
-  while #candles > MAX_CANDLES do table.remove(candles, 1) end
-end
-
-local function pushSample(price)
+local function pushPrice(price)
   local ms = nowMs()
   local baseline = tonumber(state.baseline_eurusd)
 
   if not baseline or baseline <= 0 then
     state.baseline_eurusd = price
     state.baseline_time = ms
-    state.baseline_source = ORACLE_LATEST_URL
-    state.baseline_note = "USD strength baseline set from first successful Oracle/Kraken EUR/USD sample. Delete " .. STATE_FILE .. " to rebase."
-    saveState()
     baseline = price
+    saveState()
   end
 
   local usd_strength = baseline / price
   local usd_index = 100 * usd_strength
-  local q_usd_if_quid_one = 3.40 / usd_strength
-  local changed = (last_price == nil or price ~= last_price)
+  local q_usd_if_quid_strength_1 = 3.40 / usd_strength
+  local moved = (last_price == nil or price ~= last_price)
 
   sample_count = sample_count + 1
-  if changed then change_count = change_count + 1 end
+  if moved then change_count = change_count + 1 end
   last_price = price
   last_success_ms = ms
+  last_error = "OK"
 
-  local tick = {
+  updateCandleSet("1m", price, ms)
+  updateCandleSet("5m", price, ms)
+
+  last_tick = {
     ok = true,
     quality = "LIVE",
-    mode = "ORACLE_KRAKEN_EURUSD",
     time = ms,
     provider = "Oracle",
     source = ORACLE_LATEST_URL,
@@ -392,38 +362,19 @@ local function pushSample(price)
     baseline_time = state.baseline_time,
     usd_index = usd_index,
     usd_strength_index = usd_strength,
-    q_usd_if_quid_strength_1 = q_usd_if_quid_one,
-    formula_hint = "Final later: QUSD = 3.40 * quid_strength_index / usd_strength_index",
+    q_usd_if_quid_strength_1 = q_usd_if_quid_strength_1,
     sample_count = sample_count,
     change_count = change_count,
-    changed = changed,
+    changed = moved,
     poll_seconds = POLL_SECONDS,
     response_ms = last_response_ms,
-    oracle_url = ORACLE_LATEST_URL,
     version = VERSION,
   }
-
-  last_tick = tick
-  last_error = "OK"
-
-  samples[#samples + 1] = {
-    time = tick.time,
-    pair_price = tick.pair_price,
-    usd_index = tick.usd_index,
-    usd_strength_index = tick.usd_strength_index,
-    q_usd_if_quid_strength_1 = tick.q_usd_if_quid_strength_1,
-    quality = tick.quality,
-    changed = tick.changed,
-  }
-
-  while #samples > MAX_SAMPLES do table.remove(samples, 1) end
-
-  updateCandle(tick)
 end
 
 local function handleHttpSuccess(url, handle)
   if url ~= ORACLE_LATEST_URL then
-    pcall(function() handle.close() end)
+    if handle then pcall(function() handle.close() end) end
     return
   end
 
@@ -437,7 +388,7 @@ local function handleHttpSuccess(url, handle)
 
   local price = parseOraclePrice(body)
   if price then
-    pushSample(price)
+    pushPrice(price)
   else
     failure_count = failure_count + 1
     last_error = "Bad Oracle price body: " .. clampText(body, 80)
@@ -449,35 +400,29 @@ local function handleHttpFailure(url, reason, handle)
     if handle then pcall(function() handle.close() end) end
     return
   end
-
   pending_http = false
   failure_count = failure_count + 1
   if handle then pcall(function() handle.close() end) end
   last_error = "Oracle HTTP failed: " .. tostring(reason or "unknown")
 end
 
--- =============================================================================
--- REDNET API
--- =============================================================================
 local function safeTick()
   local t = last_tick or {
     ok = false,
     quality = quality(),
-    mode = "ORACLE_KRAKEN_EURUSD",
     provider = "Oracle",
     source = ORACLE_LATEST_URL,
     upstream = "Kraken EUR/USD ticker via Oracle node",
+    pair = "EUR/USD",
     usd_index = 100,
     usd_strength_index = 1,
     q_usd_if_quid_strength_1 = 3.40,
-    error = last_error,
   }
 
   local q = quality()
   return {
     ok = (q == "LIVE" and t.ok == true),
     quality = q,
-    mode = t.mode,
     time = t.time,
     provider = t.provider,
     source = t.source,
@@ -489,7 +434,6 @@ local function safeTick()
     usd_index = t.usd_index,
     usd_strength_index = t.usd_strength_index,
     q_usd_if_quid_strength_1 = t.q_usd_if_quid_strength_1,
-    formula_hint = t.formula_hint,
     sample_count = sample_count,
     change_count = change_count,
     failure_count = failure_count,
@@ -512,7 +456,7 @@ local function handleRequest(sender, msg)
   if typ == "ping" then
     rednet.send(sender, {
       type = "forex_server_online",
-      server = os.getComputerID and os.getComputerID() or nil,
+      server = os.getComputerID(),
       version = VERSION,
       protocol = PROTOCOL,
       mode = "oracle_kraken_usd_anchor",
@@ -522,20 +466,27 @@ local function handleRequest(sender, msg)
   end
 
   if typ == "get_usd_tick" or typ == "get_forex_tick" or typ == "get_quote" then
-    rednet.send(sender, { success = true, response = safeTick(), time = nowMs(), server = os.getComputerID and os.getComputerID() or nil }, PROTOCOL)
+    rednet.send(sender, { success = true, response = safeTick(), time = nowMs(), server = os.getComputerID() }, PROTOCOL)
     return
   end
 
   if typ == "get_usd_history" or typ == "get_forex_history" then
+    local tf = tostring(msg.timeframe or "5m")
+    if not TIMEFRAMES[tf] then tf = "5m" end
     rednet.send(sender, {
       success = true,
       response = {
-        samples = samples,
-        candles = candles,
+        timeframe = tf,
+        candles = copyCandles(candles[tf]),
         latest = safeTick(),
+        stored = {
+          ["1m"] = #candles["1m"],
+          ["5m"] = #candles["5m"],
+        },
         version = VERSION,
       },
-      time = nowMs()
+      time = nowMs(),
+      server = os.getComputerID(),
     }, PROTOCOL)
     return
   end
@@ -543,18 +494,14 @@ local function handleRequest(sender, msg)
   if typ == "reset_usd_baseline" then
     state.baseline_eurusd = nil
     state.baseline_time = nil
-    state.baseline_source = nil
     saveState()
-    rednet.send(sender, { success = true, response = safeTick(), time = nowMs() }, PROTOCOL)
+    rednet.send(sender, { success = true, response = safeTick(), time = nowMs(), server = os.getComputerID() }, PROTOCOL)
     return
   end
 
   rednet.send(sender, { success = false, error = "Unknown forexserver request: " .. typ, version = VERSION }, PROTOCOL)
 end
 
--- =============================================================================
--- DISPLAY
--- =============================================================================
 local function draw()
   W, H = term.getSize()
   term.setCursorBlink(false)
@@ -562,7 +509,7 @@ local function draw()
   term.clear()
 
   fill(1, 1, W, 1, colors.blue)
-  at(2, 1, "FOREX SERVER - ORACLE KRAKEN USD ANCHOR", colors.white, colors.blue)
+  at(2, 1, "FOREX SERVER - ORACLE/KRAKEN", colors.white, colors.blue)
   at(math.max(1, W - #VERSION), 1, VERSION, colors.lightGray, colors.blue)
 
   local t = safeTick()
@@ -570,9 +517,9 @@ local function draw()
 
   at(2, 3, "Modem:        " .. tostring(modem_name or "none"), modem_name and colors.lime or colors.red)
   at(2, 4, "Protocol:     " .. PROTOCOL, colors.lightGray)
-  at(2, 5, "Oracle URL:   " .. ORACLE_LATEST_URL, colors.lightGray)
+  at(2, 5, "Oracle URL:   " .. clampText(ORACLE_LATEST_URL, math.max(10, W - 16)), colors.lightGray)
 
-  at(2, 7, "Quality:      " .. tostring(q), colourForQuality(q))
+  at(2, 7, "Quality:      " .. q, colourForQuality(q))
   at(2, 8, "EUR/USD:      " .. fmt(t.pair_price, 5), colors.lime)
   at(2, 9, "Baseline:     " .. fmt(t.baseline_pair_price, 5), colors.white)
   at(2,10, "USD index:    " .. fmt(t.usd_index, 4), colors.cyan)
@@ -581,32 +528,25 @@ local function draw()
 
   at(2,14, "Polling:      every " .. tostring(POLL_SECONDS) .. "s", colors.yellow)
   at(2,15, "Samples:      " .. tostring(sample_count) .. "  Changes: " .. tostring(change_count) .. "  Fails: " .. tostring(failure_count), colors.lightGray)
-  at(2,16, "Last success: " .. ageText(last_success_ms) .. " ago  Response: " .. tostring(last_response_ms or 0) .. "ms", colors.lightGray)
+  at(2,16, "Stored candles 1m/5m: " .. tostring(#candles["1m"]) .. " / " .. tostring(#candles["5m"]), colors.lightGray)
+  at(2,17, "Last success: " .. ageText(last_success_ms) .. " ago  Response: " .. tostring(last_response_ms or 0) .. "ms", colors.lightGray)
 
-  at(2,18, "EUR/USD sample history", colors.white)
-  drawSparkline(samples, 2, 19, math.max(10, W - 4), "pair_price", colors.lime)
+  at(2,19, "Recent 5m closes", colors.white)
+  drawSparkline(candles["5m"], 2, 20, math.max(10, W - 4), "close", colors.lime)
 
-  at(2,21, "USD strength history", colors.white)
-  drawSparkline(samples, 2, 22, math.max(10, W - 4), "usd_strength_index", colors.cyan)
-
-  at(2, H - 3, "Formula: QUSD = 3.40 * quid_strength / " .. fmt(t.usd_strength_index, 6), colors.gray)
-  at(2, H - 2, "Status: " .. clampText(last_error, W - 10), last_error == "OK" and colors.lime or colors.orange)
-  at(2, H - 1, "Oracle pulls Kraken; this CC server samples /latest at 0.1s and serves rednet clients.", colors.gray)
+  at(2, H - 2, "Status: " .. clampText(last_error, math.max(10, W - 10)), last_error == "OK" and colors.lime or colors.orange)
+  at(2, H - 1, "Server stores persistent candle history so clients can boot with existing chart data.", colors.gray)
 end
 
--- =============================================================================
--- MAIN
--- =============================================================================
 local function main()
   loadState()
   openModem()
 
-  -- Kick the first request immediately.
   requestOracleLatest()
 
   poll_timer = os.startTimer(POLL_SECONDS)
   draw_timer = os.startTimer(DRAW_SECONDS)
-  save_timer = os.startTimer(5)
+  save_timer = os.startTimer(SAVE_SECONDS)
 
   draw()
 
@@ -615,18 +555,15 @@ local function main()
 
     if ev[1] == "timer" then
       local id = ev[2]
-
       if id == poll_timer then
         requestOracleLatest()
         poll_timer = os.startTimer(POLL_SECONDS)
-
       elseif id == draw_timer then
         draw()
         draw_timer = os.startTimer(DRAW_SECONDS)
-
       elseif id == save_timer then
-        saveRuntime()
-        save_timer = os.startTimer(5)
+        saveState()
+        save_timer = os.startTimer(SAVE_SECONDS)
       end
 
     elseif ev[1] == "http_success" then
