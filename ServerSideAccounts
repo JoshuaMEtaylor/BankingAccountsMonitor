@@ -22,7 +22,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.4.29-DECIMAL-QUID-FOREX"
+local VERSION  = "1.4.30-LEVERAGED-FX-TREASURY"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -2602,6 +2602,189 @@ handlers["forex_release"] = function(sender_id, req)
 
   local memo = req.memo or ("Forex margin release " .. tostring(req.order_id or ""))
   return transfer(escrow, target, amount, "FOREX_MARGIN_RELEASE", memo, "FOREX:" .. tostring(sender_id), true)
+end
+
+
+-- LEVERAGED FX OPEN
+-- Locks user margin+spread fee and reserves treasury leverage backing.
+-- This is the atomic bank-side funding step for the forex server.
+handlers["forex_open_leveraged"] = function(sender_id, req)
+  local ok, citizen_id, citizen = authenticateUser(req.username, req.password)
+  if not ok then return false, citizen_id end
+
+  local target = req.account_id or citizen_id
+  if target ~= citizen_id and not isTrustedManagement(sender_id) then
+    return false, "Unauthorised"
+  end
+
+  if not accountExists(target) then return false, "Account not found" end
+
+  local margin_q = round2(tonumber(req.margin_q) or 0)
+  local spread_fee_q = round2(tonumber(req.spread_fee_q) or 0)
+  local treasury_reserve_q = round2(tonumber(req.treasury_reserve_q) or 0)
+  local user_lock_q = round2(margin_q + spread_fee_q)
+
+  if margin_q <= 0 then return false, "Invalid user margin" end
+  if spread_fee_q < 0 then return false, "Invalid spread fee" end
+  if treasury_reserve_q < 0 then return false, "Invalid treasury reserve" end
+  if user_lock_q <= 0 then return false, "Invalid user lock amount" end
+
+  local treasury = "treasury:quid_bank"
+  local marginEscrow = "market:fx_margin_escrow"
+  local leverageReserve = "market:fx_leverage_reserve"
+  local settlement = "market:fx_settlement"
+
+  ensureAccountRecord(treasury, "treasury", "Quid Treasury", "STATE")
+  ensureAccountRecord(marginEscrow, "escrow", "FX Margin Escrow", "SYSTEM")
+  ensureAccountRecord(leverageReserve, "escrow", "FX Leverage Reserve", "SYSTEM")
+  ensureAccountRecord(settlement, "market", "FX Settlement", "SYSTEM")
+
+  local userBal = deriveBalance(target)
+  if userBal + 0.0001 < user_lock_q then
+    return false, "Insufficient funds. Need " .. money2(user_lock_q) .. " Q, balance " .. money2(userBal) .. " Q"
+  end
+
+  local treasuryBal = deriveBalance(treasury)
+  if treasuryBal + 0.0001 < treasury_reserve_q then
+    return false, "Leverage trading unavailable. Treasury liquidity insufficient. Needed " .. money2(treasury_reserve_q) .. " Q, available " .. money2(treasuryBal) .. " Q"
+  end
+
+  local memoBase = req.memo or ("Leveraged FX " .. tostring(req.side or "") .. " " .. tostring(req.lots or "") .. " lots")
+
+  local okUser, userTx = transfer(target, marginEscrow, user_lock_q, "FOREX_MARGIN_LOCK", memoBase .. " user margin+fee", citizen_id, false)
+  if not okUser then return false, userTx end
+
+  local okTreasury, treasuryTx = true, nil
+  if treasury_reserve_q > 0 then
+    okTreasury, treasuryTx = transfer(treasury, leverageReserve, treasury_reserve_q, "FOREX_TREASURY_LEVERAGE", memoBase .. " treasury leverage reserve", "FOREX:" .. tostring(sender_id), false)
+    if not okTreasury then
+      -- Roll the user's locked margin back if treasury liquidity failed after the user transfer.
+      transfer(marginEscrow, target, user_lock_q, "FOREX_MARGIN_ROLLBACK", memoBase .. " treasury reserve failed", "FOREX:" .. tostring(sender_id), true)
+      return false, treasuryTx
+    end
+  end
+
+  return true, {
+    account_id = target,
+    margin_q = margin_q,
+    spread_fee_q = spread_fee_q,
+    user_lock_q = user_lock_q,
+    treasury_reserve_q = treasury_reserve_q,
+    user_margin_tx_id = type(userTx) == "table" and userTx.tx_id or nil,
+    treasury_reserve_tx_id = type(treasuryTx) == "table" and treasuryTx.tx_id or nil,
+    balance = deriveBalance(target),
+    treasury_balance = deriveBalance(treasury),
+    status = "funded",
+  }
+end
+
+-- LEVERAGED FX CLOSE
+-- Returns treasury reserve first, pays spread fee to treasury, then settles
+-- user's margin/profit/loss against the simulated FX settlement account.
+handlers["forex_close_leveraged"] = function(sender_id, req)
+  local target = req.account_id
+  local citizen_id = nil
+
+  if req.username and req.password then
+    local ok, cid = authenticateUser(req.username, req.password)
+    if not ok then return false, cid end
+    citizen_id = cid
+    target = target or citizen_id
+    if target ~= citizen_id and not isTrustedManagement(sender_id) then
+      return false, "Unauthorised"
+    end
+  elseif isTrustedManagement(sender_id) then
+    target = target
+  else
+    return false, "Unauthorised"
+  end
+
+  if not target or target == "" then return false, "Missing account_id" end
+  if not accountExists(target) then return false, "Account not found" end
+
+  local margin_q = round2(tonumber(req.margin_q) or 0)
+  local spread_fee_q = round2(tonumber(req.spread_fee_q) or 0)
+  local treasury_reserve_q = round2(tonumber(req.treasury_reserve_q) or 0)
+  local realized_pnl_q = round2(tonumber(req.realized_pnl_q) or 0)
+
+  if margin_q < 0 or spread_fee_q < 0 or treasury_reserve_q < 0 then
+    return false, "Invalid settlement amounts"
+  end
+
+  local treasury = "treasury:quid_bank"
+  local marginEscrow = "market:fx_margin_escrow"
+  local leverageReserve = "market:fx_leverage_reserve"
+  local settlement = "market:fx_settlement"
+
+  ensureAccountRecord(treasury, "treasury", "Quid Treasury", "STATE")
+  ensureAccountRecord(marginEscrow, "escrow", "FX Margin Escrow", "SYSTEM")
+  ensureAccountRecord(leverageReserve, "escrow", "FX Leverage Reserve", "SYSTEM")
+  ensureAccountRecord(settlement, "market", "FX Settlement", "SYSTEM")
+
+  local memoBase = req.memo or ("Leveraged FX close order " .. tostring(req.order_id or ""))
+
+  local txs = {}
+
+  -- 1. Treasury reserve always comes home first.
+  if treasury_reserve_q > 0 then
+    local okReserve, resReserve = transfer(leverageReserve, treasury, treasury_reserve_q, "FOREX_TREASURY_RETURN", memoBase .. " reserve return", "FOREX:" .. tostring(sender_id), true)
+    if not okReserve then return false, "Could not return treasury reserve: " .. tostring(resReserve) end
+    txs.treasury_return_tx_id = type(resReserve) == "table" and resReserve.tx_id or nil
+  end
+
+  -- 2. Spread fee is paid to treasury.
+  if spread_fee_q > 0 then
+    local okFee, resFee = transfer(marginEscrow, treasury, spread_fee_q, "FOREX_SPREAD_FEE", memoBase .. " 2 pip spread fee", "FOREX:" .. tostring(sender_id), true)
+    if not okFee then return false, "Could not pay spread fee: " .. tostring(resFee) end
+    txs.spread_fee_tx_id = type(resFee) == "table" and resFee.tx_id or nil
+  end
+
+  -- 3. User market P/L settles against external/simulated FX settlement.
+  local user_margin_return_q = margin_q
+  local user_profit_q = 0
+  local user_loss_q = 0
+
+  if realized_pnl_q < 0 then
+    user_loss_q = round2(math.min(margin_q, math.abs(realized_pnl_q)))
+    user_margin_return_q = round2(math.max(0, margin_q - user_loss_q))
+    if user_loss_q > 0 then
+      local okLoss, resLoss = transfer(marginEscrow, settlement, user_loss_q, "FOREX_MARKET_LOSS", memoBase .. " user loss", "FOREX:" .. tostring(sender_id), true)
+      if not okLoss then return false, "Could not settle loss: " .. tostring(resLoss) end
+      txs.loss_tx_id = type(resLoss) == "table" and resLoss.tx_id or nil
+    end
+  elseif realized_pnl_q > 0 then
+    user_profit_q = realized_pnl_q
+  end
+
+  if user_margin_return_q > 0 then
+    local okMargin, resMargin = transfer(marginEscrow, target, user_margin_return_q, "FOREX_MARGIN_RETURN", memoBase .. " margin return", "FOREX:" .. tostring(sender_id), true)
+    if not okMargin then return false, "Could not return margin: " .. tostring(resMargin) end
+    txs.margin_return_tx_id = type(resMargin) == "table" and resMargin.tx_id or nil
+  end
+
+  if user_profit_q > 0 then
+    local okProfit, resProfit = transfer(settlement, target, user_profit_q, "FOREX_MARKET_PROFIT", memoBase .. " user profit", "FOREX:" .. tostring(sender_id), true)
+    if not okProfit then return false, "Could not settle profit: " .. tostring(resProfit) end
+    txs.profit_tx_id = type(resProfit) == "table" and resProfit.tx_id or nil
+  end
+
+  local final_user_payout_q = round2(user_margin_return_q + user_profit_q)
+
+  return true, {
+    account_id = target,
+    margin_q = margin_q,
+    spread_fee_q = spread_fee_q,
+    treasury_reserve_q = treasury_reserve_q,
+    realized_pnl_q = realized_pnl_q,
+    user_loss_q = user_loss_q,
+    user_profit_q = user_profit_q,
+    user_margin_return_q = user_margin_return_q,
+    user_payout_q = final_user_payout_q,
+    balance = deriveBalance(target),
+    treasury_balance = deriveBalance(treasury),
+    txs = txs,
+    status = "settled",
+  }
 end
 
 -- LEDGER_HISTORY
