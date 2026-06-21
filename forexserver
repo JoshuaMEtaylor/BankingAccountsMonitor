@@ -1,7 +1,7 @@
 -- =============================================================================
 -- FOREX SERVER
 -- forexserver
--- v0.7.4-DECIMAL-QUID-PERSISTENT-TRADES
+-- v0.8.0-TREASURY-LEVERAGE-100X
 --
 -- Purpose:
 --   Pull the live EUR/USD number from the Oracle relay node and keep a proper
@@ -59,8 +59,10 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION = "0.7.4-DECIMAL-QUID-PERSISTENT-TRADES"
+local VERSION = "0.8.0-TREASURY-LEVERAGE-100X"
 local PROTOCOL = "quid_fx"
+local BANK_PROTOCOL = "quid_bank"
+local BANK_TIMEOUT = 5
 
 local ORACLE_LATEST_URL = "http://145.241.202.103:8000/latest"
 local ORACLE_HEALTH_URL = "http://145.241.202.103:8000/health"
@@ -93,9 +95,15 @@ local LOT_UNITS = LOT_NOTIONAL_USD
 local DEFAULT_LOTS = 0.01
 local MIN_LOTS = 0.01
 local LOT_STEP = 0.01
+local DEFAULT_LEVERAGE = 10
+local MAX_LEVERAGE = 100
+local MAINTENANCE_MARGIN_RATE = 0.50
+local SPREAD_PIPS = 2
+local PIP_SIZE = 0.0001
 local ORDER_HISTORY_MAX = 100
 
 local modem_name = nil
+local bank_id = nil
 local W, H = term.getSize()
 
 local state = {
@@ -254,6 +262,40 @@ local function openModem()
   end
   return false
 end
+
+local function discoverBank()
+  if bank_id then return true end
+  if not modem_name then return false end
+
+  for attempt = 1, 4 do
+    rednet.broadcast({ type = "ping", client = "forexserver", version = VERSION }, BANK_PROTOCOL)
+    local sender, msg = rednet.receive(BANK_PROTOCOL, 2)
+    if sender and type(msg) == "table" then
+      if msg.success ~= nil or msg.type == "treasury_online" then
+        bank_id = sender
+        return true
+      end
+    end
+  end
+
+  return false
+end
+
+local function bankRequest(req)
+  if not bank_id and not discoverBank() then
+    return false, "Bank server unavailable"
+  end
+
+  rednet.send(bank_id, req, BANK_PROTOCOL)
+  local sender, msg = rednet.receive(BANK_PROTOCOL, BANK_TIMEOUT)
+  if sender ~= bank_id or type(msg) ~= "table" then
+    bank_id = nil
+    return false, "No response from bank"
+  end
+
+  return msg.success == true, msg.response or msg.error
+end
+
 
 local function at(x, y, text, fg, bg)
   W, H = term.getSize()
@@ -434,6 +476,7 @@ local function pushPrice(price)
   updateCandleSet("1m", price, ms)
   updateCandleSet("5m", price, ms)
   updateCandleSet("15m", price, ms)
+  checkAutoLiquidations()
 
   last_tick = {
     ok = true,
@@ -576,6 +619,45 @@ local function maxLotsForBalanceQ(balance_q)
   return math.floor((rawLots / LOT_STEP) + 0.0000001) * LOT_STEP
 end
 
+
+local function clampLeverage(lev)
+  lev = tonumber(lev) or DEFAULT_LEVERAGE
+  lev = math.floor(lev + 0.0001)
+  if lev < 1 then lev = 1 end
+  if lev > MAX_LEVERAGE then lev = MAX_LEVERAGE end
+  return lev
+end
+
+local function spreadFeeQ(lots)
+  lots = tonumber(lots) or 0
+  local feeUsd = lots * LOT_NOTIONAL_USD * (SPREAD_PIPS * PIP_SIZE)
+  return round2(feeUsd / QUID_USD_VALUE)
+end
+
+local function fundingForTrade(lots, leverage)
+  lots = normalizeLots(lots)
+  if not lots then return nil, "Invalid lots" end
+  leverage = clampLeverage(leverage)
+
+  local notional_q = marginRequiredQ(lots) -- full notional value in Q
+  local user_margin_q = round2(notional_q / leverage)
+  local spread_fee_q = spreadFeeQ(lots)
+  local treasury_reserve_q = round2(math.max(0, notional_q - user_margin_q))
+  local user_required_q = round2(user_margin_q + spread_fee_q)
+  local maintenance_margin_q = round2(user_margin_q * MAINTENANCE_MARGIN_RATE)
+
+  return {
+    lots = lots,
+    leverage = leverage,
+    notional_q = notional_q,
+    user_margin_q = user_margin_q,
+    spread_fee_q = spread_fee_q,
+    treasury_reserve_q = treasury_reserve_q,
+    user_required_q = user_required_q,
+    maintenance_margin_q = maintenance_margin_q,
+  }
+end
+
 local function orderPnlUsd(order, price)
   price = tonumber(price or (last_tick and last_tick.pair_price))
   if type(order) ~= "table" or not price then return 0 end
@@ -602,21 +684,35 @@ local function decoratedOrder(order, price)
 
   local lots = normalizeLots(o.lots) or 0
   local live = tonumber(price or (last_tick and last_tick.pair_price))
+  local leverage = clampLeverage(o.leverage)
 
   o.live_price = live
   o.lots = lots
+  o.leverage = leverage
   o.units = lots * LOT_NOTIONAL_USD
   o.notional_usd = lots * LOT_NOTIONAL_USD
   o.quid_usd_value = QUID_USD_VALUE
-  o.margin_required_q = marginRequiredQ(lots)
 
-  o.unrealized_pnl_usd = orderPnlUsd(order, live)
-  o.unrealized_pnl_q = orderPnl(order, live)
+  o.user_margin_q = round2(tonumber(o.user_margin_q or o.margin_q) or 0)
+  o.margin_q = o.user_margin_q
+  o.spread_fee_q = round2(tonumber(o.spread_fee_q) or spreadFeeQ(lots))
+  o.treasury_reserve_q = round2(tonumber(o.treasury_reserve_q) or 0)
+  o.maintenance_margin_q = round2(tonumber(o.maintenance_margin_q) or (o.user_margin_q * MAINTENANCE_MARGIN_RATE))
+
+  o.raw_pnl_usd = orderPnlUsd(order, live)
+  o.raw_pnl_q = round2(o.raw_pnl_usd / QUID_USD_VALUE)
+
+  -- Net P/L starts negative because the 2-pip spread fee is part of trade cost.
+  o.unrealized_pnl_q = round2(o.raw_pnl_q - o.spread_fee_q)
   o.unrealized_pnl = o.unrealized_pnl_q
   o.pnl = o.unrealized_pnl_q
 
-  o.margin_q = round2(tonumber(o.margin_q) or tonumber(o.margin_required_q) or 0)
-  o.payout_q_if_closed = round2(math.max(0, o.margin_q + o.unrealized_pnl_q))
+  o.equity_q = round2(o.user_margin_q + o.unrealized_pnl_q)
+  if o.equity_q < 0 then o.equity_q = 0 end
+  o.margin_level = o.user_margin_q > 0 and round2((o.equity_q / o.user_margin_q) * 100) or 0
+  o.payout_q_if_closed = round2(math.max(0, o.equity_q))
+  o.margin_call = o.equity_q <= o.maintenance_margin_q
+
   return o
 end
 
@@ -627,30 +723,44 @@ local function orderBelongsTo(order, account_id)
 end
 
 local function ordersSnapshot(account_id)
+  checkAutoLiquidations()
+
   account_id = tostring(account_id or "")
   local price = last_tick and tonumber(last_tick.pair_price) or nil
   local open = {}
   local total = 0
+  local rawTotal = 0
+  local usedMargin = 0
+  local treasuryReserved = 0
+  local maintenance = 0
+  local equity = 0
 
   for i = 1, #active_orders do
     local raw = active_orders[i]
     if orderBelongsTo(raw, account_id) then
       local o = decoratedOrder(raw, price)
       if o then
-        total = total + (tonumber(o.unrealized_pnl) or 0)
+        total = round2(total + (tonumber(o.unrealized_pnl_q) or 0))
+        rawTotal = round2(rawTotal + (tonumber(o.raw_pnl_q) or 0))
+        usedMargin = round2(usedMargin + (tonumber(o.user_margin_q) or 0))
+        treasuryReserved = round2(treasuryReserved + (tonumber(o.treasury_reserve_q) or 0))
+        maintenance = round2(maintenance + (tonumber(o.maintenance_margin_q) or 0))
+        equity = round2(equity + (tonumber(o.equity_q) or 0))
         open[#open + 1] = o
       end
     end
   end
 
   local closed = {}
-  local start = math.max(1, #closed_orders - 30 + 1)
-  for i = start, #closed_orders do
+  local startIndex = math.max(1, #closed_orders - 30 + 1)
+  for i = startIndex, #closed_orders do
     local c = closed_orders[i]
     if orderBelongsTo(c, account_id) then
       closed[#closed + 1] = c
     end
   end
+
+  local marginLevel = usedMargin > 0 and round2((equity / usedMargin) * 100) or 0
 
   return {
     kind = "orders",
@@ -663,18 +773,31 @@ local function ordersSnapshot(account_id)
     open_count = #open,
     total_open_count = #active_orders,
     closed_count = #closed_orders,
+
     unrealized_pnl = total,
+    unrealized_pnl_q = total,
+    raw_pnl_q = rawTotal,
+    used_margin_q = usedMargin,
+    treasury_reserved_q = treasuryReserved,
+    maintenance_margin_q = maintenance,
+    open_equity_q = equity,
+    margin_level = marginLevel,
+
     default_lots = DEFAULT_LOTS,
     min_lots = MIN_LOTS,
     lot_step = LOT_STEP,
     lot_notional_usd = LOT_NOTIONAL_USD,
     lot_units = LOT_UNITS,
     quid_usd_value = QUID_USD_VALUE,
+    default_leverage = DEFAULT_LEVERAGE,
+    max_leverage = MAX_LEVERAGE,
+    maintenance_margin_rate = MAINTENANCE_MARGIN_RATE,
+    spread_pips = SPREAD_PIPS,
     version = VERSION,
   }
 end
 
-local function openTrade(side, lots, margin_q, reserved_tx_id, owner)
+local function openTrade(side, lots, leverage, owner)
   local price = last_tick and tonumber(last_tick.pair_price)
   if not price or price <= 0 then
     return false, "No live EUR/USD price available yet"
@@ -685,19 +808,35 @@ local function openTrade(side, lots, margin_q, reserved_tx_id, owner)
     return false, "Invalid side: " .. tostring(side)
   end
 
-  lots = normalizeLots(lots)
-  if not lots then return false, "Invalid lots. Minimum is " .. tostring(MIN_LOTS) end
-
-  local requiredMargin = marginRequiredQ(lots)
-  margin_q = round2(tonumber(margin_q) or 0)
-  if margin_q + 0.001 < requiredMargin then
-    return false, "Reserved margin too low. Need " .. tostring(requiredMargin) .. " Q for " .. tostring(lots) .. " lots"
-  end
+  local funding, fundErr = fundingForTrade(lots, leverage)
+  if not funding then return false, fundErr end
 
   owner = type(owner) == "table" and owner or {}
   local account_id = tostring(owner.account_id or "")
   if account_id == "" then
     return false, "Bank login required before opening forex orders"
+  end
+
+  if not owner.username or not owner.password then
+    return false, "Bank username/password required for leveraged order funding"
+  end
+
+  local okBank, bankRes = bankRequest({
+    type = "forex_open_leveraged",
+    username = owner.username,
+    password = owner.password,
+    account_id = account_id,
+    side = side,
+    lots = funding.lots,
+    leverage = funding.leverage,
+    margin_q = funding.user_margin_q,
+    spread_fee_q = funding.spread_fee_q,
+    treasury_reserve_q = funding.treasury_reserve_q,
+    memo = "FX " .. side .. " " .. tostring(funding.lots) .. " lots @" .. tostring(funding.leverage) .. "x",
+  })
+
+  if not okBank then
+    return false, tostring(bankRes)
   end
 
   local id = next_order_id
@@ -711,13 +850,23 @@ local function openTrade(side, lots, margin_q, reserved_tx_id, owner)
     symbol = "EURUSD",
     display_symbol = "EUR/USD",
     side = side,
-    lots = lots,
-    units = lots * LOT_NOTIONAL_USD,
-    notional_usd = lots * LOT_NOTIONAL_USD,
+    lots = funding.lots,
+    leverage = funding.leverage,
+    units = funding.lots * LOT_NOTIONAL_USD,
+    notional_usd = funding.lots * LOT_NOTIONAL_USD,
+    notional_q = funding.notional_q,
     quid_usd_value = QUID_USD_VALUE,
-    margin_required_q = requiredMargin,
-    margin_q = margin_q,
-    reserved_tx_id = reserved_tx_id,
+
+    user_margin_q = funding.user_margin_q,
+    margin_q = funding.user_margin_q,
+    spread_fee_q = funding.spread_fee_q,
+    treasury_reserve_q = funding.treasury_reserve_q,
+    user_required_q = funding.user_required_q,
+    maintenance_margin_q = funding.maintenance_margin_q,
+
+    user_margin_tx_id = type(bankRes) == "table" and bankRes.user_margin_tx_id or nil,
+    treasury_reserve_tx_id = type(bankRes) == "table" and bankRes.treasury_reserve_tx_id or nil,
+
     entry_price = price,
     opened_at = nowMs(),
     status = "OPEN",
@@ -728,7 +877,52 @@ local function openTrade(side, lots, margin_q, reserved_tx_id, owner)
   return true, decoratedOrder(order, price)
 end
 
-local function closeTrade(orderId, account_id, payout_tx_id)
+local function settleCloseWithBank(order, price, forcedReason)
+  local rawPnlUsd = orderPnlUsd(order, price)
+  local rawPnlQ = round2(rawPnlUsd / QUID_USD_VALUE)
+
+  local okBank, bankRes = bankRequest({
+    type = "forex_close_leveraged",
+    account_id = order.account_id,
+    order_id = order.id,
+    margin_q = order.user_margin_q or order.margin_q or 0,
+    spread_fee_q = order.spread_fee_q or 0,
+    treasury_reserve_q = order.treasury_reserve_q or 0,
+    realized_pnl_q = rawPnlQ,
+    memo = "FX close order " .. tostring(order.id) .. (forcedReason and (" " .. tostring(forcedReason)) or ""),
+  })
+
+  if not okBank then
+    return false, tostring(bankRes)
+  end
+
+  local closed = {}
+  for k, v in pairs(order) do closed[k] = v end
+
+  local fee = round2(tonumber(order.spread_fee_q) or 0)
+  local netPnl = round2(rawPnlQ - fee)
+  local margin = round2(tonumber(order.user_margin_q or order.margin_q) or 0)
+
+  closed.status = forcedReason and "FORCED_CLOSED" or "CLOSED"
+  closed.close_price = price
+  closed.closed_at = nowMs()
+  closed.close_reason = forcedReason or "manual"
+  closed.raw_pnl_usd = rawPnlUsd
+  closed.raw_pnl_q = rawPnlQ
+  closed.spread_fee_q = fee
+  closed.realized_pnl = netPnl
+  closed.realized_pnl_q = netPnl
+  closed.realized_pnl_usd = netPnl * QUID_USD_VALUE
+  closed.pnl = netPnl
+  closed.equity_q = round2(math.max(0, margin + netPnl))
+  closed.user_payout_q = type(bankRes) == "table" and bankRes.user_payout_q or closed.equity_q
+  closed.treasury_spread_fee_q = fee
+  closed.bank_settlement = bankRes
+
+  return true, closed
+end
+
+local function closeTrade(orderId, account_id, forcedReason)
   orderId = tonumber(orderId)
   account_id = tostring(account_id or "")
   if not orderId then return false, "No order id supplied" end
@@ -743,34 +937,15 @@ local function closeTrade(orderId, account_id, payout_tx_id)
         return false, "Order belongs to a different bank account"
       end
 
-      local rawPnlUsd = orderPnlUsd(o, price)
-      local rawPnl = rawPnlUsd / QUID_USD_VALUE
-      local margin = round2(tonumber(o.margin_q) or 0)
-      local realised = rawPnl
-      if realised < -margin then realised = -margin end
-      local payout = round2(math.max(0, margin + realised))
+      local okSettle, closedOrErr = settleCloseWithBank(o, price, forcedReason)
+      if not okSettle then return false, closedOrErr end
 
       table.remove(active_orders, i)
-
-      local closed = {}
-      for k, v in pairs(o) do closed[k] = v end
-      closed.status = "CLOSED"
-      closed.close_price = price
-      closed.closed_at = nowMs()
-      closed.raw_pnl_usd = rawPnlUsd
-      closed.raw_pnl_q = rawPnl
-      closed.realized_pnl = realised
-      closed.realized_pnl_q = round2(realised)
-      closed.realized_pnl_usd = realised * QUID_USD_VALUE
-      closed.pnl = round2(realised)
-      closed.payout_q = payout
-      closed.payout_tx_id = payout_tx_id
-
-      closed_orders[#closed_orders + 1] = closed
+      closed_orders[#closed_orders + 1] = closedOrErr
       while #closed_orders > ORDER_HISTORY_MAX do table.remove(closed_orders, 1) end
 
       saveState()
-      return true, closed
+      return true, closedOrErr
     end
   end
 
@@ -779,47 +954,45 @@ end
 
 local function closeAllTrades(account_id)
   account_id = tostring(account_id or "")
-  local price = last_tick and tonumber(last_tick.pair_price)
-  if not price or price <= 0 then return false, "No live EUR/USD price available yet" end
-
-  local kept = {}
   local closedNow = {}
 
-  for i = 1, #active_orders do
+  local i = 1
+  while i <= #active_orders do
     local o = active_orders[i]
     if account_id == "" or tostring(o.account_id or "") == account_id then
-      local rawPnlUsd = orderPnlUsd(o, price)
-      local rawPnl = rawPnlUsd / QUID_USD_VALUE
-      local margin = round2(tonumber(o.margin_q) or 0)
-      local realised = rawPnl
-      if realised < -margin then realised = -margin end
-      local payout = round2(math.max(0, margin + realised))
-
-      local closed = {}
-      for k, v in pairs(o) do closed[k] = v end
-      closed.status = "CLOSED"
-      closed.close_price = price
-      closed.closed_at = nowMs()
-      closed.raw_pnl_usd = rawPnlUsd
-      closed.raw_pnl_q = rawPnl
-      closed.realized_pnl = realised
-      closed.realized_pnl_q = round2(realised)
-      closed.realized_pnl_usd = realised * QUID_USD_VALUE
-      closed.pnl = round2(realised)
-      closed.payout_q = payout
-
-      closed_orders[#closed_orders + 1] = closed
-      closedNow[#closedNow + 1] = closed
+      local ok, res = closeTrade(o.id, account_id, "close_all")
+      if ok then
+        closedNow[#closedNow + 1] = res
+      else
+        i = i + 1
+      end
     else
-      kept[#kept + 1] = o
+      i = i + 1
     end
   end
 
-  active_orders = kept
-  while #closed_orders > ORDER_HISTORY_MAX do table.remove(closed_orders, 1) end
-  saveState()
   return true, closedNow
 end
+
+function checkAutoLiquidations()
+  local price = last_tick and tonumber(last_tick.pair_price)
+  if not price or price <= 0 then return end
+
+  local i = 1
+  while i <= #active_orders do
+    local o = decoratedOrder(active_orders[i], price)
+    if o and o.margin_call then
+      local ok, res = closeTrade(o.id, o.account_id, "maintenance_margin")
+      if not ok then
+        last_error = "Auto-liquidation failed for order " .. tostring(o.id) .. ": " .. tostring(res)
+        i = i + 1
+      end
+    else
+      i = i + 1
+    end
+  end
+end
+
 
 local function symbolsSnapshot()
   return {
@@ -859,9 +1032,10 @@ local function handleRequest(sender, msg)
   end
 
   if typ == "open_order" then
-    local ok, result = openTrade(msg.side, msg.lots, msg.margin_q, msg.reserved_tx_id, {
+    local ok, result = openTrade(msg.side, msg.lots, msg.leverage, {
       account_id = msg.account_id,
       username = msg.username,
+      password = msg.password,
       display_name = msg.display_name,
     })
     rednet.send(sender, {
@@ -877,7 +1051,7 @@ local function handleRequest(sender, msg)
   end
 
   if typ == "close_order" then
-    local ok, result = closeTrade(msg.order_id or msg.id, msg.account_id, msg.payout_tx_id)
+    local ok, result = closeTrade(msg.order_id or msg.id, msg.account_id, nil)
     rednet.send(sender, {
       success = ok,
       response = ok and ordersSnapshot(msg.account_id) or nil,
@@ -970,7 +1144,7 @@ local function draw()
   at(2,15, "Samples:      " .. tostring(sample_count) .. "  Changes: " .. tostring(change_count) .. "  Fails: " .. tostring(failure_count), colors.lightGray)
   at(2,16, "Stored candles 1m/5m/15m: " .. tostring(#candles["1m"]) .. " / " .. tostring(#candles["5m"]) .. " / " .. tostring(#candles["15m"]), colors.lightGray)
   at(2,17, "Last success: " .. ageText(last_success_ms) .. " ago  Response: " .. tostring(last_response_ms or 0) .. "ms", colors.lightGray)
-  at(2,18, "Orders:       open " .. tostring(#active_orders) .. "  P/L " .. fmt(ordersSnapshot(nil).unrealized_pnl, 2), colors.yellow)
+  at(2,18, "Orders:       open " .. tostring(#active_orders) .. "  P/L " .. fmt(ordersSnapshot(nil).unrealized_pnl_q, 2) .. " Q  Bank " .. tostring(bank_id or "search"), colors.yellow)
 
   at(2,20, "Recent 5m closes", colors.white)
   drawSparkline(candles["5m"], 2, 21, math.max(10, W - 4), "close", colors.lime)
