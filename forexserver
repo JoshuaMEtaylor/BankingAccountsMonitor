@@ -1,7 +1,7 @@
 -- =============================================================================
 -- FOREX SERVER
 -- forexserver
--- v0.8.0-TREASURY-LEVERAGE-100X
+-- v0.8.1-LOTS-ONLY-TREASURY-LEVERAGE
 --
 -- Purpose:
 --   Pull the live EUR/USD number from the Oracle relay node and keep a proper
@@ -59,7 +59,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION = "0.8.0-TREASURY-LEVERAGE-100X"
+local VERSION = "0.8.1-LOTS-ONLY-TREASURY-LEVERAGE"
 local PROTOCOL = "quid_fx"
 local BANK_PROTOCOL = "quid_bank"
 local BANK_TIMEOUT = 5
@@ -634,13 +634,16 @@ local function spreadFeeQ(lots)
   return round2(feeUsd / QUID_USD_VALUE)
 end
 
-local function fundingForTrade(lots, leverage)
+local function fundingForTrade(lots)
   lots = normalizeLots(lots)
   if not lots then return nil, "Invalid lots" end
-  leverage = clampLeverage(leverage)
+
+  -- Trader chooses lots. The treasury-backed side uses the system maximum.
+  -- We store the effective leverage internally, but the UI does not ask for it.
+  local effective_leverage = MAX_LEVERAGE
 
   local notional_q = marginRequiredQ(lots) -- full notional value in Q
-  local user_margin_q = round2(notional_q / leverage)
+  local user_margin_q = round2(notional_q / effective_leverage)
   local spread_fee_q = spreadFeeQ(lots)
   local treasury_reserve_q = round2(math.max(0, notional_q - user_margin_q))
   local user_required_q = round2(user_margin_q + spread_fee_q)
@@ -648,7 +651,7 @@ local function fundingForTrade(lots, leverage)
 
   return {
     lots = lots,
-    leverage = leverage,
+    effective_leverage = effective_leverage,
     notional_q = notional_q,
     user_margin_q = user_margin_q,
     spread_fee_q = spread_fee_q,
@@ -684,11 +687,11 @@ local function decoratedOrder(order, price)
 
   local lots = normalizeLots(o.lots) or 0
   local live = tonumber(price or (last_tick and last_tick.pair_price))
-  local leverage = clampLeverage(o.leverage)
+  local leverage = clampLeverage(o.effective_leverage or o.leverage or MAX_LEVERAGE)
 
   o.live_price = live
   o.lots = lots
-  o.leverage = leverage
+  o.effective_leverage = leverage
   o.units = lots * LOT_NOTIONAL_USD
   o.notional_usd = lots * LOT_NOTIONAL_USD
   o.quid_usd_value = QUID_USD_VALUE
@@ -789,15 +792,14 @@ local function ordersSnapshot(account_id)
     lot_notional_usd = LOT_NOTIONAL_USD,
     lot_units = LOT_UNITS,
     quid_usd_value = QUID_USD_VALUE,
-    default_leverage = DEFAULT_LEVERAGE,
-    max_leverage = MAX_LEVERAGE,
+    treasury_max_leverage = MAX_LEVERAGE,
     maintenance_margin_rate = MAINTENANCE_MARGIN_RATE,
     spread_pips = SPREAD_PIPS,
     version = VERSION,
   }
 end
 
-local function openTrade(side, lots, leverage, owner)
+local function openTrade(side, lots, owner)
   local price = last_tick and tonumber(last_tick.pair_price)
   if not price or price <= 0 then
     return false, "No live EUR/USD price available yet"
@@ -808,7 +810,7 @@ local function openTrade(side, lots, leverage, owner)
     return false, "Invalid side: " .. tostring(side)
   end
 
-  local funding, fundErr = fundingForTrade(lots, leverage)
+  local funding, fundErr = fundingForTrade(lots)
   if not funding then return false, fundErr end
 
   owner = type(owner) == "table" and owner or {}
@@ -828,11 +830,10 @@ local function openTrade(side, lots, leverage, owner)
     account_id = account_id,
     side = side,
     lots = funding.lots,
-    leverage = funding.leverage,
     margin_q = funding.user_margin_q,
     spread_fee_q = funding.spread_fee_q,
     treasury_reserve_q = funding.treasury_reserve_q,
-    memo = "FX " .. side .. " " .. tostring(funding.lots) .. " lots @" .. tostring(funding.leverage) .. "x",
+    memo = "FX " .. side .. " " .. tostring(funding.lots) .. " lots",
   })
 
   if not okBank then
@@ -851,12 +852,12 @@ local function openTrade(side, lots, leverage, owner)
     display_symbol = "EUR/USD",
     side = side,
     lots = funding.lots,
-    leverage = funding.leverage,
     units = funding.lots * LOT_NOTIONAL_USD,
     notional_usd = funding.lots * LOT_NOTIONAL_USD,
     notional_q = funding.notional_q,
     quid_usd_value = QUID_USD_VALUE,
 
+    effective_leverage = funding.effective_leverage,
     user_margin_q = funding.user_margin_q,
     margin_q = funding.user_margin_q,
     spread_fee_q = funding.spread_fee_q,
@@ -1032,7 +1033,7 @@ local function handleRequest(sender, msg)
   end
 
   if typ == "open_order" then
-    local ok, result = openTrade(msg.side, msg.lots, msg.leverage, {
+    local ok, result = openTrade(msg.side, msg.lots, {
       account_id = msg.account_id,
       username = msg.username,
       password = msg.password,
