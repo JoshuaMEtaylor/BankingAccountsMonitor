@@ -1,7 +1,7 @@
 -- =============================================================================
 -- FOREX CLIENT
 -- forexclient
--- v0.8.1-LOTS-ONLY-TREASURY-TRADER
+-- v0.8.2-EDITABLE-LOTS-FIELD
 --
 -- Purpose:
 --   Trading-terminal style client for the Oracle/Kraken EUR/USD forexserver.
@@ -67,7 +67,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION = "0.8.1-LOTS-ONLY-TREASURY-TRADER"
+local VERSION = "0.8.2-EDITABLE-LOTS-FIELD"
 local FX_PROTOCOL = "quid_fx"
 local BANK_PROTOCOL = "quid_bank"
 local BANK_TIMEOUT = 5
@@ -1225,10 +1225,16 @@ local function handleClick(x, y)
   end
 
   if lotInputRect and y == lotInputRect.y and x >= lotInputRect.x1 and x <= lotInputRect.x2 then
+    if not lots_focused then
+      -- Click acts like selecting the whole field. This avoids getting stuck
+      -- appending onto the default 0.01 value.
+      lots_text = ""
+    end
     lots_focused = true
     draw()
     return true
   else
+    if lots_focused then cleanLotsText() end
     lots_focused = false
   end
 
@@ -1284,7 +1290,7 @@ local function drawOrdersPanel(x, y, w, h)
   fill(x, y, w, h, colors.black)
 
   local bal = round2(tonumber(bank_session.balance or 0))
-  cleanLotsText()
+  if not lots_focused then cleanLotsText() end
 
   local lots = currentLots() or 0
   local maxLots = maxLotsForBalanceWithTreasury(bal)
@@ -1521,10 +1527,15 @@ local function main()
     elseif ev[1] == "char" then
       if lots_focused then
         local ch = tostring(ev[2] or "")
-        if ch:match("[0-9%.]") and #lots_text < 8 then
-          lots_text = tostring(lots_text or "") .. ch
-          cleanLotsText()
-          draw()
+        if #lots_text < 8 then
+          if ch:match("[0-9]") then
+            lots_text = tostring(lots_text or "") .. ch
+            draw()
+          elseif ch == "." and not tostring(lots_text or ""):find("%.") then
+            if lots_text == "" then lots_text = "0" end
+            lots_text = tostring(lots_text or "") .. "."
+            draw()
+          end
         end
       end
 
@@ -1533,10 +1544,14 @@ local function main()
         if ev[2] == keys.backspace then
           lots_text = tostring(lots_text or "")
           lots_text = lots_text:sub(1, -2)
-          if lots_text == "" then lots_text = "0.01" end
           draw()
         elseif ev[2] == keys.enter then
           lots_focused = false
+          cleanLotsText()
+          draw()
+        elseif ev[2] == keys.escape then
+          lots_focused = false
+          if tostring(lots_text or "") == "" then lots_text = "0.01" end
           cleanLotsText()
           draw()
         end
