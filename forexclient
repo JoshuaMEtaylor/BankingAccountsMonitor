@@ -1,7 +1,7 @@
 -- =============================================================================
 -- FOREX CLIENT
 -- forexclient
--- v0.6.5-EURUSD-TF-TABS-DRAWFIX
+-- v0.7.0-EURUSD-METATRADER-LITE
 --
 -- Purpose:
 --   Trading-terminal style client for the Oracle/Kraken EUR/USD forexserver.
@@ -67,7 +67,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION = "0.6.5-EURUSD-TF-TABS-DRAWFIX"
+local VERSION = "0.7.0-EURUSD-METATRADER-LITE"
 local FX_PROTOCOL = "quid_fx"
 local server_id = tonumber(args[2])
 
@@ -84,8 +84,15 @@ local TIMEFRAMES = {
   ["15m"] = { seconds = 900, label = "15m" },
 }
 
+local SYMBOL_ORDER = { "EURUSD" }
+local SYMBOLS = {
+  EURUSD = { display = "EUR/USD", enabled = true },
+}
+
 local active_tf = "5m"
+local active_symbol = "EURUSD"
 local MAX_CANDLES = 576
+local DEFAULT_UNITS = 10000
 
 -- Chart scaling:
 -- centred around current visible action, with hard rails and a minimum visible
@@ -133,12 +140,27 @@ local change_count = 0
 local timeout_count = 0
 local discover_count = 0
 
+local orders = {
+  active_orders = {},
+  closed_orders = {},
+  unrealized_pnl = 0,
+  open_count = 0,
+  default_units = DEFAULT_UNITS,
+}
+local selected_order_id = nil
+local last_orders_ms = 0
+local order_request_count = 0
+
 local sample_timer = nil
 local draw_timer = nil
 local save_timer = nil
 local discover_timer = nil
+local order_timer = nil
 
 local tabRects = {}
+local symbolRects = {}
+local buttonRects = {}
+local orderRowRects = {}
 
 -- Forward declaration. switchTimeframe calls draw(), and Lua needs this local
 -- declared before that function is defined.
@@ -195,6 +217,7 @@ local function loadState()
   local s = readTable(STATE_FILE)
   if type(s) == "table" then state = s end
   if TIMEFRAMES[state.active_tf] then active_tf = state.active_tf end
+  if SYMBOLS[state.active_symbol] then active_symbol = state.active_symbol end
 
   local sets = readTable(CANDLES_FILE)
   if type(sets) == "table" then
@@ -209,6 +232,7 @@ local function saveState()
   state.saved_at = nowMs()
   state.server_id = server_id
   state.active_tf = active_tf
+  state.active_symbol = active_symbol
   state.created_version = VERSION
   writeTable(STATE_FILE, state)
   writeTable(CANDLES_FILE, candleSets)
@@ -218,6 +242,14 @@ local function fmt(n, dp)
   n = tonumber(n)
   if n == nil then return "n/a" end
   return string.format("%." .. tostring(dp or 5) .. "f", n)
+end
+
+local function money(n, dp)
+  n = tonumber(n)
+  if n == nil then return "n/a" end
+  local sign = n < 0 and "-" or ""
+  n = math.abs(n)
+  return sign .. string.format("$%." .. tostring(dp or 2) .. "f", n)
 end
 
 local function clampText(s, n)
@@ -341,6 +373,50 @@ end
 local function requestAllHistories()
   if not server_id then return end
   for _, tf in ipairs(TF_ORDER) do requestHistory(tf) end
+end
+
+local function requestOrders()
+  if not server_id then return end
+  order_request_count = order_request_count + 1
+  rednet.send(server_id, {
+    type = "get_orders",
+    symbol = active_symbol,
+    client = "forexclient",
+    version = VERSION,
+    request_id = "orders_" .. tostring(order_request_count),
+  }, FX_PROTOCOL)
+end
+
+local function openOrder(side)
+  if not server_id then return end
+  rednet.send(server_id, {
+    type = "open_order",
+    symbol = active_symbol,
+    side = side,
+    units = orders.default_units or DEFAULT_UNITS,
+    client = "forexclient",
+    version = VERSION,
+    request_id = "open_" .. tostring(nowMs()),
+  }, FX_PROTOCOL)
+end
+
+local function closeSelectedOrder()
+  if not server_id then return end
+  local id = tonumber(selected_order_id)
+  if not id and orders.active_orders and #orders.active_orders > 0 then
+    id = tonumber(orders.active_orders[1].id)
+  end
+  if not id then
+    last_error = "No selected order to close"
+    return
+  end
+  rednet.send(server_id, {
+    type = "close_order",
+    order_id = id,
+    client = "forexclient",
+    version = VERSION,
+    request_id = "close_" .. tostring(nowMs()),
+  }, FX_PROTOCOL)
 end
 
 local function sendTickRequest()
@@ -488,6 +564,7 @@ local function handleServerMessage(sender, msg)
     last_server_seen_ms = nowMs()
     last_error = "Found forexserver " .. tostring(sender)
     requestAllHistories()
+    requestOrders()
     return
   end
 
@@ -501,7 +578,14 @@ local function handleServerMessage(sender, msg)
     last_server_seen_ms = nowMs()
 
     if msg.success == true and type(msg.response) == "table" then
-      if type(msg.response.candles) == "table" then
+      if msg.response.kind == "orders" then
+        orders = msg.response
+        if not orders.active_orders then orders.active_orders = {} end
+        if not orders.closed_orders then orders.closed_orders = {} end
+        orders.default_units = tonumber(orders.default_units) or DEFAULT_UNITS
+        last_orders_ms = nowMs()
+        last_error = "Orders updated"
+      elseif type(msg.response.candles) == "table" then
         local tf = tostring(msg.response.timeframe or active_tf)
         if not TIMEFRAMES[tf] then tf = active_tf end
         replaceCandlesFromServer(tf, msg.response.candles)
@@ -681,21 +765,39 @@ local function drawTabs(y)
     tabRects[#tabRects + 1] = { tf = tf, x1 = x, x2 = x + #label - 1, y = y }
     x = x + #label + 1
   end
+end
 
-  at(x + 1, y, "EUR/USD", colors.yellow, colors.black)
+local function drawSymbolPanel(x, y, w, h)
+  symbolRects = {}
+  fill(x, y, w, h, colors.black)
+  at(x, y, "SYMBOLS", colors.yellow)
+
+  local yy = y + 2
+  for _, sid in ipairs(SYMBOL_ORDER) do
+    local s = SYMBOLS[sid]
+    local label = " " .. (s and s.display or sid) .. " "
+    local active = sid == active_symbol
+    at(x, yy, label:sub(1, w), active and colors.white or colors.lightGray, active and colors.blue or colors.black)
+    symbolRects[#symbolRects + 1] = { symbol = sid, x1 = x, x2 = x + math.min(#label, w) - 1, y = yy }
+    yy = yy + 2
+  end
 end
 
 local function switchTimeframe(tf)
   if not TIMEFRAMES[tf] then return end
-  if active_tf == tf then
-    requestHistory(tf)
-    return
-  end
-
   active_tf = tf
   state.active_tf = tf
   last_history_count = #(candleSets[tf] or {})
   requestHistory(tf)
+  draw()
+end
+
+local function switchSymbol(sym)
+  if not SYMBOLS[sym] then return end
+  active_symbol = sym
+  state.active_symbol = sym
+  requestAllHistories()
+  requestOrders()
   draw()
 end
 
@@ -706,7 +808,83 @@ local function handleClick(x, y)
       return true
     end
   end
+
+  for _, r in ipairs(symbolRects) do
+    if y == r.y and x >= r.x1 and x <= r.x2 then
+      switchSymbol(r.symbol)
+      return true
+    end
+  end
+
+  for _, r in ipairs(buttonRects) do
+    if y >= r.y1 and y <= r.y2 and x >= r.x1 and x <= r.x2 then
+      if r.action == "BUY" then openOrder("BUY") end
+      if r.action == "SELL" then openOrder("SELL") end
+      if r.action == "CLOSE" then closeSelectedOrder() end
+      return true
+    end
+  end
+
+  for _, r in ipairs(orderRowRects) do
+    if y == r.y and x >= r.x1 and x <= r.x2 then
+      selected_order_id = r.id
+      draw()
+      return true
+    end
+  end
+
   return false
+end
+
+local function drawButton(x, y, label, action, bg, fg)
+  label = " " .. tostring(label or action) .. " "
+  at(x, y, label, fg or colors.white, bg or colors.gray)
+  buttonRects[#buttonRects + 1] = { action = action, x1 = x, x2 = x + #label - 1, y1 = y, y2 = y }
+  return x + #label + 1
+end
+
+local function drawOrdersPanel(x, y, w, h)
+  buttonRects = {}
+  orderRowRects = {}
+  fill(x, y, w, h, colors.black)
+
+  at(x, y, "TERMINAL", colors.yellow)
+  local bx = x + 11
+  bx = drawButton(bx, y, "BUY", "BUY", colors.green, colors.white)
+  bx = drawButton(bx, y, "SELL", "SELL", colors.red, colors.white)
+  bx = drawButton(bx, y, "CLOSE", "CLOSE", colors.gray, colors.white)
+
+  local total = tonumber(orders.unrealized_pnl or 0) or 0
+  local pnlCol = total > 0 and colors.lime or (total < 0 and colors.red or colors.lightGray)
+  at(x + math.max(35, w - 28), y, "Open P/L " .. money(total, 2), pnlCol)
+
+  at(x, y + 1, "ID  Side  Units   Entry    Live     P/L", colors.gray)
+
+  local openOrders = orders.active_orders or {}
+  local maxRows = math.max(1, h - 3)
+  for i = 1, math.min(#openOrders, maxRows) do
+    local o = openOrders[i]
+    local rowY = y + 1 + i
+    local id = tonumber(o.id)
+    local selected = selected_order_id and id == tonumber(selected_order_id)
+    local side = tostring(o.side or "?")
+    local sideCol = side == "BUY" and colors.green or colors.red
+    local pnl = tonumber(o.unrealized_pnl or o.pnl or 0) or 0
+    local pnlColRow = pnl > 0 and colors.lime or (pnl < 0 and colors.red or colors.lightGray)
+    local bg = selected and colors.blue or colors.black
+
+    at(x, rowY, string.format("%-3s", tostring(id or "?")), colors.white, bg)
+    at(x + 4, rowY, string.format("%-4s", side), sideCol, bg)
+    at(x + 10, rowY, string.format("%-7s", tostring(o.units or "?")), colors.lightGray, bg)
+    at(x + 18, rowY, fmt(o.entry_price, 5), colors.white, bg)
+    at(x + 28, rowY, fmt(o.live_price, 5), colors.white, bg)
+    at(x + 38, rowY, money(pnl, 2), pnlColRow, bg)
+    orderRowRects[#orderRowRects + 1] = { id = id, x1 = x, x2 = x + w - 1, y = rowY }
+  end
+
+  if #openOrders == 0 then
+    at(x, y + 3, "No active orders. Use BUY/SELL above.", colors.gray)
+  end
 end
 
 function draw()
@@ -714,31 +892,25 @@ function draw()
   cls()
 
   fill(1, 1, W, 1, colors.blue)
-  at(2, 1, "EUR/USD TERMINAL", colors.white, colors.blue)
+  at(2, 1, "EUR/USD METATRADER LITE", colors.white, colors.blue)
   at(math.max(1, W - #VERSION), 1, VERSION, colors.lightGray, colors.blue)
 
   drawTabs(3)
 
+  local sideW = 13
+  local ordersH = math.min(9, math.max(6, math.floor(H * 0.23)))
   local chartTop = 5
-  local chartH = math.max(10, H - chartTop - 5)
-  drawTradingCandles(2, chartTop, W - 3, chartH)
+  local chartH = math.max(8, H - chartTop - ordersH - 1)
+  local chartW = W - sideW - 4
+  if chartW < 20 then chartW = W - 3; sideW = 0 end
 
-  local list = activeCandles()
-  local c = list[#list]
-  if c then
-    local delta = (tonumber(c.close) or 0) - (tonumber(c.open) or 0)
-    local neutral = math.abs(delta) <= PRICE_EPS
-    local col = neutral and colors.lightGray or (delta > 0 and colors.green or colors.red)
-    at(2, H - 4, active_tf .. " candle  O:" .. fmt(c.open, 5) .. "  H:" .. fmt(c.high, 5) .. "  L:" .. fmt(c.low, 5) .. "  C:" .. fmt(c.close, 5), col)
-  else
-    at(2, H - 4, "No " .. active_tf .. " candles loaded yet", colors.orange)
+  drawTradingCandles(2, chartTop, chartW, chartH)
+
+  if sideW > 0 then
+    drawSymbolPanel(W - sideW + 1, 3, sideW, chartH + 2)
   end
 
-  local price = last_tick and tonumber(last_tick._client_price or last_tick.pair_price)
-  local q = last_tick and tostring(last_tick.quality or "unknown") or "OFFLINE"
-  at(2, H - 3, "Live " .. fmt(price, 5) .. " | " .. q .. " | server " .. tostring(server_id or "searching") .. " | tick " .. ageText(last_tick_ms) .. " ago | candles " .. tostring(#list), colourForQuality(q))
-  at(2, H - 2, "Samples " .. tostring(sample_count) .. " | Changes " .. tostring(change_count) .. " | Timeouts " .. tostring(timeout_count) .. " | History age " .. ageText(last_history_ms), colors.lightGray)
-  at(2, H - 1, "Status: " .. clampText(last_error, math.max(10, W - 10)), last_error == "OK" and colors.lime or colors.orange)
+  drawOrdersPanel(2, H - ordersH + 1, W - 3, ordersH)
 end
 
 local function main()
@@ -754,12 +926,13 @@ local function main()
   end
 
   if state.server_id and not server_id then server_id = tonumber(state.server_id) end
-  if server_id then requestAllHistories() else broadcastPing() end
+  if server_id then requestAllHistories(); requestOrders() else broadcastPing() end
 
   sample_timer = os.startTimer(SAMPLE_SECONDS)
   draw_timer = os.startTimer(DRAW_SECONDS)
   save_timer = os.startTimer(SAVE_SECONDS)
   discover_timer = os.startTimer(3)
+  order_timer = os.startTimer(1)
 
   draw()
 
@@ -784,6 +957,10 @@ local function main()
       elseif id == discover_timer then
         if not server_id then broadcastPing() end
         discover_timer = os.startTimer(3)
+
+      elseif id == order_timer then
+        requestOrders()
+        order_timer = os.startTimer(1)
       end
 
     elseif ev[1] == "rednet_message" then
