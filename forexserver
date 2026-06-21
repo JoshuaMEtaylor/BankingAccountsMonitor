@@ -1,7 +1,7 @@
 -- =============================================================================
 -- FOREX SERVER
 -- forexserver
--- v0.8.1-LOTS-ONLY-TREASURY-LEVERAGE
+-- v0.8.2-QUID-LOTS-CLEAR-REJECTS
 --
 -- Purpose:
 --   Pull the live EUR/USD number from the Oracle relay node and keep a proper
@@ -59,7 +59,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION = "0.8.1-LOTS-ONLY-TREASURY-LEVERAGE"
+local VERSION = "0.8.2-QUID-LOTS-CLEAR-REJECTS"
 local PROTOCOL = "quid_fx"
 local BANK_PROTOCOL = "quid_bank"
 local BANK_TIMEOUT = 5
@@ -82,16 +82,15 @@ local STATE_FILE = "data/forex_server_state.db"
 local CANDLES_FILE = "data/forex_server_candles.db"
 local ORDERS_FILE = "data/forex_server_orders.db"
 
--- Paper-trading engine. Not yet wired into Quid bank settlement.
--- Units represent EUR notional. P/L is quote-currency USD-style paper P/L.
--- FX sizing.
--- 1.00 lot = 100,000 USD notional.
--- 0.01 lot = 1,000 USD notional.
--- 1 Quid = 3.40 USD, so required margin in Q is:
---   lots * 100000 / 3.40
-local QUID_USD_VALUE = 3.40
-local LOT_NOTIONAL_USD = 100000
-local LOT_UNITS = LOT_NOTIONAL_USD
+-- Treasury FX sizing.
+-- 1.00 lot = 100,000 Q notional.
+-- 0.01 lot = 1,000 Q notional.
+-- P/L is also in Q:
+--   BUY  P/L = (live - entry) * notional_q
+--   SELL P/L = (entry - live) * notional_q
+-- 2 pips on 1.00 lot = 20 Q, because 100,000Q * 0.0002 = 20Q.
+local LOT_NOTIONAL_Q = 100000
+local LOT_UNITS = LOT_NOTIONAL_Q
 local DEFAULT_LOTS = 0.01
 local MIN_LOTS = 0.01
 local LOT_STEP = 0.01
@@ -602,20 +601,19 @@ local function normalizeLots(lots)
   return lots
 end
 
-local function notionalUsdForLots(lots)
+local function notionalQForLots(lots)
   lots = tonumber(lots) or 0
-  return lots * LOT_NOTIONAL_USD
+  return round2(lots * LOT_NOTIONAL_Q)
 end
 
 local function marginRequiredQ(lots)
-  local usd = notionalUsdForLots(lots)
-  return round2(usd / QUID_USD_VALUE)
+  -- Full notional value of the selected lot size.
+  return notionalQForLots(lots)
 end
 
 local function maxLotsForBalanceQ(balance_q)
   balance_q = tonumber(balance_q) or 0
-  local usd = balance_q * QUID_USD_VALUE
-  local rawLots = usd / LOT_NOTIONAL_USD
+  local rawLots = balance_q / LOT_NOTIONAL_Q
   return math.floor((rawLots / LOT_STEP) + 0.0000001) * LOT_STEP
 end
 
@@ -630,8 +628,7 @@ end
 
 local function spreadFeeQ(lots)
   lots = tonumber(lots) or 0
-  local feeUsd = lots * LOT_NOTIONAL_USD * (SPREAD_PIPS * PIP_SIZE)
-  return round2(feeUsd / QUID_USD_VALUE)
+  return round2(lots * LOT_NOTIONAL_Q * (SPREAD_PIPS * PIP_SIZE))
 end
 
 local function fundingForTrade(lots)
@@ -661,23 +658,23 @@ local function fundingForTrade(lots)
   }
 end
 
-local function orderPnlUsd(order, price)
+local function orderPnlQ(order, price)
   price = tonumber(price or (last_tick and last_tick.pair_price))
   if type(order) ~= "table" or not price then return 0 end
 
   local entry = tonumber(order.entry_price) or price
   local lots = tonumber(order.lots)
-  local units = lots and (lots * LOT_NOTIONAL_USD) or (tonumber(order.units) or (DEFAULT_LOTS * LOT_NOTIONAL_USD))
+  local units = lots and (lots * LOT_NOTIONAL_Q) or (tonumber(order.units) or (DEFAULT_LOTS * LOT_NOTIONAL_Q))
   local side = tostring(order.side or "BUY"):upper()
 
   if side == "SELL" then
-    return (entry - price) * units
+    return round2((entry - price) * units)
   end
-  return (price - entry) * units
+  return round2((price - entry) * units)
 end
 
 local function orderPnl(order, price)
-  return orderPnlUsd(order, price) / QUID_USD_VALUE
+  return orderPnlQ(order, price)
 end
 
 local function decoratedOrder(order, price)
@@ -692,9 +689,9 @@ local function decoratedOrder(order, price)
   o.live_price = live
   o.lots = lots
   o.effective_leverage = leverage
-  o.units = lots * LOT_NOTIONAL_USD
-  o.notional_usd = lots * LOT_NOTIONAL_USD
-  o.quid_usd_value = QUID_USD_VALUE
+  o.units = lots * LOT_NOTIONAL_Q
+  o.notional_q = notionalQForLots(lots)
+  o.lot_notional_q = LOT_NOTIONAL_Q
 
   o.user_margin_q = round2(tonumber(o.user_margin_q or o.margin_q) or 0)
   o.margin_q = o.user_margin_q
@@ -702,8 +699,7 @@ local function decoratedOrder(order, price)
   o.treasury_reserve_q = round2(tonumber(o.treasury_reserve_q) or 0)
   o.maintenance_margin_q = round2(tonumber(o.maintenance_margin_q) or (o.user_margin_q * MAINTENANCE_MARGIN_RATE))
 
-  o.raw_pnl_usd = orderPnlUsd(order, live)
-  o.raw_pnl_q = round2(o.raw_pnl_usd / QUID_USD_VALUE)
+  o.raw_pnl_q = orderPnlQ(order, live)
 
   -- Net P/L starts negative because the 2-pip spread fee is part of trade cost.
   o.unrealized_pnl_q = round2(o.raw_pnl_q - o.spread_fee_q)
@@ -789,9 +785,9 @@ local function ordersSnapshot(account_id)
     default_lots = DEFAULT_LOTS,
     min_lots = MIN_LOTS,
     lot_step = LOT_STEP,
-    lot_notional_usd = LOT_NOTIONAL_USD,
+    lot_notional_q = LOT_NOTIONAL_Q,
     lot_units = LOT_UNITS,
-    quid_usd_value = QUID_USD_VALUE,
+    lot_notional_q = LOT_NOTIONAL_Q,
     treasury_max_leverage = MAX_LEVERAGE,
     maintenance_margin_rate = MAINTENANCE_MARGIN_RATE,
     spread_pips = SPREAD_PIPS,
@@ -811,7 +807,7 @@ local function openTrade(side, lots, owner)
   end
 
   local funding, fundErr = fundingForTrade(lots)
-  if not funding then return false, fundErr end
+  if not funding then return false, tostring(fundErr or "Invalid lots") end
 
   owner = type(owner) == "table" and owner or {}
   local account_id = tostring(owner.account_id or "")
@@ -837,7 +833,7 @@ local function openTrade(side, lots, owner)
   })
 
   if not okBank then
-    return false, tostring(bankRes)
+    return false, tostring(bankRes) .. " | Trade request: " .. tostring(funding.lots) .. " lots, user margin " .. tostring(funding.user_margin_q) .. " Q, 2-pip fee " .. tostring(funding.spread_fee_q) .. " Q, total required " .. tostring(funding.user_required_q) .. " Q, treasury reserve " .. tostring(funding.treasury_reserve_q) .. " Q"
   end
 
   local id = next_order_id
@@ -852,10 +848,10 @@ local function openTrade(side, lots, owner)
     display_symbol = "EUR/USD",
     side = side,
     lots = funding.lots,
-    units = funding.lots * LOT_NOTIONAL_USD,
-    notional_usd = funding.lots * LOT_NOTIONAL_USD,
+    units = funding.lots * LOT_NOTIONAL_Q,
+    notional_q = funding.lots * LOT_NOTIONAL_Q,
     notional_q = funding.notional_q,
-    quid_usd_value = QUID_USD_VALUE,
+    lot_notional_q = LOT_NOTIONAL_Q,
 
     effective_leverage = funding.effective_leverage,
     user_margin_q = funding.user_margin_q,
@@ -879,8 +875,7 @@ local function openTrade(side, lots, owner)
 end
 
 local function settleCloseWithBank(order, price, forcedReason)
-  local rawPnlUsd = orderPnlUsd(order, price)
-  local rawPnlQ = round2(rawPnlUsd / QUID_USD_VALUE)
+  local rawPnlQ = orderPnlQ(order, price)
 
   local okBank, bankRes = bankRequest({
     type = "forex_close_leveraged",
@@ -894,7 +889,7 @@ local function settleCloseWithBank(order, price, forcedReason)
   })
 
   if not okBank then
-    return false, tostring(bankRes)
+    return false, tostring(bankRes) .. " | Trade request: " .. tostring(funding.lots) .. " lots, user margin " .. tostring(funding.user_margin_q) .. " Q, 2-pip fee " .. tostring(funding.spread_fee_q) .. " Q, total required " .. tostring(funding.user_required_q) .. " Q, treasury reserve " .. tostring(funding.treasury_reserve_q) .. " Q"
   end
 
   local closed = {}
@@ -908,12 +903,12 @@ local function settleCloseWithBank(order, price, forcedReason)
   closed.close_price = price
   closed.closed_at = nowMs()
   closed.close_reason = forcedReason or "manual"
-  closed.raw_pnl_usd = rawPnlUsd
+  closed.raw_pnl_q = rawPnlQ
   closed.raw_pnl_q = rawPnlQ
   closed.spread_fee_q = fee
   closed.realized_pnl = netPnl
   closed.realized_pnl_q = netPnl
-  closed.realized_pnl_usd = netPnl * QUID_USD_VALUE
+  closed.realized_pnl_q = netPnl
   closed.pnl = netPnl
   closed.equity_q = round2(math.max(0, margin + netPnl))
   closed.user_payout_q = type(bankRes) == "table" and bankRes.user_payout_q or closed.equity_q
