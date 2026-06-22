@@ -1,7 +1,7 @@
 -- =============================================================================
 -- FOREX SERVER
 -- forexserver
--- v0.8.2-QUID-LOTS-CLEAR-REJECTS
+-- v0.8.4-NO-STALE-TRADING
 --
 -- Purpose:
 --   Pull the live EUR/USD number from the Oracle relay node and keep a proper
@@ -59,7 +59,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION = "0.8.2-QUID-LOTS-CLEAR-REJECTS"
+local VERSION = "0.8.4-NO-STALE-TRADING"
 local PROTOCOL = "quid_fx"
 local BANK_PROTOCOL = "quid_bank"
 local BANK_TIMEOUT = 5
@@ -67,10 +67,11 @@ local BANK_TIMEOUT = 5
 local ORACLE_LATEST_URL = "http://145.241.202.103:8000/latest"
 local ORACLE_HEALTH_URL = "http://145.241.202.103:8000/health"
 
-local POLL_SECONDS = 0.10
+local POLL_SECONDS = 0.50
 local DRAW_SECONDS = 0.50
 local SAVE_SECONDS = 10
-local STALE_AFTER_MS = 5000
+local STALE_AFTER_MS = 999999999
+local HTTP_WATCHDOG_MS = 3000
 
 local TIMEFRAMES = {
   ["1m"]  = { seconds = 60,  max = 1440 }, -- 24h
@@ -229,9 +230,13 @@ local function ageText(ms)
 end
 
 local function quality()
-  if last_success_ms <= 0 then return "OFFLINE" end
-  if nowMs() - last_success_ms > STALE_AFTER_MS then return "STALE" end
-  return "LIVE"
+  -- Do not mark the market stale just because ComputerCraft missed/dropped an
+  -- HTTP event while the server was busy settling a trade with the bank.
+  -- Once we have a valid last tick, that tick remains the current market price
+  -- until a newer tick arrives.
+  if last_tick and tonumber(last_tick.pair_price) then return "LIVE" end
+  if last_success_ms > 0 then return "LIVE" end
+  return "OFFLINE"
 end
 
 local function colourForQuality(q)
@@ -262,9 +267,18 @@ local function openModem()
   return false
 end
 
+local function clearPendingHttpBeforeBlocking(reason)
+  if pending_http then
+    pending_http = false
+    skipped_polls = skipped_polls + 1
+    last_error = "HTTP poll resumed after blocking bank call" .. (reason and (": " .. tostring(reason)) or "")
+  end
+end
+
 local function discoverBank()
   if bank_id then return true end
   if not modem_name then return false end
+  clearPendingHttpBeforeBlocking("bank discovery")
 
   for attempt = 1, 4 do
     rednet.broadcast({ type = "ping", client = "forexserver", version = VERSION }, BANK_PROTOCOL)
@@ -285,6 +299,7 @@ local function bankRequest(req)
     return false, "Bank server unavailable"
   end
 
+  clearPendingHttpBeforeBlocking("bank request")
   rednet.send(bank_id, req, BANK_PROTOCOL)
   local sender, msg = rednet.receive(BANK_PROTOCOL, BANK_TIMEOUT)
   if sender ~= bank_id or type(msg) ~= "table" then
@@ -427,8 +442,18 @@ end
 
 local function requestOracleLatest()
   if pending_http then
-    skipped_polls = skipped_polls + 1
-    return
+    local age = nowMs() - (last_request_ms or 0)
+    if age > HTTP_WATCHDOG_MS then
+      -- ComputerCraft can occasionally never deliver http_success/http_failure.
+      -- If we leave pending_http stuck true forever, polling stops and quality
+      -- becomes stale even though the oracle is still fine.
+      pending_http = false
+      failure_count = failure_count + 1
+      last_error = "HTTP watchdog reset after " .. tostring(age) .. "ms"
+    else
+      skipped_polls = skipped_polls + 1
+      return
+    end
   end
 
   if not http or type(http.request) ~= "function" then
@@ -1139,7 +1164,8 @@ local function draw()
   at(2,14, "Polling:      every " .. tostring(POLL_SECONDS) .. "s", colors.yellow)
   at(2,15, "Samples:      " .. tostring(sample_count) .. "  Changes: " .. tostring(change_count) .. "  Fails: " .. tostring(failure_count), colors.lightGray)
   at(2,16, "Stored candles 1m/5m/15m: " .. tostring(#candles["1m"]) .. " / " .. tostring(#candles["5m"]) .. " / " .. tostring(#candles["15m"]), colors.lightGray)
-  at(2,17, "Last success: " .. ageText(last_success_ms) .. " ago  Response: " .. tostring(last_response_ms or 0) .. "ms", colors.lightGray)
+  local pendingInfo = pending_http and ("pending " .. ageText(last_request_ms)) or "idle"
+  at(2,17, "Last tick: " .. ageText(last_success_ms) .. " ago  Response: " .. tostring(last_response_ms or 0) .. "ms  HTTP: " .. pendingInfo, colors.lightGray)
   at(2,18, "Orders:       open " .. tostring(#active_orders) .. "  P/L " .. fmt(ordersSnapshot(nil).unrealized_pnl_q, 2) .. " Q  Bank " .. tostring(bank_id or "search"), colors.yellow)
 
   at(2,20, "Recent 5m closes", colors.white)
