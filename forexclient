@@ -67,7 +67,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION = "0.9.2-TABLE-CHART-FIX"
+local VERSION = "0.9.3-CANDLE-SCALE-FIX"
 local FX_PROTOCOL = "quid_fx"
 local BANK_PROTOCOL = "quid_bank"
 local BANK_TIMEOUT = 5
@@ -114,7 +114,7 @@ local MAINTENANCE_MARGIN_RATE = 0.50
 -- range so the chart looks alive without every tiny move becoming an ATH.
 local HARD_MIN_PRICE = 0.90000
 local HARD_MAX_PRICE = 1.90000
-local MIN_VISIBLE_RANGE = 0.01000
+local MIN_VISIBLE_RANGE = 0.00080
 local PRICE_EPS = 0.000005
 
 local STATE_FILE = "data/forex_client_state.db"
@@ -1153,22 +1153,23 @@ local function visibleCandles(maxCandles)
 end
 
 local function drawTradingCandles(x, y, w, h)
-  -- CraftOS/Lua 5.1 has a hard local-variable limit per function.
-  -- This chart intentionally uses one table as scratch space instead of dozens
-  -- of locals. The client should only render the server's latest candle data;
-  -- the server is authoritative for movement, stops, pending entries, P/L, etc.
+  -- Client is display-only. Server owns live price, candles, stops, pending
+  -- entries, P/L and liquidation. This renderer keeps the old candle look,
+  -- but uses one scratch table to avoid CraftOS's 200-local limit.
   local d = {}
 
   fill(x, y, w, h, colors.black)
 
   d.axisW = 10
   d.chartW = w - d.axisW - 1
-  if d.chartW < 8 or h < 4 then
+  if d.chartW < 12 or h < 5 then
     at(x, y, "Window too small", colors.orange)
     return
   end
 
-  d.maxN = math.max(1, math.min(d.chartW, 80))
+  d.candleW = d.chartW >= 70 and 3 or 2
+  d.span = d.candleW + 1
+  d.maxN = math.max(1, math.floor(d.chartW / d.span))
   d.list = visibleCandles(d.maxN)
 
   if #d.list < 1 then
@@ -1178,6 +1179,7 @@ local function drawTradingCandles(x, y, w, h)
 
   d.lo = nil
   d.hi = nil
+  d.prevClose = nil
 
   for i = 1, #d.list do
     d.c = d.list[i]
@@ -1185,6 +1187,8 @@ local function drawTradingCandles(x, y, w, h)
     d.cl = tonumber(d.c.close)
     d.hp = tonumber(d.c.high)
     d.lp = tonumber(d.c.low)
+
+    if d.prevClose then d.o = d.prevClose end
 
     if d.o and d.cl and d.hp and d.lp then
       if d.hp < d.o then d.hp = d.o end
@@ -1194,6 +1198,7 @@ local function drawTradingCandles(x, y, w, h)
 
       d.lo = d.lo and math.min(d.lo, d.lp) or d.lp
       d.hi = d.hi and math.max(d.hi, d.hp) or d.hp
+      d.prevClose = d.cl
     end
   end
 
@@ -1202,6 +1207,9 @@ local function drawTradingCandles(x, y, w, h)
     return
   end
 
+  -- The old 0.01000 minimum made the visible chart span about 100+ pips, so
+  -- real pipette/pip movement looked flat. This is now tight enough to show
+  -- live candle movement without turning every pipette into a huge spike.
   d.range = math.max(d.hi - d.lo, MIN_VISIBLE_RANGE)
   d.mid = (d.hi + d.lo) / 2
   d.lo = d.mid - (d.range * 0.70)
@@ -1225,7 +1233,8 @@ local function drawTradingCandles(x, y, w, h)
   at(x + d.chartW + 1, d.midY, fmt((d.hi + d.lo) / 2, 5), colors.lightGray)
   at(x + d.chartW + 1, d.botY, fmt(d.lo, 5), colors.lightGray)
 
-  d.startX = x + math.max(0, d.chartW - #d.list)
+  d.startX = x + d.chartW - (#d.list * d.span) + 1
+  d.prevClose = nil
 
   for i = 1, #d.list do
     d.c = d.list[i]
@@ -1234,37 +1243,56 @@ local function drawTradingCandles(x, y, w, h)
     d.hp = tonumber(d.c.high)
     d.lp = tonumber(d.c.low)
 
+    if d.prevClose then d.o = d.prevClose end
+
     if d.o and d.cl and d.hp and d.lp then
       if d.hp < d.o then d.hp = d.o end
       if d.hp < d.cl then d.hp = d.cl end
       if d.lp > d.o then d.lp = d.o end
       if d.lp > d.cl then d.lp = d.cl end
 
-      d.xx = d.startX + i - 1
+      d.baseX = d.startX + (i - 1) * d.span
+      d.wickX = d.baseX + math.floor(d.candleW / 2)
       d.den = d.hi - d.lo
+
       d.yh = y + h - 1 - math.floor(((d.hp - d.lo) / d.den) * (h - 1) + 0.5)
       d.yl = y + h - 1 - math.floor(((d.lp - d.lo) / d.den) * (h - 1) + 0.5)
       d.yo = y + h - 1 - math.floor(((d.o - d.lo) / d.den) * (h - 1) + 0.5)
       d.yc = y + h - 1 - math.floor(((d.cl - d.lo) / d.den) * (h - 1) + 0.5)
 
       if d.yh < y then d.yh = y end
+      if d.yh > y + h - 1 then d.yh = y + h - 1 end
+      if d.yl < y then d.yl = y end
       if d.yl > y + h - 1 then d.yl = y + h - 1 end
       if d.yo < y then d.yo = y end
       if d.yo > y + h - 1 then d.yo = y + h - 1 end
       if d.yc < y then d.yc = y end
       if d.yc > y + h - 1 then d.yc = y + h - 1 end
 
+      d.top = math.min(d.yo, d.yc)
+      d.bot = math.max(d.yo, d.yc)
+
       d.col = colors.lightGray
       if d.cl > d.o + PRICE_EPS then d.col = colors.green end
       if d.cl < d.o - PRICE_EPS then d.col = colors.red end
 
       for yy = math.min(d.yh, d.yl), math.max(d.yh, d.yl) do
-        putChar(d.xx, yy, "|", colors.lightGray, colors.black)
+        putChar(d.wickX, yy, "|", colors.lightGray, colors.black)
       end
 
-      for yy = math.min(d.yo, d.yc), math.max(d.yo, d.yc) do
-        putBlock(d.xx, yy, d.col)
+      if d.top == d.bot then
+        for xx = d.baseX, d.baseX + d.candleW - 1 do
+          putChar(xx, d.top, "-", d.col, colors.black)
+        end
+      else
+        for xx = d.baseX, d.baseX + d.candleW - 1 do
+          for yy = d.top, d.bot do
+            putBlock(xx, yy, d.col)
+          end
+        end
       end
+
+      d.prevClose = d.cl
     end
   end
 end
