@@ -67,7 +67,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION = "0.8.4-QUID-LOTS-CLEAR-REJECTS"
+local VERSION = "0.9.0-STOPS-PENDING-ORDERS"
 local FX_PROTOCOL = "quid_fx"
 local BANK_PROTOCOL = "quid_bank"
 local BANK_TIMEOUT = 5
@@ -157,6 +157,7 @@ local discover_count = 0
 
 local orders = {
   active_orders = {},
+  pending_orders = {},
   closed_orders = {},
   unrealized_pnl = 0,
   open_count = 0,
@@ -171,11 +172,18 @@ local orders = {
   maintenance_margin_rate = MAINTENANCE_MARGIN_RATE,
 }
 local selected_order_id = nil
+local selected_pending_id = nil
 local last_orders_ms = 0
 local order_request_count = 0
 local lots_text = "0.01"
+local target_text = ""
+local stop_text = ""
 local lots_focused = false
+local target_focused = false
+local stop_focused = false
 local lotInputRect = nil
+local targetInputRect = nil
+local stopInputRect = nil
 
 local bank_id = nil
 local bank_session = {
@@ -673,6 +681,43 @@ local function cleanLotsText()
   lots_text = v
 end
 
+local function cleanPriceTextValue(v, allowBlank)
+  v = tostring(v or "")
+  v = v:gsub("[^0-9%.]", "")
+  local first = v:find("%.")
+  if first then
+    v = v:sub(1, first) .. v:sub(first + 1):gsub("%.", "")
+  end
+
+  if v == "" or v == "." then
+    return allowBlank and "" or "0.00000"
+  end
+
+  local n = tonumber(v)
+  if not n or n <= 0 then return allowBlank and "" or "0.00000" end
+  return string.format("%.5f", n)
+end
+
+local function cleanTargetText()
+  target_text = cleanPriceTextValue(target_text, true)
+end
+
+local function cleanStopText()
+  stop_text = cleanPriceTextValue(stop_text, true)
+end
+
+local function currentTargetPrice()
+  local n = tonumber(target_text)
+  if n and n > 0 then return n end
+  return nil
+end
+
+local function currentStopPrice()
+  local n = tonumber(stop_text)
+  if n and n > 0 then return n end
+  return nil
+end
+
 
 local function broadcastPing()
   discover_count = discover_count + 1
@@ -738,11 +783,15 @@ local function openOrder(side)
 
   local reqId = "open_" .. tostring(nowMs())
 
+  cleanStopText()
+  local stopPrice = currentStopPrice()
+
   rednet.send(server_id, {
     type = "open_order",
     symbol = active_symbol,
     side = side,
     lots = lots,
+    stop_loss_price = stopPrice,
     account_id = bank_session.citizen_id,
     username = bank_session.username,
     password = bank_session._password,
@@ -753,6 +802,107 @@ local function openOrder(side)
   }, FX_PROTOCOL)
 
   last_error = "Sending " .. tostring(side) .. " " .. tostring(lots) .. " lots..."
+end
+
+local function placePendingOrder(side)
+  if not server_id then return end
+  if not bank_session.logged_in or not bank_session.citizen_id then
+    last_error = "Bank login required"
+    return
+  end
+
+  cleanLotsText()
+  cleanTargetText()
+  cleanStopText()
+
+  local lots = currentLots()
+  local target = currentTargetPrice()
+  local stopPrice = currentStopPrice()
+
+  if not lots then
+    last_error = "Enter a valid lot amount"
+    return
+  end
+  if not target then
+    last_error = "Enter a trigger price in Entry@"
+    return
+  end
+
+  local reqId = "pending_" .. tostring(nowMs())
+
+  rednet.send(server_id, {
+    type = "place_pending_order",
+    symbol = active_symbol,
+    side = side,
+    lots = lots,
+    target_price = target,
+    stop_loss_price = stopPrice,
+    account_id = bank_session.citizen_id,
+    username = bank_session.username,
+    password = bank_session._password,
+    display_name = bank_session.display_name,
+    client = "forexclient",
+    version = VERSION,
+    request_id = reqId,
+  }, FX_PROTOCOL)
+
+  last_error = "Placing " .. tostring(side) .. " pending @ " .. fmt(target, 5) .. "..."
+end
+
+local function setSelectedStopLoss()
+  if not server_id then return end
+  local id = tonumber(selected_order_id)
+  if not id and orders.active_orders and #orders.active_orders > 0 then
+    id = tonumber(orders.active_orders[1].id)
+  end
+  if not id then
+    last_error = "Select an open order first"
+    return
+  end
+
+  cleanStopText()
+  local stopPrice = currentStopPrice()
+  if not stopPrice then
+    last_error = "Enter a stop loss price first"
+    return
+  end
+
+  rednet.send(server_id, {
+    type = "set_stop_loss",
+    order_id = id,
+    stop_loss_price = stopPrice,
+    account_id = bank_session.citizen_id,
+    username = bank_session.username,
+    client = "forexclient",
+    version = VERSION,
+    request_id = "stop_" .. tostring(nowMs()),
+  }, FX_PROTOCOL)
+
+  last_error = "Setting stop loss for order " .. tostring(id) .. "..."
+end
+
+local function cancelSelectedPending()
+  if not server_id then return end
+  local id = tonumber(selected_pending_id)
+  if not id and orders.pending_orders and #orders.pending_orders > 0 then
+    id = tonumber(orders.pending_orders[1].id)
+  end
+  if not id then
+    last_error = "No selected pending order to cancel"
+    return
+  end
+
+  rednet.send(server_id, {
+    type = "cancel_pending_order",
+    pending_order_id = id,
+    account_id = bank_session.citizen_id,
+    username = bank_session.username,
+    client = "forexclient",
+    version = VERSION,
+    request_id = "cancel_pending_" .. tostring(nowMs()),
+  }, FX_PROTOCOL)
+
+  last_error = "Cancelling pending order " .. tostring(id) .. "..."
 end
 
 local function closeSelectedOrder()
@@ -940,6 +1090,7 @@ local function handleServerMessage(sender, msg)
       if msg.response.kind == "orders" then
         orders = msg.response
         if not orders.active_orders then orders.active_orders = {} end
+        if not orders.pending_orders then orders.pending_orders = {} end
         if not orders.closed_orders then orders.closed_orders = {} end
         orders.default_lots = tonumber(orders.default_lots) or DEFAULT_LOTS
         orders.min_lots = tonumber(orders.min_lots) or MIN_LOTS
@@ -961,6 +1112,12 @@ local function handleServerMessage(sender, msg)
           elseif msg.order.status == "OPEN" then
             refreshBankBalanceNow()
             last_error = "Order " .. tostring(msg.order.id or "?") .. " opened"
+          end
+        elseif type(msg.pending_order) == "table" then
+          if msg.pending_order.status == "PENDING" then
+            last_error = "Pending order " .. tostring(msg.pending_order.id or "?") .. " placed"
+          elseif msg.pending_order.status == "CANCELLED" then
+            last_error = "Pending order " .. tostring(msg.pending_order.id or "?") .. " cancelled"
           end
         end
 
@@ -1216,12 +1373,10 @@ local function handleClick(x, y)
   end
 
   if lotInputRect and y == lotInputRect.y and x >= lotInputRect.x1 and x <= lotInputRect.x2 then
-    if not lots_focused then
-      -- Click acts like selecting the whole field. This avoids getting stuck
-      -- appending onto the default 0.01 value.
-      lots_text = ""
-    end
+    if not lots_focused then lots_text = "" end
     lots_focused = true
+    target_focused = false
+    stop_focused = false
     draw()
     return true
   else
@@ -1229,10 +1384,36 @@ local function handleClick(x, y)
     lots_focused = false
   end
 
+  if targetInputRect and y == targetInputRect.y and x >= targetInputRect.x1 and x <= targetInputRect.x2 then
+    target_focused = true
+    lots_focused = false
+    stop_focused = false
+    draw()
+    return true
+  else
+    if target_focused then cleanTargetText() end
+    target_focused = false
+  end
+
+  if stopInputRect and y == stopInputRect.y and x >= stopInputRect.x1 and x <= stopInputRect.x2 then
+    stop_focused = true
+    lots_focused = false
+    target_focused = false
+    draw()
+    return true
+  else
+    if stop_focused then cleanStopText() end
+    stop_focused = false
+  end
+
   for _, r in ipairs(buttonRects) do
     if y >= r.y1 and y <= r.y2 and x >= r.x1 and x <= r.x2 then
       if r.action == "BUY" then openOrder("BUY") end
       if r.action == "SELL" then openOrder("SELL") end
+      if r.action == "BUY_PENDING" then placePendingOrder("BUY") end
+      if r.action == "SELL_PENDING" then placePendingOrder("SELL") end
+      if r.action == "SET_STOP" then setSelectedStopLoss() end
+      if r.action == "CANCEL_PENDING" then cancelSelectedPending() end
       if r.action == "CLOSE" then closeSelectedOrder() end
       return true
     end
@@ -1240,7 +1421,13 @@ local function handleClick(x, y)
 
   for _, r in ipairs(orderRowRects) do
     if y == r.y and x >= r.x1 and x <= r.x2 then
-      selected_order_id = r.id
+      if r.kind == "pending" then
+        selected_pending_id = r.id
+        selected_order_id = nil
+      else
+        selected_order_id = r.id
+        selected_pending_id = nil
+      end
       draw()
       return true
     end
@@ -1278,10 +1465,14 @@ local function drawOrdersPanel(x, y, w, h)
   buttonRects = {}
   orderRowRects = {}
   lotInputRect = nil
+  targetInputRect = nil
+  stopInputRect = nil
   fill(x, y, w, h, colors.black)
 
   local bal = round2(tonumber(bank_session.balance or 0))
   if not lots_focused then cleanLotsText() end
+  if not target_focused then cleanTargetText() end
+  if not stop_focused then cleanStopText() end
 
   local lots = currentLots() or 0
   local maxLots = maxLotsForBalanceWithTreasury(bal)
@@ -1300,36 +1491,57 @@ local function drawOrdersPanel(x, y, w, h)
   at(x, y + 1, "Used " .. qfmt(used) .. " | Open P/L " .. qfmt(floating) .. " | MarginLvl " .. tostring(level) .. "%", floating >= 0 and colors.lime or colors.red)
 
   at(x, y + 2, "Lots", colors.lightGray)
-  local inputW = 10
-  fill(x + 6, y + 2, inputW, 1, lots_focused and colors.white or colors.gray)
-  at(x + 7, y + 2, tostring(lots_text):sub(1, inputW - 2), colors.black, lots_focused and colors.white or colors.gray)
-  lotInputRect = { x1 = x + 6, x2 = x + 6 + inputW - 1, y = y + 2 }
+  local lotW = 8
+  fill(x + 6, y + 2, lotW, 1, lots_focused and colors.white or colors.gray)
+  at(x + 7, y + 2, tostring(lots_text):sub(1, lotW - 2), colors.black, lots_focused and colors.white or colors.gray)
+  lotInputRect = { x1 = x + 6, x2 = x + 6 + lotW - 1, y = y + 2 }
 
-  at(x + 20, y + 2, "Max " .. string.format("%.2f", maxLots) .. " lots | Margin " .. qfmt(userMargin) .. " | 2-pip fee " .. qfmt(spreadFee) .. " | Req " .. qfmt(required), afford and colors.lightGray or colors.red)
+  at(x + 16, y + 2, "Entry@", colors.lightGray)
+  local targetW = 10
+  fill(x + 23, y + 2, targetW, 1, target_focused and colors.white or colors.gray)
+  at(x + 24, y + 2, tostring(target_text):sub(1, targetW - 2), colors.black, target_focused and colors.white or colors.gray)
+  targetInputRect = { x1 = x + 23, x2 = x + 23 + targetW - 1, y = y + 2 }
+
+  at(x + 35, y + 2, "Stop", colors.lightGray)
+  local stopW = 10
+  fill(x + 41, y + 2, stopW, 1, stop_focused and colors.white or colors.gray)
+  at(x + 42, y + 2, tostring(stop_text):sub(1, stopW - 2), colors.black, stop_focused and colors.white or colors.gray)
+  stopInputRect = { x1 = x + 41, x2 = x + 41 + stopW - 1, y = y + 2 }
+
+  at(x + 53, y + 2, "Max " .. string.format("%.2f", maxLots) .. " | Req " .. qfmt(required), afford and colors.lightGray or colors.red)
 
   if lots_focused then
-    term.setCursorPos(x + 7 + math.min(#lots_text, inputW - 2), y + 2)
+    term.setCursorPos(x + 7 + math.min(#lots_text, lotW - 2), y + 2)
+    term.setCursorBlink(true)
+  elseif target_focused then
+    term.setCursorPos(x + 24 + math.min(#target_text, targetW - 2), y + 2)
+    term.setCursorBlink(true)
+  elseif stop_focused then
+    term.setCursorPos(x + 42 + math.min(#stop_text, stopW - 2), y + 2)
     term.setCursorBlink(true)
   end
 
-  local buyW = math.max(12, math.floor(w * 0.18))
-  local sellW = math.max(12, math.floor(w * 0.18))
-  local closeW = math.max(10, math.floor(w * 0.12))
-  local btnH = math.min(3, math.max(1, h - 8))
   local btnY = y + 3
-
-  drawBigButton(x, btnY, buyW, btnH, "BUY", "BUY", afford and colors.green or colors.gray, colors.white)
-  drawBigButton(x + buyW + 2, btnY, sellW, btnH, "SELL", "SELL", afford and colors.red or colors.gray, colors.white)
-  drawBigButton(x + buyW + sellW + 4, btnY, closeW, btnH, "CLOSE", "CLOSE", colors.gray, colors.white)
+  local btnH = 2
+  local bw = math.max(7, math.floor(w / 9))
+  drawBigButton(x, btnY, bw, btnH, "BUY", "BUY", afford and colors.green or colors.gray, colors.white)
+  drawBigButton(x + bw + 1, btnY, bw, btnH, "SELL", "SELL", afford and colors.red or colors.gray, colors.white)
+  drawBigButton(x + (bw + 1) * 2, btnY, bw, btnH, "BUY@", "BUY_PENDING", colors.green, colors.white)
+  drawBigButton(x + (bw + 1) * 3, btnY, bw, btnH, "SELL@", "SELL_PENDING", colors.red, colors.white)
+  drawBigButton(x + (bw + 1) * 4, btnY, bw, btnH, "STOP", "SET_STOP", colors.orange, colors.white)
+  drawBigButton(x + (bw + 1) * 5, btnY, bw, btnH, "CANCEL", "CANCEL_PENDING", colors.gray, colors.white)
+  drawBigButton(x + (bw + 1) * 6, btnY, bw, btnH, "CLOSE", "CLOSE", colors.gray, colors.white)
 
   local headerY = btnY + btnH + 1
-  at(x, headerY, "ID Side Lots Margin Fee Entry    Live     P/L   M%", colors.gray)
+  at(x, headerY, "OPEN: ID Side Lots Margin Fee Entry    Live     P/L    Stop", colors.gray)
 
   local openOrders = orders.active_orders or {}
-  local maxRows = math.max(1, h - btnH - 6)
-  for i = 1, math.min(#openOrders, maxRows) do
+  local rowY = headerY + 1
+  local maxY = y + h - 1
+
+  for i = 1, #openOrders do
+    if rowY > maxY then break end
     local o = openOrders[i]
-    local rowY = headerY + i
     local id = tonumber(o.id)
     local selected = selected_order_id and id == tonumber(selected_order_id)
     local side = tostring(o.side or "?")
@@ -1346,12 +1558,38 @@ local function drawOrdersPanel(x, y, w, h)
     at(x + 29, rowY, fmt(o.entry_price, 5), colors.white, bg)
     at(x + 39, rowY, fmt(o.live_price, 5), colors.white, bg)
     at(x + 49, rowY, qfmt(pnl), pnlColRow, bg)
-    at(x + 60, rowY, tostring(o.margin_level or 0) .. "%", (tonumber(o.margin_level or 0) < 100) and colors.red or colors.lightGray, bg)
-    orderRowRects[#orderRowRects + 1] = { id = id, x1 = x, x2 = x + w - 1, y = rowY }
+    at(x + 61, rowY, fmt(o.stop_loss_price, 5), o.stop_loss_price and colors.orange or colors.gray, bg)
+    orderRowRects[#orderRowRects + 1] = { kind = "open", id = id, x1 = x, x2 = x + w - 1, y = rowY }
+    rowY = rowY + 1
   end
 
-  if #openOrders == 0 then
-    at(x, headerY + 2, "Enter lots, then BUY/SELL. Treasury backs leverage automatically.", colors.gray)
+  if rowY <= maxY then
+    rowY = rowY + 1
+    at(x, rowY, "PENDING: ID Side Lots Target   Stop     Trigger", colors.gray)
+    rowY = rowY + 1
+  end
+
+  local pendingOrders = orders.pending_orders or {}
+  for i = 1, #pendingOrders do
+    if rowY > maxY then break end
+    local p = pendingOrders[i]
+    local id = tonumber(p.id)
+    local selected = selected_pending_id and id == tonumber(selected_pending_id)
+    local side = tostring(p.side or "?")
+    local sideCol = side == "BUY" and colors.green or colors.red
+    local bg = selected and colors.blue or colors.black
+    at(x, rowY, string.format("%-2s", tostring(id or "?")), colors.white, bg)
+    at(x + 3, rowY, string.format("%-4s", side), sideCol, bg)
+    at(x + 8, rowY, string.format("%-5s", tostring(p.lots or "?")), colors.lightGray, bg)
+    at(x + 14, rowY, fmt(p.target_price, 5), colors.yellow, bg)
+    at(x + 24, rowY, fmt(p.stop_loss_price, 5), p.stop_loss_price and colors.orange or colors.gray, bg)
+    at(x + 34, rowY, tostring(p.trigger_dir or "?"), colors.lightGray, bg)
+    orderRowRects[#orderRowRects + 1] = { kind = "pending", id = id, x1 = x, x2 = x + w - 1, y = rowY }
+    rowY = rowY + 1
+  end
+
+  if #openOrders == 0 and #pendingOrders == 0 and rowY <= maxY then
+    at(x, rowY, "Market: BUY/SELL. Pending: enter Entry@ then BUY@/SELL@. Stop: enter Stop and press STOP.", colors.gray)
   end
 end
 
@@ -1516,34 +1754,54 @@ local function main()
       -- Monitor is display-only. All control stays on the computer terminal.
 
     elseif ev[1] == "char" then
-      if lots_focused then
-        local ch = tostring(ev[2] or "")
-        if #lots_text < 8 then
-          if ch:match("[0-9]") then
-            lots_text = tostring(lots_text or "") .. ch
-            draw()
-          elseif ch == "." and not tostring(lots_text or ""):find("%.") then
-            if lots_text == "" then lots_text = "0" end
-            lots_text = tostring(lots_text or "") .. "."
-            draw()
-          end
+      local ch = tostring(ev[2] or "")
+
+      local function appendText(v, maxLen)
+        v = tostring(v or "")
+        if #v >= maxLen then return v end
+        if ch:match("[0-9]") then
+          return v .. ch
+        elseif ch == "." and not v:find("%.") then
+          if v == "" then v = "0" end
+          return v .. "."
         end
+        return v
+      end
+
+      if lots_focused then
+        lots_text = appendText(lots_text, 8)
+        draw()
+      elseif target_focused then
+        target_text = appendText(target_text, 10)
+        draw()
+      elseif stop_focused then
+        stop_text = appendText(stop_text, 10)
+        draw()
       end
 
     elseif ev[1] == "key" then
-      if lots_focused then
+      if lots_focused or target_focused or stop_focused then
         if ev[2] == keys.backspace then
-          lots_text = tostring(lots_text or "")
-          lots_text = lots_text:sub(1, -2)
+          if lots_focused then lots_text = tostring(lots_text or ""):sub(1, -2)
+          elseif target_focused then target_text = tostring(target_text or ""):sub(1, -2)
+          elseif stop_focused then stop_text = tostring(stop_text or ""):sub(1, -2) end
           draw()
         elseif ev[2] == keys.enter then
+          if lots_focused then cleanLotsText() end
+          if target_focused then cleanTargetText() end
+          if stop_focused then cleanStopText() end
           lots_focused = false
-          cleanLotsText()
+          target_focused = false
+          stop_focused = false
           draw()
         elseif ev[2] == keys.escape then
           lots_focused = false
+          target_focused = false
+          stop_focused = false
           if tostring(lots_text or "") == "" then lots_text = "0.01" end
           cleanLotsText()
+          cleanTargetText()
+          cleanStopText()
           draw()
         end
       end
