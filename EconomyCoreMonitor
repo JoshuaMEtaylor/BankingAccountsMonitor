@@ -61,7 +61,7 @@ for i = 2, #args do
   runtime_args[#runtime_args + 1] = args[i]
 end
 
-local VERSION         = "0.5.25-FX-SPREAD-GDP"
+local VERSION         = "0.5.26-TAVERN-GDP"
 local PROTOCOL        = "quid_bank"
 local CONTRACT_PROTOCOL = "quid_contracts"
 local DB_TIMEOUT      = 5
@@ -1215,13 +1215,15 @@ local function fallbackSnapshot()
 
   -- GDP is assembled from ContractServer fulfilled contracts plus bank ledger
   -- non-contract output. Bank-side output includes restaurant/service output and
-  -- financial service revenue from leveraged FX spread fees. Trader P/L is not GDP.
+  -- financial service revenue from leveraged FX spread fees, and state-owned Tavern lodging revenue. Trader P/L is not GDP.
   -- The bank request explicitly excludes contract payouts so we do not double
   -- count contracts already read from ContractServer.
   local bankServiceGdp = 0
   local bankHospitalityGdp = 0
+  local bankTavernGdp = 0
   local bankFinancialGdp = 0
   local bankServiceEvents = 0
+  local bankTavernEvents = 0
   local bankFinancialEvents = 0
   local bankGdpRes = nil
   local okGdp, gdpRes = cachedDbRequest({
@@ -1236,8 +1238,10 @@ local function fallbackSnapshot()
     -- dining/service output plus financial spread-fee output.
     bankServiceGdp = num(gdpRes.non_contract_gdp or gdpRes.service_gdp or gdpRes.services_gdp or gdpRes.gdp or gdpRes.private_gdp) or 0
     bankHospitalityGdp = num(gdpRes.hospitality_gdp or gdpRes.meal_gdp) or 0
+    bankTavernGdp = num(gdpRes.tavern_gdp or gdpRes.lodging_gdp) or 0
     bankFinancialGdp = num(gdpRes.financial_gdp or gdpRes.finance_gdp or gdpRes.forex_spread_fee_gdp) or 0
     bankServiceEvents = num(gdpRes.service_events or gdpRes.hospitality_events or gdpRes.transaction_count) or 0
+    bankTavernEvents = num(gdpRes.tavern_events or gdpRes.lodging_events) or 0
     bankFinancialEvents = num(gdpRes.financial_events or gdpRes.forex_spread_fee_events) or 0
   else
     endpointErrors[#endpointErrors + 1] = "service_gdp=" .. shortText(tostring(gdpRes), 36)
@@ -1247,11 +1251,11 @@ local function fallbackSnapshot()
   local outputStatus = "Waiting for ContractServer / bank output GDP"
   if contractEco and contractEco.connected then
     contractGdp = tonumber(contractEco.gdp_365d or contractEco.gdp_24h) or 0
-    outputStatus = "GDP = fulfilled contracts + bank service/financial output"
+    outputStatus = "GDP = fulfilled contracts + bank service/financial/Tavern output"
   elseif bankServiceGdp > 0 then
-    outputStatus = "GDP = bank service/financial output; ContractServer unavailable"
+    outputStatus = "GDP = bank service/financial/Tavern output; ContractServer unavailable"
   else
-    outputStatus = "Waiting for fulfilled contracts / service or FX fee output"
+    outputStatus = "Waiting for fulfilled contracts / service, Tavern, or FX fee output"
   end
 
   local gdp = contractGdp + bankServiceGdp
@@ -1307,10 +1311,12 @@ local function fallbackSnapshot()
     contracts = contractEco,
     service_gdp = bankServiceGdp,
     hospitality_gdp = bankHospitalityGdp,
+    tavern_gdp = bankTavernGdp,
     financial_gdp = bankFinancialGdp,
     contract_gdp = contractGdp,
     bank_gdp = bankGdpRes,
     service_events = bankServiceEvents,
+    tavern_events = bankTavernEvents,
     financial_events = bankFinancialEvents,
     _raw_accounts = accounts,
     accounts_from_previous = accountsFromPrevious,
@@ -1636,18 +1642,23 @@ local function drawScaleCard(x, y, w, h, snap)
 
   local svc = snap and snap.service_gdp or nil
   local hosp = snap and snap.hospitality_gdp or nil
+  local tavern = snap and snap.tavern_gdp or nil
   local fin = snap and snap.financial_gdp or nil
   local conGdp = snap and snap.contract_gdp or nil
   local serviceLine = "GDP C/B/F: " .. fmtMoney(conGdp or 0) .. " / " .. fmtMoney(svc or 0) .. " / " .. fmtMoney(fin or 0)
   writeAt(x + 2, y + 7, shortText(serviceLine, w - 4), (svc and svc > 0) and C.good or C.dim, C.bg)
 
   local detailY = y + 8
-  if fin and fin > 0 then
+  if tavern and tavern > 0 then
+    writeAt(x + 2, detailY, shortText("Tavern lodging GDP: " .. fmtMoney(tavern), w - 4), colors.yellow, C.bg)
+    detailY = detailY + 1
+  end
+  if fin and fin > 0 and detailY <= y + 9 then
     writeAt(x + 2, detailY, shortText("FX spread-fee GDP: " .. fmtMoney(fin), w - 4), colors.yellow, C.bg)
     detailY = detailY + 1
   end
   if hosp and hosp > 0 and detailY <= y + 9 then
-    writeAt(x + 2, detailY, shortText("Restaurant/meals GDP: " .. fmtMoney(hosp), w - 4), colors.yellow, C.bg)
+    writeAt(x + 2, detailY, shortText("Hospitality GDP: " .. fmtMoney(hosp), w - 4), colors.yellow, C.bg)
     detailY = detailY + 1
   end
 
