@@ -67,7 +67,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION = "0.9.1-LOCAL-LIMIT-FIX"
+local VERSION = "0.9.2-TABLE-CHART-FIX"
 local FX_PROTOCOL = "quid_fx"
 local BANK_PROTOCOL = "quid_bank"
 local BANK_TIMEOUT = 5
@@ -1153,139 +1153,118 @@ local function visibleCandles(maxCandles)
 end
 
 local function drawTradingCandles(x, y, w, h)
+  -- CraftOS/Lua 5.1 has a hard local-variable limit per function.
+  -- This chart intentionally uses one table as scratch space instead of dozens
+  -- of locals. The client should only render the server's latest candle data;
+  -- the server is authoritative for movement, stops, pending entries, P/L, etc.
+  local d = {}
+
   fill(x, y, w, h, colors.black)
 
-  local axisW = 10
-  local chartW = w - axisW - 1
-  if chartW < 12 or h < 5 then
-    at(x, y, "Window too small for chart", colors.orange)
+  d.axisW = 10
+  d.chartW = w - d.axisW - 1
+  if d.chartW < 8 or h < 4 then
+    at(x, y, "Window too small", colors.orange)
     return
   end
 
-  local candleW = chartW >= 70 and 3 or 2
-  local span = candleW + 1
-  local maxN = math.max(1, math.floor(chartW / span))
-  local list = visibleCandles(maxN)
+  d.maxN = math.max(1, math.min(d.chartW, 80))
+  d.list = visibleCandles(d.maxN)
 
-  if #list == 0 then
-    at(x + 2, y + math.floor(h / 2), "Awaiting " .. active_tf .. " candle history...", colors.gray)
+  if #d.list < 1 then
+    at(x + 2, y + math.floor(h / 2), "Awaiting server candles...", colors.gray)
     return
   end
 
-  local lo = nil
-  local hi = nil
-  local lastClose = nil
+  d.lo = nil
+  d.hi = nil
 
-  for i = 1, #list do
-    local c = list[i]
-    local o = tonumber(c.open)
-    local cl = tonumber(c.close)
-    local hp = tonumber(c.high)
-    local lp = tonumber(c.low)
+  for i = 1, #d.list do
+    d.c = d.list[i]
+    d.o = tonumber(d.c.open)
+    d.cl = tonumber(d.c.close)
+    d.hp = tonumber(d.c.high)
+    d.lp = tonumber(d.c.low)
 
-    if i > 1 and lastClose then o = lastClose end
-    if o and cl and hp and lp then
-      if hp < o then hp = o end
-      if hp < cl then hp = cl end
-      if lp > o then lp = o end
-      if lp > cl then lp = cl end
-      lo = lo and math.min(lo, lp) or lp
-      hi = hi and math.max(hi, hp) or hp
-      lastClose = cl
+    if d.o and d.cl and d.hp and d.lp then
+      if d.hp < d.o then d.hp = d.o end
+      if d.hp < d.cl then d.hp = d.cl end
+      if d.lp > d.o then d.lp = d.o end
+      if d.lp > d.cl then d.lp = d.cl end
+
+      d.lo = d.lo and math.min(d.lo, d.lp) or d.lp
+      d.hi = d.hi and math.max(d.hi, d.hp) or d.hp
     end
   end
 
-  if not lo or not hi then return end
-
-  local range = hi - lo
-  local mid = (hi + lo) / 2
-  local targetRange = math.max(range * 1.35, MIN_VISIBLE_RANGE)
-  local chartLo = mid - (targetRange / 2)
-  local chartHi = mid + (targetRange / 2)
-
-  if chartLo < HARD_MIN_PRICE then
-    chartHi = chartHi + (HARD_MIN_PRICE - chartLo)
-    chartLo = HARD_MIN_PRICE
-  end
-  if chartHi > HARD_MAX_PRICE then
-    chartLo = chartLo - (chartHi - HARD_MAX_PRICE)
-    chartHi = HARD_MAX_PRICE
-  end
-  if chartLo < HARD_MIN_PRICE then chartLo = HARD_MIN_PRICE end
-  if chartHi <= chartLo then chartHi = chartLo + MIN_VISIBLE_RANGE end
-
-  local topY = y
-  local midY = y + math.floor((h - 1) / 2)
-  local botY = y + h - 1
-
-  for xx = x, x + chartW - 1 do
-    putChar(xx, topY, ".", colors.gray, colors.black)
-    putChar(xx, midY, ".", colors.gray, colors.black)
-    putChar(xx, botY, ".", colors.gray, colors.black)
+  if not d.lo or not d.hi then
+    at(x + 2, y + math.floor(h / 2), "No usable candle prices", colors.orange)
+    return
   end
 
-  at(x + chartW + 1, topY, fmt(chartHi, 5), colors.lightGray)
-  at(x + chartW + 1, midY, fmt((chartHi + chartLo) / 2, 5), colors.lightGray)
-  at(x + chartW + 1, botY, fmt(chartLo, 5), colors.lightGray)
+  d.range = math.max(d.hi - d.lo, MIN_VISIBLE_RANGE)
+  d.mid = (d.hi + d.lo) / 2
+  d.lo = d.mid - (d.range * 0.70)
+  d.hi = d.mid + (d.range * 0.70)
 
-  local startX = x + chartW - (#list * span) + 1
-  lastClose = nil
+  if d.lo < HARD_MIN_PRICE then d.lo = HARD_MIN_PRICE end
+  if d.hi > HARD_MAX_PRICE then d.hi = HARD_MAX_PRICE end
+  if d.hi <= d.lo then d.hi = d.lo + MIN_VISIBLE_RANGE end
 
-  for i = 1, #list do
-    local c = list[i]
-    local o = tonumber(c.open)
-    local cl = tonumber(c.close)
-    local hp = tonumber(c.high)
-    local lp = tonumber(c.low)
+  d.topY = y
+  d.midY = y + math.floor((h - 1) / 2)
+  d.botY = y + h - 1
 
-    if i > 1 and lastClose then o = lastClose end
+  for xx = x, x + d.chartW - 1 do
+    putChar(xx, d.topY, ".", colors.gray, colors.black)
+    putChar(xx, d.midY, ".", colors.gray, colors.black)
+    putChar(xx, d.botY, ".", colors.gray, colors.black)
+  end
 
-    if o and cl and hp and lp then
-      if hp < o then hp = o end
-      if hp < cl then hp = cl end
-      if lp > o then lp = o end
-      if lp > cl then lp = cl end
+  at(x + d.chartW + 1, d.topY, fmt(d.hi, 5), colors.lightGray)
+  at(x + d.chartW + 1, d.midY, fmt((d.hi + d.lo) / 2, 5), colors.lightGray)
+  at(x + d.chartW + 1, d.botY, fmt(d.lo, 5), colors.lightGray)
 
-      local baseX = startX + (i - 1) * span
-      local wickX = baseX + math.floor(candleW / 2)
-      local denom = chartHi - chartLo
+  d.startX = x + math.max(0, d.chartW - #d.list)
 
-      local yh = y + h - 1 - math.floor(((hp - chartLo) / denom) * (h - 1) + 0.5)
-      local yl = y + h - 1 - math.floor(((lp - chartLo) / denom) * (h - 1) + 0.5)
-      local yo = y + h - 1 - math.floor(((o - chartLo) / denom) * (h - 1) + 0.5)
-      local yc = y + h - 1 - math.floor(((cl - chartLo) / denom) * (h - 1) + 0.5)
+  for i = 1, #d.list do
+    d.c = d.list[i]
+    d.o = tonumber(d.c.open)
+    d.cl = tonumber(d.c.close)
+    d.hp = tonumber(d.c.high)
+    d.lp = tonumber(d.c.low)
 
-      if yh < y then yh = y end
-      if yl > y + h - 1 then yl = y + h - 1 end
-      if yo < y then yo = y end
-      if yo > y + h - 1 then yo = y + h - 1 end
-      if yc < y then yc = y end
-      if yc > y + h - 1 then yc = y + h - 1 end
+    if d.o and d.cl and d.hp and d.lp then
+      if d.hp < d.o then d.hp = d.o end
+      if d.hp < d.cl then d.hp = d.cl end
+      if d.lp > d.o then d.lp = d.o end
+      if d.lp > d.cl then d.lp = d.cl end
 
-      local bodyTop = math.min(yo, yc)
-      local bodyBot = math.max(yo, yc)
-      local up = cl > o + PRICE_EPS
-      local down = cl < o - PRICE_EPS
-      local col = up and colors.green or (down and colors.red or colors.lightGray)
-      local wickCol = (up or down) and colors.lightGray or colors.gray
+      d.xx = d.startX + i - 1
+      d.den = d.hi - d.lo
+      d.yh = y + h - 1 - math.floor(((d.hp - d.lo) / d.den) * (h - 1) + 0.5)
+      d.yl = y + h - 1 - math.floor(((d.lp - d.lo) / d.den) * (h - 1) + 0.5)
+      d.yo = y + h - 1 - math.floor(((d.o - d.lo) / d.den) * (h - 1) + 0.5)
+      d.yc = y + h - 1 - math.floor(((d.cl - d.lo) / d.den) * (h - 1) + 0.5)
 
-      for yy = yh, yl do
-        putChar(wickX, yy, "|", wickCol, colors.black)
+      if d.yh < y then d.yh = y end
+      if d.yl > y + h - 1 then d.yl = y + h - 1 end
+      if d.yo < y then d.yo = y end
+      if d.yo > y + h - 1 then d.yo = y + h - 1 end
+      if d.yc < y then d.yc = y end
+      if d.yc > y + h - 1 then d.yc = y + h - 1 end
+
+      d.col = colors.lightGray
+      if d.cl > d.o + PRICE_EPS then d.col = colors.green end
+      if d.cl < d.o - PRICE_EPS then d.col = colors.red end
+
+      for yy = math.min(d.yh, d.yl), math.max(d.yh, d.yl) do
+        putChar(d.xx, yy, "|", colors.lightGray, colors.black)
       end
 
-      if bodyTop == bodyBot then
-        for xx = baseX, baseX + candleW - 1 do
-          putChar(xx, bodyTop, "-", col, colors.black)
-        end
-      else
-        for xx = baseX, baseX + candleW - 1 do
-          for yy = bodyTop, bodyBot do
-            putBlock(xx, yy, col)
-          end
-        end
+      for yy = math.min(d.yo, d.yc), math.max(d.yo, d.yc) do
+        putBlock(d.xx, yy, d.col)
       end
-
-      lastClose = cl
     end
   end
 end
