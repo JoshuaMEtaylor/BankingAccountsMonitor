@@ -59,7 +59,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION = "0.9.0-SYNTHETIC-ORDER-FLOW"
+local VERSION = "0.9.1-STOPS-PENDING-ORDERS"
 local PROTOCOL = "quid_fx"
 local BANK_PROTOCOL = "quid_bank"
 local BANK_TIMEOUT = 5
@@ -122,8 +122,10 @@ local candles = {
 }
 
 local active_orders = {}
+local pending_orders = {}
 local closed_orders = {}
 local next_order_id = 1
+local next_pending_id = 1
 
 local last_tick = nil
 local last_price = nil
@@ -206,8 +208,10 @@ local function loadState()
   local o = readTable(ORDERS_FILE)
   if type(o) == "table" then
     if type(o.active_orders) == "table" then active_orders = o.active_orders end
+    if type(o.pending_orders) == "table" then pending_orders = o.pending_orders end
     if type(o.closed_orders) == "table" then closed_orders = o.closed_orders end
     next_order_id = tonumber(o.next_order_id) or next_order_id
+    next_pending_id = tonumber(o.next_pending_id) or next_pending_id
   end
 end
 
@@ -217,8 +221,10 @@ local function saveState()
   writeTable(CANDLES_FILE, candles)
   writeTable(ORDERS_FILE, {
     active_orders = active_orders,
+    pending_orders = pending_orders,
     closed_orders = closed_orders,
     next_order_id = next_order_id,
+    next_pending_id = next_pending_id,
     saved_at = state.saved_at,
     version = VERSION,
   })
@@ -641,9 +647,12 @@ local function emitSyntheticPrice(ms, price, changed)
   updateCandleSet("1m", price, ms)
   updateCandleSet("5m", price, ms)
   updateCandleSet("15m", price, ms)
-  checkAutoLiquidations()
 
   buildSyntheticTick(ms, price, changed)
+
+  processStopLosses()
+  checkAutoLiquidations()
+  processPendingOrders()
 end
 
 local function syntheticStep()
@@ -961,6 +970,256 @@ local function orderBelongsTo(order, account_id)
   return tostring(order and order.account_id or "") == account_id
 end
 
+
+local function scrubPendingOrder(p)
+  if type(p) ~= "table" then return nil end
+  local o = {}
+  for k, v in pairs(p) do
+    if k ~= "password" and k ~= "_password" then o[k] = v end
+  end
+  return o
+end
+
+local function validStopForSide(side, stopPrice, refPrice)
+  stopPrice = tonumber(stopPrice)
+  refPrice = tonumber(refPrice)
+  side = tostring(side or ""):upper()
+  if not stopPrice or stopPrice <= 0 then return true end
+  if not refPrice or refPrice <= 0 then return true end
+  if side == "BUY" then return stopPrice < refPrice end
+  if side == "SELL" then return stopPrice > refPrice end
+  return false
+end
+
+local function stopLossTriggered(order, price)
+  if type(order) ~= "table" then return false end
+  local stop = tonumber(order.stop_loss_price)
+  price = tonumber(price)
+  if not stop or stop <= 0 or not price or price <= 0 then return false end
+
+  local side = tostring(order.side or "BUY"):upper()
+  if side == "BUY" then return price <= stop end
+  if side == "SELL" then return price >= stop end
+  return false
+end
+
+local function pendingTriggerDirection(side, target, current)
+  side = tostring(side or ""):upper()
+  target = tonumber(target)
+  current = tonumber(current)
+  if not target or not current then return nil end
+
+  if side == "BUY" then
+    if target <= current then return "BELOW" end -- buy limit style
+    return "ABOVE" -- buy stop style
+  elseif side == "SELL" then
+    if target >= current then return "ABOVE" end -- sell limit style
+    return "BELOW" -- sell stop style
+  end
+
+  return nil
+end
+
+local function pendingTriggered(p, price)
+  if type(p) ~= "table" then return false end
+  price = tonumber(price)
+  local target = tonumber(p.target_price)
+  if not price or not target then return false end
+
+  local dir = tostring(p.trigger_dir or "")
+  if dir == "ABOVE" then return price >= target end
+  if dir == "BELOW" then return price <= target end
+
+  return false
+end
+
+local function addClosedRecord(record)
+  closed_orders[#closed_orders + 1] = record
+  while #closed_orders > ORDER_HISTORY_MAX do table.remove(closed_orders, 1) end
+end
+
+local function setStopLoss(orderId, account_id, stopPrice)
+  orderId = tonumber(orderId)
+  account_id = tostring(account_id or "")
+  stopPrice = tonumber(stopPrice)
+
+  if not orderId then return false, "No order id supplied" end
+  if stopPrice and stopPrice < 0 then return false, "Invalid stop loss price" end
+
+  local price = last_tick and tonumber(last_tick.pair_price)
+  if not price or price <= 0 then return false, "No live price available" end
+
+  for i = 1, #active_orders do
+    local o = active_orders[i]
+    if tonumber(o.id) == orderId then
+      if account_id ~= "" and tostring(o.account_id or "") ~= account_id then
+        return false, "Order belongs to a different bank account"
+      end
+
+      if stopPrice and stopPrice > 0 and not validStopForSide(o.side, stopPrice, price) then
+        if tostring(o.side or ""):upper() == "BUY" then
+          return false, "BUY stop loss must be below current price " .. fmt(price, 5)
+        else
+          return false, "SELL stop loss must be above current price " .. fmt(price, 5)
+        end
+      end
+
+      if stopPrice and stopPrice > 0 then
+        o.stop_loss_price = stopPrice
+      else
+        o.stop_loss_price = nil
+      end
+      o.stop_updated_at = nowMs()
+      saveState()
+      return true, decoratedOrder(o, price)
+    end
+  end
+
+  return false, "Order not found: " .. tostring(orderId)
+end
+
+local function createPendingOrder(side, lots, targetPrice, stopLossPrice, owner)
+  local price = last_tick and tonumber(last_tick.pair_price)
+  if not price or price <= 0 then return false, "No live EUR/USD price available yet" end
+
+  side = tostring(side or "BUY"):upper()
+  if side ~= "BUY" and side ~= "SELL" then return false, "Invalid side: " .. tostring(side) end
+
+  lots = normalizeLots(lots)
+  if not lots then return false, "Invalid lots. Minimum is " .. tostring(MIN_LOTS) end
+
+  targetPrice = tonumber(targetPrice)
+  if not targetPrice or targetPrice <= 0 then return false, "Enter a valid trigger price" end
+
+  stopLossPrice = tonumber(stopLossPrice)
+  if stopLossPrice and stopLossPrice <= 0 then stopLossPrice = nil end
+  if stopLossPrice and not validStopForSide(side, stopLossPrice, targetPrice) then
+    if side == "BUY" then
+      return false, "BUY stop loss must be below target price"
+    else
+      return false, "SELL stop loss must be above target price"
+    end
+  end
+
+  owner = type(owner) == "table" and owner or {}
+  local account_id = tostring(owner.account_id or "")
+  if account_id == "" then return false, "Bank login required before placing pending orders" end
+  if not owner.username or not owner.password then return false, "Bank username/password required for pending order execution" end
+
+  local funding, fundErr = fundingForTrade(lots)
+  if not funding then return false, tostring(fundErr or "Invalid lots") end
+
+  local id = next_pending_id
+  next_pending_id = next_pending_id + 1
+
+  local dir = pendingTriggerDirection(side, targetPrice, price)
+
+  local p = {
+    id = id,
+    account_id = account_id,
+    username = owner.username,
+    password = owner.password, -- private server: required so server can execute while terminal is offline
+    display_name = owner.display_name,
+    symbol = "EURUSD",
+    display_symbol = "EUR/USD",
+    side = side,
+    lots = lots,
+    target_price = targetPrice,
+    trigger_dir = dir,
+    stop_loss_price = stopLossPrice,
+    status = "PENDING",
+    created_at = nowMs(),
+    created_price = price,
+    estimated_margin_q = funding.user_margin_q,
+    estimated_spread_fee_q = funding.spread_fee_q,
+    estimated_required_q = funding.user_required_q,
+    estimated_treasury_reserve_q = funding.treasury_reserve_q,
+  }
+
+  pending_orders[#pending_orders + 1] = p
+  saveState()
+  return true, scrubPendingOrder(p)
+end
+
+local function cancelPendingOrder(pendingId, account_id)
+  pendingId = tonumber(pendingId)
+  account_id = tostring(account_id or "")
+  if not pendingId then return false, "No pending order id supplied" end
+
+  for i = 1, #pending_orders do
+    local p = pending_orders[i]
+    if tonumber(p.id) == pendingId then
+      if account_id ~= "" and tostring(p.account_id or "") ~= account_id then
+        return false, "Pending order belongs to a different bank account"
+      end
+      table.remove(pending_orders, i)
+      p.status = "CANCELLED"
+      p.cancelled_at = nowMs()
+      addClosedRecord(scrubPendingOrder(p))
+      saveState()
+      return true, scrubPendingOrder(p)
+    end
+  end
+
+  return false, "Pending order not found: " .. tostring(pendingId)
+end
+
+function processPendingOrders()
+  local price = last_tick and tonumber(last_tick.pair_price)
+  if not price or price <= 0 then return end
+
+  local i = 1
+  while i <= #pending_orders do
+    local p = pending_orders[i]
+    if pendingTriggered(p, price) then
+      table.remove(pending_orders, i)
+
+      local ok, result = openTrade(p.side, p.lots, {
+        account_id = p.account_id,
+        username = p.username,
+        password = p.password,
+        display_name = p.display_name,
+        stop_loss_price = p.stop_loss_price,
+        pending_order_id = p.id,
+        target_price = p.target_price,
+      })
+
+      if ok then
+        -- active order has been added by openTrade
+      else
+        local failed = scrubPendingOrder(p)
+        failed.status = "PENDING_FAILED"
+        failed.failed_at = nowMs()
+        failed.fail_price = price
+        failed.error = tostring(result)
+        addClosedRecord(failed)
+        saveState()
+      end
+    else
+      i = i + 1
+    end
+  end
+end
+
+function processStopLosses()
+  local price = last_tick and tonumber(last_tick.pair_price)
+  if not price or price <= 0 then return end
+
+  local i = 1
+  while i <= #active_orders do
+    local o = active_orders[i]
+    if stopLossTriggered(o, price) then
+      local ok, res = closeTrade(o.id, o.account_id, "stop_loss")
+      if not ok then
+        last_error = "Stop loss failed for order " .. tostring(o.id) .. ": " .. tostring(res)
+        i = i + 1
+      end
+    else
+      i = i + 1
+    end
+  end
+end
+
 local function ordersSnapshot(account_id)
   checkAutoLiquidations()
 
@@ -990,6 +1249,14 @@ local function ordersSnapshot(account_id)
     end
   end
 
+  local pending = {}
+  for i = 1, #pending_orders do
+    local p = pending_orders[i]
+    if orderBelongsTo(p, account_id) then
+      pending[#pending + 1] = scrubPendingOrder(p)
+    end
+  end
+
   local closed = {}
   local startIndex = math.max(1, #closed_orders - 30 + 1)
   for i = startIndex, #closed_orders do
@@ -1008,9 +1275,12 @@ local function ordersSnapshot(account_id)
     price = price,
     account_id = account_id ~= "" and account_id or nil,
     active_orders = open,
+    pending_orders = pending,
     closed_orders = closed,
     open_count = #open,
+    pending_count = #pending,
     total_open_count = #active_orders,
+    total_pending_count = #pending_orders,
     closed_count = #closed_orders,
 
     unrealized_pnl = total,
@@ -1035,7 +1305,7 @@ local function ordersSnapshot(account_id)
   }
 end
 
-local function openTrade(side, lots, owner)
+function openTrade(side, lots, owner)
   local price = last_tick and tonumber(last_tick.pair_price)
   if not price or price <= 0 then
     return false, "No live EUR/USD price available yet"
@@ -1050,6 +1320,16 @@ local function openTrade(side, lots, owner)
   if not funding then return false, tostring(fundErr or "Invalid lots") end
 
   owner = type(owner) == "table" and owner or {}
+  local stopLossPrice = tonumber(owner.stop_loss_price)
+  if stopLossPrice and stopLossPrice <= 0 then stopLossPrice = nil end
+  if stopLossPrice and not validStopForSide(side, stopLossPrice, price) then
+    if side == "BUY" then
+      return false, "BUY stop loss must be below entry/current price " .. fmt(price, 5)
+    else
+      return false, "SELL stop loss must be above entry/current price " .. fmt(price, 5)
+    end
+  end
+
   local account_id = tostring(owner.account_id or "")
   if account_id == "" then
     return false, "Bank login required before opening forex orders"
@@ -1105,6 +1385,9 @@ local function openTrade(side, lots, owner)
     treasury_reserve_tx_id = type(bankRes) == "table" and bankRes.treasury_reserve_tx_id or nil,
 
     entry_price = price,
+    stop_loss_price = stopLossPrice,
+    pending_order_id = owner.pending_order_id,
+    target_price = owner.target_price,
     opened_at = nowMs(),
     status = "OPEN",
   }
@@ -1158,7 +1441,7 @@ local function settleCloseWithBank(order, price, forcedReason)
   return true, closed
 end
 
-local function closeTrade(orderId, account_id, forcedReason)
+function closeTrade(orderId, account_id, forcedReason)
   orderId = tonumber(orderId)
   account_id = tostring(account_id or "")
   if not orderId then return false, "No order id supplied" end
@@ -1273,7 +1556,55 @@ local function handleRequest(sender, msg)
       username = msg.username,
       password = msg.password,
       display_name = msg.display_name,
+      stop_loss_price = msg.stop_loss_price,
     })
+    rednet.send(sender, {
+      success = ok,
+      response = ok and ordersSnapshot(msg.account_id) or nil,
+      order = ok and result or nil,
+      error = ok and nil or tostring(result),
+      time = nowMs(),
+      server = os.getComputerID(),
+      request_id = msg.request_id,
+    }, PROTOCOL)
+    return
+  end
+
+  if typ == "place_pending_order" then
+    local ok, result = createPendingOrder(msg.side, msg.lots, msg.target_price, msg.stop_loss_price, {
+      account_id = msg.account_id,
+      username = msg.username,
+      password = msg.password,
+      display_name = msg.display_name,
+    })
+    rednet.send(sender, {
+      success = ok,
+      response = ok and ordersSnapshot(msg.account_id) or nil,
+      pending_order = ok and result or nil,
+      error = ok and nil or tostring(result),
+      time = nowMs(),
+      server = os.getComputerID(),
+      request_id = msg.request_id,
+    }, PROTOCOL)
+    return
+  end
+
+  if typ == "cancel_pending_order" then
+    local ok, result = cancelPendingOrder(msg.pending_order_id or msg.id, msg.account_id)
+    rednet.send(sender, {
+      success = ok,
+      response = ok and ordersSnapshot(msg.account_id) or nil,
+      pending_order = ok and result or nil,
+      error = ok and nil or tostring(result),
+      time = nowMs(),
+      server = os.getComputerID(),
+      request_id = msg.request_id,
+    }, PROTOCOL)
+    return
+  end
+
+  if typ == "set_stop_loss" then
+    local ok, result = setStopLoss(msg.order_id or msg.id, msg.account_id, msg.stop_loss_price)
     rednet.send(sender, {
       success = ok,
       response = ok and ordersSnapshot(msg.account_id) or nil,
@@ -1381,7 +1712,7 @@ local function draw()
   at(2,16, "Stored candles 1m/5m/15m: " .. tostring(#candles["1m"]) .. " / " .. tostring(#candles["5m"]) .. " / " .. tostring(#candles["15m"]), colors.lightGray)
   local pendingInfo = pending_http and ("pending " .. ageText(last_request_ms)) or "idle"
   at(2,17, "Last anchor: " .. ageText(last_success_ms) .. " ago  Response: " .. tostring(last_response_ms or 0) .. "ms  HTTP: " .. pendingInfo, colors.lightGray)
-  at(2,18, "Orders:       open " .. tostring(#active_orders) .. "  P/L " .. fmt(ordersSnapshot(nil).unrealized_pnl_q, 2) .. " Q  Bank " .. tostring(bank_id or "search"), colors.yellow)
+  at(2,18, "Orders:       open " .. tostring(#active_orders) .. " pending " .. tostring(#pending_orders) .. "  P/L " .. fmt(ordersSnapshot(nil).unrealized_pnl_q, 2) .. " Q  Bank " .. tostring(bank_id or "search"), colors.yellow)
 
   at(2,20, "Recent 5m closes", colors.white)
   drawSparkline(candles["5m"], 2, 21, math.max(10, W - 4), "close", colors.lime)
