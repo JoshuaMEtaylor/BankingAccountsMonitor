@@ -59,7 +59,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION = "0.9.1-STOPS-PENDING-ORDERS"
+local VERSION = "0.9.2-LIVE-CANDLE-FLOW"
 local PROTOCOL = "quid_fx"
 local BANK_PROTOCOL = "quid_bank"
 local BANK_TIMEOUT = 5
@@ -153,6 +153,14 @@ local anchor_velocity_pips_per_sec = 0
 local anchor_gap_seconds = 0
 local anchor_move_pips = 0
 local anchor_history = {}
+
+-- Synthetic candle-flow state.
+-- This is deliberately stateful so the candle visibly walks around instead of
+-- just sitting on the anchor until the next real update arrives.
+local synthetic_momentum_pips = 0
+local synthetic_last_anchor_seen = nil
+local synthetic_corridor_pips = 0
+local synthetic_last_noise_pips = 0
 
 local poll_timer = nil
 local synth_timer = nil
@@ -581,18 +589,51 @@ local function sessionActivityMultiplier()
   return 0.65
 end
 
-local function syntheticNoisePips(dt, pps, distancePips)
-  local activity = sessionActivityMultiplier()
-  local base = pps * dt * 0.35 * activity
-
-  -- If the latest anchor move was tiny, stay tiny. This is the key part:
-  -- a 1 pip move over 10s should create a slow, quiet candle, not fake chaos.
-  local recentMoveCap = math.max(0.02, math.min(0.75, (anchor_velocity_pips_per_sec or 0.05) * dt * 1.2))
-  local distCap = math.max(0.02, math.min(0.75, distancePips * 0.12))
-
-  local amp = math.min(math.max(base, 0.003), recentMoveCap, distCap)
-  return randSigned() * amp
+local function sign(n)
+  n = tonumber(n) or 0
+  if n > 0 then return 1 end
+  if n < 0 then return -1 end
+  return 0
 end
+
+local function syntheticCorridorPips(pps)
+  pps = tonumber(pps) or 0
+  local activity = sessionActivityMultiplier()
+
+  -- The corridor is the allowed "live order flow" band around the real anchor
+  -- once synthetic price has caught up. Quiet anchors get a tight band. Moving
+  -- anchors get a wider band.
+  local move = tonumber(anchor_move_pips) or 0
+  local c = (0.65 + (pps * 4.50) + (move * 0.035)) * math.max(0.35, activity)
+
+  return clamp(c, 0.45, 8.00)
+end
+
+local function syntheticNoiseAmpPips(dt, pps)
+  dt = math.max(0.05, tonumber(dt) or SYNTH_SECONDS)
+  pps = tonumber(pps) or 0
+
+  local activity = sessionActivityMultiplier()
+  local anchorPps = tonumber(anchor_velocity_pips_per_sec) or 0
+
+  -- This is the important change:
+  -- even if the latest anchor is currently unchanged, the candle still gets a
+  -- small visible pipette-level random walk. The size is still scaled by recent
+  -- anchor movement, so a slow day stays slow.
+  local flowPps = (pps * 0.65) + (anchorPps * 0.35)
+  flowPps = clamp(flowPps, 0.06, 5.00)
+
+  local amp = (0.045 + (flowPps * 0.32)) * math.sqrt(dt / 0.25) * math.max(0.45, activity)
+
+  -- 0.035 pip = enough to sometimes round into a 0.1 pip visible move.
+  -- Higher real movement expands the random walk naturally.
+  return clamp(amp, 0.035, 1.20)
+end
+
+local function roundPrice5(price)
+  return math.floor((tonumber(price) or 0) * 100000 + 0.5) / 100000
+end
+
 
 local function buildSyntheticTick(ms, price, changed)
   local baseline = tonumber(state.baseline_eurusd)
@@ -619,6 +660,9 @@ local function buildSyntheticTick(ms, price, changed)
     anchor_velocity_pips_per_sec = anchor_velocity_pips_per_sec,
     recent_anchor_pps = recentAnchorPps(),
     session_activity = sessionActivityMultiplier(),
+    synthetic_momentum_pips = synthetic_momentum_pips,
+    synthetic_corridor_pips = synthetic_corridor_pips,
+    synthetic_last_noise_pips = synthetic_last_noise_pips,
     baseline_pair_price = baseline,
     baseline_time = state.baseline_time,
     usd_index = usd_index,
@@ -661,6 +705,8 @@ local function syntheticStep()
   local ms = nowMs()
 
   if not synthetic_price or synthetic_price <= 0 then
+    synthetic_last_anchor_seen = anchor_price
+    synthetic_momentum_pips = 0
     emitSyntheticPrice(ms, anchor_price, true)
     return
   end
@@ -668,34 +714,88 @@ local function syntheticStep()
   local dt = math.max(0.05, (ms - (synthetic_time_ms or ms)) / 1000)
   local target = anchor_price
   local distance = target - synthetic_price
-  local distancePips = math.abs(distance) / PIP_SIZE
+  local distancePipsSigned = distance / PIP_SIZE
+  local distancePips = math.abs(distancePipsSigned)
 
   local pps = recentAnchorPps()
+  local corridor = syntheticCorridorPips(pps)
+  synthetic_corridor_pips = corridor
 
-  -- Bridge speed is based on how fast the actual anchors are moving.
-  -- Quiet real feed => slow bridge. Active real feed => faster bridge.
-  local bridgeSeconds = clamp(distancePips / math.max(0.12, pps * 2.0), 2.0, 8.0)
-  local pull = distance * math.min(0.85, dt / bridgeSeconds)
-
-  local noisePips = syntheticNoisePips(dt, pps, distancePips)
-  local noise = noisePips * PIP_SIZE
-
-  local nextPrice = synthetic_price + pull + noise
-
-  -- Do not let random noise throw us past the anchor by much.
-  local maxOverPips = clamp(pps * 2.0, 0.15, 3.0)
-  if distance > 0 and nextPrice > target + (maxOverPips * PIP_SIZE) then
-    nextPrice = target + (maxOverPips * PIP_SIZE)
-  elseif distance < 0 and nextPrice < target - (maxOverPips * PIP_SIZE) then
-    nextPrice = target - (maxOverPips * PIP_SIZE)
+  -- A new real anchor gives the synthetic flow directional pressure, but we do
+  -- not snap. We just bias momentum toward the new anchor.
+  if synthetic_last_anchor_seen ~= anchor_price then
+    synthetic_last_anchor_seen = anchor_price
+    local kick = clamp(distancePips * 0.10, 0.08, 1.25)
+    synthetic_momentum_pips = synthetic_momentum_pips + (sign(distancePipsSigned) * kick)
   end
 
-  -- Round to 5 decimals because EUR/USD pip display should be readable and stable.
-  nextPrice = math.floor(nextPrice * 100000 + 0.5) / 100000
+  local noiseAmp = syntheticNoiseAmpPips(dt, pps)
+  local shock = randSigned() * noiseAmp
+  synthetic_last_noise_pips = shock
+
+  -- Momentum makes movement look like order flow instead of pure static noise.
+  -- Quiet market: small drifting pipettes.
+  -- Active market: bigger continuation and wicks.
+  local decay = clamp(0.82 - (dt * 0.18), 0.60, 0.90)
+  synthetic_momentum_pips = (synthetic_momentum_pips * decay) + (shock * 0.55)
+
+  local maxMomentum = clamp(0.18 + (pps * 0.90) + (anchor_move_pips * 0.015), 0.18, 2.80)
+  synthetic_momentum_pips = clamp(synthetic_momentum_pips, -maxMomentum, maxMomentum)
+
+  local movePips = synthetic_momentum_pips
+
+  if distancePips > corridor then
+    -- If we are away from the real anchor, trend back to it. The trend rate is
+    -- based on real anchor velocity, so a 1 pip / 10 sec day bridges slowly,
+    -- while a fast anchor jump bridges faster.
+    local bridgePps = clamp((pps * 2.50) + 0.15, 0.15, 7.50)
+    local trendPips = sign(distancePipsSigned) * math.min(distancePips * 0.22, bridgePps * dt)
+    movePips = movePips + trendPips
+  else
+    -- Once near the anchor, do not glue to it. Mean-revert gently while random
+    -- walk and momentum keep the candle visibly alive inside the reasonable band.
+    local reversionPips = distancePipsSigned * math.min(0.18, dt / 5.0)
+    movePips = movePips + reversionPips + (shock * 0.45)
+  end
+
+  local nextPrice = synthetic_price + (movePips * PIP_SIZE)
+
+  -- If the synthetic price is far away because a new real anchor arrived, do
+  -- not let random momentum move it further away. That prevents ugly fake
+  -- divergence while still avoiding a snap.
+  local nextDistancePips = math.abs((target - nextPrice) / PIP_SIZE)
+  if distancePips > corridor and nextDistancePips > distancePips + 0.05 then
+    local forcedPips = sign(distancePipsSigned) * math.min(distancePips * 0.20, clamp((pps * 2.0) + 0.12, 0.12, 6.0) * dt)
+    nextPrice = synthetic_price + (forcedPips * PIP_SIZE)
+    synthetic_momentum_pips = synthetic_momentum_pips * 0.35
+  end
+
+  -- Once caught up, keep the live synthetic price inside a realistic band
+  -- around the anchor. Bounce momentum at the edge so it looks like a wick.
+  local errorFromAnchorPips = (nextPrice - target) / PIP_SIZE
+  if math.abs(errorFromAnchorPips) > corridor and distancePips <= corridor * 1.50 then
+    nextPrice = target + (sign(errorFromAnchorPips) * corridor * PIP_SIZE)
+    synthetic_momentum_pips = -synthetic_momentum_pips * 0.45
+  end
+
+  nextPrice = roundPrice5(nextPrice)
+
+  -- Because EUR/USD is displayed to 5 decimals, tiny sub-pip movements can
+  -- round away. Force an occasional one-pipette move if we are otherwise flat
+  -- but still inside the corridor. This is what makes the candle visibly move.
+  if nextPrice == synthetic_price then
+    local step = (randSigned() >= 0 and 1 or -1) * 0.00001
+    local nudged = roundPrice5(synthetic_price + step)
+    local nudgedError = math.abs((nudged - target) / PIP_SIZE)
+    if distancePips > corridor or nudgedError <= corridor then
+      nextPrice = nudged
+    end
+  end
 
   local changed = (nextPrice ~= synthetic_price)
   emitSyntheticPrice(ms, nextPrice, changed)
 end
+
 
 local function pushPrice(price)
   local ms = nowMs()
@@ -814,6 +914,9 @@ local function safeTick()
     anchor_velocity_pips_per_sec = anchor_velocity_pips_per_sec,
     recent_anchor_pps = recentAnchorPps(),
     session_activity = sessionActivityMultiplier(),
+    synthetic_momentum_pips = synthetic_momentum_pips,
+    synthetic_corridor_pips = synthetic_corridor_pips,
+    synthetic_last_noise_pips = synthetic_last_noise_pips,
     poll_seconds = POLL_SECONDS,
     synthetic_seconds = SYNTH_SECONDS,
     response_ms = last_response_ms,
@@ -1705,7 +1808,7 @@ local function draw()
   at(2, 9, "Anchor real:  " .. fmt(t.anchor_price, 5) .. "  age " .. tostring(t.anchor_age_ms and (math.floor(t.anchor_age_ms / 100) / 10) or "n/a") .. "s", colors.yellow)
   at(2,10, "Anchor flow:  " .. fmt(t.anchor_move_pips, 2) .. " pips / " .. fmt(t.anchor_gap_seconds, 1) .. "s  " .. fmt(t.anchor_velocity_pips_per_sec, 3) .. " pips/s", colors.cyan)
   at(2,11, "Synth flow:   every " .. tostring(SYNTH_SECONDS) .. "s  ticks " .. tostring(synthetic_tick_count) .. "  changes " .. tostring(synthetic_change_count), colors.cyan)
-  at(2,12, "Session x:    " .. fmt(t.session_activity, 2) .. "  Recent real velocity " .. fmt(t.recent_anchor_pps, 3) .. " pips/s", colors.lime)
+  at(2,12, "Flow:         band " .. fmt(t.synthetic_corridor_pips, 2) .. "p  mom " .. fmt(t.synthetic_momentum_pips, 2) .. "p  vel " .. fmt(t.recent_anchor_pps, 3) .. " p/s", colors.lime)
 
   at(2,14, "Oracle poll:  every " .. tostring(POLL_SECONDS) .. "s", colors.yellow)
   at(2,15, "Anchor reads: " .. tostring(sample_count) .. "  Anchor changes: " .. tostring(change_count) .. "  Fails: " .. tostring(failure_count), colors.lightGray)
