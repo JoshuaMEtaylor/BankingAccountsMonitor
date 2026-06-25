@@ -22,7 +22,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.4.30-LEVERAGED-FX-TREASURY"
+local VERSION  = "1.4.31-TAVERN-STATE-ENTERPRISE"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -248,7 +248,8 @@ local function txCategory(tx_type, from_id, to_id)
     payroll = true; economic = true
   end
 
-  if tx_type == "HOSPITALITY_MEAL" or tx_type == "HOSPITALITY_SUBSIDY" or tx_type == "SERVICE_PAYMENT" then
+  if tx_type == "HOSPITALITY_MEAL" or tx_type == "HOSPITALITY_SUBSIDY" or tx_type == "SERVICE_PAYMENT"
+    or tx_type == "TAVERN_NIGHT" or tx_type == "TAVERN_STAY" then
     service = true; economic = true
   end
 
@@ -839,6 +840,13 @@ local function transfer(from_id, to_id, amount, tx_type, memo, actor, allow_over
       local issued_after = monetary_state.total_minted - burned_before
       pcall(recordMoneyPrintShock, amount, issued_before, issued_after, tx_id)
     end
+
+  -- External Tavern guests are not domestic bank accounts, but their payment
+  -- still becomes Quid held by the Treasury. Keep issued supply honest without
+  -- treating this as policy money-printing pressure.
+  elseif from_id == "SYSTEM" and to_id ~= "SYSTEM" and tx_type == "TAVERN_NIGHT" then
+    monetary_state.total_minted = round2(minted_before + amount)
+
   elseif tx_type == "BURN" then
     monetary_state.total_burned = round2(burned_before + amount)
   end
@@ -1439,6 +1447,7 @@ local DEFAULT_PRICE_ORACLE = {
   },
   service_prices = {
     dining_meal = { label="Dining Hall meal", sector="food", base=2.00, min_price=2 },
+    tavern_night = { label="Tavern nightly stay", sector="hospitality", base=5.00, min_price=5 },
     courier_job = { label="Courier service", sector="logistics", base=4.00, min_price=4 },
     guard_service = { label="Guard service", sector="defence", base=5.00, min_price=5 },
   },
@@ -2010,6 +2019,13 @@ local function serviceTierMultiplier(service, tier, gain)
     return 1.00, "normal meal"
   end
 
+  if service == "tavern_night" then
+    if tier:find("lux",1,true) or tier:find("suite",1,true) then return 2.00, "luxury room" end
+    if tier:find("private",1,true) or tier:find("single",1,true) then return 1.50, "private room" end
+    if tier:find("cheap",1,true) or tier:find("shared",1,true) or tier:find("bunk",1,true) then return 0.75, "shared bed" end
+    return 1.00, "standard room"
+  end
+
   return tonumber(tier) or 1.00, tier ~= "" and tier or "standard"
 end
 
@@ -2283,6 +2299,7 @@ local GDP_TX_TYPES = {
   LIVING_COST = true,
   HOSPITALITY_MEAL = true,
   HOSPITALITY_SUBSIDY = true,
+  TAVERN_NIGHT = true,
 }
 
 local GDP_CONTRACT_TX_TYPES = {
@@ -2296,11 +2313,17 @@ local GDP_SERVICE_TX_TYPES = {
   LIVING_COST = true,
   HOSPITALITY_MEAL = true,
   HOSPITALITY_SUBSIDY = true,
+  TAVERN_NIGHT = true,
 }
 
 local GDP_HOSPITALITY_TX_TYPES = {
   HOSPITALITY_MEAL = true,
   HOSPITALITY_SUBSIDY = true,
+  TAVERN_NIGHT = true,
+}
+
+local GDP_TAVERN_TX_TYPES = {
+  TAVERN_NIGHT = true,
 }
 
 local function isPrivateGDPTransaction(tx_type, from_id, to_id)
@@ -2317,6 +2340,11 @@ local function isPrivateGDPTransaction(tx_type, from_id, to_id)
   -- colonist, so it counts as service GDP.
   if tx_type == "HOSPITALITY_SUBSIDY" then return true end
 
+  -- Tavern is a state-owned enterprise. Revenue goes to Treasury, but the stay
+  -- is still real lodging output, so it must count as GDP despite the Treasury
+  -- being the destination account.
+  if tx_type == "TAVERN_NIGHT" then return true end
+
   if isGovernmentAccount(from_id) or isGovernmentAccount(to_id) then return false end
 
   return GDP_TX_TYPES[tx_type] == true
@@ -2331,6 +2359,8 @@ local function calculatePrivateGDP(window_ms)
   local service_count = 0
   local hospitality_total = 0
   local hospitality_count = 0
+  local tavern_total = 0
+  local tavern_count = 0
   local contract_total = 0
   local contract_count = 0
   local non_contract_total = 0
@@ -2372,6 +2402,11 @@ local function calculatePrivateGDP(window_ms)
           hospitality_total = hospitality_total + amount
           hospitality_count = hospitality_count + 1
         end
+
+        if GDP_TAVERN_TX_TYPES[tx_type] then
+          tavern_total = tavern_total + amount
+          tavern_count = tavern_count + 1
+        end
       end
     end
   end
@@ -2397,6 +2432,8 @@ local function calculatePrivateGDP(window_ms)
     services_gdp = math.floor(service_total),
     hospitality_gdp = math.floor(hospitality_total),
     meal_gdp = math.floor(hospitality_total),
+    tavern_gdp = math.floor(tavern_total),
+    lodging_gdp = math.floor(tavern_total),
     contract_gdp = math.floor(contract_total),
     non_contract_gdp = math.floor(non_contract_total),
     gdp_per_capita = per_capita,
@@ -2404,11 +2441,12 @@ local function calculatePrivateGDP(window_ms)
     transaction_count = count,
     service_events = service_count,
     hospitality_events = hospitality_count,
+    tavern_events = tavern_count,
     contract_events = contract_count,
     non_contract_events = non_contract_count,
     by_type = by_type,
     events_by_type = events_by_type,
-    note = "GDP estimate from settled output/service transactions. Hospitality meal payments and Treasury meal subsidies count as service GDP."
+    note = "GDP estimate from settled output/service transactions. Hospitality meals, Treasury meal subsidies, and state-owned Tavern stays count as service GDP."
   }
 end
 
@@ -3451,6 +3489,87 @@ handlers["hospitality_meal_payment"] = function(sender_id, req)
       citizen = type(citizen_tx) == "table" and citizen_tx.tx_id or nil,
       treasury = type(treasury_tx) == "table" and treasury_tx.tx_id or nil,
     },
+  }
+end
+
+
+-- TAVERN_NIGHT_PAYMENT
+-- State-owned Tavern / Inn nightly lodging fee.
+--
+-- Payment policy:
+--   1. If payer_id is a known bank account, debit that account and credit Treasury.
+--      This uses overdraft so a stay cannot silently disappear because an NPC is
+--      temporarily broke.
+--   2. If the guest is not a known citizen/account, treat it as external visitor
+--      revenue and credit Treasury directly.
+--   3. Both forms use TAVERN_NIGHT so the ledger, transaction stats, and GDP
+--      monitor can count lodging output cleanly.
+handlers["tavern_night_payment"] = function(sender_id, req)
+  req = req or {}
+  local payer_id = req.payer_id or req.citizen_id or req.account_id
+  local guest_id = tostring(req.guest_id or req.visitor_id or "")
+  local guest_name = tostring(req.guest_name or req.name or payer_id or guest_id or "guest")
+  if guest_name == "" then guest_name = "guest" end
+  local treasury_id = req.treasury_id or "treasury:quid_bank"
+  local tier = tostring(req.tier or "standard")
+  local amount = tonumber(req.amount)
+  local quote = nil
+
+  if not accountExists(treasury_id) then return false, "Treasury account not found: " .. tostring(treasury_id) end
+  local tacc = accounts[treasury_id]
+  if not tacc or tacc.type ~= "treasury" then return false, "Destination is not a treasury account" end
+
+  if not amount or amount <= 0 then
+    quote = quoteServicePrice("tavern_night", tier, nil, "hospitality")
+    amount = tonumber(quote.total)
+  end
+
+  if not amount or amount <= 0 then return false, "Invalid nightly fee" end
+  amount = math.floor(amount)
+  if amount <= 0 then return false, "Invalid integer nightly fee" end
+
+  local from_id = "SYSTEM"
+  local source = "external_guest"
+  local known_account = false
+
+  if payer_id and tostring(payer_id) ~= "" and accountExists(tostring(payer_id)) then
+    from_id = tostring(payer_id)
+    source = "account"
+    known_account = true
+  end
+
+  local memo = req.memo or ("Tavern nightly stay: " .. guest_name .. " (" .. tier .. ")")
+  local ok, res = transfer(
+    from_id,
+    treasury_id,
+    amount,
+    "TAVERN_NIGHT",
+    memo,
+    "TAVERN:" .. tostring(sender_id),
+    known_account
+  )
+
+  if not ok then return false, res end
+
+  audit("ACTION", "STATE", sender_id, "TAVERN_NIGHT_SETTLED",
+    tostring(from_id) .. " -> " .. tostring(treasury_id)
+    .. " amount=" .. tostring(amount)
+    .. " guest=" .. tostring(guest_name)
+    .. " source=" .. tostring(source))
+
+  return true, {
+    payer_id = known_account and from_id or nil,
+    guest_id = guest_id ~= "" and guest_id or nil,
+    guest_name = guest_name,
+    treasury_id = treasury_id,
+    amount = amount,
+    paid = amount,
+    source = source,
+    external_guest = not known_account,
+    tier = tier,
+    quote = quote,
+    tx = res,
+    tx_id = type(res) == "table" and res.tx_id or nil,
   }
 end
 
