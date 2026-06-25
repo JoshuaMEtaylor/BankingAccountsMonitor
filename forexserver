@@ -59,7 +59,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION = "0.8.4-NO-STALE-TRADING"
+local VERSION = "0.9.0-SYNTHETIC-ORDER-FLOW"
 local PROTOCOL = "quid_fx"
 local BANK_PROTOCOL = "quid_bank"
 local BANK_TIMEOUT = 5
@@ -68,10 +68,12 @@ local ORACLE_LATEST_URL = "http://145.241.202.103:8000/latest"
 local ORACLE_HEALTH_URL = "http://145.241.202.103:8000/health"
 
 local POLL_SECONDS = 0.50
+local SYNTH_SECONDS = 0.25
 local DRAW_SECONDS = 0.50
 local SAVE_SECONDS = 10
 local STALE_AFTER_MS = 999999999
 local HTTP_WATCHDOG_MS = 3000
+local SYNTH_HISTORY_MAX = 12
 
 local TIMEFRAMES = {
   ["1m"]  = { seconds = 60,  max = 1440 }, -- 24h
@@ -135,8 +137,23 @@ local sample_count = 0
 local change_count = 0
 local failure_count = 0
 local skipped_polls = 0
+local synthetic_tick_count = 0
+local synthetic_change_count = 0
+
+-- Anchor = real/oracle price. Synthetic = playable/tradable live price.
+local anchor_price = nil
+local anchor_time_ms = 0
+local previous_anchor_price = nil
+local previous_anchor_time_ms = 0
+local synthetic_price = nil
+local synthetic_time_ms = 0
+local anchor_velocity_pips_per_sec = 0
+local anchor_gap_seconds = 0
+local anchor_move_pips = 0
+local anchor_history = {}
 
 local poll_timer = nil
+local synth_timer = nil
 local draw_timer = nil
 local save_timer = nil
 
@@ -475,6 +492,202 @@ local function requestOracleLatest()
   end
 end
 
+
+local function clamp(n, lo, hi)
+  n = tonumber(n) or 0
+  if n < lo then return lo end
+  if n > hi then return hi end
+  return n
+end
+
+local function randSigned()
+  return (math.random() * 2) - 1
+end
+
+local function recordAnchorMove(oldPrice, newPrice, oldMs, newMs)
+  oldPrice = tonumber(oldPrice)
+  newPrice = tonumber(newPrice)
+  oldMs = tonumber(oldMs) or 0
+  newMs = tonumber(newMs) or nowMs()
+
+  if not oldPrice or not newPrice or oldPrice <= 0 or newPrice <= 0 or oldMs <= 0 or newMs <= oldMs then
+    return
+  end
+
+  local gapS = math.max(0.1, (newMs - oldMs) / 1000)
+  local movePips = math.abs(newPrice - oldPrice) / PIP_SIZE
+  local pps = movePips / gapS
+
+  anchor_gap_seconds = gapS
+  anchor_move_pips = movePips
+  anchor_velocity_pips_per_sec = pps
+
+  anchor_history[#anchor_history + 1] = {
+    time = newMs,
+    gap_s = gapS,
+    move_pips = movePips,
+    pps = pps,
+    dir = newPrice >= oldPrice and 1 or -1,
+  }
+
+  while #anchor_history > SYNTH_HISTORY_MAX do table.remove(anchor_history, 1) end
+end
+
+local function recentAnchorPps()
+  if #anchor_history == 0 then return 0.05 end
+
+  local totalWeight = 0
+  local total = 0
+  local now = nowMs()
+
+  for i = #anchor_history, 1, -1 do
+    local h = anchor_history[i]
+    local ageS = math.max(0, (now - (tonumber(h.time) or now)) / 1000)
+    local w = 1 / (1 + ageS / 20)
+    total = total + ((tonumber(h.pps) or 0) * w)
+    totalWeight = totalWeight + w
+  end
+
+  if totalWeight <= 0 then return 0.05 end
+
+  local pps = total / totalWeight
+
+  -- If the anchor itself has not changed for a while, calm the synthetic flow down.
+  local quietS = anchor_time_ms > 0 and ((now - anchor_time_ms) / 1000) or 60
+  local quietDecay = 1 / (1 + quietS / 25)
+
+  return math.max(0.02, pps * quietDecay)
+end
+
+local function sessionActivityMultiplier()
+  -- Small realism layer only. Real anchor movement remains the main driver.
+  -- os.date("!*t") is UTC, which maps well to FX session discussion.
+  local t = os.date("!*t")
+  local wday = tonumber(t.wday) or 1 -- Sunday=1
+  local hour = tonumber(t.hour) or 0
+
+  if wday == 1 or wday == 7 then return 0.15 end -- weekend
+
+  if hour >= 13 and hour < 16 then return 1.30 end -- London/NY overlap
+  if hour >= 7 and hour < 12 then return 1.10 end -- London
+  if hour >= 16 and hour < 21 then return 0.95 end -- NY
+  if hour >= 0 and hour < 6 then return 0.45 end -- Asia/quiet for EUR/USD
+  return 0.65
+end
+
+local function syntheticNoisePips(dt, pps, distancePips)
+  local activity = sessionActivityMultiplier()
+  local base = pps * dt * 0.35 * activity
+
+  -- If the latest anchor move was tiny, stay tiny. This is the key part:
+  -- a 1 pip move over 10s should create a slow, quiet candle, not fake chaos.
+  local recentMoveCap = math.max(0.02, math.min(0.75, (anchor_velocity_pips_per_sec or 0.05) * dt * 1.2))
+  local distCap = math.max(0.02, math.min(0.75, distancePips * 0.12))
+
+  local amp = math.min(math.max(base, 0.003), recentMoveCap, distCap)
+  return randSigned() * amp
+end
+
+local function buildSyntheticTick(ms, price, changed)
+  local baseline = tonumber(state.baseline_eurusd)
+  if not baseline or baseline <= 0 then baseline = price end
+
+  local usd_strength = baseline / price
+  local usd_index = 100 * usd_strength
+  local q_usd_if_quid_strength_1 = 3.40 / usd_strength
+
+  last_tick = {
+    ok = true,
+    quality = "LIVE",
+    time = ms,
+    provider = "Synthetic/Oracle",
+    source = ORACLE_LATEST_URL,
+    upstream = "Synthetic order flow anchored to Oracle EUR/USD",
+    pair = "EUR/USD",
+    pair_price = price,
+    synthetic_price = price,
+    anchor_price = anchor_price,
+    anchor_age_ms = anchor_time_ms > 0 and (ms - anchor_time_ms) or nil,
+    anchor_gap_seconds = anchor_gap_seconds,
+    anchor_move_pips = anchor_move_pips,
+    anchor_velocity_pips_per_sec = anchor_velocity_pips_per_sec,
+    recent_anchor_pps = recentAnchorPps(),
+    session_activity = sessionActivityMultiplier(),
+    baseline_pair_price = baseline,
+    baseline_time = state.baseline_time,
+    usd_index = usd_index,
+    usd_strength_index = usd_strength,
+    q_usd_if_quid_strength_1 = q_usd_if_quid_strength_1,
+    sample_count = sample_count,
+    change_count = change_count,
+    synthetic_tick_count = synthetic_tick_count,
+    synthetic_change_count = synthetic_change_count,
+    changed = changed,
+    poll_seconds = POLL_SECONDS,
+    synthetic_seconds = SYNTH_SECONDS,
+    response_ms = last_response_ms,
+    version = VERSION,
+  }
+end
+
+local function emitSyntheticPrice(ms, price, changed)
+  if not price or price <= 0 then return end
+  synthetic_price = price
+  synthetic_time_ms = ms
+
+  synthetic_tick_count = synthetic_tick_count + 1
+  if changed then synthetic_change_count = synthetic_change_count + 1 end
+
+  updateCandleSet("1m", price, ms)
+  updateCandleSet("5m", price, ms)
+  updateCandleSet("15m", price, ms)
+  checkAutoLiquidations()
+
+  buildSyntheticTick(ms, price, changed)
+end
+
+local function syntheticStep()
+  if not anchor_price then return end
+
+  local ms = nowMs()
+
+  if not synthetic_price or synthetic_price <= 0 then
+    emitSyntheticPrice(ms, anchor_price, true)
+    return
+  end
+
+  local dt = math.max(0.05, (ms - (synthetic_time_ms or ms)) / 1000)
+  local target = anchor_price
+  local distance = target - synthetic_price
+  local distancePips = math.abs(distance) / PIP_SIZE
+
+  local pps = recentAnchorPps()
+
+  -- Bridge speed is based on how fast the actual anchors are moving.
+  -- Quiet real feed => slow bridge. Active real feed => faster bridge.
+  local bridgeSeconds = clamp(distancePips / math.max(0.12, pps * 2.0), 2.0, 8.0)
+  local pull = distance * math.min(0.85, dt / bridgeSeconds)
+
+  local noisePips = syntheticNoisePips(dt, pps, distancePips)
+  local noise = noisePips * PIP_SIZE
+
+  local nextPrice = synthetic_price + pull + noise
+
+  -- Do not let random noise throw us past the anchor by much.
+  local maxOverPips = clamp(pps * 2.0, 0.15, 3.0)
+  if distance > 0 and nextPrice > target + (maxOverPips * PIP_SIZE) then
+    nextPrice = target + (maxOverPips * PIP_SIZE)
+  elseif distance < 0 and nextPrice < target - (maxOverPips * PIP_SIZE) then
+    nextPrice = target - (maxOverPips * PIP_SIZE)
+  end
+
+  -- Round to 5 decimals because EUR/USD pip display should be readable and stable.
+  nextPrice = math.floor(nextPrice * 100000 + 0.5) / 100000
+
+  local changed = (nextPrice ~= synthetic_price)
+  emitSyntheticPrice(ms, nextPrice, changed)
+end
+
 local function pushPrice(price)
   local ms = nowMs()
   local baseline = tonumber(state.baseline_eurusd)
@@ -486,43 +699,34 @@ local function pushPrice(price)
     saveState()
   end
 
-  local usd_strength = baseline / price
-  local usd_index = 100 * usd_strength
-  local q_usd_if_quid_strength_1 = 3.40 / usd_strength
-  local moved = (last_price == nil or price ~= last_price)
-
   sample_count = sample_count + 1
-  if moved then change_count = change_count + 1 end
-  last_price = price
   last_success_ms = ms
   last_error = "OK"
 
-  updateCandleSet("1m", price, ms)
-  updateCandleSet("5m", price, ms)
-  updateCandleSet("15m", price, ms)
-  checkAutoLiquidations()
+  local moved = (anchor_price == nil or price ~= anchor_price)
+  last_price = price
 
-  last_tick = {
-    ok = true,
-    quality = "LIVE",
-    time = ms,
-    provider = "Oracle",
-    source = ORACLE_LATEST_URL,
-    upstream = "Kraken EUR/USD ticker via Oracle node",
-    pair = "EUR/USD",
-    pair_price = price,
-    baseline_pair_price = baseline,
-    baseline_time = state.baseline_time,
-    usd_index = usd_index,
-    usd_strength_index = usd_strength,
-    q_usd_if_quid_strength_1 = q_usd_if_quid_strength_1,
-    sample_count = sample_count,
-    change_count = change_count,
-    changed = moved,
-    poll_seconds = POLL_SECONDS,
-    response_ms = last_response_ms,
-    version = VERSION,
-  }
+  if moved then
+    change_count = change_count + 1
+
+    if anchor_price and anchor_time_ms and anchor_time_ms > 0 then
+      previous_anchor_price = anchor_price
+      previous_anchor_time_ms = anchor_time_ms
+      recordAnchorMove(previous_anchor_price, price, previous_anchor_time_ms, ms)
+    end
+
+    anchor_price = price
+    anchor_time_ms = ms
+  elseif not anchor_price then
+    anchor_price = price
+    anchor_time_ms = ms
+  end
+
+  -- First real tick boots the synthetic market. After that, syntheticStep()
+  -- generates the tradable/live price at SYNTH_SECONDS.
+  if not synthetic_price then
+    emitSyntheticPrice(ms, price, true)
+  end
 end
 
 local function handleHttpSuccess(url, handle)
@@ -570,6 +774,8 @@ local function safeTick()
     usd_index = 100,
     usd_strength_index = 1,
     q_usd_if_quid_strength_1 = 3.40,
+    synthetic_tick_count = synthetic_tick_count,
+    anchor_price = anchor_price,
   }
 
   local q = quality()
@@ -591,7 +797,16 @@ local function safeTick()
     change_count = change_count,
     failure_count = failure_count,
     skipped_polls = skipped_polls,
+    synthetic_tick_count = synthetic_tick_count,
+    synthetic_change_count = synthetic_change_count,
+    anchor_price = anchor_price,
+    anchor_gap_seconds = anchor_gap_seconds,
+    anchor_move_pips = anchor_move_pips,
+    anchor_velocity_pips_per_sec = anchor_velocity_pips_per_sec,
+    recent_anchor_pps = recentAnchorPps(),
+    session_activity = sessionActivityMultiplier(),
     poll_seconds = POLL_SECONDS,
+    synthetic_seconds = SYNTH_SECONDS,
     response_ms = last_response_ms,
     last_success_ms = last_success_ms,
     stale_age_ms = last_success_ms > 0 and (nowMs() - last_success_ms) or nil,
@@ -1155,17 +1370,17 @@ local function draw()
   at(2, 5, "Oracle URL:   " .. clampText(ORACLE_LATEST_URL, math.max(10, W - 16)), colors.lightGray)
 
   at(2, 7, "Quality:      " .. q, colourForQuality(q))
-  at(2, 8, "EUR/USD:      " .. fmt(t.pair_price, 5), colors.lime)
-  at(2, 9, "Baseline:     " .. fmt(t.baseline_pair_price, 5), colors.white)
-  at(2,10, "USD index:    " .. fmt(t.usd_index, 4), colors.cyan)
-  at(2,11, "USD strength: " .. fmt(t.usd_strength_index, 6) .. "x", colors.cyan)
-  at(2,12, "Q/USD @ Q=1:  $" .. fmt(t.q_usd_if_quid_strength_1, 4), colors.lime)
+  at(2, 8, "Live synth:   " .. fmt(t.pair_price, 5), colors.lime)
+  at(2, 9, "Anchor real:  " .. fmt(t.anchor_price, 5) .. "  age " .. tostring(t.anchor_age_ms and (math.floor(t.anchor_age_ms / 100) / 10) or "n/a") .. "s", colors.yellow)
+  at(2,10, "Anchor flow:  " .. fmt(t.anchor_move_pips, 2) .. " pips / " .. fmt(t.anchor_gap_seconds, 1) .. "s  " .. fmt(t.anchor_velocity_pips_per_sec, 3) .. " pips/s", colors.cyan)
+  at(2,11, "Synth flow:   every " .. tostring(SYNTH_SECONDS) .. "s  ticks " .. tostring(synthetic_tick_count) .. "  changes " .. tostring(synthetic_change_count), colors.cyan)
+  at(2,12, "Session x:    " .. fmt(t.session_activity, 2) .. "  Recent real velocity " .. fmt(t.recent_anchor_pps, 3) .. " pips/s", colors.lime)
 
-  at(2,14, "Polling:      every " .. tostring(POLL_SECONDS) .. "s", colors.yellow)
-  at(2,15, "Samples:      " .. tostring(sample_count) .. "  Changes: " .. tostring(change_count) .. "  Fails: " .. tostring(failure_count), colors.lightGray)
+  at(2,14, "Oracle poll:  every " .. tostring(POLL_SECONDS) .. "s", colors.yellow)
+  at(2,15, "Anchor reads: " .. tostring(sample_count) .. "  Anchor changes: " .. tostring(change_count) .. "  Fails: " .. tostring(failure_count), colors.lightGray)
   at(2,16, "Stored candles 1m/5m/15m: " .. tostring(#candles["1m"]) .. " / " .. tostring(#candles["5m"]) .. " / " .. tostring(#candles["15m"]), colors.lightGray)
   local pendingInfo = pending_http and ("pending " .. ageText(last_request_ms)) or "idle"
-  at(2,17, "Last tick: " .. ageText(last_success_ms) .. " ago  Response: " .. tostring(last_response_ms or 0) .. "ms  HTTP: " .. pendingInfo, colors.lightGray)
+  at(2,17, "Last anchor: " .. ageText(last_success_ms) .. " ago  Response: " .. tostring(last_response_ms or 0) .. "ms  HTTP: " .. pendingInfo, colors.lightGray)
   at(2,18, "Orders:       open " .. tostring(#active_orders) .. "  P/L " .. fmt(ordersSnapshot(nil).unrealized_pnl_q, 2) .. " Q  Bank " .. tostring(bank_id or "search"), colors.yellow)
 
   at(2,20, "Recent 5m closes", colors.white)
@@ -1181,7 +1396,9 @@ local function main()
 
   requestOracleLatest()
 
+  math.randomseed(nowMs() + os.getComputerID())
   poll_timer = os.startTimer(POLL_SECONDS)
+  synth_timer = os.startTimer(SYNTH_SECONDS)
   draw_timer = os.startTimer(DRAW_SECONDS)
   save_timer = os.startTimer(SAVE_SECONDS)
 
@@ -1195,6 +1412,9 @@ local function main()
       if id == poll_timer then
         requestOracleLatest()
         poll_timer = os.startTimer(POLL_SECONDS)
+      elseif id == synth_timer then
+        syntheticStep()
+        synth_timer = os.startTimer(SYNTH_SECONDS)
       elseif id == draw_timer then
         draw()
         draw_timer = os.startTimer(DRAW_SECONDS)
