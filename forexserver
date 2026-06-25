@@ -59,7 +59,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION = "0.9.2-LIVE-CANDLE-FLOW"
+local VERSION = "0.9.3-VISIBLE-LIVE-FLOW"
 local PROTOCOL = "quid_fx"
 local BANK_PROTOCOL = "quid_bank"
 local BANK_TIMEOUT = 5
@@ -68,7 +68,7 @@ local ORACLE_LATEST_URL = "http://145.241.202.103:8000/latest"
 local ORACLE_HEALTH_URL = "http://145.241.202.103:8000/health"
 
 local POLL_SECONDS = 0.50
-local SYNTH_SECONDS = 0.25
+local SYNTH_SECONDS = 0.10
 local DRAW_SECONDS = 0.50
 local SAVE_SECONDS = 10
 local STALE_AFTER_MS = 999999999
@@ -606,7 +606,7 @@ local function syntheticCorridorPips(pps)
   local move = tonumber(anchor_move_pips) or 0
   local c = (0.65 + (pps * 4.50) + (move * 0.035)) * math.max(0.35, activity)
 
-  return clamp(c, 0.45, 8.00)
+  return clamp(c, 1.20, 8.00)
 end
 
 local function syntheticNoiseAmpPips(dt, pps)
@@ -627,7 +627,7 @@ local function syntheticNoiseAmpPips(dt, pps)
 
   -- 0.035 pip = enough to sometimes round into a 0.1 pip visible move.
   -- Higher real movement expands the random walk naturally.
-  return clamp(amp, 0.035, 1.20)
+  return clamp(amp, 0.085, 1.20)
 end
 
 local function roundPrice5(price)
@@ -784,7 +784,18 @@ local function syntheticStep()
   -- round away. Force an occasional one-pipette move if we are otherwise flat
   -- but still inside the corridor. This is what makes the candle visibly move.
   if nextPrice == synthetic_price then
-    local step = (randSigned() >= 0 and 1 or -1) * 0.00001
+    -- Force visible pipette motion when rounding would otherwise hide the flow.
+    -- Most steps are 0.1 pip; occasional steps are 0.2 pip. The corridor clamp
+    -- keeps this fair and close to the real anchor.
+    local units = 1
+    if math.random() < 0.20 then units = 2 end
+    local dir = randSigned() >= 0 and 1 or -1
+
+    -- If we are already near an edge of the allowed band, bias back inward.
+    local edge = (synthetic_price - target) / PIP_SIZE
+    if math.abs(edge) > corridor * 0.75 then dir = -sign(edge) end
+
+    local step = dir * units * 0.00001
     local nudged = roundPrice5(synthetic_price + step)
     local nudgedError = math.abs((nudged - target) / PIP_SIZE)
     if distancePips > corridor or nudgedError <= corridor then
