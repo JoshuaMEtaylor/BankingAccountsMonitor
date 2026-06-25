@@ -22,7 +22,7 @@ if args[1] ~= "--updated" then
   return
 end
 
-local VERSION  = "1.4.31-FX-SPREAD-GDP"
+local VERSION  = "1.4.30-LEVERAGED-FX-TREASURY"
 local DB_LABEL = "QuidBank-DB"
 local PROTOCOL = "quid_bank"
 local PROTOCOL_BROADCAST = "quid_bank_discovery"
@@ -235,7 +235,6 @@ local function txCategory(tx_type, from_id, to_id)
   local payroll = false
   local service = false
   local contract = false
-  local financial = false
   local company = false
   local personal = false
 
@@ -257,13 +256,6 @@ local function txCategory(tx_type, from_id, to_id)
     contract = true; economic = true
   end
 
-  -- Bank/treasury revenue from the leveraged FX spread is real financial-service output.
-  -- Trader market P/L is deliberately not included here; only the spread fee earned
-  -- by the bank counts as economic activity.
-  if tx_type == "FOREX_SPREAD_FEE" then
-    financial = true; service = true; economic = true
-  end
-
   if tostring(from_id or ""):find("^company:") or tostring(to_id or ""):find("^company:") then
     company = true
   end
@@ -276,7 +268,7 @@ local function txCategory(tx_type, from_id, to_id)
 
   return {
     economic = economic, admin = admin, monetary = monetary, payroll = payroll,
-    service = service, contract = contract, financial = financial, company = company, personal = personal,
+    service = service, contract = contract, company = company, personal = personal,
   }
 end
 
@@ -519,7 +511,6 @@ local function emptyTxDay(day)
     payroll = 0,
     service = 0,
     contract = 0,
-    financial = 0,
     company = 0,
     personal = 0,
     by_type = {},
@@ -530,7 +521,6 @@ local function emptyTxDay(day)
     payroll_value = 0,
     service_value = 0,
     contract_value = 0,
-    financial_value = 0,
     company_value = 0,
     personal_value = 0,
     first_tx = nil,
@@ -595,7 +585,6 @@ local function recordTransactionStat(tx_id, tx_type, from_id, to_id, amount)
   bump(cat.payroll, "payroll", "payroll_value")
   bump(cat.service, "service", "service_value")
   bump(cat.contract, "contract", "contract_value")
-  bump(cat.financial, "financial", "financial_value")
   bump(cat.company, "company", "company_value")
   bump(cat.personal, "personal", "personal_value")
 
@@ -619,7 +608,7 @@ local function transactionStatsSummary(day)
   for d = day - 6, day do
     local rec = transaction_stats.days[tostring(d)]
     if type(rec) == "table" then
-      for _, k in ipairs({"total","economic","admin","monetary","payroll","service","contract","financial","company","personal","value","economic_value","admin_value","monetary_value","payroll_value","service_value","contract_value","financial_value","company_value","personal_value"}) do
+      for _, k in ipairs({"total","economic","admin","monetary","payroll","service","contract","company","personal","value","economic_value","admin_value","monetary_value","payroll_value","service_value","contract_value","company_value","personal_value"}) do
         week[k] = (tonumber(week[k]) or 0) + (tonumber(rec[k]) or 0)
       end
     end
@@ -2294,7 +2283,6 @@ local GDP_TX_TYPES = {
   LIVING_COST = true,
   HOSPITALITY_MEAL = true,
   HOSPITALITY_SUBSIDY = true,
-  FOREX_SPREAD_FEE = true, -- bank spread-fee revenue from leveraged FX service
 }
 
 local GDP_CONTRACT_TX_TYPES = {
@@ -2308,16 +2296,11 @@ local GDP_SERVICE_TX_TYPES = {
   LIVING_COST = true,
   HOSPITALITY_MEAL = true,
   HOSPITALITY_SUBSIDY = true,
-  FOREX_SPREAD_FEE = true, -- financial service fee earned by the bank/treasury
 }
 
 local GDP_HOSPITALITY_TX_TYPES = {
   HOSPITALITY_MEAL = true,
   HOSPITALITY_SUBSIDY = true,
-}
-
-local GDP_FINANCIAL_TX_TYPES = {
-  FOREX_SPREAD_FEE = true,
 }
 
 local function isPrivateGDPTransaction(tx_type, from_id, to_id)
@@ -2334,11 +2317,6 @@ local function isPrivateGDPTransaction(tx_type, from_id, to_id)
   -- colonist, so it counts as service GDP.
   if tx_type == "HOSPITALITY_SUBSIDY" then return true end
 
-  -- Spread fees are bank output for providing leveraged FX access. They are
-  -- paid to the treasury, so this must be allowed before the normal government
-  -- account exclusion. Market profits/losses remain excluded.
-  if GDP_FINANCIAL_TX_TYPES[tx_type] then return true end
-
   if isGovernmentAccount(from_id) or isGovernmentAccount(to_id) then return false end
 
   return GDP_TX_TYPES[tx_type] == true
@@ -2353,8 +2331,6 @@ local function calculatePrivateGDP(window_ms)
   local service_count = 0
   local hospitality_total = 0
   local hospitality_count = 0
-  local financial_total = 0
-  local financial_count = 0
   local contract_total = 0
   local contract_count = 0
   local non_contract_total = 0
@@ -2396,11 +2372,6 @@ local function calculatePrivateGDP(window_ms)
           hospitality_total = hospitality_total + amount
           hospitality_count = hospitality_count + 1
         end
-
-        if GDP_FINANCIAL_TX_TYPES[tx_type] then
-          financial_total = financial_total + amount
-          financial_count = financial_count + 1
-        end
       end
     end
   end
@@ -2426,9 +2397,6 @@ local function calculatePrivateGDP(window_ms)
     services_gdp = math.floor(service_total),
     hospitality_gdp = math.floor(hospitality_total),
     meal_gdp = math.floor(hospitality_total),
-    financial_gdp = math.floor(financial_total),
-    finance_gdp = math.floor(financial_total),
-    forex_spread_fee_gdp = math.floor(financial_total),
     contract_gdp = math.floor(contract_total),
     non_contract_gdp = math.floor(non_contract_total),
     gdp_per_capita = per_capita,
@@ -2436,13 +2404,11 @@ local function calculatePrivateGDP(window_ms)
     transaction_count = count,
     service_events = service_count,
     hospitality_events = hospitality_count,
-    financial_events = financial_count,
-    forex_spread_fee_events = financial_count,
     contract_events = contract_count,
     non_contract_events = non_contract_count,
     by_type = by_type,
     events_by_type = events_by_type,
-    note = "GDP estimate from settled output/service transactions. Leveraged FX trader P/L is excluded; only FOREX_SPREAD_FEE revenue counts as financial service GDP."
+    note = "GDP estimate from settled output/service transactions. Hospitality meal payments and Treasury meal subsidies count as service GDP."
   }
 end
 
