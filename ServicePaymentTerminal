@@ -1,28 +1,40 @@
 -- =============================================================================
--- SERVICE PAYMENT TERMINAL
+-- NPC BUSINESS PAYMENT TERMINAL
 -- ServicePaymentTerminal
 --
--- v1.2.8-TREASURY-COVER-VISUAL
+-- v1.3.0-NPC-BUSINESS-TAVERN
 --
--- Dining Hall / Restaurant point-of-sale for MineColonies citizens.
+-- Combined MineColonies business transaction collector.
 --
--- Current simple mode:
---   any positive citizen saturation change = one salmon meal
---   base salmon meal price = 2 Q
+-- Handles:
+--   * Dining Hall / Restaurant meals:
+--       - detects positive citizen saturation changes
+--       - charges the citizen account through hospitality_meal_payment
+--       - hospitality company receives the meal revenue
+--       - treasury covers citizen shortfalls through the bank handler
 --
--- Payment route:
---   1. Ask the bank to run hospitality_meal_payment.
---   2. The bank may charge the citizen first and then treasury covers any gap.
---   3. This terminal displays the split as citizen paid / treasury covered.
+--   * State Tavern / Inn nightly stays:
+--       - treats the Tavern as a state-owned enterprise
+--       - charges one nightly lodging fee per visible guest/citizen per MC day
+--       - known citizens/accounts pay into treasury:quid_bank
+--       - unknown visitors are external guests credited to treasury
+--       - uses tavern_night_payment so GDP/transaction stats can count it
 --
--- Important:
---   The terminal no longer treats bank-covered shortfall as unpaid.
+-- Pricing:
+--   * Dining meals use quote_service_price("dining_meal") when available.
+--   * Tavern stays use quote_service_price("tavern_night") when available.
+--   * Both therefore move with the bank's inflation / sector index model.
+--
+-- Requires ServerSideAccounts with:
+--   * quote_service_price
+--   * hospitality_meal_payment
+--   * tavern_night_payment
 -- =============================================================================
 
 local args = {...}
 
 if args[1] ~= "--updated" then
-  print("[ Service Payment Terminal ]")
+  print("[ NPC Business Payment Terminal ]")
   print("Deleting old version...")
   fs.delete("startup.lua")
   print("Downloading latest from GitHub...")
@@ -30,7 +42,9 @@ if args[1] ~= "--updated" then
   local url = "https://raw.githubusercontent.com/JoshuaMEtaylor/BankingAccountsMonitor/refs/heads/main/ServicePaymentTerminal?cb=" .. cb
   shell.run("wget " .. url .. " startup.lua")
   if not fs.exists("startup.lua") then
-    print("Download failed. Expected GitHub file: ServicePaymentTerminal")
+    print("")
+    print("Download failed.")
+    print("Expected GitHub file: ServicePaymentTerminal")
     return
   end
   print("Relaunching...")
@@ -42,18 +56,34 @@ end
 -- =============================================================================
 -- CONFIG
 -- =============================================================================
-local VERSION = "1.2.8-TREASURY-COVER-VISUAL"
+local VERSION = "1.3.0-NPC-BUSINESS-TAVERN"
 local BANK_PROTOCOL = "quid_bank"
-local TARGET_COMPANY = "company:hospitality" -- fallback only; real target is resolved from bank mappings/accounts
+local TREASURY_ID = "treasury:quid_bank"
 
-local SCAN_SECONDS = 2
+-- Dining fallback company. The terminal still tries to resolve the real
+-- hospitality company from bank employment mappings/accounts first.
+local TARGET_COMPANY = "company:hospitality"
+
+local SCAN_SECONDS = 3
 local DINING_RADIUS = 28
-local MEAL_COOLDOWN_SECONDS = 0
-local MIN_SAT_GAIN = 0.01
+local TAVERN_RADIUS = 36
+local NIGHT_START_HOUR = 18
+local NIGHT_END_HOUR = 6
+
+local ENABLE_DINING = true
+local ENABLE_TAVERN = true
+local AUTO_CHARGE_DEFAULT = true
+
+-- Citizens still need to be near a Tavern and it must be night, so random
+-- passers-by are not charged. Visitors/guests returned by MineColonies Tavern
+-- APIs can be charged even if no position is exposed by the peripheral.
+local CHARGE_VISITORS_WITHOUT_POSITION = true
+local CHARGE_CITIZENS_ONLY_AT_NIGHT = true
 
 local SALMON_BASE_PRICE = 2.00
-local BASE_NORMAL_MEAL_PRICE = SALMON_BASE_PRICE
+local TAVERN_BASE_FALLBACK_PRICE = 5.00
 local MIN_CHARGE = 1
+local MIN_SAT_GAIN = 0.01
 
 local STATE_FILE = "data/service_payment_state.db"
 local CONFIG_FILE = "data/service_payment_config.db"
@@ -66,57 +96,87 @@ local colony = nil
 local active_company_id = TARGET_COMPANY
 local active_company_source = "fallback"
 local active_dining_name = "fallback target"
-local auto_charge = true
+local auto_charge = AUTO_CHARGE_DEFAULT
 local last_message = "Booting..."
 local last_colour = colors.lightGray
 local W, H = term.getSize()
 
 local pricing = {
-  general_index = 1.00,
-  food_index = 1.00,
-  effective_index = 1.00,
-  normal_meal = BASE_NORMAL_MEAL_PRICE,
-  live_food_prices = 0,
-  monetary_pressure = 0,
-  source = "salmon_base_price",
+  dining = {
+    general_index = 1.00,
+    food_index = 1.00,
+    effective_index = 1.00,
+    normal_meal = SALMON_BASE_PRICE,
+    source = "fallback salmon base",
+    tier = "normal meal",
+  },
+  tavern = {
+    nightly_fee = TAVERN_BASE_FALLBACK_PRICE,
+    base_price = TAVERN_BASE_FALLBACK_PRICE,
+    hospitality_index = 1.00,
+    sector_label = "Hospitality CPI",
+    tier = "standard room",
+    source = "fallback",
+  },
 }
 
 local state = {
   citizens = {},
   receivables = {},
+  tavern_stays = {},
   events = {},
 }
 
 local stats = {
+  -- Shared/current scan
   citizens_seen = 0,
+  visitors_seen = 0,
+  buildings_seen = 0,
+  pricing_refreshes = 0,
+
+  -- Dining scan counters
   dining_buildings = 0,
   near_dining = 0,
   saturation_rises = 0,
-  meals_charged = 0,
-
-  -- Paid values from successful bank responses.
-  charged = 0,              -- full company revenue received
-  citizen_paid = 0,         -- amount pulled from colonist accounts
-  treasury_covered = 0,     -- amount paid by treasury subsidy/fallback
-  unpaid = 0,               -- true remaining uncovered shortfall only
-
-  skipped_cooldown = 0,
-  skipped_not_near = 0,
-  skipped_small_gain = 0,
-  skipped_staff = 0,
-  pricing_refreshes = 0,
   last_gain = 0,
-  last_charge = 0,
+
+  -- Dining cumulative totals
+  meals_charged = 0,
+  dining_revenue = 0,
+  citizen_paid = 0,
+  treasury_covered = 0,
+  unpaid = 0,
+  last_meal_charge = 0,
   last_citizen_paid = 0,
   last_treasury_covered = 0,
   last_uncovered = 0,
+
+  -- Tavern scan counters
+  taverns_found = 0,
+  tavern_people_seen = 0,
+  near_tavern = 0,
+  tavern_already_charged_today = 0,
+  tavern_skipped_staff = 0,
+  tavern_skipped_not_near = 0,
+  tavern_skipped_not_night = 0,
+  tavern_failed_charges = 0,
+
+  -- Tavern cumulative totals
+  stays_charged = 0,
+  tavern_revenue = 0,
+  tavern_citizen_revenue = 0,
+  tavern_guest_revenue = 0,
+  last_tavern_charge = 0,
+  last_tavern_guest = "",
+  last_tavern_source = "",
 }
 
 -- =============================================================================
 -- BASIC HELPERS
 -- =============================================================================
 local function now()
-  return os.epoch("utc")
+  if os.epoch then return os.epoch("utc") end
+  return math.floor(os.clock() * 1000)
 end
 
 local function lower(s)
@@ -133,14 +193,8 @@ local function setMsg(msg, col)
 end
 
 local function ensureDir(path)
-  local parts = {}
-  for p in string.gmatch(path, "[^/]+") do parts[#parts + 1] = p end
-  table.remove(parts)
-  local cur = ""
-  for _, p in ipairs(parts) do
-    cur = cur == "" and p or (cur .. "/" .. p)
-    if not fs.exists(cur) then fs.makeDir(cur) end
-  end
+  local dir = fs.getDir(path)
+  if dir and dir ~= "" and not fs.exists(dir) then fs.makeDir(dir) end
 end
 
 local function readFile(path)
@@ -168,7 +222,13 @@ local function money(n)
   n = tonumber(n) or 0
   local sign = ""
   if n < 0 then sign = "-"; n = math.abs(n) end
-  return sign .. tostring(math.floor(n + 0.5)) .. " Q"
+  local s = tostring(math.floor(n + 0.5))
+  local out = ""
+  while #s > 3 do
+    out = "," .. s:sub(-3) .. out
+    s = s:sub(1, -4)
+  end
+  return sign .. s .. out .. " Q"
 end
 
 local function roundMoney(n)
@@ -177,9 +237,10 @@ local function roundMoney(n)
   return math.max(MIN_CHARGE, math.floor(n + 0.5))
 end
 
-local function countTable(t)
+local function countRows(t)
   local n = 0
-  for _ in pairs(t or {}) do n = n + 1 end
+  if type(t) ~= "table" then return 0 end
+  for _ in pairs(t) do n = n + 1 end
   return n
 end
 
@@ -187,14 +248,24 @@ local function normalType(t)
   t = tostring(t or "")
   t = t:gsub("com%.minecolonies%.building%.", "")
   t = t:gsub("com%.minecolonies%.job%.", "")
-  t = t:gsub("[^%w_%-]", "")
+  t = t:gsub("[^%w_%- ]", "")
   return lower(t)
+end
+
+local function safeKey(s)
+  s = lower(s or "")
+  s = s:gsub("[^%w_%-]", "_")
+  s = s:gsub("_+", "_")
+  s = s:gsub("^_+", "")
+  s = s:gsub("_+$", "")
+  if s == "" then return nil end
+  return s
 end
 
 local function getPos(v)
   if type(v) ~= "table" then return nil end
 
-  local src = v.location or v.position or v.pos or v.loc or v.blockPos or v.homeLocation or nil
+  local src = v.location or v.position or v.pos or v.loc or v.blockPos or v.homeLocation or v.hutLocation or nil
   if type(src) == "table" then
     local x = tonumber(src.x or src.X or src[1])
     local y = tonumber(src.y or src.Y or src[2])
@@ -218,17 +289,55 @@ local function dist(a, b)
   return math.sqrt((dx * dx) + (dy * dy) + (dz * dz))
 end
 
-local function citizenStableId(z)
+local function mcDay()
+  if os.day then
+    local ok, d = pcall(os.day, "ingame")
+    if ok and tonumber(d) then return math.floor(tonumber(d)) end
+    ok, d = pcall(os.day)
+    if ok and tonumber(d) then return math.floor(tonumber(d)) end
+  end
+  return math.floor(now() / 1200000)
+end
+
+local function mcHour()
+  if os.time then
+    local ok, t = pcall(os.time, "ingame")
+    if ok and tonumber(t) then return tonumber(t) % 24 end
+    ok, t = pcall(os.time)
+    if ok and tonumber(t) then return tonumber(t) % 24 end
+  end
+  local dayMs = now() % 1200000
+  return (dayMs / 1200000) * 24
+end
+
+local function isNight()
+  local h = mcHour()
+  if NIGHT_START_HOUR > NIGHT_END_HOUR then
+    return h >= NIGHT_START_HOUR or h < NIGHT_END_HOUR
+  end
+  return h >= NIGHT_START_HOUR and h < NIGHT_END_HOUR
+end
+
+local function mctText()
+  local h = mcHour()
+  local hour = math.floor(h)
+  local minute = math.floor((h - hour) * 60)
+  return string.format("Day %d %02d:%02dMCT", mcDay(), hour, minute)
+end
+
+local function stableId(z)
   if type(z) ~= "table" then return nil end
-  local id = z.id or z.citizen_id or z.citizenId or z.uuid or z.name
+  local id = z.id or z.citizen_id or z.citizenId or z.citizenID or z.uuid or z.name or z.displayName
   if id == nil then return nil end
   return tostring(id)
 end
 
 local function citizenUsername(z)
-  local id = citizenStableId(z)
+  local id = stableId(z)
   if not id then return nil end
-  id = id:gsub("[^%w_%-]", "_")
+  id = tostring(id):gsub("[^%w_%-]", "_")
+  if id:find("^citizen:mc_") then return id:gsub("^citizen:", "") end
+  if id:find("^citizen:") then return id:gsub("^citizen:", "") end
   if id:find("^mc_") then return id end
   return "mc_" .. id
 end
@@ -237,6 +346,16 @@ local function citizenAccountId(z)
   local u = citizenUsername(z)
   if not u then return nil end
   return "citizen:" .. u
+end
+
+local function personName(z, fallback)
+  return tostring(z and (z.name or z.display_name or z.displayName or z.nickname) or fallback or "guest")
+end
+
+local function visitorGuestId(z)
+  local id = stableId(z) or personName(z, "guest")
+  local key = safeKey(id) or ("guest_" .. tostring(now()))
+  return "guest:" .. key
 end
 
 local function companySlug(text)
@@ -261,24 +380,6 @@ local function isSafeCompanyId(id)
   if not id:find("^company:") then return false end
   if id:find("minecolonies", 1, true) or id:find("building", 1, true) or id:find("%.") then return false end
   return true
-end
-
-local function diningCompanyIdForBuilding(b)
-  if type(b) ~= "table" then return nil end
-  local explicit = b.company_id or b.companyId or b.account_id or b.accountId or b.business_id or b.businessId
-  if explicit and tostring(explicit) ~= "" then
-    explicit = tostring(explicit)
-    if explicit:find("^company:") and isSafeCompanyId(explicit) then return explicit end
-  end
-  return nil
-end
-
-local function citizenName(z, fallback)
-  return tostring(z and (z.name or z.display_name or z.displayName) or fallback or "citizen")
-end
-
-local function citizenSaturation(z)
-  return tonumber(z and (z.saturation or z.food or z.foodLevel or z.food_level) or 0) or 0
 end
 
 -- =============================================================================
@@ -329,8 +430,38 @@ local function bankReq(req, timeout)
   end
 end
 
+local function callList(methods)
+  if not colony then return {}, "none" end
+  for _, name in ipairs(methods) do
+    if type(colony[name]) == "function" then
+      local ok, data = pcall(colony[name])
+      if ok and type(data) == "table" then return data, name end
+    end
+  end
+  return {}, "none"
+end
+
+local function getLiveBuildings()
+  return callList({ "getBuildings", "getHuts", "getWorkOrders" })
+end
+
+local function getLiveCitizens()
+  return callList({ "getCitizens" })
+end
+
+local function getLiveVisitors()
+  return callList({
+    "getVisitors",
+    "getVisitorList",
+    "getGuests",
+    "getGuestList",
+    "getTavernVisitors",
+    "getTavernGuests",
+  })
+end
+
 -- =============================================================================
--- COMPANY TARGET RESOLUTION
+-- BUILDING / STAFF DETECTION
 -- =============================================================================
 local function textHasHospitality(text)
   text = lower(text or "")
@@ -343,6 +474,149 @@ local function textHasHospitality(text)
     or text:find("waiter", 1, true)
 end
 
+local function collectText(v, out, depth, seen)
+  out = out or {}
+  depth = depth or 0
+  if depth > 4 then return out end
+  seen = seen or {}
+
+  local tv = type(v)
+  if tv == "string" or tv == "number" or tv == "boolean" then
+    out[#out + 1] = tostring(v)
+    return out
+  end
+  if tv ~= "table" then return out end
+  if seen[v] then return out end
+  seen[v] = true
+
+  local keys = {
+    "work", "workBuilding", "work_building", "job", "jobName", "job_name",
+    "profession", "occupation", "role", "title", "name", "type", "buildingType"
+  }
+  for _, k in ipairs(keys) do
+    if v[k] ~= nil then collectText(v[k], out, depth + 1, seen) end
+  end
+  return out
+end
+
+local function isDiningStaffCitizen(z)
+  local chunks = {}
+  collectText(z, chunks, 0, {})
+  local text = lower(table.concat(chunks, " "))
+  if text == "" then return false end
+  return text:find("waiter", 1, true) ~= nil
+    or text:find("cook", 1, true) ~= nil
+    or text:find("restaurant", 1, true) ~= nil
+    or text:find("dining", 1, true) ~= nil
+    or text:find("kitchen", 1, true) ~= nil
+end
+
+local function isTavernStaffCitizen(z)
+  local chunks = {}
+  collectText(z, chunks, 0, {})
+  local text = lower(table.concat(chunks, " "))
+  if text == "" then return false end
+  return text:find("tavern", 1, true) ~= nil
+    or text:find("innkeeper", 1, true) ~= nil
+    or text:find("host", 1, true) ~= nil
+    or text:find("bartender", 1, true) ~= nil
+end
+
+local function diningCompanyIdForBuilding(b)
+  if type(b) ~= "table" then return nil end
+  local explicit = b.company_id or b.companyId or b.account_id or b.accountId or b.business_id or b.businessId
+  if explicit and tostring(explicit) ~= "" then
+    explicit = tostring(explicit)
+    if explicit:find("^company:") and isSafeCompanyId(explicit) then return explicit end
+  end
+  return nil
+end
+
+local function isDiningBuilding(b)
+  if type(b) ~= "table" then return false end
+  local t = normalType(b.type or b.name or b.buildingType)
+  local n = lower((b.name or "") .. " " .. (b.type or "") .. " " .. (b.buildingType or ""))
+
+  local wanted = t:find("dining", 1, true)
+    or t:find("restaurant", 1, true)
+    or t == "cook"
+    or n:find("dining", 1, true)
+    or n:find("restaurant", 1, true)
+    or n:find("cook", 1, true)
+    or n:find("kitchen", 1, true)
+
+  local wrong = n:find("tavern", 1, true) or n:find("inn", 1, true) or n:find("bar", 1, true)
+  return wanted and not wrong
+end
+
+local function isTavernBuilding(b)
+  if type(b) ~= "table" then return false end
+  local text = normalType(
+    tostring(b.name or "") .. " " ..
+    tostring(b.type or "") .. " " ..
+    tostring(b.buildingType or "") .. " " ..
+    tostring(b.job or "")
+  )
+
+  return text:find("tavern", 1, true) ~= nil
+    or text:find("inn", 1, true) ~= nil
+    or text:find("lodging", 1, true) ~= nil
+end
+
+local function diningBuildings(buildings)
+  local out = {}
+  for _, b in pairs(buildings or {}) do
+    if isDiningBuilding(b) then
+      local p = getPos(b)
+      if p then
+        out[#out + 1] = {
+          name = tostring(b.name or b.type or "Dining Hall"),
+          company_id = diningCompanyIdForBuilding(b),
+          pos = p,
+          raw = b,
+        }
+      end
+    end
+  end
+  return out
+end
+
+local function tavernBuildings(buildings)
+  local out = {}
+  for _, b in pairs(buildings or {}) do
+    if isTavernBuilding(b) then
+      local p = getPos(b)
+      if p then
+        out[#out + 1] = {
+          name = tostring(b.name or b.type or b.buildingType or "Tavern"),
+          pos = p,
+          raw = b,
+        }
+      end
+    end
+  end
+  return out
+end
+
+local function nearestBuilding(pos, list)
+  if not pos then return nil, nil end
+  local best, bestDist = nil, 999999
+  for _, b in ipairs(list or {}) do
+    local d = dist(pos, b.pos)
+    if d < bestDist then best = b; bestDist = d end
+  end
+  return best, bestDist
+end
+
+local function isNearBuilding(pos, list, radius)
+  local best, bestDist = nearestBuilding(pos, list)
+  if best and bestDist and bestDist <= radius then return true, best, bestDist end
+  return false, best, bestDist
+end
+
+-- =============================================================================
+-- HOSPITALITY COMPANY RESOLUTION
+-- =============================================================================
 local function resolveHospitalityCompanyFromMappings()
   local ok, res = bankReq({ type = "list_employee_mappings", include_inactive = false }, 4)
   if not ok or type(res) ~= "table" or type(res.employees) ~= "table" then return nil, nil end
@@ -417,153 +691,104 @@ end
 -- =============================================================================
 -- PRICING
 -- =============================================================================
-local function refreshPricing()
-  pricing.general_index = 1.00
-  pricing.food_index = 1.00
-  pricing.effective_index = 1.00
-  pricing.normal_meal = SALMON_BASE_PRICE
-  pricing.monetary_pressure = 0
-  pricing.source = "salmon_base_price"
+local function refreshDiningPricing()
   stats.pricing_refreshes = stats.pricing_refreshes + 1
-  return true
+
+  local ok, res = bankReq({
+    type = "quote_service_price",
+    service = "dining_meal",
+    tier = "normal",
+    saturation_gain = 5,
+    sector = "food",
+  }, 4)
+
+  if ok and type(res) == "table" then
+    pricing.dining.normal_meal = roundMoney(res.total or SALMON_BASE_PRICE)
+    pricing.dining.general_index = tonumber(res.general_index or res.effective_index) or 1.00
+    pricing.dining.food_index = tonumber(res.sector_index or res.effective_index) or 1.00
+    pricing.dining.effective_index = tonumber(res.effective_index or res.sector_index) or 1.00
+    pricing.dining.source = tostring(res.source or "bank quote")
+    pricing.dining.tier = tostring(res.tier or "normal meal")
+    return true
+  end
+
+  pricing.dining.normal_meal = SALMON_BASE_PRICE
+  pricing.dining.food_index = 1.00
+  pricing.dining.effective_index = 1.00
+  pricing.dining.source = "fallback: " .. tostring(res)
+  pricing.dining.tier = "salmon"
+  return false
 end
 
-local function mealTierForGain(gain)
-  gain = tonumber(gain) or 0
-  if gain > 0 then return 1.00, "salmon" end
-  return 0, "none"
+local function refreshTavernPricing()
+  stats.pricing_refreshes = stats.pricing_refreshes + 1
+
+  local ok, res = bankReq({
+    type = "quote_service_price",
+    service = "tavern_night",
+    tier = "standard",
+    sector = "hospitality",
+  }, 4)
+
+  if ok and type(res) == "table" then
+    pricing.tavern.nightly_fee = roundMoney(res.total or TAVERN_BASE_FALLBACK_PRICE)
+    pricing.tavern.base_price = tonumber(res.base_price) or TAVERN_BASE_FALLBACK_PRICE
+    pricing.tavern.hospitality_index = tonumber(res.sector_index or res.effective_index) or 1.00
+    pricing.tavern.sector_label = tostring(res.sector_label or "Hospitality CPI")
+    pricing.tavern.tier = tostring(res.tier or "standard room")
+    pricing.tavern.source = tostring(res.source or "bank quote")
+    return true
+  end
+
+  pricing.tavern.nightly_fee = roundMoney(TAVERN_BASE_FALLBACK_PRICE)
+  pricing.tavern.base_price = TAVERN_BASE_FALLBACK_PRICE
+  pricing.tavern.hospitality_index = 1.00
+  pricing.tavern.sector_label = "fallback"
+  pricing.tavern.tier = "standard room"
+  pricing.tavern.source = "fallback: " .. tostring(res)
+  return false
+end
+
+local function refreshPricing()
+  local okDining = true
+  local okTavern = true
+  if ENABLE_DINING then okDining = refreshDiningPricing() end
+  if ENABLE_TAVERN then okTavern = refreshTavernPricing() end
+  return okDining and okTavern
 end
 
 local function priceMeal(gain)
-  local tier, label = mealTierForGain(gain)
-  if tier <= 0 then return 0, label, tier end
+  gain = tonumber(gain) or 0
+  if gain <= MIN_SAT_GAIN then return 0, "none", 0 end
+
+  local ok, res = bankReq({
+    type = "quote_service_price",
+    service = "dining_meal",
+    saturation_gain = gain,
+    sector = "food",
+  }, 4)
+
+  if ok and type(res) == "table" then
+    local amount = roundMoney(res.total or pricing.dining.normal_meal or SALMON_BASE_PRICE)
+    pricing.dining.normal_meal = amount > 0 and amount or pricing.dining.normal_meal
+    pricing.dining.food_index = tonumber(res.sector_index or res.effective_index) or pricing.dining.food_index
+    pricing.dining.effective_index = tonumber(res.effective_index or res.sector_index) or pricing.dining.effective_index
+    pricing.dining.source = tostring(res.source or "bank quote")
+    pricing.dining.tier = tostring(res.tier or "meal")
+    return amount, tostring(res.tier or "meal"), tonumber(res.tier_multiplier) or 1.00
+  end
+
   return roundMoney(SALMON_BASE_PRICE), "salmon", 1.00
 end
 
 -- =============================================================================
--- COLONY SCANNING
--- =============================================================================
-local function getLiveCitizens()
-  if not colony or type(colony.getCitizens) ~= "function" then return {} end
-  local ok, citizens = pcall(colony.getCitizens)
-  if ok and type(citizens) == "table" then return citizens end
-  return {}
-end
-
-local function getLiveBuildings()
-  if not colony or type(colony.getBuildings) ~= "function" then return {} end
-  local ok, buildings = pcall(colony.getBuildings)
-  if ok and type(buildings) == "table" then return buildings end
-  return {}
-end
-
-local function isDiningBuilding(b)
-  if type(b) ~= "table" then return false end
-  local t = normalType(b.type or b.name or b.buildingType)
-  local n = lower((b.name or "") .. " " .. (b.type or "") .. " " .. (b.buildingType or ""))
-
-  local wanted = t:find("dining", 1, true)
-    or t:find("restaurant", 1, true)
-    or t == "cook"
-    or n:find("dining", 1, true)
-    or n:find("restaurant", 1, true)
-    or n:find("cook", 1, true)
-    or n:find("kitchen", 1, true)
-
-  local wrong = n:find("tavern", 1, true) or n:find("inn", 1, true) or n:find("bar", 1, true)
-  return wanted and not wrong
-end
-
-local function diningBuildings(buildings)
-  local out = {}
-  for _, b in ipairs(buildings or {}) do
-    if isDiningBuilding(b) then
-      local p = getPos(b)
-      if p then
-        local dname = tostring(b.name or b.type or "Dining Hall")
-        out[#out + 1] = {
-          name = dname,
-          company_id = diningCompanyIdForBuilding(b),
-          pos = p,
-          raw = b,
-        }
-      end
-    end
-  end
-  return out
-end
-
-local function isNearDining(pos, dining)
-  if not pos then return false, nil, nil end
-  local best, bestDist = nil, 999999
-  for _, d in ipairs(dining or {}) do
-    local dd = dist(pos, d.pos)
-    if dd < bestDist then bestDist = dd; best = d end
-  end
-  if best and bestDist <= DINING_RADIUS then return true, best, bestDist end
-  return false, best, bestDist
-end
-
-local function collectWorkText(v, out, depth, seen)
-  out = out or {}
-  depth = depth or 0
-  if depth > 4 then return out end
-  seen = seen or {}
-
-  local tv = type(v)
-  if tv == "string" or tv == "number" or tv == "boolean" then
-    out[#out + 1] = tostring(v)
-    return out
-  end
-  if tv ~= "table" then return out end
-  if seen[v] then return out end
-  seen[v] = true
-
-  local keys = {
-    "work", "workBuilding", "work_building", "job", "jobName", "job_name",
-    "profession", "occupation", "role", "title", "name", "type", "buildingType"
-  }
-  for _, k in ipairs(keys) do
-    if v[k] ~= nil then collectWorkText(v[k], out, depth + 1, seen) end
-  end
-  return out
-end
-
-local function isDiningStaffCitizen(z)
-  if type(z) ~= "table" then return false end
-  local chunks = {}
-  local fields = {
-    "work", "workBuilding", "work_building", "job", "jobName", "job_name",
-    "profession", "occupation", "role", "title"
-  }
-
-  for _, k in ipairs(fields) do
-    if z[k] ~= nil then collectWorkText(z[k], chunks, 0, {}) end
-  end
-
-  local text = lower(table.concat(chunks, " "))
-  if text == "" then return false end
-
-  return text:find("waiter", 1, true) ~= nil
-    or text:find("cook", 1, true) ~= nil
-    or text:find("restaurant", 1, true) ~= nil
-    or text:find("dining", 1, true) ~= nil
-    or text:find("kitchen", 1, true) ~= nil
-end
-
--- =============================================================================
--- PAYMENT
+-- PAYMENT / EVENT HELPERS
 -- =============================================================================
 local function addEvent(ev)
   state.events = state.events or {}
   ev.time = ev.time or now()
   state.events[#state.events + 1] = ev
-  local keep = {}
-  local cutoff = now() - (30 * 60 * 1000)
-  for _, e in ipairs(state.events) do
-    if tonumber(e.time) and tonumber(e.time) >= cutoff then keep[#keep + 1] = e end
-  end
-  state.events = keep
+  while #state.events > 40 do table.remove(state.events, 1) end
 end
 
 local function totalReceivables()
@@ -580,20 +805,12 @@ local function decodeMealPayment(res, requested)
   local treasury_paid = tonumber(res.treasury_paid or res.treasury_covered or res.subsidy_paid or res.state_paid or res.subsidy or 0)
   local shortfall = tonumber(res.shortfall or res.unpaid or res.remaining_shortfall or 0) or 0
 
-  -- Compatibility with older bank response: old server only returned paid/shortfall.
-  -- If paid == requested and shortfall == 0, treat it as fully covered, not unpaid.
-  if company_received >= requested and shortfall <= 0 then
-    shortfall = 0
-  end
-
-  -- If the patched bank returned a full paid amount but did not yet include split
-  -- fields, keep the terminal truthful: company got paid; split unknown.
+  if company_received >= requested and shortfall <= 0 then shortfall = 0 end
   if not citizen_paid then citizen_paid = 0 end
   if not treasury_paid then treasury_paid = 0 end
 
   local split_total = citizen_paid + treasury_paid
   if company_received > 0 and split_total == 0 then
-    -- Unknown split, keep it out of subsidy totals rather than inventing it.
     citizen_paid = company_received
   elseif company_received > 0 and split_total < company_received and treasury_paid > 0 then
     treasury_paid = treasury_paid + (company_received - split_total)
@@ -630,11 +847,11 @@ local function chargeCitizenMeal(citizen_id, name, amount, label, gain, company_
     local pay = decodeMealPayment(res, amount)
 
     stats.meals_charged = stats.meals_charged + 1
-    stats.charged = stats.charged + pay.company_received
+    stats.dining_revenue = stats.dining_revenue + pay.company_received
     stats.citizen_paid = stats.citizen_paid + pay.citizen_paid
     stats.treasury_covered = stats.treasury_covered + pay.treasury_paid
     stats.unpaid = stats.unpaid + pay.uncovered
-    stats.last_charge = pay.company_received
+    stats.last_meal_charge = pay.company_received
     stats.last_citizen_paid = pay.citizen_paid
     stats.last_treasury_covered = pay.treasury_paid
     stats.last_uncovered = pay.uncovered
@@ -658,10 +875,8 @@ local function chargeCitizenMeal(citizen_id, name, amount, label, gain, company_
       uncovered = pay.uncovered,
       tx_id = pay.tx_id,
       treasury_tx_id = pay.treasury_tx_id,
-      normal_meal = pricing.normal_meal,
-      food_index = pricing.food_index,
-      general_index = pricing.general_index,
-      effective_index = pricing.effective_index,
+      food_index = pricing.dining.food_index,
+      effective_index = pricing.dining.effective_index,
     })
 
     if pay.uncovered > 0 then
@@ -678,19 +893,77 @@ local function chargeCitizenMeal(citizen_id, name, amount, label, gain, company_
   return false
 end
 
-local function processCitizen(z, dining)
+local function chargeTavernNight(person, tavern)
+  local amount = roundMoney(pricing.tavern.nightly_fee)
+  if amount <= 0 then return false, "Invalid nightly fee" end
+
+  local memo = "Tavern nightly stay"
+  if tavern and tavern.name then memo = memo .. " at " .. tostring(tavern.name) end
+  memo = memo .. " for " .. tostring(person.name or person.key)
+
+  local ok, res = bankReq({
+    type = "tavern_night_payment",
+    payer_id = person.account_id,
+    guest_id = person.guest_id or person.key,
+    guest_name = person.name,
+    treasury_id = TREASURY_ID,
+    amount = amount,
+    tier = "standard",
+    memo = memo,
+  }, 6)
+
+  if ok and type(res) == "table" then
+    local paid = tonumber(res.paid or res.amount or amount) or amount
+    stats.stays_charged = stats.stays_charged + 1
+    stats.tavern_revenue = stats.tavern_revenue + paid
+    stats.last_tavern_charge = paid
+    stats.last_tavern_guest = tostring(person.name or person.key)
+    stats.last_tavern_source = tostring(res.source or person.source)
+
+    if res.external_guest or person.source ~= "citizen" then
+      stats.tavern_guest_revenue = stats.tavern_guest_revenue + paid
+    else
+      stats.tavern_citizen_revenue = stats.tavern_citizen_revenue + paid
+    end
+
+    addEvent({
+      type = "tavern_night",
+      day = mcDay(),
+      person_key = person.key,
+      name = person.name,
+      source = res.source or person.source,
+      tavern = tavern and tavern.name or nil,
+      amount = paid,
+      tx_id = res.tx_id,
+      price_index = pricing.tavern.hospitality_index,
+      price_source = pricing.tavern.source,
+    })
+
+    setMsg("Tavern stay paid: " .. tostring(person.name) .. " -> Treasury " .. money(paid), colors.lime)
+    return true
+  end
+
+  stats.tavern_failed_charges = stats.tavern_failed_charges + 1
+  setMsg("Tavern charge failed for " .. tostring(person.name) .. ": " .. tostring(res), colors.red)
+  return false, res
+end
+
+-- =============================================================================
+-- DINING PROCESSING
+-- =============================================================================
+local function processDiningCitizen(z, dining)
   local cid = citizenAccountId(z)
   if not cid then return end
 
-  local name = citizenName(z, cid)
-  local sat = citizenSaturation(z)
+  local name = personName(z, cid)
+  local sat = tonumber(z.saturation or z.food or z.foodLevel or z.food_level or 0) or 0
   local pos = getPos(z)
   local near = false
   local nearBuilding = nil
   local nearDistance = nil
 
   if #dining > 0 then
-    near, nearBuilding, nearDistance = isNearDining(pos, dining)
+    near, nearBuilding, nearDistance = isNearBuilding(pos, dining, DINING_RADIUS)
   else
     near = true
   end
@@ -712,12 +985,12 @@ local function processCitizen(z, dining)
   local oldSat = tonumber(rec.sat)
   if oldSat ~= nil then
     local gain = sat - oldSat
-    if gain > 0 then
+    if gain > MIN_SAT_GAIN then
       stats.saturation_rises = stats.saturation_rises + 1
       stats.last_gain = gain
 
       local amount, label = priceMeal(gain)
-      if amount > 0 then
+      if amount > 0 and auto_charge then
         local company_id = rec.near_company_id or active_company_id or TARGET_COMPANY
         if chargeCitizenMeal(cid, name, amount, label, gain, company_id) then
           rec.last_charge_at = t
@@ -743,6 +1016,128 @@ local function pruneMissingCitizens(seen)
   end
 end
 
+-- =============================================================================
+-- TAVERN PROCESSING
+-- =============================================================================
+local function makeTavernPerson(z, source)
+  local name = personName(z, source == "citizen" and "citizen" or "guest")
+  if source == "citizen" then
+    local cid = citizenAccountId(z)
+    if not cid then return nil end
+    return {
+      key = cid,
+      source = "citizen",
+      name = name,
+      account_id = cid,
+      guest_id = nil,
+      pos = getPos(z),
+      raw = z,
+    }
+  end
+
+  local gid = visitorGuestId(z)
+  return {
+    key = gid,
+    source = "visitor",
+    name = name,
+    account_id = nil,
+    guest_id = gid,
+    pos = getPos(z),
+    raw = z,
+  }
+end
+
+local function processTavernPerson(person, taverns)
+  if not person then return end
+  local day = mcDay()
+  state.tavern_stays = state.tavern_stays or {}
+  local rec = state.tavern_stays[person.key] or {}
+
+  local near = false
+  local tavern = nil
+  local distance = nil
+
+  if person.pos and #taverns > 0 then
+    tavern, distance = nearestBuilding(person.pos, taverns)
+    if tavern and distance and distance <= TAVERN_RADIUS then near = true end
+  elseif person.source == "visitor" and CHARGE_VISITORS_WITHOUT_POSITION then
+    near = true
+    tavern = taverns[1]
+  end
+
+  rec.name = person.name
+  rec.source = person.source
+  rec.last_seen = now()
+
+  if not near then
+    stats.tavern_skipped_not_near = stats.tavern_skipped_not_near + 1
+    state.tavern_stays[person.key] = rec
+    return
+  end
+
+  stats.near_tavern = stats.near_tavern + 1
+  rec.near_at = now()
+  rec.tavern = tavern and tavern.name or "visitor list"
+  rec.distance = distance
+
+  if person.source == "citizen" and isTavernStaffCitizen(person.raw) then
+    stats.tavern_skipped_staff = stats.tavern_skipped_staff + 1
+    state.tavern_stays[person.key] = rec
+    return
+  end
+
+  if person.source == "citizen" and CHARGE_CITIZENS_ONLY_AT_NIGHT and not isNight() then
+    stats.tavern_skipped_not_night = stats.tavern_skipped_not_night + 1
+    state.tavern_stays[person.key] = rec
+    return
+  end
+
+  if tonumber(rec.last_charged_day) == day then
+    stats.tavern_already_charged_today = stats.tavern_already_charged_today + 1
+    state.tavern_stays[person.key] = rec
+    return
+  end
+
+  if auto_charge then
+    local ok = chargeTavernNight(person, tavern)
+    if ok then
+      rec.last_charged_day = day
+      rec.last_charged_at = now()
+      rec.last_amount = pricing.tavern.nightly_fee
+    end
+  end
+
+  state.tavern_stays[person.key] = rec
+end
+
+local function pruneOldTavernStays(seen)
+  local cutoff = now() - (2 * 60 * 60 * 1000)
+  for key, rec in pairs(state.tavern_stays or {}) do
+    if not seen[key] and tonumber(rec.last_seen or 0) < cutoff then
+      state.tavern_stays[key] = nil
+    end
+  end
+end
+
+-- =============================================================================
+-- POLL LOOP
+-- =============================================================================
+local function resetScanStats()
+  stats.citizens_seen = 0
+  stats.visitors_seen = 0
+  stats.buildings_seen = 0
+  stats.dining_buildings = 0
+  stats.near_dining = 0
+  stats.saturation_rises = 0
+  stats.taverns_found = 0
+  stats.tavern_people_seen = 0
+  stats.near_tavern = 0
+  stats.tavern_already_charged_today = 0
+  stats.tavern_skipped_staff = 0
+  stats.tavern_skipped_not_near = 0
+  stats.tavern_skipped_not_night = 0
+end
+
 local function poll()
   if not connectColony() then
     setMsg("No local colonyIntegrator on this terminal.", colors.red)
@@ -750,38 +1145,72 @@ local function poll()
   end
   if not db_id then discoverBank() end
   refreshPricing()
+  resetScanStats()
 
-  local citizens = getLiveCitizens()
   local buildings = getLiveBuildings()
-  local dining = diningBuildings(buildings)
+  local citizens = getLiveCitizens()
+  local visitors = getLiveVisitors()
 
-  local resolved_company, resolved_source = resolveHospitalityCompany(dining)
-  active_company_id = resolved_company or TARGET_COMPANY
-  active_company_source = resolved_source or "fallback"
+  stats.buildings_seen = countRows(buildings)
+  stats.citizens_seen = countRows(citizens)
+  stats.visitors_seen = countRows(visitors)
 
-  if #dining > 0 then
-    active_dining_name = dining[1].name or "Dining Hall"
-  else
-    active_dining_name = "fallback target"
+  local dining = {}
+  if ENABLE_DINING then
+    dining = diningBuildings(buildings)
+    stats.dining_buildings = #dining
+
+    local resolved_company, resolved_source = resolveHospitalityCompany(dining)
+    active_company_id = resolved_company or TARGET_COMPANY
+    active_company_source = resolved_source or "fallback"
+
+    if #dining > 0 then active_dining_name = dining[1].name or "Dining Hall" else active_dining_name = "fallback target" end
+    for _, d in ipairs(dining or {}) do d.company_id = active_company_id end
+
+    local seenDining = {}
+    for _, z in pairs(citizens or {}) do
+      local cid = citizenAccountId(z)
+      if cid then seenDining[cid] = true end
+      processDiningCitizen(z, dining)
+    end
+    pruneMissingCitizens(seenDining)
   end
 
-  for _, d in ipairs(dining or {}) do
-    d.company_id = active_company_id
+  if ENABLE_TAVERN then
+    local taverns = tavernBuildings(buildings)
+    stats.taverns_found = #taverns
+    stats.tavern_people_seen = stats.citizens_seen + stats.visitors_seen
+
+    local seenTavern = {}
+    for _, z in pairs(citizens or {}) do
+      local p = makeTavernPerson(z, "citizen")
+      if p then
+        seenTavern[p.key] = true
+        processTavernPerson(p, taverns)
+      end
+    end
+
+    for _, z in pairs(visitors or {}) do
+      local p = makeTavernPerson(z, "visitor")
+      if p then
+        seenTavern[p.key] = true
+        processTavernPerson(p, taverns)
+      end
+    end
+
+    pruneOldTavernStays(seenTavern)
   end
 
-  stats.citizens_seen = #citizens
-  stats.dining_buildings = #dining
-  stats.near_dining = 0
-
-  local seen = {}
-  for _, z in ipairs(citizens) do
-    local cid = citizenAccountId(z)
-    if cid then seen[cid] = true end
-    processCitizen(z, dining)
-  end
-
-  pruneMissingCitizens(seen)
   writeFile(STATE_FILE, state)
+
+  if ENABLE_TAVERN and stats.taverns_found <= 0 and stats.visitors_seen <= 0 then
+    setMsg("Scanned. Dining active; no Tavern found and no visitor list available.", colors.orange)
+  elseif auto_charge then
+    setMsg("Scanned NPC business transactions.", colors.lime)
+  else
+    setMsg("Scanned NPC business transactions. Auto charge is off.", colors.orange)
+  end
+
   return true
 end
 
@@ -835,28 +1264,28 @@ end
 local function draw()
   cls()
   fill(1, 1, W, 1, colors.purple)
-  at(2, 1, "SERVICE PAYMENT TERMINAL", colors.white, colors.purple)
+  at(2, 1, "NPC BUSINESS PAYMENT TERMINAL", colors.white, colors.purple)
   at(math.max(2, W - #VERSION), 1, VERSION, colors.lightGray, colors.purple)
 
-  at(2, 3, "Source:       any sat change = salmon charge", colors.white)
+  at(2, 3, "Time:         " .. mctText() .. (isNight() and "  NIGHT" or "  DAY"), isNight() and colors.lime or colors.lightGray)
   at(2, 4, "Bank:         " .. tostring(db_id or "not connected"), db_id and colors.lime or colors.red)
   at(2, 5, "Colony:       " .. tostring(colony and "connected" or "missing"), colony and colors.lime or colors.red)
-  at(2, 6, "Company:      " .. tostring(active_company_id or TARGET_COMPANY), colors.lime)
-  at(2, 7, "Dining area:  " .. tostring(active_dining_name or "unknown"), colors.lightGray)
-  at(2, 8, "Target via:   " .. tostring(active_company_source or "fallback"), colors.gray)
-  at(2, 9, "Auto:         " .. (auto_charge and "ON" or "OFF"), auto_charge and colors.lime or colors.orange)
+  at(2, 6, "Auto:         " .. (auto_charge and "ON" or "OFF") .. "   Citizens " .. tostring(stats.citizens_seen) .. " / Visitors " .. tostring(stats.visitors_seen), auto_charge and colors.lime or colors.orange)
 
-  at(2, 11,  "Citizens:     " .. tostring(stats.citizens_seen) .. "   Near dining: " .. tostring(stats.near_dining), colors.lightGray)
-  at(2, 12, "Dining halls: " .. tostring(stats.dining_buildings) .. "   Radius: " .. tostring(DINING_RADIUS), stats.dining_buildings > 0 and colors.lime or colors.orange)
-  at(2, 13, "Food item:    salmon", colors.cyan)
-  at(2, 14, "Charge price: " .. money(SALMON_BASE_PRICE) .. " per sat-rise event", colors.cyan)
-  at(2, 15, "Pricing:      fixed base food price", colors.lightGray)
+  at(2, 8, "DINING HALL / RESTAURANT", colors.cyan)
+  at(2, 9, "Company:      " .. tostring(active_company_id or TARGET_COMPANY) .. " via " .. tostring(active_company_source or "fallback"), colors.lightGray)
+  at(2, 10, "Dining halls: " .. tostring(stats.dining_buildings) .. "   Near: " .. tostring(stats.near_dining) .. "   Radius: " .. tostring(DINING_RADIUS), stats.dining_buildings > 0 and colors.lime or colors.orange)
+  at(2, 11, "Meal price:   " .. money(pricing.dining.normal_meal) .. "   " .. tostring(pricing.dining.tier) .. "   Food x" .. string.format("%.3f", tonumber(pricing.dining.food_index) or 1), colors.cyan)
+  at(2, 12, "Meals:        " .. tostring(stats.meals_charged) .. "   Revenue: " .. money(stats.dining_revenue) .. "   Sat rises: " .. tostring(stats.saturation_rises), colors.lime)
+  at(2, 13, "Paid by:      Citizens " .. money(stats.citizen_paid) .. " / Treasury " .. money(stats.treasury_covered) .. " / Unpaid " .. money(stats.unpaid), stats.unpaid > 0 and colors.orange or colors.lightGray)
 
-  at(2, 17, "Sat rises:    " .. tostring(stats.saturation_rises) .. "   Last gain: +" .. string.format("%.1f", stats.last_gain), colors.lightGray)
-  at(2, 18, "Meals:        " .. tostring(stats.meals_charged) .. "   Revenue: " .. money(stats.charged), colors.lime)
-  at(2, 19, "Paid by:      Citizens " .. money(stats.citizen_paid) .. "   Treasury " .. money(stats.treasury_covered), stats.treasury_covered > 0 and colors.yellow or colors.lightGray)
-  at(2, 20, "Uncovered:    " .. money(stats.unpaid) .. "   Receivables: " .. money(totalReceivables()), stats.unpaid > 0 and colors.orange or colors.gray)
-  at(2, 21, "Last split:   citizen " .. money(stats.last_citizen_paid) .. " / treasury " .. money(stats.last_treasury_covered), colors.lightGray)
+  at(2, 15, "STATE TAVERN / INN", colors.orange)
+  at(2, 16, "Treasury:     " .. TREASURY_ID .. "   Taverns: " .. tostring(stats.taverns_found) .. "   Radius: " .. tostring(TAVERN_RADIUS), stats.taverns_found > 0 and colors.lime or colors.orange)
+  at(2, 17, "Nightly fee:  " .. money(pricing.tavern.nightly_fee) .. "   " .. tostring(pricing.tavern.tier) .. "   Hosp x" .. string.format("%.3f", tonumber(pricing.tavern.hospitality_index) or 1), colors.cyan)
+  at(2, 18, "Eligible:     Near " .. tostring(stats.near_tavern) .. "   Already today " .. tostring(stats.tavern_already_charged_today) .. "   Skipped day " .. tostring(stats.tavern_skipped_not_night), colors.lightGray)
+  at(2, 19, "Stays:        " .. tostring(stats.stays_charged) .. "   Treasury revenue: " .. money(stats.tavern_revenue), colors.lime)
+  at(2, 20, "Revenue src:  Citizens " .. money(stats.tavern_citizen_revenue) .. " / External guests " .. money(stats.tavern_guest_revenue), colors.lightGray)
+  at(2, 21, "Last stay:    " .. tostring(stats.last_tavern_guest or "") .. " " .. money(stats.last_tavern_charge) .. " (" .. tostring(stats.last_tavern_source or "") .. ")", colors.gray)
 
   local third = math.floor((W - 8) / 3)
   local bScan = button(2, H - 3, third, "Poll Now", colors.purple)
@@ -876,8 +1305,13 @@ local function loadConfig()
 
   if tonumber(cfg.scan_seconds) then SCAN_SECONDS = math.max(1, tonumber(cfg.scan_seconds)) end
   if tonumber(cfg.dining_radius) then DINING_RADIUS = math.max(4, tonumber(cfg.dining_radius)) end
-  if tonumber(cfg.meal_cooldown_seconds) then MEAL_COOLDOWN_SECONDS = math.max(0, tonumber(cfg.meal_cooldown_seconds)) end
-  if tonumber(cfg.base_normal_meal_price) then BASE_NORMAL_MEAL_PRICE = math.max(0.1, tonumber(cfg.base_normal_meal_price)) end
+  if tonumber(cfg.tavern_radius) then TAVERN_RADIUS = math.max(4, tonumber(cfg.tavern_radius)) end
+  if cfg.auto_charge ~= nil then auto_charge = cfg.auto_charge and true or false end
+  if cfg.enable_dining ~= nil then ENABLE_DINING = cfg.enable_dining and true or false end
+  if cfg.enable_tavern ~= nil then ENABLE_TAVERN = cfg.enable_tavern and true or false end
+  if cfg.charge_visitors_without_position ~= nil then CHARGE_VISITORS_WITHOUT_POSITION = cfg.charge_visitors_without_position and true or false end
+  if cfg.charge_citizens_only_at_night ~= nil then CHARGE_CITIZENS_ONLY_AT_NIGHT = cfg.charge_citizens_only_at_night and true or false end
+
   if cfg.target_company or cfg.company_id then
     local t = tostring(cfg.target_company or cfg.company_id)
     if t ~= "" then
@@ -889,11 +1323,28 @@ local function loadConfig()
   end
 end
 
+local function saveConfig()
+  writeFile(CONFIG_FILE, {
+    scan_seconds = SCAN_SECONDS,
+    dining_radius = DINING_RADIUS,
+    tavern_radius = TAVERN_RADIUS,
+    auto_charge = auto_charge,
+    enable_dining = ENABLE_DINING,
+    enable_tavern = ENABLE_TAVERN,
+    charge_visitors_without_position = CHARGE_VISITORS_WITHOUT_POSITION,
+    charge_citizens_only_at_night = CHARGE_CITIZENS_ONLY_AT_NIGHT,
+    target_company = TARGET_COMPANY,
+  })
+end
+
 local function main()
-  state = readFile(STATE_FILE) or state
-  state.citizens = state.citizens or {}
-  state.receivables = state.receivables or {}
-  state.events = state.events or {}
+  local loaded = readFile(STATE_FILE)
+  if type(loaded) == "table" then state = loaded end
+  state.citizens = type(state.citizens) == "table" and state.citizens or {}
+  state.receivables = type(state.receivables) == "table" and state.receivables or {}
+  state.tavern_stays = type(state.tavern_stays) == "table" and state.tavern_stays or {}
+  state.events = type(state.events) == "table" and state.events or {}
+
   loadConfig()
 
   if not openModem() then
@@ -921,6 +1372,7 @@ local function main()
         poll()
       elseif hit(bAuto, p2, p3) then
         auto_charge = not auto_charge
+        saveConfig()
         setMsg("Auto " .. (auto_charge and "on" or "off"), colors.yellow)
       elseif hit(bRecon, p2, p3) then
         discoverBank()
@@ -932,6 +1384,7 @@ local function main()
 
     elseif ev == "terminate" then
       writeFile(STATE_FILE, state)
+      saveConfig()
       break
     end
   end
